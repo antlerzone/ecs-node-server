@@ -1,0 +1,38 @@
+{
+  "name": "app",
+  "version": "1.0.0",
+  "main": "app.js",
+  "scripts": {
+    "start": "node server.js",
+    "start:app": "node app.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "ali-oss": "^6.23.0",
+    "aws4": "^1.13.2",
+    "axios": "^1.13.5",
+    "bcrypt": "^6.0.0",
+    "cors": "^2.8.6",
+    "csv-parse": "^6.1.0",
+    "dotenv": "^17.3.1",
+    "exceljs": "^4.4.0",
+    "express": "^5.2.1",
+    "form-data": "^4.0.5",
+    "googleapis": "^144.0.0",
+    "joi": "^18.0.2",
+    "json5": "^2.2.3",
+    "multer": "^2.0.2",
+    "mysql2": "^3.18.0",
+    "pdfkit": "^0.17.2",
+    "sharp": "^0.33.5",
+    "stripe": "^17.4.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}

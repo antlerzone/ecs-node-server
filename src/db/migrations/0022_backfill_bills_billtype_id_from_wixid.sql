@@ -1,0 +1,5 @@
+-- 【已废弃】bills 表不关联 account。
+-- 规则：Wix CMS 导入用 wixid；MySQL 内用 _id (FK) 做 reference。bills 的「类型」= supplierdetail。
+-- 请用 0023_bills_billtype_to_supplierdetail_id.sql：billtype_wixid → supplierdetail，supplierdetail_id FK 到 supplierdetail。
+-- 原内容（勿再执行）：
+-- UPDATE bills t INNER JOIN account a ON a.wix_id = t.billtype_wixid ... SET t.billtype_id = a.id;

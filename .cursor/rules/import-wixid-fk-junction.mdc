@@ -1,0 +1,24 @@
+---
+description: Import 时凡有 wix_id/*_wixid 必须解析为 _id (FK)，并同步 Junction
+alwaysApply: false
+globs: scripts/import-*.js
+---
+
+# Import 脚本：wixid → FK + Junction
+
+## 必须遵守
+
+1. **凡是 CSV/输入里的 `wix_id` 或 `*_wixid` 列（表示 reference），一律视为旧 Wix ID，必须解析为对应的 `_id`（FK）并写入本行。**
+   - 例：有 `client_wixid` → 用 `clientdetail.wix_id` 查得 `id` → 写入本行 `client_id`。
+   - 列对应关系与「查表」见 `docs/db/import-wixid-to-fk-junction-rule.md` 第一节。
+
+2. **若解析出的 FK 参与 Junction 表，必须在同一次 import 里写入 Junction。**
+   - 例：import **account** 时若写了 `client_id`，必须同时 `INSERT` **account_client**（account_id, client_id, system）。
+   - 例：import **ownerdetail** 时若写了 `client_id` / `property_id`，必须同步 **owner_client** / **owner_property**（多值时拆成多行）。
+
+3. **不要**在业务逻辑或 API 里用 `_wixid` 做关联；导入阶段解析成 `_id` 后，后续一律用 `_id`。见 `mysql-fk-use-id-only.mdc`。
+
+## 参考
+
+- 列 ↔ FK ↔ 查表 ↔ Junction 完整表：`docs/db/import-wixid-to-fk-junction-rule.md`
+- 所有 FK 与 Junction 表：`docs/db/fk-and-junction-tables.md`

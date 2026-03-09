@@ -1,0 +1,121 @@
+require('dotenv').config();
+
+const express = require('express');
+const cors = require('cors');
+
+const clientresolver = require('./src/middleware/clientresolver');
+const invoiceroutes = require('./src/modules/bukku/routes/invoice.routes');
+const quoteroutes = require('./src/modules/bukku/routes/quote.routes');
+const orderroutes = require('./src/modules/bukku/routes/order.routes');
+const deliveryorderroutes = require('./src/modules/bukku/routes/deliveryOrder.routes');
+const creditnoteroutes = require('./src/modules/bukku/routes/creditNote.routes');
+const invoicepaymentroutes = require('./src/modules/bukku/routes/invoicepayment.routes');
+const refundroutes = require('./src/modules/bukku/routes/refund.routes');
+const purchaseorderroutes = require('./src/modules/bukku/routes/purchaseOrder.routes');
+const goodsreceivednoteroutes = require('./src/modules/bukku/routes/goodsReceivedNote.routes');
+const purchasebillroutes = require('./src/modules/bukku/routes/purchaseBill.routes');
+const purchasecreditnoteroutes = require('./src/modules/bukku/routes/purchaseCreditNote.routes');
+const purchasepaymentroutes = require('./src/modules/bukku/routes/purchasePayment.routes');
+const purchaserefundroutes = require('./src/modules/bukku/routes/purchaseRefund.routes');
+const bankingincomeroutes = require('./src/modules/bukku/routes/bankingIncome.routes');
+const bankingexpenseroutes = require('./src/modules/bukku/routes/bankingExpense.routes');
+const bankingtransferroutes = require('./src/modules/bukku/routes/bankingTransfer.routes');
+const contactroutes = require('./src/modules/bukku/routes/contact.routes');
+const productroutes = require('./src/modules/bukku/routes/product.routes');
+const journalentryroutes = require('./src/modules/bukku/routes/journalEntry.routes');
+const accountroutes = require('./src/modules/bukku/routes/account.routes');
+const listroutes = require('./src/modules/bukku/routes/list.routes');
+const xeroAccountRoutes = require('./src/modules/xero/routes/account.routes');
+const xeroInvoiceRoutes = require('./src/modules/xero/routes/invoice.routes');
+const autocountInvoiceRoutes = require('./src/modules/autocount/routes/invoice.routes');
+const fileroutes = require('./src/modules/bukku/routes/file.routes');
+const locationroutes = require('./src/modules/bukku/routes/location.routes');
+const tagroutes = require('./src/modules/bukku/routes/tag.routes');
+const ttlockLockRoutes = require('./src/modules/ttlock/routes/lock.routes');
+const ttlockGatewayRoutes = require('./src/modules/ttlock/routes/gateway.routes');
+const ttlockUserRoutes = require('./src/modules/ttlock/routes/user.routes');
+const cnyiotMeterRoutes = require('./src/modules/cnyiot/routes/meter.routes');
+const cnyiotPriceRoutes = require('./src/modules/cnyiot/routes/price.routes');
+const cnyiotUserRoutes = require('./src/modules/cnyiot/routes/user.routes');
+const clientroutes = require('./src/modules/client/routes/client.routes');
+const apiAuth = require('./src/middleware/apiAuth');
+const accessroutes = require('./src/modules/access/access.routes');
+const apiUserRoutes = require('./src/modules/api-user/api-user.routes');
+const errorhandler = require('./src/middleware/errorhandler');
+const stripeRoutes = require('./src/modules/stripe/stripe.routes');
+const { webhookHandler: stripeWebhookHandler } = require('./src/modules/stripe/stripe.routes');
+const { webhookHandler: xeroWebhookHandler } = require('./src/modules/xero/webhook');
+const billingRoutes = require('./src/modules/billing/billing.routes');
+const contactRoutes = require('./src/modules/contact/contact.routes');
+const accountSaaSRoutes = require('./src/modules/account/account.routes');
+const admindashboardRoutes = require('./src/modules/admindashboard/admindashboard.routes');
+const tenancyCronRoutes = require('./src/modules/tenancysetting/tenancy-cron.routes');
+const tenancysettingRoutes = require('./src/modules/tenancysetting/tenancysetting.routes');
+const metersettingRoutes = require('./src/modules/metersetting/metersetting.routes');
+
+const app = express();
+
+app.use(cors());
+// Webhooks need raw body for signature verification; mount before express.json()
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), stripeWebhookHandler);
+app.post('/api/xero/webhook', express.raw({ type: 'application/json' }), xeroWebhookHandler);
+app.use(express.json());
+app.use(clientresolver);
+const recordApiErrorMiddleware = require('./src/middleware/recordApiErrorMiddleware');
+app.use(recordApiErrorMiddleware);
+
+app.use('/api/bukku/invoices', invoiceroutes);
+app.use('/api/bukku/quotes', quoteroutes);
+app.use('/api/bukku/orders', orderroutes);
+app.use('/api/bukku/delivery_orders', deliveryorderroutes);
+app.use('/api/bukku/credit_notes', creditnoteroutes);
+app.use('/api/bukku/payments', invoicepaymentroutes);
+app.use('/api/bukku/refunds', refundroutes);
+app.use('/api/bukku/purchases/orders', purchaseorderroutes);
+app.use('/api/bukku/purchases/goods_received_notes', goodsreceivednoteroutes);
+app.use('/api/bukku/purchases/bills', purchasebillroutes);
+app.use('/api/bukku/purchases/credit_notes', purchasecreditnoteroutes);
+app.use('/api/bukku/purchases/payments', purchasepaymentroutes);
+app.use('/api/bukku/purchases/refunds', purchaserefundroutes);
+app.use('/api/bukku/banking/incomes', bankingincomeroutes);
+app.use('/api/bukku/banking/expenses', bankingexpenseroutes);
+app.use('/api/bukku/banking/transfers', bankingtransferroutes);
+app.use('/api/bukku/contacts', contactroutes);
+app.use('/api/bukku/products', productroutes);
+app.use('/api/bukku/journal_entries', journalentryroutes);
+app.use('/api/bukku/accounts', accountroutes);
+app.use('/api/bukku/lists', listroutes);
+app.use('/api/xero/accounts', xeroAccountRoutes);
+app.use('/api/xero/invoices', xeroInvoiceRoutes);
+app.use('/api/autocount/invoices', autocountInvoiceRoutes);
+app.use('/api/bukku/files', fileroutes);
+app.use('/api/bukku/locations', locationroutes);
+app.use('/api/bukku/tags', tagroutes);
+app.use('/api/ttlock/locks', ttlockLockRoutes);
+app.use('/api/ttlock/gateways', ttlockGatewayRoutes);
+app.use('/api/ttlock/users', ttlockUserRoutes);
+app.use('/api/cnyiot/meters', cnyiotMeterRoutes);
+app.use('/api/cnyiot/prices', cnyiotPriceRoutes);
+app.use('/api/cnyiot/users', cnyiotUserRoutes);
+app.use('/api/client', clientroutes);
+app.use('/api/stripe', stripeRoutes);
+app.use('/api/billing', billingRoutes);
+app.use('/api/contact', apiAuth, contactRoutes);
+app.use('/api/account', apiAuth, accountSaaSRoutes);
+app.use('/api/admindashboard', apiAuth, admindashboardRoutes);
+app.use('/api/access', apiAuth, accessroutes);
+app.use('/api/admin/api-users', apiUserRoutes);
+app.use('/api/cron', tenancyCronRoutes);
+app.use('/api/tenancysetting', apiAuth, tenancysettingRoutes);
+app.use('/api/metersetting', apiAuth, metersettingRoutes);
+app.use(errorhandler);
+
+app.get('/', (req, res) => {
+  res.json({ ok: true, message: 'server running' });
+});
+
+const port = process.env.PORT || 5000;
+
+app.listen(port, '0.0.0.0', () => {
+  console.log(`server running on port ${port}`);
+});
