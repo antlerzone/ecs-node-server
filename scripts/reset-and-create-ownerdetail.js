@@ -1,5 +1,6 @@
 /**
- * 删除 ownerdetail 表并按新结构重建（reference = xxx_wixid + xxx_id）。
+ * 删除 ownerdetail 表并按兼容结构重建。
+ * 0142 后：不再包含 legacy 列 client_id / property_id（关系走 owner_client / owner_property）。
  * 用法：node scripts/reset-and-create-ownerdetail.js
  */
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
@@ -23,9 +24,7 @@ CREATE TABLE ownerdetail (
   status varchar(50) DEFAULT NULL,
   approvalpending text DEFAULT NULL,
   client_wixid varchar(255) DEFAULT NULL,
-  client_id varchar(36) DEFAULT NULL,
   property_wixid varchar(255) DEFAULT NULL,
-  property_id varchar(36) DEFAULT NULL,
   profile text DEFAULT NULL,
   account text DEFAULT NULL,
   created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -34,17 +33,11 @@ CREATE TABLE ownerdetail (
   KEY idx_ownerdetail_wix_id (wix_id),
   KEY idx_ownerdetail_email (email),
   KEY idx_ownerdetail_client_wixid (client_wixid),
-  KEY idx_ownerdetail_client_id (client_id),
   KEY idx_ownerdetail_property_wixid (property_wixid),
-  KEY idx_ownerdetail_property_id (property_id),
   KEY idx_ownerdetail_bankname_wixid (bankname_wixid),
   KEY idx_ownerdetail_bankname_id (bankname_id),
   CONSTRAINT fk_ownerdetail_bankname
-    FOREIGN KEY (bankname_id) REFERENCES bankdetail (id) ON UPDATE CASCADE ON DELETE SET NULL,
-  CONSTRAINT fk_ownerdetail_client
-    FOREIGN KEY (client_id) REFERENCES clientdetail (id) ON UPDATE CASCADE ON DELETE SET NULL,
-  CONSTRAINT fk_ownerdetail_property
-    FOREIGN KEY (property_id) REFERENCES propertydetail (id) ON UPDATE CASCADE ON DELETE SET NULL
+    FOREIGN KEY (bankname_id) REFERENCES bankdetail (id) ON UPDATE CASCADE ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 `;
 

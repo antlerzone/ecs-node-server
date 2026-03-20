@@ -1,5 +1,11 @@
 require('dotenv').config();
 
+// Log once at startup whether SaaS Bukku (manual renew/topup invoice) can run
+const _bukkuKey = process.env.BUKKU_SAAS_API_KEY || process.env.BUKKU_SAAS_BUKKU_API_KEY;
+const _bukkuSub = process.env.BUKKU_SAAS_SUBDOMAIN || process.env.BUKKU_SAAS_BUKKUSUBDOMAIN;
+const _bukkuOk = !!(_bukkuKey && String(_bukkuKey).trim() && _bukkuSub && String(_bukkuSub).trim());
+console.log('[server] BUKKU_SAAS for invoice:', _bukkuOk ? 'configured=yes' : 'configured=no (set BUKKU_SAAS_API_KEY & BUKKU_SAAS_SUBDOMAIN in .env and restart)');
+
 const express = require('express');
 const cors = require('cors');
 
@@ -39,6 +45,7 @@ const cnyiotPriceRoutes = require('./src/modules/cnyiot/routes/price.routes');
 const cnyiotUserRoutes = require('./src/modules/cnyiot/routes/user.routes');
 const clientroutes = require('./src/modules/client/routes/client.routes');
 const apiAuth = require('./src/middleware/apiAuth');
+const apiClientScope = require('./src/middleware/apiClientScope');
 const accessroutes = require('./src/modules/access/access.routes');
 const apiUserRoutes = require('./src/modules/api-user/api-user.routes');
 const errorhandler = require('./src/middleware/errorhandler');
@@ -46,20 +53,75 @@ const stripeRoutes = require('./src/modules/stripe/stripe.routes');
 const { webhookHandler: stripeWebhookHandler } = require('./src/modules/stripe/stripe.routes');
 const { webhookHandler: xeroWebhookHandler } = require('./src/modules/xero/webhook');
 const billingRoutes = require('./src/modules/billing/billing.routes');
+const agreementRoutes = require('./src/modules/agreement/agreement.routes');
 const contactRoutes = require('./src/modules/contact/contact.routes');
 const accountSaaSRoutes = require('./src/modules/account/account.routes');
 const admindashboardRoutes = require('./src/modules/admindashboard/admindashboard.routes');
 const tenancyCronRoutes = require('./src/modules/tenancysetting/tenancy-cron.routes');
 const tenancysettingRoutes = require('./src/modules/tenancysetting/tenancysetting.routes');
 const metersettingRoutes = require('./src/modules/metersetting/metersetting.routes');
+const tenantdashboardRoutes = require('./src/modules/tenantdashboard/tenantdashboard.routes');
+const tenantinvoiceRoutes = require('./src/modules/tenantinvoice/tenantinvoice.routes');
+const smartdoorsettingRoutes = require('./src/modules/smartdoorsetting/smartdoorsetting.routes');
+const agreementsettingRoutes = require('./src/modules/agreementsetting/agreementsetting.routes');
+const companysettingRoutes = require('./src/modules/companysetting/companysetting.routes');
+const propertysettingRoutes = require('./src/modules/propertysetting/propertysetting.routes');
+const ownersettingRoutes = require('./src/modules/ownersetting/ownersetting.routes');
+const roomsettingRoutes = require('./src/modules/roomsetting/roomsetting.routes');
+const portalAuthRoutes = require('./src/modules/portal-auth/portal-auth.routes');
+const docsAuthRoutes = require('./src/modules/docs-auth/docs-auth.routes');
+const payexRoutes = require('./src/modules/payex/payex.routes');
+const availableunitRoutes = require('./src/modules/availableunit/availableunit.routes');
+const termsRoutes = require('./src/modules/terms/terms.routes');
+const generatereportRoutes = require('./src/modules/generatereport/generatereport.routes');
+const bookingRoutes = require('./src/modules/booking/booking.routes');
+const bankBulkTransferRoutes = require('./src/modules/bankbulktransfer/bankbulktransfer.routes');
+const expensesRoutes = require('./src/modules/expenses/expenses.routes');
+const ownerportalRoutes = require('./src/modules/ownerportal/ownerportal.routes');
+const enquiryRoutes = require('./src/modules/enquiry/enquiry.routes');
+const ownerEnquiryRoutes = require('./src/modules/owner-enquiry/owner-enquiry.routes');
+const sandboxRoutes = require('./src/modules/sandbox/sandbox.routes');
+const helpRoutes = require('./src/modules/help/help.routes');
+const paymentVerificationRoutes = require('./src/modules/payment-verification/payment-verification.routes');
+const finverseCallbackRoutes = require('./src/modules/finverse/finverse-callback.routes');
+const uploadRoutes = require('./src/modules/upload/upload.routes');
+const downloadRoutes = require('./src/modules/download/download.routes');
+const publicRoutes = require('./src/modules/public/public.routes');
+
+// Google / Facebook OAuth for portal login (strategies register on require)
+require('./src/modules/portal-auth/passport-strategies');
+const passport = require('passport');
 
 const app = express();
 
-app.use(cors());
+app.use(cors({
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-request-id', 'X-Request-Id']
+}));
+// Finverse Link (link.prod.finverse.net) XHR to our callback must pass preflight; ensure OPTIONS and GET get CORS.
+app.use('/api/finverse', (req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin === 'https://link.prod.finverse.net') {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-request-id, X-Request-Id');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    if (req.method === 'OPTIONS') return res.status(204).end();
+  }
+  next();
+});
+app.use(passport.initialize());
 // Webhooks need raw body for signature verification; mount before express.json()
-app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), stripeWebhookHandler);
+// Use type: () => true so we always get Buffer (Stripe may send application/json; charset=utf-8)
+app.post('/api/stripe/webhook', express.raw({ type: () => true, limit: '1mb' }), stripeWebhookHandler);
 app.post('/api/xero/webhook', express.raw({ type: 'application/json' }), xeroWebhookHandler);
 app.use(express.json());
+app.use((req, res, next) => {
+  const p = req.path || req.url?.split('?')[0] || '';
+  if (p.includes('availableunit') || p.includes('available-unit')) {
+    console.log('[server] request', { method: req.method, path: p, url: req.originalUrl });
+  }
+  next();
+});
 app.use(clientresolver);
 const recordApiErrorMiddleware = require('./src/middleware/recordApiErrorMiddleware');
 app.use(recordApiErrorMiddleware);
@@ -100,22 +162,76 @@ app.use('/api/cnyiot/users', cnyiotUserRoutes);
 app.use('/api/client', clientroutes);
 app.use('/api/stripe', stripeRoutes);
 app.use('/api/billing', billingRoutes);
-app.use('/api/contact', apiAuth, contactRoutes);
-app.use('/api/account', apiAuth, accountSaaSRoutes);
-app.use('/api/admindashboard', apiAuth, admindashboardRoutes);
+app.use('/api/agreement', agreementRoutes);
+// Bank bulk transfer (Excel / CSV / ZIP)
+app.use('/api/bank-bulk-transfer', bankBulkTransferRoutes);
+// Fallback when Nginx sends portal proxy path to Node: same routes under /api/portal/proxy/...
+// (If these requests hit Next first, Next forwards to /api/agreementsetting/* instead.)
+app.use('/api/portal/proxy/billing', billingRoutes);
+app.use('/api/portal/proxy/agreementsetting', apiAuth, apiClientScope, agreementsettingRoutes);
+// OSS logo / company chop (multipart). app.js had these; server.js is production entry — must match Next proxy → /api/upload
+app.use('/api/portal/proxy/upload', apiAuth, uploadRoutes);
+app.use('/api/portal/proxy/download', downloadRoutes);
+// apiClientScope: operator API can only access data for api_user.client_id (no cross-operator data)
+app.use('/api/contact', apiAuth, apiClientScope, contactRoutes);
+app.use('/api/account', apiAuth, apiClientScope, accountSaaSRoutes);
+app.use('/api/admindashboard', apiAuth, apiClientScope, admindashboardRoutes);
+app.use('/api/terms', apiAuth, apiClientScope, termsRoutes);
 app.use('/api/access', apiAuth, accessroutes);
 app.use('/api/admin/api-users', apiUserRoutes);
 app.use('/api/cron', tenancyCronRoutes);
-app.use('/api/tenancysetting', apiAuth, tenancysettingRoutes);
-app.use('/api/metersetting', apiAuth, metersettingRoutes);
+app.use('/api/tenancysetting', apiAuth, apiClientScope, tenancysettingRoutes);
+app.use('/api/metersetting', apiAuth, apiClientScope, metersettingRoutes);
+app.use('/api/tenantdashboard', apiAuth, tenantdashboardRoutes);
+app.use('/api/tenantinvoice', apiAuth, apiClientScope, tenantinvoiceRoutes);
+app.use('/api/smartdoorsetting', apiAuth, apiClientScope, smartdoorsettingRoutes);
+app.use('/api/agreementsetting', apiAuth, apiClientScope, agreementsettingRoutes);
+app.use('/api/companysetting', companysettingRoutes);
+app.use('/api/upload', apiAuth, uploadRoutes);
+app.use('/api/propertysetting', apiAuth, apiClientScope, propertysettingRoutes);
+app.use('/api/ownersetting', apiAuth, apiClientScope, ownersettingRoutes);
+app.use('/api/roomsetting', apiAuth, apiClientScope, roomsettingRoutes);
+app.use('/api/generatereport', apiAuth, apiClientScope, generatereportRoutes);
+app.use('/api/booking', apiAuth, bookingRoutes);
+app.use('/api/expenses', apiAuth, apiClientScope, expensesRoutes);
+app.use('/api/ownerportal', apiAuth, ownerportalRoutes);
+app.use('/api/portal-auth', portalAuthRoutes);
+app.use('/api/docs-auth', docsAuthRoutes);
+app.use('/api/payex', payexRoutes);
+app.use('/api/sandbox', apiAuth, sandboxRoutes);
+// Enquiry – public (plans, addons, banks, credit-plans, submit); used by portal pricing page
+app.use('/api/enquiry', enquiryRoutes);
+// Owner enquiry – kept behind API auth to match legacy behavior.
+app.use('/api/owner-enquiry', apiAuth, ownerEnquiryRoutes);
+// Help – FAQ + ticket (topup_manual / manual billing ticket from portal credit page)
+app.use('/api/help', helpRoutes);
+// Payment verification: receipt upload, invoices, matching, approve/reject, Finverse sync
+app.use('/api/payment-verification', apiAuth, apiClientScope, paymentVerificationRoutes);
+app.use('/api/finverse', finverseCallbackRoutes);
+// Portal may proxy /api/pricing/* to Node; same handler as enquiry (credit-plans)
+app.use('/api/pricing', enquiryRoutes);
+app.use('/api/download', downloadRoutes);
+app.use('/api/public', publicRoutes);
+// Available Unit list – public (no login), for portal /available-unit page
+app.use('/api/availableunit', availableunitRoutes);
+app.use('/api/available-unit', availableunitRoutes);
 app.use(errorhandler);
 
 app.get('/', (req, res) => {
   res.json({ ok: true, message: 'server running' });
 });
 
+// Log unmatched API requests (404) to see what path hit the server
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/')) {
+    console.log('[server] 404 (no route)', { method: req.method, path: req.path, url: req.originalUrl });
+  }
+  next();
+});
+
 const port = process.env.PORT || 5000;
 
 app.listen(port, '0.0.0.0', () => {
   console.log(`server running on port ${port}`);
+  console.log('[server] availableunit routes mounted: /api/availableunit/list, /api/available-unit/list');
 });

@@ -107,10 +107,10 @@ async function main() {
       [DEMO_INTEGRATION_ID, DEMO_CLIENT_ID]
     );
 
-    // 5) client_credit
+    // 5) client_credit (default high so demo operator/owner/tenant don't need to top up)
     await conn.query(
-      `INSERT INTO client_credit (id, client_id, type, amount, updated_at) VALUES (?, ?, 'flex', 9999, NOW())
-       ON DUPLICATE KEY UPDATE amount = 9999, updated_at = NOW()`,
+      `INSERT INTO client_credit (id, client_id, type, amount, updated_at) VALUES (?, ?, 'flex', 99999, NOW())
+       ON DUPLICATE KEY UPDATE amount = 99999, updated_at = NOW()`,
       [DEMO_CREDIT_ID, DEMO_CLIENT_ID]
     );
 
@@ -132,10 +132,10 @@ async function main() {
 
     // 8) ownerdetail (antlerzone@gmail.com)
     await conn.query(
-      `INSERT INTO ownerdetail (id, ownername, email, client_id, property_id, created_at, updated_at)
-       VALUES (?, 'Demo Owner', ?, ?, NULL, NOW(), NOW())
-       ON DUPLICATE KEY UPDATE ownername = 'Demo Owner', email = VALUES(email), client_id = VALUES(client_id), updated_at = NOW()`,
-      [DEMO_OWNER_ID, DEMO_CLIENT_EMAIL, DEMO_CLIENT_ID]
+      `INSERT INTO ownerdetail (id, ownername, email, created_at, updated_at)
+       VALUES (?, 'Demo Owner', ?, NOW(), NOW())
+       ON DUPLICATE KEY UPDATE ownername = 'Demo Owner', email = VALUES(email), updated_at = NOW()`,
+      [DEMO_OWNER_ID, DEMO_CLIENT_EMAIL]
     );
     // owner_client junction (optional if migration 0037/0048 not run)
     try {
@@ -154,10 +154,6 @@ async function main() {
        ON DUPLICATE KEY UPDATE shortname = 'Demo Property', apartmentname = 'Demo Property A', address = 'Demo Address',
          active = 1, agreementtemplate_id = VALUES(agreementtemplate_id), owner_id = VALUES(owner_id), updated_at = NOW()`,
       [DEMO_PROPERTY_ID, DEMO_CLIENT_ID, DEMO_AGREEMENT_TEMPLATE_ID, DEMO_OWNER_ID]
-    );
-    await conn.query(
-      `UPDATE ownerdetail SET property_id = ? WHERE id = ?`,
-      [DEMO_PROPERTY_ID, DEMO_OWNER_ID]
     );
     try {
       await conn.query(
