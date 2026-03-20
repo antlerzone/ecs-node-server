@@ -48,11 +48,6 @@ async function getOwnerList(clientId, opts = {}) {
     const [fromJunction] = await pool.query('SELECT owner_id FROM owner_client WHERE client_id = ?', [clientId]);
     (fromJunction || []).forEach((r) => ownerIdsLinkedToClient.add(r.owner_id));
   } catch (_) { /* owner_client may not exist */ }
-  try {
-    const [fromLegacy] = await pool.query('SELECT id FROM ownerdetail WHERE client_id = ?', [clientId]);
-    (fromLegacy || []).forEach((r) => ownerIdsLinkedToClient.add(r.id));
-  } catch (_) { /* client_id column may not exist */ }
-
   const allOwnerIds = [...ownerIdsLinkedToClient];
   let ownerMap = {};
   if (allOwnerIds.length) {
@@ -146,6 +141,7 @@ async function getOwnerList(clientId, opts = {}) {
     items.push({
       _id: primaryOid,
       id: primaryOid,
+      email: o.email || '',
       ownername: { ownerName: hasPending && completedProps.length === 0 ? 'Pending Owner' : (o.ownerName || o.email || 'Owner') },
       properties: allProps,
       propertiesLabel: shortnames.length ? shortnames.join(', ') : '—',
@@ -163,6 +159,7 @@ async function getOwnerList(clientId, opts = {}) {
     items.push({
       _id: `pending_${o.id}`,
       id: `pending_${o.id}`,
+      email: o.email || '',
       ownername: { ownerName: 'Pending Owner' },
       properties: pendingProps,
       propertiesLabel: shortnames.length ? shortnames.join(', ') : '—',
@@ -457,18 +454,13 @@ async function deleteOwnerFromProperty(clientId, propertyId) {
 }
 
 /**
- * Remove owner–client mapping: DELETE FROM owner_client; clear ownerdetail.client_id so list no longer includes this owner.
+ * Remove owner–client mapping from junction table only.
  * Use when owner has no properties under this client; after this they no longer appear in this client's list.
  */
 async function removeOwnerMapping(clientId, ownerId) {
   if (!clientId || !ownerId) return { ok: false, reason: 'MISSING_PARAMS' };
   try {
     await pool.query('DELETE FROM owner_client WHERE client_id = ? AND owner_id = ?', [clientId, ownerId]);
-    try {
-      await pool.query('UPDATE ownerdetail SET client_id = NULL, updated_at = NOW() WHERE id = ? AND client_id = ?', [ownerId, clientId]);
-    } catch (_) {
-      // client_id column may not exist on ownerdetail
-    }
     return { ok: true };
   } catch (e) {
     return { ok: false, reason: 'DB_ERROR' };

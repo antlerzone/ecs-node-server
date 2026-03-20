@@ -5,11 +5,14 @@
  * All endpoints require email; owner is resolved by email (ownerdetail.email).
  */
 
-const { randomUUID } = require('crypto');
+const { randomUUID, createHash } = require('crypto');
 const pool = require('../../config/db');
 const { ACCOUNTING_PLAN_IDS } = require('../access/access.service');
 const contactSync = require('../contact/contact-sync.service');
 const { malaysiaDateRangeToUtcForQuery } = require('../../utils/dateMalaysia');
+const { updatePortalProfile } = require('../portal-auth/portal-auth.service');
+const lockWrapper = require('../ttlock/wrappers/lock.wrapper');
+const { signatureValueToPublicUrl } = require('../upload/signature-image-to-oss-url');
 
 function parseJson(val) {
   if (val == null) return null;
@@ -44,6 +47,30 @@ async function getClientIdsByOwnerIdFromJunction(ownerId) {
     [ownerId]
   );
   return (rows || []).map((x) => x.client_id);
+}
+
+/**
+ * Operator list for owner portal “Contact operator” (title + WhatsApp/contact from client_profile).
+ */
+async function getLinkedOperatorsForClientIds(clientIds) {
+  if (!Array.isArray(clientIds) || clientIds.length === 0) return [];
+  const unique = [...new Set(clientIds.filter(Boolean))];
+  if (unique.length === 0) return [];
+  const placeholders = unique.map(() => '?').join(',');
+  const [rows] = await pool.query(
+    `SELECT c.id AS client_id, c.title,
+            TRIM(COALESCE(cp.contact, '')) AS contact
+       FROM clientdetail c
+       LEFT JOIN client_profile cp ON cp.client_id = c.id
+      WHERE c.id IN (${placeholders})
+      ORDER BY COALESCE(c.title, '') ASC, c.id ASC`,
+    unique
+  );
+  return (rows || []).map((row) => ({
+    clientId: row.client_id,
+    title: row.title || 'Operator',
+    contact: row.contact || ''
+  }));
 }
 
 /**
@@ -92,8 +119,7 @@ async function getOwnerByEmail(email) {
   if (!email || !String(email).trim()) return null;
   const [rows] = await pool.query(
     `SELECT id, ownername, nric, email, mobilenumber, bankname_id, bankaccount, accountholder,
-            nricfront, nricback, signature, profile, approvalpending, account,
-            property_id, client_id
+            nricfront, nricback, signature, profile, approvalpending, account
        FROM ownerdetail WHERE LOWER(TRIM(email)) = ? LIMIT 1`,
     [String(email).trim().toLowerCase()]
   );
@@ -102,8 +128,19 @@ async function getOwnerByEmail(email) {
   let propertyIds = await getPropertyIdsByOwnerIdFromJunction(r.id);
   let clientIds = await getClientIdsByOwnerIdFromJunction(r.id);
   if (propertyIds.length === 0) propertyIds = await getPropertyIdsByOwnerId(r.id);
-  if (propertyIds.length === 0 && r.property_id) propertyIds = [r.property_id];
-  if (clientIds.length === 0 && r.client_id) clientIds = [r.client_id];
+  if (propertyIds.length > 0) {
+    const ph = propertyIds.map(() => '?').join(',');
+    const [pRows] = await pool.query(
+      `SELECT DISTINCT client_id FROM propertydetail WHERE id IN (${ph}) AND client_id IS NOT NULL AND TRIM(client_id) != ''`,
+      propertyIds
+    );
+    for (const row of pRows || []) {
+      if (row.client_id && !clientIds.includes(row.client_id)) {
+        clientIds.push(row.client_id);
+      }
+    }
+  }
+  const linkedOperators = await getLinkedOperatorsForClientIds(clientIds);
   let approvalpending = parseJson(r.approvalpending);
   if (Array.isArray(approvalpending) && approvalpending.length > 0) {
     approvalpending = await enrichApprovalPending(approvalpending);
@@ -127,12 +164,13 @@ async function getOwnerByEmail(email) {
     approvalpending,
     account: parseJson(r.account),
     property: propertyIds,
-    client: clientIds
+    client: clientIds,
+    linkedOperators
   };
 }
 
 /**
- * Get property ids by owner id (from propertydetail.owner_id). Used when ownerdetail.property_id is empty.
+ * Get property ids by owner id (from propertydetail.owner_id). Used when owner_property is empty.
  */
 async function getPropertyIdsByOwnerId(ownerId) {
   if (ownerId == null) return [];
@@ -250,10 +288,22 @@ async function getBanks() {
 
 /**
  * Update owner profile (and optionally approvalpending, account). Only owner identified by email can update.
+ * When no ownerdetail row exists (portal user not yet mapped by any operator), create one so they can register profile.
  */
 async function updateOwnerProfile(email, payload) {
-  const owner = await getOwnerByEmail(email);
-  if (!owner) return { ok: false, reason: 'OWNER_NOT_FOUND' };
+  let owner = await getOwnerByEmail(email);
+  if (!owner) {
+    const norm = (email || '').toString().trim().toLowerCase();
+    if (!norm) return { ok: false, reason: 'NO_EMAIL' };
+    const id = randomUUID();
+    await pool.query(
+      `INSERT INTO ownerdetail (id, email, ownername, account, approvalpending, created_at, updated_at)
+       VALUES (?, ?, '', '[]', '[]', NOW(), NOW())`,
+      [id, norm]
+    );
+    owner = await getOwnerByEmail(email);
+    if (!owner) return { ok: false, reason: 'OWNER_NOT_FOUND' };
+  }
   const id = owner._id;
 
   const updates = [];
@@ -297,6 +347,59 @@ async function updateOwnerProfile(email, payload) {
     `UPDATE ownerdetail SET ${updates.join(', ')}, updated_at = NOW() WHERE id = ?`,
     params
   );
+  const norm = (owner.email || email || '').toString().trim().toLowerCase();
+  if (norm) {
+    const profileObj = payload.profile && typeof payload.profile === 'object' ? payload.profile : null;
+    const profileAddress =
+      profileObj && profileObj.address && typeof profileObj.address === 'object' ? profileObj.address : null;
+    const addressFull =
+      profileAddress
+        ? [profileAddress.street, profileAddress.city, profileAddress.state, profileAddress.postcode]
+            .filter((s) => s != null && String(s).trim())
+            .map((s) => String(s).trim())
+            .join(', ')
+        : undefined;
+
+    const portalPayload = {};
+    if (payload.ownerName !== undefined) {
+      portalPayload.fullname = payload.ownerName;
+    }
+    if (payload.mobileNumber !== undefined) portalPayload.phone = payload.mobileNumber;
+    if (payload.nric !== undefined) portalPayload.nric = payload.nric;
+    if (payload.nricFront !== undefined) portalPayload.nricfront = payload.nricFront;
+    if (payload.nricback !== undefined) portalPayload.nricback = payload.nricback;
+    if (payload.bankName !== undefined) portalPayload.bankname_id = payload.bankName;
+    if (payload.bankAccount !== undefined) portalPayload.bankaccount = payload.bankAccount;
+    if (payload.accountholder !== undefined) portalPayload.accountholder = payload.accountholder;
+    if (addressFull !== undefined) portalPayload.address = addressFull;
+    if (profileObj) {
+      if (profileObj.entity_type !== undefined) portalPayload.entity_type = profileObj.entity_type;
+      if (profileObj.reg_no_type !== undefined) portalPayload.reg_no_type = profileObj.reg_no_type;
+      if (profileObj.reg_no_type !== undefined) portalPayload.id_type = profileObj.reg_no_type;
+      if (profileObj.tax_id_no !== undefined) portalPayload.tax_id_no = profileObj.tax_id_no;
+      if (profileObj.avatar_url !== undefined) portalPayload.avatar_url = profileObj.avatar_url;
+    }
+    if (Object.keys(portalPayload).length > 0) {
+      try {
+        await updatePortalProfile(norm, portalPayload);
+      } catch (_) { /* portal_account may not exist or have profile columns */ }
+    }
+  }
+
+  // After profile edit (ownerName etc.): sync owner to accounting contact for each linked client so contact name/phone stay in sync.
+  if (updates.length > 0) {
+    try {
+      const [linkRows] = await pool.query('SELECT client_id FROM owner_client WHERE owner_id = ?', [id]);
+      for (const row of linkRows || []) {
+        if (row.client_id) {
+          syncOwnerForClient(email, { ownerId: id, clientId: row.client_id }).catch((e) =>
+            console.warn('[ownerportal] syncOwnerForClient after update-profile', row.client_id, e?.message || e)
+          );
+        }
+      }
+    } catch (_) { /* best-effort */ }
+  }
+
   return { ok: true, owner: await getOwnerByEmail(email) };
 }
 
@@ -311,28 +414,44 @@ async function getOwnerPayoutList(email, { propertyId, startDate, endDate }) {
   const toStr = endDate && String(endDate).trim().substring(0, 10);
   const { fromUtc, toUtc } = malaysiaDateRangeToUtcForQuery(fromStr || null, toStr || null);
   if (!fromUtc || !toUtc) return { ok: false, reason: 'START_END_DATE_REQUIRED' };
+  let propertyIds = Array.isArray(owner.property) ? owner.property.map((p) => (typeof p === 'object' && p._id ? p._id : p)) : [];
+  if (propertyIds.length === 0) propertyIds = await getPropertyIdsByOwnerId(owner._id);
+  if (propertyIds.length === 0) return { ok: true, items: [] };
+  propertyIds = [...new Set(propertyIds.filter(Boolean))];
+
+  const allMode = !propertyId || String(propertyId).toLowerCase() === 'all';
+  if (!allMode && !propertyIds.includes(propertyId)) return { ok: false, reason: 'FORBIDDEN_PROPERTY' };
+  const targetPropertyIds = allMode ? propertyIds : [propertyId];
+  const placeholders = targetPropertyIds.map(() => '?').join(',');
+
   const [rows] = await pool.query(
-    `SELECT id, property_id, period, totalrental, totalutility, totalcollection, expenses, netpayout, monthlyreport
-       FROM ownerpayout
-       WHERE property_id = ? AND period >= ? AND period <= ?
-       ORDER BY period ASC`,
-    [propertyId, fromUtc, toUtc]
+    `SELECT o.id, o.property_id, o.period, o.totalrental, o.totalutility, o.totalcollection, o.expenses, o.netpayout, o.monthlyreport, o.payment_date,
+            p.shortname AS property_shortname
+       FROM ownerpayout o
+       LEFT JOIN propertydetail p ON p.id = o.property_id
+       WHERE o.property_id IN (${placeholders}) AND o.period >= ? AND o.period <= ?
+       ORDER BY o.period DESC, p.shortname ASC`,
+    [...targetPropertyIds, fromUtc, toUtc]
   );
   const items = (rows || []).map(r => ({
     _id: r.id,
+    id: r.id,
+    propertyId: r.property_id,
+    propertyName: r.property_shortname || '',
     period: r.period,
     totalrental: r.totalrental,
     totalutility: r.totalutility,
     totalcollection: r.totalcollection,
     expenses: r.expenses,
     netpayout: r.netpayout,
-    monthlyreport: r.monthlyreport
+    monthlyreport: r.monthlyreport,
+    paymentDate: r.payment_date
   }));
   return { ok: true, items };
 }
 
 /**
- * Cost list (bills/UtilityBills) by property and period. Paginated.
+ * Cost list (bills/UtilityBills + ownerpayout management_fee) by property and period. Paginated.
  * startDate/endDate 来自 datepicker，视为 UTC+8 日历日；查询时转为 UTC 范围与 DB (UTC) 比较。
  */
 async function getCostList(email, { propertyId, startDate, endDate, skip = 0, limit = 10 }) {
@@ -342,22 +461,33 @@ async function getCostList(email, { propertyId, startDate, endDate, skip = 0, li
   const toStr = endDate && String(endDate).trim().substring(0, 10);
   const { fromUtc, toUtc } = malaysiaDateRangeToUtcForQuery(fromStr || null, toStr || null);
   if (!fromUtc || !toUtc) return { ok: false, reason: 'START_END_DATE_REQUIRED' };
-  const [countRows] = await pool.query(
-    'SELECT COUNT(*) AS total FROM bills WHERE property_id = ? AND period >= ? AND period <= ?',
-    [propertyId, fromUtc, toUtc]
-  );
-  const totalCount = Number(countRows[0]?.total || 0);
-  const [rows] = await pool.query(
-    `SELECT b.id, b.period, b.amount, b.description, b.billurl AS bukkuurl, b.property_id,
-            p.shortname AS property_shortname, c.currency AS client_currency
-       FROM bills b
-       LEFT JOIN propertydetail p ON p.id = b.property_id
-       LEFT JOIN clientdetail c ON c.id = p.client_id
-       WHERE b.property_id = ? AND b.period >= ? AND b.period <= ?
-       ORDER BY b.period DESC LIMIT ? OFFSET ?`,
-    [propertyId, fromUtc, toUtc, limit, skip]
-  );
-  const items = (rows || []).map(r => ({
+
+  const [billRows, mgmtRows, countRows] = await Promise.all([
+    pool.query(
+      `SELECT b.id, b.period, b.amount, b.description, b.billurl AS bukkuurl, b.property_id,
+              p.shortname AS property_shortname, c.currency AS client_currency
+         FROM bills b
+         LEFT JOIN propertydetail p ON p.id = b.property_id
+         LEFT JOIN clientdetail c ON c.id = p.client_id
+         WHERE b.property_id = ? AND b.period >= ? AND b.period <= ?
+         ORDER BY b.period DESC`,
+      [propertyId, fromUtc, toUtc]
+    ),
+    pool.query(
+      `SELECT o.id, o.period, o.management_fee AS amount, p.shortname AS property_shortname
+         FROM ownerpayout o
+         LEFT JOIN propertydetail p ON p.id = o.property_id
+         WHERE o.property_id = ? AND o.period >= ? AND o.period <= ? AND (o.management_fee IS NOT NULL AND o.management_fee > 0)
+         ORDER BY o.period DESC`,
+      [propertyId, fromUtc, toUtc]
+    ),
+    pool.query(
+      'SELECT COUNT(*) AS total FROM bills WHERE property_id = ? AND period >= ? AND period <= ?',
+      [propertyId, fromUtc, toUtc]
+    )
+  ]);
+
+  const billItems = (billRows[0] || []).map(r => ({
     _id: r.id,
     period: r.period,
     amount: r.amount,
@@ -365,8 +495,31 @@ async function getCostList(email, { propertyId, startDate, endDate, skip = 0, li
     bukkuurl: r.bukkuurl,
     listingTitle: r.property_shortname,
     property: r.property_id ? { _id: r.property_id, shortname: r.property_shortname } : null,
-    client: r.client_currency ? { currency: r.client_currency } : null
+    client: r.client_currency ? { currency: r.client_currency } : null,
+    costType: 'bill'
   }));
+
+  const mgmtItems = (mgmtRows[0] || []).map(r => ({
+    _id: `mgmt-${r.id}`,
+    period: r.period,
+    amount: r.amount,
+    description: 'Management Fee',
+    bukkuurl: null,
+    listingTitle: r.property_shortname,
+    property: { _id: propertyId, shortname: r.property_shortname },
+    client: null,
+    costType: 'management_fee'
+  }));
+
+  const allItems = [...billItems, ...mgmtItems].sort((a, b) => {
+    const pa = a.period ? new Date(a.period).getTime() : 0;
+    const pb = b.period ? new Date(b.period).getTime() : 0;
+    return pb - pa;
+  });
+
+  const totalCount = Number(countRows[0]?.total || 0) + mgmtItems.length;
+  const items = allItems.slice(skip, skip + limit);
+
   return { ok: true, items, totalCount };
 }
 
@@ -491,16 +644,70 @@ async function updateAgreementSign(email, agreementId, { ownersign, ownerSignedA
 
   const updates = [];
   const params = [];
-  if (ownersign !== undefined) { updates.push('ownersign = ?'); params.push(ownersign); }
-  if (ownerSignedAt !== undefined) { updates.push('owner_signed_at = ?'); params.push(ownerSignedAt); }
+  let ownerSignRaw = '';
+  let ownerSignedAtIso = null;
+  let ownerSignedAtMysql = null;
+  let ownerSignedHash = null;
+  if (ownersign !== undefined) {
+    ownerSignRaw = String(ownersign ?? '').trim();
+    const publicSign = await signatureValueToPublicUrl(ownersign, {
+      clientId: existing.client,
+      signatureKey: 'ownersign'
+    });
+    if (!publicSign.ok) {
+      return { ok: false, reason: 'SIGNATURE_UPLOAD_FAILED', message: `owner ownersign: ${publicSign.reason}` };
+    }
+    updates.push('ownersign = ?');
+    params.push(publicSign.value);
+  }
+  if (ownerSignedAt !== undefined) {
+    const d = ownerSignedAt instanceof Date ? ownerSignedAt : new Date(ownerSignedAt);
+    if (!Number.isNaN(d.getTime())) ownerSignedAtIso = d.toISOString();
+    // MySQL DATETIME doesn't accept ISO strings with trailing "Z" in our schema.
+    // Use "YYYY-MM-DD HH:mm:ss" (drop milliseconds + timezone).
+    ownerSignedAtMysql = ownerSignedAtIso
+      ? ownerSignedAtIso.replace('T', ' ').replace(/\.\d{3}Z$/, '')
+      : null;
+    updates.push('owner_signed_at = ?');
+    params.push(ownerSignedAtMysql);
+  }
+  if (ownersign !== undefined && ownerSignedAtIso) {
+    const [rows] = await pool.query('SELECT hash_draft FROM agreement WHERE id = ? LIMIT 1', [agreementId]);
+    const hashDraft = rows?.[0]?.hash_draft != null ? String(rows[0].hash_draft) : '';
+    ownerSignedHash = createHash('sha256')
+      .update([agreementId, ownerSignRaw, ownerSignedAtIso, hashDraft].join('|'), 'utf8')
+      .digest('hex');
+    updates.push('owner_signed_hash = ?');
+    params.push(ownerSignedHash);
+  }
   if (ownerSignedIp !== undefined) { updates.push('owner_signed_ip = ?'); params.push(String(ownerSignedIp).trim().slice(0, 45) || null); }
   if (status !== undefined) { updates.push('status = ?'); params.push(status); }
   if (updates.length === 0) return { ok: true };
   params.push(agreementId);
-  await pool.query(
-    `UPDATE agreement SET ${updates.join(', ')}, updated_at = NOW() WHERE id = ?`,
-    params
-  );
+  try {
+    await pool.query(
+      `UPDATE agreement SET ${updates.join(', ')}, updated_at = NOW() WHERE id = ?`,
+      params
+    );
+  } catch (e) {
+    const msg = String(e?.sqlMessage || e?.message || '');
+    if ((e?.code === 'ER_BAD_FIELD_ERROR' || e?.errno === 1054) && msg.includes('owner_signed_hash')) {
+      const updatesLegacy = [];
+      const paramsLegacy = [];
+      for (let i = 0; i < updates.length; i += 1) {
+        if (updates[i].startsWith('owner_signed_hash')) continue;
+        updatesLegacy.push(updates[i]);
+        paramsLegacy.push(params[i]);
+      }
+      paramsLegacy.push(agreementId);
+      await pool.query(
+        `UPDATE agreement SET ${updatesLegacy.join(', ')}, updated_at = NOW() WHERE id = ?`,
+        paramsLegacy
+      );
+    } else {
+      throw e;
+    }
+  }
   return { ok: true };
 }
 
@@ -545,27 +752,45 @@ async function completeAgreementApproval(email, { ownerId, propertyId, clientId,
 }
 
 /**
- * mergeOwnerMultiReference: add propertyId and clientId to owner's property/client (single-id columns; if multi needed later use junction).
+ * mergeOwnerMultiReference: add propertyId and clientId to owner junction tables.
+ * When clientId is set, also INSERT IGNORE into owner_client so Contact list shows owner as approved.
+ * When propertyId is set, also INSERT IGNORE into owner_property and set propertydetail.owner_id.
  */
 async function mergeOwnerMultiReference(email, { ownerId, propertyId, clientId }) {
   const owner = await getOwnerByEmail(email);
   if (!owner) return { ok: false, reason: 'OWNER_NOT_FOUND' };
   if (owner._id !== ownerId) return { ok: false, reason: 'OWNER_MISMATCH' };
 
-  const [rows] = await pool.query(
-    'SELECT id, property_id, client_id FROM ownerdetail WHERE id = ? LIMIT 1',
-    [ownerId]
-  );
+  const [rows] = await pool.query('SELECT id FROM ownerdetail WHERE id = ? LIMIT 1', [ownerId]);
   const r = rows[0];
   if (!r) return { ok: false, message: 'Owner not found' };
-  let newPropertyId = r.property_id;
-  let newClientId = r.client_id;
-  if (propertyId && r.property_id !== propertyId) newPropertyId = propertyId;
-  if (clientId && r.client_id !== clientId) newClientId = clientId;
-  await pool.query(
-    'UPDATE ownerdetail SET property_id = ?, client_id = ?, updated_at = NOW() WHERE id = ?',
-    [newPropertyId, newClientId, ownerId]
-  );
+  try {
+    if (clientId) {
+      await pool.query(
+        'INSERT IGNORE INTO owner_client (id, client_id, owner_id, created_at) VALUES (UUID(), ?, ?, NOW())',
+        [clientId, ownerId]
+      );
+    }
+    if (propertyId) {
+      let resolvedClientId = clientId || null;
+      if (!resolvedClientId) {
+        const [propRows] = await pool.query('SELECT client_id FROM propertydetail WHERE id = ? LIMIT 1', [propertyId]);
+        resolvedClientId = propRows?.[0]?.client_id || null;
+      }
+      await pool.query(
+        'INSERT IGNORE INTO owner_property (id, owner_id, property_id, created_at) VALUES (UUID(), ?, ?, NOW())',
+        [ownerId, propertyId]
+      );
+      if (resolvedClientId) {
+        await pool.query(
+          'UPDATE propertydetail SET owner_id = ?, updated_at = NOW() WHERE id = ? AND client_id = ?',
+          [ownerId, propertyId, resolvedClientId]
+        );
+      }
+    }
+  } catch (e) {
+    console.warn('[ownerportal] mergeOwnerMultiReference junction/owner_id sync:', e?.message || e);
+  }
   return { ok: true };
 }
 
@@ -588,7 +813,9 @@ async function removeApprovalPending(email, { ownerId, propertyId, clientId }) {
   const filtered = pending.filter((p) => {
     const pid = p.propertyid ?? p.propertyId;
     const cid = p.clientid ?? p.clientId;
-    return !(pid === propertyId && cid === clientId);
+    const matchProperty = (propertyId == null && pid == null) || pid === propertyId;
+    const matchClient = cid === clientId;
+    return !(matchProperty && matchClient);
   });
   await pool.query(
     'UPDATE ownerdetail SET approvalpending = ?, updated_at = NOW() WHERE id = ?',
@@ -669,6 +896,229 @@ async function syncOwnerForClient(email, { ownerId, clientId }) {
   }
 }
 
+/**
+ * Get smart door items for owner's properties. For Smart Door page.
+ * 门锁可装在 property 大门 或 每个 room 门上。
+ * - 只有 property 大门有锁 → 1 option: Property A
+ * - 4 个 room 有锁、property 没有 → 4 options: Property A | Room A, ...
+ * - property + 4 room 都有锁 → 5 options
+ */
+async function getRoomsWithLocksForOwner(email) {
+  const owner = await getOwnerByEmail(email);
+  if (!owner) return { ok: false, reason: 'OWNER_NOT_FOUND' };
+  let propertyIds = Array.isArray(owner.property) ? owner.property.map(p => (typeof p === 'object' && p._id ? p._id : p)) : [];
+  if (propertyIds.length === 0) propertyIds = await getPropertyIdsByOwnerId(owner._id);
+  if (propertyIds.length === 0) return { ok: true, items: [] };
+  propertyIds = [...new Set(propertyIds)];
+
+  const placeholders = propertyIds.map(() => '?').join(',');
+  const [propRows] = await pool.query(
+    `SELECT p.id AS property_id, p.shortname AS property_shortname, p.client_id,
+            pl.lockid AS property_lockid
+       FROM propertydetail p
+       LEFT JOIN lockdetail pl ON pl.id = p.smartdoor_id
+       WHERE p.id IN (${placeholders})`,
+    propertyIds
+  );
+
+  const result = [];
+  for (const p of propRows || []) {
+    const propName = (p.property_shortname || '').trim() || String(p.property_id);
+
+    if (p.property_lockid) {
+      result.push({
+        _id: `property:${p.property_id}`,
+        itemId: `property:${p.property_id}`,
+        type: 'property',
+        propertyId: p.property_id,
+        propertyShortname: propName,
+        clientId: p.client_id,
+        lockIds: [p.property_lockid],
+        label: propName
+      });
+    }
+
+    const [roomRows] = await pool.query(
+      `SELECT rd.id AS room_id, rd.roomname, rl.lockid
+       FROM roomdetail rd
+       LEFT JOIN lockdetail rl ON rl.id = rd.smartdoor_id
+       WHERE rd.property_id = ? AND rd.smartdoor_id IS NOT NULL AND rl.lockid IS NOT NULL
+       ORDER BY rd.roomname, rd.id`,
+      [p.property_id]
+    );
+    const seenRoomLabels = new Set();
+    for (const r of roomRows || []) {
+      let roomName = (r.roomname || '').trim() || String(r.room_id);
+      let label = `${propName} | ${roomName}`;
+      if (seenRoomLabels.has(label)) {
+        label = `${propName} | ${roomName} (${String(r.room_id).slice(-4)})`;
+      }
+      seenRoomLabels.add(label);
+      result.push({
+        _id: `room:${r.room_id}`,
+        itemId: `room:${r.room_id}`,
+        type: 'room',
+        propertyId: p.property_id,
+        roomId: r.room_id,
+        propertyShortname: propName,
+        roomName,
+        clientId: p.client_id,
+        lockIds: [r.lockid],
+        label
+      });
+    }
+  }
+
+  const labelCount = {};
+  for (const item of result) {
+    const base = item.label;
+    labelCount[base] = (labelCount[base] || 0) + 1;
+  }
+  const labelIndex = {};
+  for (const item of result) {
+    if (labelCount[item.label] > 1) {
+      labelIndex[item.label] = (labelIndex[item.label] || 0) + 1;
+      item.label = `${item.label} (${labelIndex[item.label]})`;
+    }
+  }
+
+  return { ok: true, items: result };
+}
+
+/**
+ * Get lock info for owner's item. itemId = "property:${propertyId}" or "room:${roomId}".
+ */
+async function getLockInfoForOwner(email, itemId) {
+  const owner = await getOwnerByEmail(email);
+  if (!owner) return null;
+  const propertyIds = Array.isArray(owner.property) ? owner.property.map(p => (typeof p === 'object' && p._id ? p._id : p)) : [];
+  if (propertyIds.length === 0) propertyIds.push(...(await getPropertyIdsByOwnerId(owner._id)));
+
+  const propMatch = String(itemId || '').match(/^property:(.+)$/);
+  const roomMatch = String(itemId || '').match(/^room:(.+)$/);
+
+  if (propMatch) {
+    const propertyId = propMatch[1];
+    if (!propertyIds.includes(propertyId)) return null;
+    const [pRows] = await pool.query(
+      `SELECT p.client_id, pl.lockid AS property_lockid
+         FROM propertydetail p
+         LEFT JOIN lockdetail pl ON pl.id = p.smartdoor_id
+         WHERE p.id = ? LIMIT 1`,
+      [propertyId]
+    );
+    const p = pRows?.[0];
+    if (!p || !p.property_lockid) return null;
+    const profile = owner.profile && typeof owner.profile === 'object' ? owner.profile : parseJson(owner.profile) || {};
+    const ownerPropertyPasscodes = profile.owner_property_passcodes || {};
+    const propPass = ownerPropertyPasscodes[propertyId];
+    return { clientId: p.client_id, lockIds: [p.property_lockid], primaryLockId: p.property_lockid, password: propPass?.password ?? null, keyboardPwdId: propPass?.keyboardPwdId ?? null };
+  }
+
+  if (roomMatch) {
+    const roomId = roomMatch[1];
+    const [rRows] = await pool.query(
+      `SELECT rd.property_id, p.client_id, rl.lockid
+         FROM roomdetail rd
+         LEFT JOIN propertydetail p ON p.id = rd.property_id
+         LEFT JOIN lockdetail rl ON rl.id = rd.smartdoor_id
+         WHERE rd.id = ? AND rd.smartdoor_id IS NOT NULL LIMIT 1`,
+      [roomId]
+    );
+    const r = rRows?.[0];
+    if (!r || !r.lockid || !propertyIds.includes(r.property_id)) return null;
+    const profile = owner.profile && typeof owner.profile === 'object' ? owner.profile : parseJson(owner.profile) || {};
+    const ownerRoomPasscodes = profile.owner_room_passcodes || {};
+    const roomPass = ownerRoomPasscodes[roomId];
+    return { clientId: r.client_id, lockIds: [r.lockid], primaryLockId: r.lockid, password: roomPass?.password ?? null, keyboardPwdId: roomPass?.keyboardPwdId ?? null };
+  }
+
+  return null;
+}
+
+/**
+ * Remote unlock for owner's item. itemId = "property:${propertyId}" or "room:${roomId}".
+ */
+async function remoteUnlockForOwner(email, itemId) {
+  const info = await getLockInfoForOwner(email, itemId);
+  if (!info) return { ok: false, reason: 'PROPERTY_OR_LOCK_NOT_FOUND' };
+  if (!info.lockIds.length) return { ok: false, reason: 'NO_SMARTDOOR' };
+  for (const lockId of info.lockIds) {
+    await lockWrapper.remoteUnlock(info.clientId, lockId);
+  }
+  return { ok: true };
+}
+
+/**
+ * Get owner passcode for item (from profile.owner_property_passcodes or owner_room_passcodes).
+ */
+async function getPasscodeForOwner(email, itemId) {
+  const info = await getLockInfoForOwner(email, itemId);
+  if (!info) return { ok: false, reason: 'PROPERTY_OR_LOCK_NOT_FOUND' };
+  return { ok: true, password: info.password ?? null, keyboardPwdId: info.keyboardPwdId ?? null };
+}
+
+/**
+ * Create or update owner's TTLock passcode. property: one password; room: one password per room.
+ */
+async function savePasscodeForOwner(email, itemId, newPassword) {
+  const owner = await getOwnerByEmail(email);
+  if (!owner) return { ok: false, reason: 'OWNER_NOT_FOUND' };
+  const info = await getLockInfoForOwner(email, itemId);
+  if (!info) return { ok: false, reason: 'PROPERTY_OR_LOCK_NOT_FOUND' };
+  if (!info.primaryLockId) return { ok: false, reason: 'NO_SMARTDOOR' };
+  const pwd = String(newPassword ?? '').trim();
+  if (!pwd || pwd.length < 4 || pwd.length > 12) return { ok: false, reason: 'INVALID_PASSWORD' };
+
+  const profile = owner.profile && typeof owner.profile === 'object' ? owner.profile : parseJson(owner.profile) || {};
+  const name = 'Owner';
+  const endMs = Date.now() + 10 * 365 * 24 * 60 * 60 * 1000;
+
+  if (info.keyboardPwdId != null) {
+    try {
+      await lockWrapper.changePasscode(info.clientId, info.primaryLockId, {
+        keyboardPwdId: info.keyboardPwdId,
+        name,
+        startDate: Date.now() - 60000,
+        endDate: Date.now() - 60000
+      });
+    } catch (_) { /* best-effort expire old */ }
+  }
+
+  let data;
+  try {
+    data = await lockWrapper.addPasscode(info.clientId, info.primaryLockId, {
+      name,
+      password: pwd,
+      startDate: Date.now(),
+      endDate: endMs
+    });
+  } catch (addErr) {
+    return { ok: false, reason: addErr.message || 'TTLOCK_ADD_PASSCODE_FAILED' };
+  }
+
+  const newKeyboardPwdId = data?.keyboardPwdId ?? info.keyboardPwdId;
+  const propMatch = String(itemId || '').match(/^property:(.+)$/);
+  const roomMatch = String(itemId || '').match(/^room:(.+)$/);
+
+  if (propMatch) {
+    const ownerPropertyPasscodes = profile.owner_property_passcodes || {};
+    ownerPropertyPasscodes[propMatch[1]] = { password: pwd, keyboardPwdId: newKeyboardPwdId };
+    profile.owner_property_passcodes = ownerPropertyPasscodes;
+  } else if (roomMatch) {
+    const ownerRoomPasscodes = profile.owner_room_passcodes || {};
+    ownerRoomPasscodes[roomMatch[1]] = { password: pwd, keyboardPwdId: newKeyboardPwdId };
+    profile.owner_room_passcodes = ownerRoomPasscodes;
+  }
+
+  await pool.query(
+    'UPDATE ownerdetail SET profile = ? WHERE id = ?',
+    [JSON.stringify(profile), owner._id]
+  );
+
+  return { ok: true, password: pwd };
+}
+
 module.exports = {
   getOwnerByEmail,
   getPropertyIdsByOwnerId,
@@ -687,5 +1137,9 @@ module.exports = {
   completeAgreementApproval,
   mergeOwnerMultiReference,
   removeApprovalPending,
-  syncOwnerForClient
+  syncOwnerForClient,
+  getRoomsWithLocksForOwner,
+  remoteUnlockForOwner,
+  getPasscodeForOwner,
+  savePasscodeForOwner
 };

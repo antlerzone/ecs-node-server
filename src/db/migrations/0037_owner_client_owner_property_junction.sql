@@ -1,8 +1,10 @@
 -- One owner can be authorised for multiple clients and multiple properties.
 -- Use junction tables owner_client and owner_property (multiple rows = multiple FKs per owner).
--- ownerdetail.client_id / property_id stay as legacy columns (no FK); Node reads from junction.
+-- Note:
+--   Legacy columns ownerdetail.client_id / ownerdetail.property_id were removed in
+--   0142_ownerdetail_drop_legacy_client_property.sql.
 
--- 1) Remove single-value FK from ownerdetail if they exist (skip if you never added them)
+-- 1) Remove single-value FK from ownerdetail if they exist (historical step for old schemas)
 -- ALTER TABLE ownerdetail DROP FOREIGN KEY fk_ownerdetail_client;
 -- ALTER TABLE ownerdetail DROP FOREIGN KEY fk_ownerdetail_property;
 
