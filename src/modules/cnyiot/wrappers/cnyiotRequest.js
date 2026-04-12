@@ -8,7 +8,7 @@ const { getValidCnyIotToken, getValidCnyIotTokenForPlatform, requestNewToken, in
 const { encryptApiKey } = require('../lib/encryptApiKey');
 
 // 官方直连地址 https://www.openapi.cnyiot.com/api.ashx
-const BASE_URL = process.env.CNYIOT_BASE_URL || process.env.CNYIOT_PROXY_BASE || 'https://www.openapi.cnyiot.com/api.ashx';
+const BASE_URL = process.env.CNYIOT_BASE_URL || 'https://www.openapi.cnyiot.com/api.ashx';
 const API_ID = process.env.CNYIOT_API_ID || 'coliman';
 const CNYIOT_FETCH_TIMEOUT_MS = Number(process.env.CNYIOT_FETCH_TIMEOUT_MS) || 25000;
 

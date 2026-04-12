@@ -5,6 +5,7 @@
 
 const { randomUUID } = require('crypto');
 const pool = require('../../config/db');
+const { notifySaasManualTicket } = require('./saas-manual-ticket-notify');
 
 const DEFAULT_PAGE_SIZE = 10;
 
@@ -61,6 +62,16 @@ async function submitTicket(email, payload) {
     [id, mode, description, video, photo, clientId, emailVal, ticketId, now, now]
   );
 
+  if (mode === 'topup_manual' || mode === 'billing_manual') {
+    void notifySaasManualTicket({
+      mode,
+      ticketid: ticketId,
+      description,
+      submitterEmail: emailVal,
+      clientId
+    });
+  }
+
   return { ok: true, ticketId };
 }
 
@@ -92,12 +103,19 @@ async function recordApiError(req, responseBody) {
   const id = randomUUID();
   const ticketId = generateTicketId();
   const now = new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+  const descParts = [reason.slice(0, 65535)];
+  if (page) descParts.push(`page: ${page}`);
+  if (apiPath) descParts.push(`path: ${apiPath}`);
+  if (apiMethod) descParts.push(`method: ${apiMethod}`);
+  if (actionClicked) descParts.push(`action: ${actionClicked}`);
+  if (functionName) descParts.push(`function: ${functionName}`);
+  const description = descParts.join(' | ');
 
   try {
     await pool.query(
-      `INSERT INTO ticket (id, mode, description, source, page, action_clicked, function_name, api_path, api_method, client_id, email, ticketid, created_at, updated_at)
-       VALUES (?, ?, ?, 'api_error', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, 'api_error', reason.slice(0, 65535), page, actionClicked, functionName, apiPath, apiMethod, clientId, email, ticketId, now, now]
+      `INSERT INTO ticket (id, mode, description, client_id, email, ticketid, created_at, updated_at)
+       VALUES (?, 'api_error', ?, ?, ?, ?, ?, ?)`,
+      [id, description.slice(0, 65535), clientId, email, ticketId, now, now]
     );
   } catch (err) {
     console.error('[help] recordApiError insert failed', err.message);
@@ -125,8 +143,8 @@ async function recordAccountingError(clientId, payload) {
 
   try {
     await pool.query(
-      `INSERT INTO ticket (id, mode, description, source, client_id, ticketid, created_at, updated_at)
-       VALUES (?, 'accounting_error', ?, 'accounting_error', ?, ?, ?, ?)`,
+      `INSERT INTO ticket (id, mode, description, client_id, ticketid, created_at, updated_at)
+       VALUES (?, 'accounting_error', ?, ?, ?, ?, ?)`,
       [id, description.slice(0, 65535), clientId, ticketId, now, now]
     );
   } catch (err) {
@@ -158,6 +176,14 @@ async function recordManualBillingTicket(clientId, email, payload) {
      VALUES (?, 'billing_manual', ?, ?, ?, ?, ?, ?)`,
     [id, description.slice(0, 65535), clientId, email || null, ticketId, now, now]
   );
+
+  void notifySaasManualTicket({
+    mode: 'billing_manual',
+    ticketid: ticketId,
+    description: description.slice(0, 65535),
+    submitterEmail: email || null,
+    clientId
+  });
 }
 
 module.exports = {

@@ -8,7 +8,7 @@ const { getExpensesFilters } = require('./expenses.service');
 const pool = require('../../config/db');
 
 async function getClientCurrency(clientId) {
-  const [rows] = await pool.query('SELECT currency FROM clientdetail WHERE id = ? LIMIT 1', [clientId]);
+  const [rows] = await pool.query('SELECT currency FROM operatordetail WHERE id = ? LIMIT 1', [clientId]);
   return (rows[0] && rows[0].currency) ? String(rows[0].currency).toUpperCase() : 'MYR';
 }
 

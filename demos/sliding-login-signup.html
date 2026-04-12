@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sliding Login & Sign up</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,600;0,9..40,700;1,9..40,400&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #c9d6e8;
+      --card: #f4f6f9;
+      --text: #1e3a5f;
+      --muted: #6b7c93;
+      --blue: #2563eb;
+      --blue-dark: #1d4ed8;
+      --white: #ffffff;
+      --radius: 22px;
+      --dur: 0.65s;
+      --ease: cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: "DM Sans", system-ui, sans-serif;
+      background: linear-gradient(145deg, #dfe9f3 0%, #b8c9dc 50%, #a8bdd4 100%);
+      padding: 24px;
+    }
+
+    /* 外层卡片：白底表单区 + 上层滑动蓝窗 */
+    .card {
+      position: relative;
+      width: min(880px, 100%);
+      min-height: 520px;
+      background: var(--card);
+      border-radius: var(--radius);
+      box-shadow:
+        0 25px 50px -12px rgba(30, 58, 95, 0.35),
+        0 0 0 1px rgba(255, 255, 255, 0.5) inset;
+      overflow: hidden;
+    }
+
+    .forms {
+      display: flex;
+      min-height: 520px;
+    }
+
+    .form-side {
+      flex: 1;
+      padding: 48px 40px 40px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      z-index: 1;
+    }
+
+    .form-side h2 {
+      margin: 0 0 20px;
+      font-size: 1.75rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+
+    .socials {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+
+    .socials a {
+      width: 42px;
+      height: 42px;
+      border-radius: 10px;
+      border: 1px solid #d1d9e6;
+      background: var(--white);
+      display: grid;
+      place-items: center;
+      font-size: 0.75rem;
+      font-weight: 700;
+      color: var(--muted);
+      text-decoration: none;
+      transition: border-color 0.2s, transform 0.2s;
+    }
+
+    .socials a:hover {
+      border-color: var(--blue);
+      transform: translateY(-2px);
+    }
+
+    .hint {
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin: 0 0 22px;
+    }
+
+    .field {
+      width: 100%;
+      max-width: 300px;
+      padding: 14px 16px;
+      margin-bottom: 14px;
+      border: none;
+      border-radius: 10px;
+      background: #e8ecf4;
+      font: inherit;
+      color: var(--text);
+      outline: none;
+      transition: box-shadow 0.2s;
+    }
+
+    .field:focus {
+      box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.35);
+    }
+
+    .field::placeholder {
+      color: #8b9cb0;
+    }
+
+    .link {
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin: 6px 0 20px;
+      align-self: flex-end;
+      max-width: 300px;
+      width: 100%;
+      text-align: right;
+    }
+
+    .link a {
+      color: var(--muted);
+      text-decoration: none;
+      border-bottom: 1px solid transparent;
+      transition: border-color 0.2s, color 0.2s;
+    }
+
+    .link a:hover {
+      color: var(--blue);
+      border-bottom-color: var(--blue);
+    }
+
+    .btn-solid {
+      margin-top: 8px;
+      padding: 14px 48px;
+      border: none;
+      border-radius: 12px;
+      background: linear-gradient(180deg, var(--blue) 0%, var(--blue-dark) 100%);
+      color: var(--white);
+      font: inherit;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      cursor: pointer;
+      box-shadow: 0 8px 20px rgba(37, 99, 235, 0.35);
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+
+    .btn-solid:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 12px 28px rgba(37, 99, 235, 0.4);
+    }
+
+    /* 滑动蓝层：盖住「当前不需要」的那一侧表单 */
+    .blue-window {
+      position: absolute;
+      top: 0;
+      left: 50%;
+      width: 50%;
+      height: 100%;
+      z-index: 4;
+      overflow: hidden;
+      transition: transform var(--dur) var(--ease);
+      border-radius: 0 var(--radius) var(--radius) 0;
+    }
+
+    .card.active .blue-window {
+      transform: translateX(-100%);
+      border-radius: var(--radius) 0 0 var(--radius);
+    }
+
+    .blue-slide {
+      display: flex;
+      width: 200%;
+      height: 100%;
+      transition: transform var(--dur) var(--ease);
+      transform: translateX(-50%);
+    }
+
+    .card.active .blue-slide {
+      transform: translateX(0);
+    }
+
+    .blue-face {
+      flex: 0 0 50%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 40px 36px;
+      background: linear-gradient(165deg, #3b82f6 0%, #1d4ed8 55%, #1e40af 100%);
+      color: var(--white);
+    }
+
+    .blue-face h1 {
+      margin: 0 0 16px;
+      font-size: clamp(1.5rem, 3vw, 2rem);
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .blue-face p {
+      margin: 0 0 28px;
+      font-size: 0.95rem;
+      line-height: 1.55;
+      opacity: 0.95;
+      max-width: 280px;
+    }
+
+    .btn-ghost {
+      padding: 12px 42px;
+      border: 2px solid var(--white);
+      border-radius: 999px;
+      background: transparent;
+      color: var(--white);
+      font: inherit;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      cursor: pointer;
+      transition: background 0.2s, color 0.2s;
+    }
+
+    .btn-ghost:hover {
+      background: rgba(255, 255, 255, 0.15);
+    }
+
+    /* 与参考图类似的弧形分界（蓝窗左侧内凹感） */
+    .blue-window::before {
+      content: "";
+      position: absolute;
+      top: 10%;
+      bottom: 10%;
+      left: -20px;
+      width: 44px;
+      border-radius: 50%;
+      background: inherit;
+      z-index: 1;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity var(--dur) var(--ease);
+    }
+
+    .blue-face {
+      position: relative;
+    }
+
+    .blue-face::after {
+      content: "";
+      position: absolute;
+      top: 8%;
+      bottom: 8%;
+      width: 48px;
+      border-radius: 50%;
+      background: linear-gradient(165deg, #3b82f6 0%, #1d4ed8 100%);
+      opacity: 0.95;
+    }
+
+    .blue-slide > .blue-face:first-child::after {
+      right: -24px;
+    }
+
+    .blue-slide > .blue-face:last-child::after {
+      left: -24px;
+    }
+
+    @media (max-width: 720px) {
+      body {
+        padding: 16px;
+      }
+
+      .card {
+        min-height: 480px;
+      }
+
+      .forms {
+        min-height: 480px;
+      }
+
+      .form-side {
+        padding: 28px 18px;
+      }
+
+      .form-side h2 {
+        font-size: 1.35rem;
+      }
+
+      .field {
+        max-width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="card" id="container">
+    <div class="forms">
+      <section class="form-side" aria-label="Sign in">
+        <h2>Sign In</h2>
+        <div class="socials">
+          <a href="#" aria-label="Google">G+</a>
+          <a href="#" aria-label="Facebook">f</a>
+          <a href="#" aria-label="GitHub">⌘</a>
+          <a href="#" aria-label="LinkedIn">in</a>
+        </div>
+        <p class="hint">or use your email password</p>
+        <input class="field" type="email" placeholder="Email" autocomplete="username" />
+        <input class="field" type="password" placeholder="Password" autocomplete="current-password" />
+        <p class="link"><a href="#">Forget Your Password?</a></p>
+        <button type="button" class="btn-solid">SIGN IN</button>
+      </section>
+
+      <section class="form-side" aria-label="Create account">
+        <h2>Create Account</h2>
+        <div class="socials">
+          <a href="#" aria-label="Google">G+</a>
+          <a href="#" aria-label="Facebook">f</a>
+          <a href="#" aria-label="GitHub">⌘</a>
+          <a href="#" aria-label="LinkedIn">in</a>
+        </div>
+        <p class="hint">or use your email for registration</p>
+        <input class="field" type="text" placeholder="Name" autocomplete="name" />
+        <input class="field" type="email" placeholder="Email" autocomplete="email" />
+        <input class="field" type="password" placeholder="Password" autocomplete="new-password" />
+        <button type="button" class="btn-solid">SIGN UP</button>
+      </section>
+    </div>
+
+    <div class="blue-window" aria-hidden="true">
+      <div class="blue-slide">
+        <div class="blue-face">
+          <h1>Welcome Back!</h1>
+          <p>Enter your personal details to use all of site features</p>
+          <button type="button" class="btn-ghost" id="goSignIn">SIGN IN</button>
+        </div>
+        <div class="blue-face">
+          <h1>Hello, Friend!</h1>
+          <p>Register with your personal details to use all of site features</p>
+          <button type="button" class="btn-ghost" id="goSignUp">SIGN UP</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const container = document.getElementById("container");
+    const goSignUp = document.getElementById("goSignUp");
+    const goSignIn = document.getElementById("goSignIn");
+
+    goSignUp.addEventListener("click", () => {
+      container.classList.add("active");
+    });
+
+    goSignIn.addEventListener("click", () => {
+      container.classList.remove("active");
+    });
+  </script>
+</body>
+</html>

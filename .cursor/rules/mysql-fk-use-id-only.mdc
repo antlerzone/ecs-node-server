@@ -1,17 +1,16 @@
 ---
-description: MySQL 外键统一用 _id，Node 里不再使用 _wixid
+description: MySQL 外键统一用 _id；0087 后 id = Wix _id，已无 _wixid 列
 alwaysApply: true
 ---
 
 # 外键命名与使用约定（Wix reference → MySQL）
 
-- **历史来源：** 在 Wix CMS 里用 reference（如 property、client）；迁到 MySQL 后先有 **`_wixid`** 列（如 `property_wixid`、`client_wixid`）存原 Wix ID。
-- **对齐后：** 用 service 做 FK 对齐后，每张表会有对应的 **`_id`** 列（如 `property_id`、`client_id`），指向 MySQL 主表的 `id`。
-- **规则：** 若一个表有 `property_wixid`，则一定有 `property_id`；同理 `client_wixid` 与 `client_id` 成对存在。
+- **0087 后：** 所有表 `id` = Wix CMS 的 `_id`（UUID 同格式）。已删除 `wix_id`、`*_wixid` 列。
+- **FK：** 一律用 `_id` 列（如 `property_id`、`client_id`），指向主表 `id`。
 
 ## Node 开发必须遵守
 
-- **一律用 `_id` 做主关联，不要再使用 `_wixid`。** 查询、JOIN、写入 FK 时只用 `client_id`、`property_id` 等，不以 `client_wixid`、`property_wixid` 作为业务逻辑或关联依据。
-- `_wixid` 仅保留用于导入/迁移/对历史数据；新代码与 API 以 `_id` 为准。
+- **一律用 `_id` 做主关联。** 查询、JOIN、写入 FK 时只用 `client_id`、`property_id` 等。
+- **Import：** Wix 导出的 `_id` 直接写入 `id`；reference 列直接写入对应 `_id`。
 
-文档与沟通记录见 `docs/index.md`「Wix reference → _wixid / _id 约定」与「沟通记录」。库表设计见 `docs/db/`。
+文档见 `docs/index.md`「Wix reference → id 约定」与 `docs/db/import-wixid-to-fk-junction-rule.md`。

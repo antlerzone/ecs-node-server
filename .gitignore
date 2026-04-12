@@ -1,5 +1,8 @@
 node_modules/
 .env
+
+# ECS: enables automatic pm2 restart after cleanlemon/next-app build (see scripts/pm2-restart-after-build.mjs)
+cleanlemon/next-app/.enable-pm2-restart-after-build
 logs/
 *.log
 secrets/*.json

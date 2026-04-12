@@ -1,5 +1,5 @@
 /**
- * 清空 clientdetail 及 4 张子表（client_integration, client_profile, client_pricingplan_detail, client_credit）。
+ * 清空 operatordetail 及 4 张子表（client_integration, client_profile, client_pricingplan_detail, client_credit）。
  * 用法：node scripts/clear-client-and-subtables.js
  */
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
@@ -10,7 +10,7 @@ const TABLES = [
   'client_pricingplan_detail',
   'client_profile',
   'client_integration',
-  'clientdetail',
+  'operatordetail',
 ];
 
 async function run() {
@@ -28,7 +28,7 @@ async function run() {
       console.log('[clear]', table);
     }
     await conn.query('SET FOREIGN_KEY_CHECKS = 1');
-    console.log('[clear] Done. You can re-upload clientdetail.csv and run import.');
+    console.log('[clear] Done. You can re-upload operatordetail.csv and run import.');
   } catch (err) {
     console.error('[clear] Error:', err.message);
     process.exit(1);

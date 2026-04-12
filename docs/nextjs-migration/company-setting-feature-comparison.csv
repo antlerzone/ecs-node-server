@@ -1,0 +1,32 @@
+功能,Wix (旧),Next (新),状态
+权限,UI_PERMISSION_MAP: profilesetting/usersetting/integration/billing/admin 控制 section 与按钮,hasPermission(profilesetting/usersetting/integration) 控制编辑; 无 billing 按钮,已有(结构不同)
+页面结构,#sectiontab + #buttonprofile/usersetting/integration/topup/admin; 各 #section* 切换,单页四 Card: Company Info / Fees / Staff / Integrations; 无 Tab 切换,已有(单页卡片)
+Mobile,Mobile 显示 "Please setting on pc version" collapse 各 section,无单独 company 页 mobile 分支(侧栏统一),可接受
+Credit<0 强制 Topup,enterForcedTopupModeManage 只显示 sectiontopup,无( Credit 在 Billing 页),可接受
+Profile 区块,sectionprofile: getProfile + getBanks + getUploadCreds,Card "Company Information",已有
+Profile 公司名/SSM/地址/联系,text + input 可编辑 updateProfile,Input title/ssm/address/contact + Save Company Info,已有
+Profile 货币,dropdowncurrency MYR/SGD 只读,无,少
+Profile 子域名,input5profile subdomain,无,少
+Profile TIN,inputtin,无,少
+Profile 收款户号/户名/银行,inputaccountnumber/accountholder + dropdownbank (getBanks),无,少
+Profile 公司 logo,htmluploadbuttonprofile getUploadCreds OSS 上传 → profilephoto,无,少
+Profile 公司盖章,htmlcompanychop getUploadCreds uploadPath /api/upload/chop → companyChop,无,少
+Fees/Admin 区块,sectionadmin getAdmin saveAdmin,Card "Fees & Charges" + Set Fees 弹窗,已有
+Fees 日期与金额,payout/salary/rental/deposit/dueDate/agreementFees/otherFees/parking/smartDoor/meter/commissionDate + commissionRules(24月),同; 弹窗内完整表单,已有
+Fees 月底备注,specific 且 day>=28 显示 MONTH_END_REMARK,无,少(可补)
+User Setting 区块,sectionusersetting getStaffList createStaff updateStaff,Card "Staff Management",已有
+Staff 列表,repeater 分页 STAFF_PAGE_SIZE=10 name/email/status/Edit,列表 name/email/权限 Badge/Edit; 无分页,部分(无分页)
+Staff 状态开关,每行 #checkboxusersetting updateStaff({ status }),无,少
+Staff 新增,buttonnewuser 受 maxStaffAllowed 限制,Add Staff 受 maxStaffAllowed 限制,已有
+Staff 编辑/创建弹窗,name/email/salary/bankAccount/dropdownbankname/permission; mainAdmin 只读权限,Dialog name/email/permissions 仅; 无 salary/bankAccount/bankName,少
+Staff syncToAccounting,payload syncToAccounting: true,未传,少(可补)
+Integration 区块,sectionintegration getOnboardStatus getIntegrationTemplate,Card "System Integrations",已有
+Stripe Connect,buttonstripeonboard getStripeConnectOnboardUrl 跳转; stripeConnectOAuthComplete 回调 ?code=&state=,Connect 跳转 OAuth; 无页面 load 时 code+state 回调处理,少(依赖重进页)
+CNYIOT,buttoncnyiotonboard 选 Create New / Connect Existing 再 cnyiotConnect,Manage 弹窗 username/password Connect; 无 Create vs Connect 选择,部分
+TTLock,buttonttlockonboard 选 Create New / Connect Existing 再 ttlockConnect,同 username/password; 无 Create vs Connect 选择,部分
+Accounting 多选一,Xero/Bukku/SQL/AutoCount 选一后填表 connect; disconnect 各 provider,Accounting Connect 选系统 + 填表; Manage Disconnect,已有
+Accounting 选项来源,getIntegrationTemplate addonAccount.provider dropdown,硬编码 INTEGRATION_TEMPLATE,部分
+E-Invoice 开关,Bukku/AutoCount/SQL/Xero 弹窗 checkboxeinvoiceonboard updateAccountingEinvoice,Bukku 无; AutoCount/SQL 有 Enable E-Invoice,部分(Bukku 可补)
+Xero 回调,handleXeroCallbackIfNeeded 页面 load 时 ?code 换 token 再 redirect 清 URL,无(依赖重进页或后端),少
+Topup 区块,sectiontopup getMyBillingInfo getCreditPlans startNormalTopup; amount>1000 submitTicket + boxproblem2,无(Operator 有 Billing/Credit 入口),刻意不做
+Admin 权限,sectionadmin 仅 admin 可见,Set Fees 受 canEditProfile(含 profilesetting),已有

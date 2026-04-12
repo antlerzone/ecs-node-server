@@ -74,7 +74,7 @@ async function run() {
     }
     if (hasClientId && hasClientWixid) {
       const [rows] = await conn.query(
-        `SELECT id, wix_id FROM clientdetail WHERE wix_id IS NOT NULL`
+        `SELECT id, wix_id FROM operatordetail WHERE wix_id IS NOT NULL`
       );
       const wixToId = new Map(rows.map(r => [r.wix_id, r.id]));
       const [pdRows] = await conn.query(

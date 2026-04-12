@@ -1,47 +1,54 @@
 /**
- * SQL Account API: Payment Voucher (allocate payment to invoice / record payment).
- * Paths per Postman Collection; confirm with https://wiki.sql.com.my/wiki/SQL_Accounting_Linking
+ * SQL Account API: Payment Voucher (Postman → /paymentvoucher).
+ * Used for payment-out flows (e.g. refund deposit). Bukku/Xero-style: list, read, create, update, remove.
  */
 
 const sqlaccountrequest = require('./sqlaccountrequest');
+const { paymentVoucher: PATH } = require('../lib/postmanPaths');
 
-/**
- * List payments. GET /Payment or path from Postman.
- */
+function docPath(dockey) {
+  const d = encodeURIComponent(String(dockey ?? '').trim());
+  return `${PATH}/${d}`;
+}
+
+async function list(req, params = {}) {
+  return sqlaccountrequest({ req, method: 'get', path: PATH, params });
+}
+
+async function read(req, dockey) {
+  return sqlaccountrequest({ req, method: 'get', path: docPath(dockey) });
+}
+
+async function create(req, payload) {
+  return sqlaccountrequest({ req, method: 'post', path: PATH, data: payload || {} });
+}
+
+async function update(req, dockey, payload) {
+  return sqlaccountrequest({ req, method: 'put', path: docPath(dockey), data: payload || {} });
+}
+
+async function remove(req, dockey) {
+  return sqlaccountrequest({ req, method: 'delete', path: docPath(dockey) });
+}
+
 async function listPayments(req, params = {}) {
-  return sqlaccountrequest({
-    req,
-    method: 'get',
-    path: '/Payment',
-    params
-  });
+  return list(req, params);
 }
 
-/**
- * Get single payment. GET /Payment/{id}
- */
 async function getPayment(req, paymentId) {
-  return sqlaccountrequest({
-    req,
-    method: 'get',
-    path: `/Payment/${encodeURIComponent(paymentId)}`
-  });
+  return read(req, paymentId);
 }
 
-/**
- * Create payment. POST /Payment
- * @param {object} payload - Payment voucher payload per SQL Account API (invoice ref, account, amount, etc.)
- */
 async function createPayment(req, payload) {
-  return sqlaccountrequest({
-    req,
-    method: 'post',
-    path: '/Payment',
-    data: payload || {}
-  });
+  return create(req, payload);
 }
 
 module.exports = {
+  list,
+  read,
+  create,
+  update,
+  remove,
   listPayments,
   getPayment,
   createPayment

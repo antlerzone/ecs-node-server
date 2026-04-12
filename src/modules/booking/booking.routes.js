@@ -11,6 +11,7 @@ const {
   getAvailableRooms,
   searchTenants,
   getTenant,
+  lookupTenantForBooking,
   getRoom,
   getParkingLotsByProperty,
   createBooking,
@@ -32,6 +33,14 @@ function withEmail(req, res, handler) {
       const msg = err?.message || 'BACKEND_ERROR';
       if (msg === 'ACCESS_DENIED' || msg === 'NO_PERMISSION' || msg === 'NO_CLIENT_ID') {
         return res.status(403).json({ ok: false, reason: msg });
+      }
+      if (
+        msg === 'HANDOVER_CARD_PHOTO_REQUIRED' ||
+        msg === 'HANDOVER_UNIT_PHOTO_REQUIRED' ||
+        msg === 'HANDOVER_TENANT_SIGNATURE_REQUIRED' ||
+        msg === 'PARKING_NOT_AVAILABLE'
+      ) {
+        return res.status(400).json({ ok: false, reason: msg });
       }
       if (msg === 'TENANT_NOT_FOUND' || msg === 'ROOM_NOT_FOUND' || msg === 'TENANCY_NOT_FOUND') {
         return res.status(404).json({ ok: false, reason: msg });
@@ -62,6 +71,9 @@ router.post('/search-tenants', (req, res) => {
 });
 router.post('/tenant', (req, res) => {
   withEmail(req, res, (email, body) => getTenant(email, body.tenantId));
+});
+router.post('/lookup-tenant', (req, res) => {
+  withEmail(req, res, (email, body) => lookupTenantForBooking(email, body.tenantEmail ?? body.emailInput ?? ''));
 });
 router.post('/room', (req, res) => {
   withEmail(req, res, (email, body) => getRoom(email, body.roomId));

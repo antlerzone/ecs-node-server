@@ -119,7 +119,7 @@ async function run() {
     const s = String(wixId).trim();
     return map.get(s) || map.get(s.replace(/^!/, '')) || null;
   }
-  const clientMap = await loadWixIdMap('clientdetail');
+  const clientMap = await loadWixIdMap('operatordetail');
 
   const usedIds = new Set();
   let inserted = 0;

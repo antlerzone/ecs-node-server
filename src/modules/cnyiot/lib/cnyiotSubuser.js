@@ -1,6 +1,6 @@
 /**
  * Client 的 CNYIoT 子账号（租客）创建与 client_integration 读写。
- * 规则：subdomain 取自 client_profile（或 clientdetail），统一小写、不可与其它 client 重复；
+ * 规则：subdomain 取自 client_profile（或 operatordetail），统一小写、不可与其它 client 重复；
  * 默认密码 0123456789；记录存 client_integration values_json。
  */
 
@@ -10,7 +10,7 @@ const userWrapper = require('../wrappers/user.wrapper');
 const DEFAULT_SUBUSER_PASSWORD = '0123456789';
 
 /**
- * 取 client 的 subdomain（小写）。优先 client_profile，否则 clientdetail。
+ * 取 client 的 subdomain（小写）。优先 client_profile，否则 operatordetail。
  */
 async function getClientSubdomain(clientId) {
   const [profileRows] = await pool.query(
@@ -19,7 +19,7 @@ async function getClientSubdomain(clientId) {
   );
   if (profileRows.length > 0) return String(profileRows[0].subdomain).trim().toLowerCase();
   const [clientRows] = await pool.query(
-    'SELECT subdomain FROM clientdetail WHERE id = ? LIMIT 1',
+    'SELECT subdomain FROM operatordetail WHERE id = ? LIMIT 1',
     [clientId]
   );
   if (clientRows.length > 0 && clientRows[0].subdomain) {
@@ -87,14 +87,14 @@ async function updateCnyiotSubuserInIntegration(clientId, fields) {
 }
 
 /**
- * 取当前 client 的 cnyiot_subuser_id（Station_index）。先读 client_integration，无则回退 clientdetail。
+ * 取当前 client 的 cnyiot_subuser_id（Station_index）。先读 client_integration，无则回退 operatordetail。
  */
 async function getCnyiotSubuserId(clientId) {
   const cur = await getCnyiotIntegration(clientId);
   const fromIntegration = cur?.values?.cnyiot_subuser_id;
   if (fromIntegration != null && fromIntegration !== '') return fromIntegration;
   const [rows] = await pool.query(
-    'SELECT cnyiot_subuser_id FROM clientdetail WHERE id = ? AND cnyiot_subuser_id IS NOT NULL AND TRIM(cnyiot_subuser_id) != "" LIMIT 1',
+    'SELECT cnyiot_subuser_id FROM operatordetail WHERE id = ? AND cnyiot_subuser_id IS NOT NULL AND TRIM(cnyiot_subuser_id) != "" LIMIT 1',
     [clientId]
   );
   if (rows.length > 0 && rows[0].cnyiot_subuser_id) return rows[0].cnyiot_subuser_id;
@@ -189,7 +189,7 @@ async function ensureClientCnyiotSubuser(clientId, opts = {}) {
   });
 
   await pool.query(
-    'UPDATE clientdetail SET cnyiot_subuser_id = ?, cnyiot_subuser_login = ?, cnyiot_subuser_manual = 0, updated_at = NOW() WHERE id = ?',
+    'UPDATE operatordetail SET cnyiot_subuser_id = ?, cnyiot_subuser_login = ?, cnyiot_subuser_manual = 0, updated_at = NOW() WHERE id = ?',
     [String(stationIndex), actualLoginName, clientId]
   );
 

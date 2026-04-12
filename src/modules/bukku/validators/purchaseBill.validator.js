@@ -71,7 +71,7 @@ const create_purchase_bill_schema = joi.object({
   remarks: joi.string().optional(),
   tax_mode: joi.string().valid(...tax_mode_enum).required(),
   form_items: joi.array().items(form_item_schema).min(1).required(),
-  deposit_items: joi.array().items(deposit_item_schema).when('payment_mode', { is: 'cash', then: joi.required().min(1), otherwise: joi.optional() }),
+  deposit_items: joi.array().items(deposit_item_schema).when('payment_mode', { is: 'cash', then: joi.array().items(deposit_item_schema).min(1).required(), otherwise: joi.optional() }),
   status: joi.string().valid('draft', 'pending_approval', 'ready').required(),
   files: joi.array().items(file_schema).optional(),
   fields: joi.array().items(field_schema).optional(),

@@ -1,10 +1,14 @@
 /**
- * Settlement journal: 每個 client 每個 payout 日一筆分錄（DR Bank, CR Stripe）。
- * 已寫過的不重複：只處理 journal_created_at IS NULL 的列；有 stripepayout 記錄才入賬，沒有就不用。
- * 不另建表，做完分錄後更新 stripepayout.accounting_journal_id 與 journal_created_at。
+ * Settlement journal（operator 可見賬）：每 client 每日一筆 — CR Stripe clearing（gross）、DR Bank（轉 operator）、DR Processing（支付通道費 + 內部平台 markup 合併，不單獨暴露 SaaS 明細）。
+ * gross_amount_cents 若為 NULL，則用 STRIPE_ESTIMATE_GATEWAY_PERCENT + 1% 反推 gross（近似）。
  */
 
 const pool = require('../../config/db');
+const {
+  PLATFORM_MARKUP_PERCENT,
+  getStripeEstimateGatewayPercent,
+  computeResidualFeeSplitFromGrossAndTransferCents
+} = require('../../constants/payment-fees');
 const {
   resolveClientAccounting,
   getPaymentDestinationAccountId
@@ -15,47 +19,63 @@ const autocountJournalEntry = require('../autocount/wrappers/journalEntry.wrappe
 const sqlJournalEntry = require('../sqlaccount/wrappers/journalEntry.wrapper');
 
 /**
- * Create one settlement journal in client's accounting: DR Bank, CR Stripe (same amount).
- * Description includes settlement id (stripepayout.id) for traceability.
- * @param {string} clientId
- * @param {{ amountCents: number, currency: string, payoutDate: string (YYYY-MM-DD), description?: string, settlementId?: string }} opts
- * @param {object} req - req.client from resolveClientAccounting
- * @param {string} provider - 'bukku' | 'xero' | 'autocount' | 'sql'
- * @returns {Promise<{ ok: boolean, journalDocId?: string, reason?: string }>}
+ * @param {{ transferTotalCents: number, grossCents: number, currency: string, payoutDate: string, description?: string, settlementId?: string }} opts
  */
 async function createSettlementJournal(clientId, opts, req, provider) {
-  const { amountCents, currency, payoutDate, description, settlementId } = opts;
-  if (!amountCents || amountCents <= 0) {
+  const { transferTotalCents, grossCents, currency, payoutDate, description, settlementId } = opts;
+  const cc = currency != null ? String(currency).trim().toUpperCase() : '';
+  if (!cc) return { ok: false, reason: 'CLIENT_CURRENCY_MISSING' };
+  if (!['MYR', 'SGD'].includes(cc)) return { ok: false, reason: 'UNSUPPORTED_CLIENT_CURRENCY' };
+  const transferCents = Math.max(0, Math.round(Number(transferTotalCents) || 0));
+  let gross = Math.max(0, Math.round(Number(grossCents) || 0));
+  if (gross <= 0 && transferCents > 0) {
+    const estGw = getStripeEstimateGatewayPercent();
+    const denom = 100 - PLATFORM_MARKUP_PERCENT - estGw;
+    gross = denom > 0 ? Math.round((transferCents * 100) / denom) : transferCents;
+  }
+  if (transferCents <= 0 || gross <= 0) {
     return { ok: false, reason: 'INVALID_AMOUNT' };
   }
-  const amount = amountCents / 100;
-  const base = (description || 'Stripe payout to bank').trim();
+  const split = computeResidualFeeSplitFromGrossAndTransferCents(gross, transferCents);
+  /** Gateway + platform markup combined on one processing line (markup not broken out for operator-facing books). */
+  const feeProcessingCombined = (split.gatewayFeeCents + split.saasMarkupCents) / 100;
+  const grossMajor = gross / 100;
+  const netMajor = transferCents / 100;
+  const base = (description || 'Stripe Connect transfers / settlement').trim();
   const withId = settlementId ? `${base} · Settlement ID: ${settlementId}`.trim() : base;
   const desc = withId.slice(0, 255);
+
   const bankDest = await getPaymentDestinationAccountId(clientId, provider, 'bank');
   const stripeDest = await getPaymentDestinationAccountId(clientId, provider, 'stripe');
+  const processingFeeDest = await getPaymentDestinationAccountId(clientId, provider, 'processing_fee');
   if (!bankDest || !bankDest.accountId) {
     return { ok: false, reason: 'NO_BANK_ACCOUNT_MAPPING' };
   }
   if (!stripeDest || !stripeDest.accountId) {
     return { ok: false, reason: 'NO_STRIPE_ACCOUNT_MAPPING' };
   }
+  if (!processingFeeDest?.accountId) {
+    return { ok: false, reason: 'NO_PROCESSING_FEE_ACCOUNT_MAPPING' };
+  }
 
   if (provider === 'bukku') {
     const bankId = Number(bankDest.accountId);
     const stripeId = Number(stripeDest.accountId);
-    if (Number.isNaN(bankId) || Number.isNaN(stripeId)) {
+    const feeId = Number(processingFeeDest.accountId);
+    if (Number.isNaN(bankId) || Number.isNaN(stripeId) || Number.isNaN(feeId)) {
       return { ok: false, reason: 'BUKKU_ACCOUNT_ID_INVALID' };
     }
+    const items = [
+      { line: 1, account_id: bankId, description: desc, debit_amount: netMajor, credit_amount: null },
+      { line: 2, account_id: feeId, description: desc, debit_amount: feeProcessingCombined, credit_amount: null },
+      { line: 3, account_id: stripeId, description: desc, debit_amount: null, credit_amount: grossMajor }
+    ];
     const payload = {
-      currency_code: (currency || 'MYR').toUpperCase(),
+      currency_code: cc,
       date: payoutDate,
       description: desc,
       exchange_rate: 1,
-      journal_items: [
-        { line: 1, account_id: bankId, description: desc, debit_amount: amount, credit_amount: null },
-        { line: 2, account_id: stripeId, description: desc, debit_amount: null, credit_amount: amount }
-      ],
+      journal_items: items,
       status: 'ready'
     };
     try {
@@ -74,14 +94,13 @@ async function createSettlementJournal(clientId, opts, req, provider) {
   if (provider === 'xero') {
     const bankCode = String(bankDest.accountId).trim();
     const stripeCode = String(stripeDest.accountId).trim();
-    const payload = {
-      Narration: desc,
-      Date: payoutDate,
-      JournalLines: [
-        { Description: desc, LineAmount: -amount, AccountCode: bankCode },
-        { Description: desc, LineAmount: amount, AccountCode: stripeCode }
-      ]
-    };
+    const feeCode = String(processingFeeDest.accountId).trim();
+    const lines = [
+      { Description: desc, LineAmount: -netMajor, AccountCode: bankCode },
+      { Description: desc, LineAmount: -feeProcessingCombined, AccountCode: feeCode },
+      { Description: desc, LineAmount: grossMajor, AccountCode: stripeCode }
+    ];
+    const payload = { Narration: desc, Date: payoutDate, JournalLines: lines };
     try {
       const res = await xeroManualJournal.create(req, payload);
       if (!res.ok) {
@@ -99,19 +118,22 @@ async function createSettlementJournal(clientId, opts, req, provider) {
   if (provider === 'autocount') {
     const bankAccNo = String(bankDest.accountId).trim();
     const stripeAccNo = String(stripeDest.accountId).trim();
+    const feeAccNo = String(processingFeeDest.accountId).trim();
+    const details = [
+      { accNo: bankAccNo, dr: netMajor, cr: 0, description: desc },
+      { accNo: feeAccNo, dr: feeProcessingCombined, cr: 0, description: desc },
+      { accNo: stripeAccNo, dr: 0, cr: grossMajor, description: desc }
+    ];
     const payload = {
       master: {
         docDate: payoutDate,
         taxDate: payoutDate,
-        currencyCode: (currency || 'MYR').toUpperCase(),
+        currencyCode: cc,
         currencyRate: 1,
         journalType: 'GENERAL',
         description: desc
       },
-      details: [
-        { accNo: bankAccNo, dr: amount, cr: 0, description: desc },
-        { accNo: stripeAccNo, dr: 0, cr: amount, description: desc }
-      ]
+      details
     };
     try {
       const res = await autocountJournalEntry.createJournalEntry(req, payload);
@@ -129,14 +151,13 @@ async function createSettlementJournal(clientId, opts, req, provider) {
   if (provider === 'sql') {
     const bankCode = String(bankDest.accountId).trim();
     const stripeCode = String(stripeDest.accountId).trim();
-    const payload = {
-      Date: payoutDate,
-      Description: desc,
-      Lines: [
-        { AccountCode: bankCode, Debit: amount, Credit: 0, Description: desc },
-        { AccountCode: stripeCode, Debit: 0, Credit: amount, Description: desc }
-      ]
-    };
+    const feeCode = String(processingFeeDest.accountId).trim();
+    const lines = [
+      { AccountCode: bankCode, Debit: netMajor, Credit: 0, Description: desc },
+      { AccountCode: feeCode, Debit: feeProcessingCombined, Credit: 0, Description: desc },
+      { AccountCode: stripeCode, Debit: 0, Credit: grossMajor, Description: desc }
+    ];
+    const payload = { Date: payoutDate, Description: desc, Lines: lines };
     try {
       const res = await sqlJournalEntry.createJournalEntry(req, payload);
       if (!res || res.ok === false) {
@@ -156,7 +177,7 @@ async function createSettlementJournal(clientId, opts, req, provider) {
 /**
  * 依一筆 stripepayout 建立分錄並更新該筆的 accounting_journal_id、journal_created_at。
  * 若該筆已有 journal_created_at 則直接回傳 ALREADY_JOURNALED。
- * @param {object} row - stripepayout row: id, client_id, payout_date, total_amount_cents, currency, journal_created_at
+ * @param {object} row - stripepayout row: id, client_id, payout_date, total_amount_cents, gross_amount_cents, currency, journal_created_at
  * @returns {Promise<{ ok: boolean, journalDocId?: string, reason?: string }>}
  */
 async function createJournalForStripePayoutRow(row) {
@@ -171,10 +192,17 @@ async function createJournalForStripePayoutRow(row) {
   const payoutDate = row.payout_date instanceof Date
     ? row.payout_date.toISOString().slice(0, 10)
     : String(row.payout_date || '').slice(0, 10);
-  const amountCents = Number(row.total_amount_cents) || 0;
-  const currency = (row.currency || 'MYR').toString().trim() || 'MYR';
+  const transferTotalCents = Number(row.total_amount_cents) || 0;
+  const grossAmountCents = row.gross_amount_cents != null ? Number(row.gross_amount_cents) : null;
+  const currency = row.currency != null && String(row.currency).trim() ? String(row.currency).trim().toUpperCase() : '';
+  if (!currency) {
+    return { ok: false, reason: 'CLIENT_CURRENCY_MISSING' };
+  }
+  if (!['MYR', 'SGD'].includes(currency)) {
+    return { ok: false, reason: 'UNSUPPORTED_CLIENT_CURRENCY' };
+  }
 
-  if (amountCents <= 0) {
+  if (transferTotalCents <= 0) {
     return { ok: false, reason: 'INVALID_AMOUNT' };
   }
   if (!payoutDate) {
@@ -193,10 +221,11 @@ async function createJournalForStripePayoutRow(row) {
   const result = await createSettlementJournal(
     clientId,
     {
-      amountCents,
+      transferTotalCents,
+      grossCents: grossAmountCents != null && grossAmountCents > 0 ? grossAmountCents : Math.round((transferTotalCents * 100) / 97),
       currency,
       payoutDate,
-      description: 'Stripe payout to bank',
+      description: 'Stripe Connect transfers / settlement',
       settlementId: row.id
     },
     resolved.req,
@@ -224,10 +253,10 @@ async function createJournalForStripePayoutRow(row) {
  * @returns {Promise<Array<{ id, client_id, payout_date, total_amount_cents, currency, journal_created_at, ... }>>}
  */
 async function getStripePayoutsPendingJournal(clientId = null) {
-  let sql = 'SELECT id, client_id, payout_date, total_amount_cents, currency, accounting_journal_id, journal_created_at FROM stripepayout WHERE journal_created_at IS NULL AND total_amount_cents > 0 ORDER BY payout_date ASC, client_id';
+  let sql = 'SELECT id, client_id, payout_date, total_amount_cents, gross_amount_cents, currency, accounting_journal_id, journal_created_at FROM stripepayout WHERE journal_created_at IS NULL AND total_amount_cents > 0 ORDER BY payout_date ASC, client_id';
   const args = [];
   if (clientId) {
-    sql = 'SELECT id, client_id, payout_date, total_amount_cents, currency, accounting_journal_id, journal_created_at FROM stripepayout WHERE client_id = ? AND journal_created_at IS NULL AND total_amount_cents > 0 ORDER BY payout_date ASC';
+    sql = 'SELECT id, client_id, payout_date, total_amount_cents, gross_amount_cents, currency, accounting_journal_id, journal_created_at FROM stripepayout WHERE client_id = ? AND journal_created_at IS NULL AND total_amount_cents > 0 ORDER BY payout_date ASC';
     args.push(clientId);
   }
   const [rows] = await pool.query(sql, args);
@@ -253,9 +282,104 @@ async function processPendingStripePayoutJournals(rows) {
   return { created, errors };
 }
 
+async function upsertStripeOperatorPayoutFromWebhook(clientId, payout) {
+  if (!clientId || !payout?.id) return null;
+  const id = require('crypto').randomUUID();
+  const payoutId = String(payout.id).trim();
+  const amountCents = Math.max(0, Math.round(Number(payout.amount) || 0));
+  const currency = String(payout.currency || '').trim().toUpperCase() || 'MYR';
+  const statusRaw = String(payout.status || '').trim().toLowerCase();
+  const status = ['paid', 'failed', 'canceled'].includes(statusRaw) ? statusRaw : 'pending';
+  const arrivalDate = payout.arrival_date
+    ? new Date(Number(payout.arrival_date) * 1000).toISOString().slice(0, 10)
+    : null;
+  const rawJson = JSON.stringify(payout);
+  await pool.query(
+    `INSERT INTO stripe_operator_payouts
+      (id, client_id, payout_id, status, currency, amount_cents, arrival_date, raw_data, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+     ON DUPLICATE KEY UPDATE
+       status = CASE
+         WHEN stripe_operator_payouts.status = 'paid' THEN stripe_operator_payouts.status
+         ELSE VALUES(status)
+       END,
+       currency = VALUES(currency),
+       amount_cents = VALUES(amount_cents),
+       arrival_date = COALESCE(stripe_operator_payouts.arrival_date, VALUES(arrival_date)),
+       raw_data = VALUES(raw_data),
+       updated_at = NOW()`,
+    [id, clientId, payoutId, status, currency, amountCents, arrivalDate, rawJson]
+  );
+  const [rows] = await pool.query(
+    `SELECT id, client_id, payout_id, status, currency, amount_cents, arrival_date, raw_data,
+            accounting_journal_id, journal_created_at
+       FROM stripe_operator_payouts
+      WHERE client_id = ? AND payout_id = ?
+      LIMIT 1`,
+    [clientId, payoutId]
+  );
+  return rows?.[0] || null;
+}
+
+async function createJournalForStripeOperatorPayoutRow(row) {
+  if (!row || !row.id || !row.client_id) {
+    return { ok: false, reason: 'MISSING_ROW_OR_ID' };
+  }
+  if (row.journal_created_at) {
+    return { ok: true, reason: 'ALREADY_JOURNALED', journalDocId: row.accounting_journal_id || undefined };
+  }
+  if (String(row.status || '').trim().toLowerCase() !== 'paid') {
+    return { ok: false, reason: 'PAYOUT_NOT_PAID' };
+  }
+
+  const payoutDate = row.arrival_date instanceof Date
+    ? row.arrival_date.toISOString().slice(0, 10)
+    : String(row.arrival_date || '').slice(0, 10);
+  const transferTotalCents = Number(row.amount_cents) || 0;
+  const currency = row.currency != null && String(row.currency).trim() ? String(row.currency).trim().toUpperCase() : '';
+  if (!currency) return { ok: false, reason: 'CLIENT_CURRENCY_MISSING' };
+  if (!['MYR', 'SGD'].includes(currency)) return { ok: false, reason: 'UNSUPPORTED_CLIENT_CURRENCY' };
+  if (transferTotalCents <= 0) return { ok: false, reason: 'INVALID_AMOUNT' };
+  if (!payoutDate) return { ok: false, reason: 'MISSING_PAYOUT_DATE' };
+
+  const resolved = await resolveClientAccounting(row.client_id);
+  if (!resolved.ok || !resolved.provider || !resolved.req) {
+    return { ok: false, reason: resolved.reason || 'NO_ACCOUNTING' };
+  }
+  const provider = resolved.provider;
+  if (!['bukku', 'xero', 'autocount', 'sql'].includes(provider)) {
+    return { ok: false, reason: 'UNSUPPORTED_PROVIDER', provider };
+  }
+
+  const result = await createSettlementJournal(
+    row.client_id,
+    {
+      transferTotalCents,
+      grossCents: null,
+      currency,
+      payoutDate,
+      description: 'Stripe payout to bank',
+      settlementId: row.payout_id
+    },
+    resolved.req,
+    provider
+  );
+  if (!result.ok) return result;
+
+  await pool.query(
+    `UPDATE stripe_operator_payouts
+        SET accounting_journal_id = ?, journal_created_at = NOW(), updated_at = NOW()
+      WHERE id = ? AND journal_created_at IS NULL`,
+    [result.journalDocId || null, row.id]
+  );
+  return { ok: true, journalDocId: result.journalDocId };
+}
+
 module.exports = {
   createSettlementJournal,
   createJournalForStripePayoutRow,
+  upsertStripeOperatorPayoutFromWebhook,
+  createJournalForStripeOperatorPayoutRow,
   getStripePayoutsPendingJournal,
   processPendingStripePayoutJournals
 };

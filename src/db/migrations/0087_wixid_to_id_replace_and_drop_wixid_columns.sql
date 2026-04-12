@@ -1,0 +1,14 @@
+-- Migration 0087: Replace id with wix_id, drop all *_wixid columns.
+--
+-- Executed via: node scripts/migrate-wixid-to-id.js
+--
+-- What was done:
+-- 1) All tables with wix_id: id = COALESCE(wix_id, id) (use Wix UUID as primary key)
+-- 2) All FK references in child tables updated to new parent ids
+-- 3) Dropped all wix_id and *_wixid columns (client_wixid, property_wixid, etc.)
+--
+-- Future import: Wix CMS export _id goes directly into id column. No wix_id column.
+-- Code unchanged: all logic uses _id (client_id, property_id, etc.) as before.
+--
+-- This file is a record only. Re-running would fail (columns already dropped).
+-- To re-run the migration on a fresh DB, use: node scripts/migrate-wixid-to-id.js

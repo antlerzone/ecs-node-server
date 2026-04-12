@@ -66,13 +66,18 @@ const form_item_schema = joi.object({
 
 /* ================= TERM ITEM ================= */
 
-const term_item_schema = joi.object({
-  id: joi.number().optional(),
-  term_id: joi.number().optional(),
-  date: joi.date().iso().optional(),
-  payment_due: joi.string().required(),
-  description: joi.string().optional()
-});
+// Bukku POST /sales/invoices (official sample): term row either { term_id, payment_due, description }
+// OR { date, payment_due, description }; payment_due = "50%" or "100.25" — never a date.
+const term_item_schema = joi
+  .object({
+    id: joi.number().optional(),
+    term_id: joi.number().optional(),
+    date: joi.alternatives().try(joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/), joi.date().iso()).optional(),
+    /** Due *amount* (value or %), not a date. */
+    payment_due: joi.string().max(32).required(),
+    description: joi.string().optional()
+  })
+  .or('term_id', 'date');
 
 /* ================= DEPOSIT ITEM ================= */
 

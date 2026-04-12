@@ -2,6 +2,34 @@ const axios = require('axios');
 
 const BASE_URL = 'https://api.bukku.my';
 
+/** POST /sales/invoices — full request/response for debugging Bukku vs MyInvois validation (no Bearer token logged). */
+function logBukkuSalesInvoice(method, endpoint, data, outcome) {
+  try {
+    const line = {
+      tag: 'bukku-api/sales-invoices',
+      ts: new Date().toISOString(),
+      method: String(method || '').toUpperCase(),
+      endpoint,
+      note:
+        'If company uses MyInvois, validation errors often appear in error body (not a separate e-invoice service call from this Node app).',
+      ...(outcome.ok === true
+        ? {
+            outcome: 'http_ok',
+            responseBody: outcome.data
+          }
+        : {
+            outcome: 'http_error',
+            httpStatus: outcome.status,
+            errorBody: outcome.error
+          })
+    };
+    if (data !== undefined) line.requestBody = data;
+    console.log('[bukku-api]', JSON.stringify(line));
+  } catch (e) {
+    console.warn('[bukku-api] logBukkuSalesInvoice failed:', e?.message || e);
+  }
+}
+
 /**
  * Call Bukku API. Requires token and subdomain (Company-Subdomain header).
  * @param {object} opts
@@ -16,6 +44,8 @@ async function bukkurequest({ method = 'get', endpoint, token, subdomain, data, 
   if (!token || !subdomain) {
     return { ok: false, error: 'missing bukku token or subdomain' };
   }
+  const isSalesInvoicePost =
+    String(method || '').toLowerCase() === 'post' && String(endpoint || '').includes('/sales/invoices');
   try {
     const res = await axios({
       method,
@@ -29,13 +59,17 @@ async function bukkurequest({ method = 'get', endpoint, token, subdomain, data, 
       data,
       params
     });
-    return { ok: true, data: res.data };
+    const out = { ok: true, data: res.data };
+    if (isSalesInvoicePost) logBukkuSalesInvoice(method, endpoint, data, out);
+    return out;
   } catch (err) {
-    return {
+    const out = {
       ok: false,
       status: err.response?.status,
       error: err.response?.data || err.message
     };
+    if (isSalesInvoicePost) logBukkuSalesInvoice(method, endpoint, data, out);
+    return out;
   }
 }
 

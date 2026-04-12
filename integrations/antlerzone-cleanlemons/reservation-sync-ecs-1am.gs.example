@@ -1,0 +1,129 @@
+/**
+ * Google Apps Script — nightly sync Reservation rows → ECS google-sheet-schedule
+ *
+ * workingDay：吉隆坡日历日 + T00:00:00.000+08:00（固定 UTC+8）
+ *
+ * Deploy: 绑定试算表的项目，或独立项目（需自行 openById）。
+ *
+ * 触发器（Google 侧，非 ECS cron）：
+ *   触发器 → 新增 → syncReservationToEcs → 时间驱动 → 日计时器 → 凌晨 1:00–2:00
+ *   项目时区：Asia/Kuala_Lumpur（文件 → 项目设置）
+ *
+ * Secrets：脚本属性 ECS_API_KEY = 与 cln_client_integration 一致的 B2B Key
+ *
+ * 多文件项目：勿与其它 .gs 共用同名全局变量。本文件使用 RESERVATION_SHEET（勿再声明 SHEET_NAME）。
+ *
+ * 列号（按当前 Reservation 表；若你增删列请改 COL_*）：
+ *   C=Reservation ID, E=Check Out, L=_ID(Listing UUID→property), M=ecs(成功后标记)
+ */
+var KL_TZ = 'Asia/Kuala_Lumpur';
+
+var ECS_URL = 'https://api.cleanlemons.com/api/cleanlemon-sync/google-sheet-schedule';
+var ECS_API_KEY = PropertiesService.getScriptProperties().getProperty('ECS_API_KEY') || 'REPLACE_WITH_B2B_API_KEY';
+
+var RESERVATION_SHEET = 'Reservation';
+/** 1-based：E = Check Out Date */
+var COL_CHECKOUT = 5;
+/** 1-based：C = Reservation ID */
+var COL_RESERVATION_ID = 3;
+/** 1-based：L = _ID（Listing UUID，body.property） */
+var COL_PROPERTY = 12;
+/** 1-based：M = ecs（成功后写入 Done） */
+var COL_DONE = 13;
+/** 仅处理吉隆坡日历日严格晚于该日的行（默认不含 2026-04-01） */
+var CUTOFF_YMD_KL = '2026-04-01';
+
+function syncReservationToEcs() {
+  var ss = SpreadsheetApp.getActive();
+  var sheet = ss.getSheetByName(RESERVATION_SHEET);
+  if (!sheet) throw new Error('Missing sheet: ' + RESERVATION_SHEET);
+
+  var data = sheet.getDataRange().getValues();
+  if (sheet.getLastRow() < 2) return;
+
+  for (var r = 1; r < data.length; r++) {
+    var rowNum = r + 1;
+    var checkoutRaw = data[r][COL_CHECKOUT - 1];
+    var propertyId = String(data[r][COL_PROPERTY - 1] || '').trim();
+    var reservationId = String(data[r][COL_RESERVATION_ID - 1] || '').trim();
+    var doneCell = String(data[r][COL_DONE - 1] || '').trim();
+
+    if (!propertyId || !reservationId) continue;
+    if (doneCell && /^(done|sent|yes|1)$/i.test(doneCell)) continue;
+
+    var checkoutDate = parseSheetDate(checkoutRaw);
+    if (!checkoutDate) continue;
+
+    var checkoutYmdKl = Utilities.formatDate(checkoutDate, KL_TZ, 'yyyy-MM-dd');
+    if (checkoutYmdKl <= CUTOFF_YMD_KL) continue;
+
+    var workingDayIso = formatWorkingDayIsoKl(checkoutDate);
+
+    var res = UrlFetchApp.fetch(ECS_URL, {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { Authorization: 'Bearer ' + ECS_API_KEY },
+      payload: JSON.stringify({
+        property: propertyId,
+        reservationId: reservationId,
+        workingDay: workingDayIso
+      }),
+      muteHttpExceptions: true
+    });
+
+    if (res.getResponseCode() >= 200 && res.getResponseCode() < 300) {
+      sheet.getRange(rowNum, COL_DONE).setValue('Done');
+    } else {
+      Logger.log('Row ' + rowNum + ' failed HTTP ' + res.getResponseCode() + ' ' + res.getContentText());
+    }
+  }
+}
+
+/**
+ * Date 单元格、YYYY-MM-DD 文本、M/D/YYYY 文本（如 4/5/2026）
+ */
+function parseSheetDate(v) {
+  if (v instanceof Date && !isNaN(v.getTime())) {
+    var ymd = Utilities.formatDate(v, KL_TZ, 'yyyy-MM-dd').split('-');
+    return new Date(Number(ymd[0]), Number(ymd[1]) - 1, Number(ymd[2]));
+  }
+  if (typeof v === 'string') {
+    var s = v.trim();
+    if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
+      var p = s.slice(0, 10).split('-');
+      return new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]));
+    }
+    var md = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(s);
+    if (md) {
+      return new Date(Number(md[3]), Number(md[1]) - 1, Number(md[2]));
+    }
+  }
+  return null;
+}
+
+function formatWorkingDayIsoKl(d) {
+  return Utilities.formatDate(d, KL_TZ, 'yyyy-MM-dd') + 'T00:00:00.000+08:00';
+}
+
+/**
+ * 手动运行：查看第 5360 行会传给 ECS 的 workingDay（不 POST）
+ */
+function debugRow5360() {
+  var rowNum = 5360;
+  var sheet = SpreadsheetApp.getActive().getSheetByName(RESERVATION_SHEET);
+  if (!sheet) throw new Error('Missing sheet: ' + RESERVATION_SHEET);
+
+  var checkoutRaw = sheet.getRange(rowNum, COL_CHECKOUT).getValue();
+  Logger.log('Raw cell value: ' + checkoutRaw + ' (type: ' + typeof checkoutRaw + ')');
+
+  var checkoutDate = parseSheetDate(checkoutRaw);
+  if (!checkoutDate) {
+    Logger.log('parseSheetDate → null');
+    return;
+  }
+
+  var ymdKl = Utilities.formatDate(checkoutDate, KL_TZ, 'yyyy-MM-dd');
+  var workingDay = formatWorkingDayIsoKl(checkoutDate);
+  Logger.log('KL calendar date (yyyy-MM-dd): ' + ymdKl);
+  Logger.log('Payload workingDay → ECS: ' + workingDay);
+}

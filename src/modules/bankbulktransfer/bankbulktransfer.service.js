@@ -1,7 +1,14 @@
 /**
  * Bank bulk transfer – migrated from Wix backend/access/bankbulktransfer.jsw.
- * Data from MySQL: bills, propertydetail, supplierdetail (bill type), bankdetail,
- * ownerpayout, ownerdetail, clientdetail / client_profile. bills 不关联 account；类型用 supplierdetail_id / billtype_wixid.
+ * Data from MySQL: bills, propertydetail, property_supplier_extra, supplierdetail (bill type), bankdetail,
+ * ownerpayout, ownerdetail, operatordetail / client_profile. bills 不关联 account；类型用 supplierdetail_id.
+ *
+ * Expenses 下载 JomPay / Bulk Transfer 与 Property Setting Edit utility 的对应关系：
+ * - 户号 (Reference 1 / account no)：优先从 property_supplier_extra(property_id, supplier_id) 取 value
+ *   （即 Edit utility 里 Electric/Water/Wifi/Management + Add 填的 ID）；若无则从 propertydetail 的 electric/water/wifidetail 按 utility_type 取。
+ * - 若 supplier 有 billercode（JomPay）→ 生成 PayBill Excel：Biller Code + Reference 1（户号）+ Amount。
+ * - 若 supplier 无 billercode 但有 bank 资料（bankholder, bankaccount, bankdetail_id）→ 生成 Bulk Transfer Excel：Bene Account No.、Bene Full Name 等。
+ * 故在 Contact setting 维护 supplier（JomPay 填 billercode，银行填 bank 资料），在 Property setting Edit utility 填各物业的户号/ID，下载的 CSV/Excel 即含完整资料。
  */
 
 const pool = require('../../config/db');
@@ -19,13 +26,46 @@ function sanitizeLimited(str, maxLen = 20) {
 }
 
 /**
- * JomPay Excel Column B "Reference 1"（户号）— 一律从 table propertydetail 取：
- * - utility_type=water  → propertydetail.water
- * - utility_type=electric → propertydetail.electric
- * - utility_type=wifi    → propertydetail.wifi_id（无则 wifidetail）
- * 仅当 supplierdetail.utility_type 为 electric/water/wifi 时填值；否则视为普通 supplier，返回 ''。
+ * For free-text fields like "Other Payment Details" we need to keep '-' so dates look like:
+ * "date from 2026-01-01 to 2026-01-31".
  */
-function getReference(bill, property, supplierTitle, supplierdetailId, propertyInternetTypeId, supplierUtilityType) {
+function sanitizePaymentDetails(str, maxLen = 60) {
+  if (!str) return '';
+  const clean = String(str).replace(/[^a-zA-Z0-9 \-]/g, '');
+  return clean.substring(0, maxLen);
+}
+
+function formatMalaysiaYmdRangeFromPeriod(periodValue) {
+  // ownerpayout.period is stored as a DB datetime; we treat it as "start" for the month range.
+  // Output format: YYYY-MM-DD.
+  const d = periodValue ? new Date(periodValue) : null;
+  if (!d || Number.isNaN(d.getTime())) return { fromYmd: '', toYmd: '' };
+  // Shift to Malaysia time (UTC+8) so Y-M-D matches the intended calendar date.
+  const malaysia = new Date(d.getTime() + 8 * 60 * 60 * 1000);
+  const y = malaysia.getUTCFullYear();
+  const m = malaysia.getUTCMonth(); // 0-11
+  const from = new Date(Date.UTC(y, m, malaysia.getUTCDate()));
+  const to = new Date(Date.UTC(y, m + 1, 0)); // end of month
+  return {
+    fromYmd: from.toISOString().slice(0, 10),
+    toYmd: to.toISOString().slice(0, 10),
+  };
+}
+
+/**
+ * JomPay Excel Column B "Reference 1"（户号）— 优先从 property_supplier_extra 取（Edit utility 填的 supplier + ID）；
+ * 若无则从 propertydetail 取：utility_type=electric/water/wifi 对应 electric/water/wifidetail。
+ */
+function getReferenceFromExtra(propertyId, supplierdetailId, extraMap) {
+  if (!propertyId || !supplierdetailId || !extraMap) return '';
+  const v = extraMap.get(`${propertyId}|${supplierdetailId}`);
+  return v != null && String(v).trim() !== '' ? String(v).trim() : '';
+}
+
+/**
+ * Fallback: Reference from propertydetail columns (electric/water/wifidetail) by supplier utility_type.
+ */
+function getReferenceFromPropertyDetail(property, supplierUtilityType) {
   if (!property) return '';
   const type = (supplierUtilityType || '').toLowerCase();
   if (type !== 'electric' && type !== 'water' && type !== 'wifi') return '';
@@ -81,6 +121,9 @@ async function getBankBulkTransferData(params = {}) {
   if (type === 'owner') {
     payments = await buildOwnerPayments(ids, clientId);
   }
+  if (type === 'refund') {
+    payments = await buildRefundPayments(ids, clientId);
+  }
 
   if (!payments.length) {
     return { success: false };
@@ -90,21 +133,53 @@ async function getBankBulkTransferData(params = {}) {
 }
 
 /**
+ * Load property_supplier_extra for (property_id, supplier_id) pairs from bills.
+ * Returns Map keyed by "propertyId|supplierId" -> value (reference/account no).
+ */
+async function loadPropertySupplierExtraMap(rows) {
+  const pairs = [];
+  const seen = new Set();
+  for (const r of rows) {
+    if (!r.property_id || !r.supplierdetail_id) continue;
+    const key = `${r.property_id}|${r.supplierdetail_id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    pairs.push([r.property_id, r.supplierdetail_id]);
+  }
+  if (pairs.length === 0) return new Map();
+  const placeholders = pairs.map(() => '(?,?)').join(',');
+  const flat = pairs.flat();
+  const [extraRows] = await pool.query(
+    `SELECT property_id, supplier_id, value FROM property_supplier_extra WHERE (property_id, supplier_id) IN (${placeholders})`,
+    flat
+  );
+  const map = new Map();
+  for (const row of extraRows || []) {
+    const k = `${row.property_id}|${row.supplier_id}`;
+    const v = row.value != null ? String(row.value).trim() : '';
+    if (v !== '') map.set(k, v);
+  }
+  return map;
+}
+
+/**
  * Build supplier (utility bill) payments from bills.
- * Bills -> property, supplierdetail (bill type via supplierdetail_id / billtype_wixid). Payee from supplierdetail.
+ * Reference 1: prefer property_supplier_extra (Edit utility); fallback propertydetail (electric/water/wifi).
  */
 async function buildSupplierPayments(ids, clientId) {
   const placeholders = ids.map(() => '?').join(',');
   const [rows] = await pool.query(
-    `SELECT b.id, b.amount, b.description, b.supplierdetail_id, b.billtype_wixid, b.property_id, b.client_id,
+    `SELECT b.id, b.amount, b.description, b.supplierdetail_id, b.property_id, b.client_id, b.period,
             p.water, p.electric, p.wifidetail, p.wifi_id, p.unitnumber, p.internettype_id,
             s.title AS billtype_title, s.utility_type AS supplier_utility_type, s.billercode, s.bankdetail_id, s.bankholder, s.bankaccount, s.email
        FROM bills b
        LEFT JOIN propertydetail p ON p.id = b.property_id
-       LEFT JOIN supplierdetail s ON (s.id = b.supplierdetail_id OR (b.supplierdetail_id IS NULL AND s.wix_id = b.billtype_wixid AND (b.client_id IS NULL OR s.client_id = b.client_id)))
+       LEFT JOIN supplierdetail s ON s.id = b.supplierdetail_id
        WHERE b.id IN (${placeholders}) AND (b.client_id = ? OR ? IS NULL)`,
     [...ids, clientId, clientId]
   );
+
+  const extraMap = await loadPropertySupplierExtraMap(rows);
 
   const payments = [];
   for (const bill of rows) {
@@ -124,7 +199,7 @@ async function buildSupplierPayments(ids, clientId) {
     const supplierdetailId = bill.supplierdetail_id || null;
     const billtypeTitle = bill.billtype_title || '';
     let supplier = null;
-    if (supplierdetailId || bill.billtype_wixid) {
+    if (supplierdetailId) {
       supplier = {
         title: billtypeTitle,
         billercode: bill.billercode || null,
@@ -137,14 +212,9 @@ async function buildSupplierPayments(ids, clientId) {
     }
     if (!supplier) supplier = { title: billtypeTitle, name: billtypeTitle || 'Supplier' };
 
-    const reference = getReference(
-      bill,
-      property,
-      supplier.title,
-      supplierdetailId,
-      property?.internettype_id,
-      bill.supplier_utility_type
-    );
+    const referenceFromExtra = getReferenceFromExtra(bill.property_id, supplierdetailId, extraMap);
+    const referenceFromProperty = getReferenceFromPropertyDetail(property, bill.supplier_utility_type);
+    const reference = referenceFromExtra || referenceFromProperty;
 
     const paymentType = supplier.billercode ? 'JOMPAY' : 'TRANSFER';
     payments.push({
@@ -165,6 +235,43 @@ async function buildSupplierPayments(ids, clientId) {
         bankAccount: supplier.bankaccount || '',
         email: supplier.email || '',
         name: supplier.name || supplier.title || ''
+      }
+    });
+  }
+  return payments;
+}
+
+/**
+ * Build refund deposit payments (tenant bank details from refunddeposit + tenantdetail + bankdetail).
+ */
+async function buildRefundPayments(ids, clientId) {
+  const placeholders = ids.map(() => '?').join(',');
+  const [rows] = await pool.query(
+    `SELECT rd.id, rd.amount, rd.roomtitle, rd.tenantname,
+            tn.fullname AS tenant_fullname, tn.bankaccount AS tenant_bankaccount, tn.accountholder AS tenant_accountholder, tn.bankname_id,
+            b.bankname AS tenant_bankname
+     FROM refunddeposit rd
+     LEFT JOIN tenantdetail tn ON tn.id = rd.tenant_id
+     LEFT JOIN bankdetail b ON b.id = tn.bankname_id
+     WHERE rd.id IN (${placeholders}) AND rd.client_id = ?`,
+    [...ids, clientId]
+  );
+  const payments = [];
+  for (const r of rows) {
+    payments.push({
+      ownerPayoutId: r.id,
+      paymentType: 'TRANSFER',
+      amount: Number(r.amount || 0),
+      reference: r.tenant_fullname || r.tenantname || '',
+      description: 'Refund deposit',
+      unitNumber: r.roomtitle || '',
+      supplierName: r.tenant_fullname || r.tenantname || '',
+      supplier: {
+        bankHolder: r.tenant_accountholder || r.tenant_fullname || r.tenantname || '',
+        bankAccount: r.tenant_bankaccount || '',
+        email: '',
+        name: r.tenant_fullname || r.tenantname || '',
+        bankName: r.bankname_id || null
       }
     });
   }
@@ -252,13 +359,15 @@ async function generatePublicBankFormat(payments, clientId) {
 
     if (p.paymentType === 'JOMPAY') {
       if (!supplier.billerCode || String(supplier.billerCode).trim() === '') {
-        skippedItems.push({ id: p.billId, label: itemLabel, reason: '缺少 Biller Code，无法加入 JomPay' });
+        skippedItems.push({ id: p.billId, label: itemLabel, reason: 'Missing Biller Code; cannot include in JomPay' });
         continue;
       }
-      const ut = (p.utilityType || '').toLowerCase();
-      if ((ut === 'electric' || ut === 'water' || ut === 'wifi') && (!p.reference || String(p.reference).trim() === '')) {
-        const col = ut === 'electric' ? 'propertydetail.electric' : ut === 'water' ? 'propertydetail.water' : 'propertydetail.wifi_id';
-        skippedItems.push({ id: p.billId, label: itemLabel, reason: `utility_type=${ut} 但 propertydetail 对应栏位为空（请填写 ${col}），未加入 JomPay` });
+      if (!p.reference || String(p.reference).trim() === '') {
+        skippedItems.push({
+          id: p.billId,
+          label: itemLabel,
+          reason: "Please fill this Property's account number/ID for the supplier in Edit utility; skipped from JomPay",
+        });
         continue;
       }
       billerPayments.push({
@@ -284,16 +393,36 @@ async function generatePublicBankFormat(payments, clientId) {
         swiftCode: bank.swiftcode || '',
         amount: Number(parseFloat(p.amount).toFixed(2)),
         email: supplier.email || '',
-        recipientReference: sanitizeLimited(String(p.property?.unitNumber || ''), 20),
-        otherPaymentDetails: sanitizeLimited(String(p.description || ''), 20)
+        // For owner payout bulk transfer: Recipient Reference must be "OwnerPayout"
+        recipientReference: p.ownerPayoutId ? 'OwnerPayout' : sanitizeLimited(String(p.property?.unitNumber || ''), 20),
+        otherPaymentDetails: (() => {
+          // For owner payout bulk transfer: Other Payment Details must be a date range.
+          if (p.ownerPayoutId) {
+            const { fromYmd, toYmd } = formatMalaysiaYmdRangeFromPeriod(p.period);
+            return sanitizePaymentDetails(`date from ${fromYmd} to ${toYmd}`, 80);
+          }
+          return sanitizeLimited(String(p.description || ''), 20);
+        })()
       });
     } else {
-      skippedItems.push({ id: p.billId || p.ownerPayoutId, label: itemLabel, reason: '缺少银行资料（bankdetail），无法加入 Bulk Transfer' });
+      skippedItems.push({
+        id: p.billId || p.ownerPayoutId,
+        label: itemLabel,
+        reason: 'Missing bank details (bankdetail); cannot include in Bulk Transfer',
+      });
     }
   }
 
+  // NOTE:
+  // - For owner payout downloads, the file name prefix should come from the OWNER bank account,
+  //   not the operator/company profile account.
+  // - For supplier/utility downloads, keep existing behavior using client_profile.accountnumber.
   let accountNumber = 'ACCOUNT';
-  if (clientId) {
+  const ownerPayment = payments.find(p => p.ownerPayoutId || String(p.description || '').trim().toLowerCase() === 'owner payout');
+  const ownerBankAccount = ownerPayment?.supplier?.bankAccount;
+  if (ownerBankAccount && String(ownerBankAccount).trim() !== '') {
+    accountNumber = String(ownerBankAccount).trim();
+  } else if (clientId) {
     const [profileRows] = await pool.query(
       'SELECT accountnumber FROM client_profile WHERE client_id = ? LIMIT 1',
       [clientId]
@@ -302,7 +431,7 @@ async function generatePublicBankFormat(payments, clientId) {
       accountNumber = profileRows[0].accountnumber;
     } else {
       const [clientRows] = await pool.query(
-        'SELECT profile FROM clientdetail WHERE id = ? LIMIT 1',
+        'SELECT profile FROM operatordetail WHERE id = ? LIMIT 1',
         [clientId]
       );
       const profile = clientRows[0]?.profile;

@@ -1,0 +1,24 @@
+功能,Wix (旧),Next (新),Next 状态
+权限,permission.propertylisting \|\| admin; getAccessContext; credit<0 强制 Topup,operator 路由登录,已有
+列表,getRoomList(keyword, propertyId, sort, page, pageSize, limit); cache 最多 2000,getRoomList(propertyId, keyword, limit: 2000),已有
+筛选,下拉 Property + 搜索 + 类型 (All/Available/Available Soon/Non-available),Property 下拉 + Search + 类型下拉 (All/Available/Available Soon/Not available),已有
+分页,20 条/页; cache≤2000 前端分页 超则 server,Per page 下拉 10/50/100/500/1000 + Previous/Next,已有
+列表展示,Repeater 卡片; 底色 by available/availablesoon,Table: Property/Room/Status/Active/Available/Tenant/Actions,已有
+Available 列,available 青 availablesoon 深青 否则红,Available / Available Soon / Not available 徽章 (三态),已有
+列表 Active 开关,每行 #checkboxstatus → setRoomActive; 有 meter/smartdoor/tenancy 时 disable,每行 Switch → setRoomActive; 有 tenancy/meter/smartdoor 时仅显示文案,已有
+View detail,点 #buttondetail → getTenancyForRoom → #boxdetail 显示 roomName + tenant fullname/phone/rental/dates,View detail 按钮 → getTenancyForRoom → 弹窗显示 room + tenant/rental/period,已有
+Edit 入口,列表 #buttondetail(详情) + #buttonupdatedetail(进编辑),列表 View detail + Edit,已有
+编辑,sectiondetail: roomName/description/remark/price/property + mainPhoto/mediaGallery + Meter/Smart Door + Update,Edit Dialog: roomName/description/price/remark/mainPhoto/gallery/property/meter/smartDoor/active + Save,已有
+Price,编辑 #inputdetail4 → updateRoom(price),Edit 内 Price 数字框 → updateRoom(price),已有
+Remark,#dropdownremark (Mix Gender / Girl Only / Male Only) → updateRoom(remark),Edit 内 Remark 下拉 (—/Mix Gender/Girl Only/Male Only) → updateRoom(remark),已有
+Main Photo,getUploadCreds + #htmluploadbutton1 → mainPhoto,uploadFile → mainPhoto,已有
+Media Gallery,getUploadCreds + #htmluploadbutton2 → mediaGallery[],uploadFile → mediaGallery,已有
+Meter 下拉,getMeterDropdownOptions(roomId) → updateRoomMeter,getRoomMeterOptions(room.id) → Edit 内 Select → updateRoomMeter,已有
+Smart Door 下拉,getSmartDoorDropdownOptions(roomId) → updateRoomSmartDoor,getRoomSmartDoorOptions(room.id) → Edit 内 Select → updateRoomSmartDoor,已有
+setRoomActive,列表 checkbox; 有 meter/smartdoor/tenancy 不可关,列表 Switch + Edit 内 Switch; 有 tenancy/meter/smartdoor 不可关,已有
+Add Room,#buttonnewroom → sectionnewroom repeater 多行 → insertRooms(records),Add Room 弹窗单行 roomName+property → insertRoom([{ roomName, property }]),已有(单条)
+批量新增,repeater 多行 #buttonaddnewroom → insertRooms 一次提交,不做 (产品取舍),刻意不做
+getTenancyForRoom,点详情时 getTenancyForRoom(roomId) → 弹窗,View detail → getTenancyForRoom(roomId) → 弹窗,已有
+getUploadCreds,getUploadCreds → postMessage 上传,uploadFile 走 /api/upload,已有(实现不同)
+Topup Section,#buttontopup / Credit plans / Checkout,无 (在 Credit 页),刻意不做
+Mobile,Please setting on pc version,响应式,新更好

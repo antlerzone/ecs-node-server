@@ -12,10 +12,10 @@ const {
   getOwnerTenantAgreementContext,
   getOwnerTenantAgreementHtml,
   requestPdfGeneration,
-  finalizeAgreementPdf,
   isAgreementDataComplete,
   prepareAgreementForSignature,
-  tryPrepareDraftForAgreement
+  tryPrepareDraftForAgreement,
+  mergeOperatorStaffVarsForAgreement
 } = require('./agreement.service');
 
 function getEmail(req) {
@@ -46,7 +46,8 @@ async function requireAccess(req, res, next) {
 router.post('/tenant-context', requireAccess, async (req, res, next) => {
   try {
     const { tenancyId, agreementTemplateId, staffVars = {} } = req.body || {};
-    const result = await getTenantAgreementContext(tenancyId, agreementTemplateId, staffVars);
+    const merged = mergeOperatorStaffVarsForAgreement(staffVars, req.ctx?.staff);
+    const result = await getTenantAgreementContext(tenancyId, agreementTemplateId, merged);
     res.json(result);
   } catch (err) {
     next(err);
@@ -60,7 +61,8 @@ router.post('/tenant-context', requireAccess, async (req, res, next) => {
 router.post('/owner-context', requireAccess, async (req, res, next) => {
   try {
     const { ownerId, propertyId, clientId, agreementTemplateId, staffVars = {} } = req.body || {};
-    const result = await getOwnerAgreementContext(ownerId, propertyId, clientId, agreementTemplateId, staffVars);
+    const merged = mergeOperatorStaffVarsForAgreement(staffVars, req.ctx?.staff);
+    const result = await getOwnerAgreementContext(ownerId, propertyId, clientId, agreementTemplateId, merged);
     res.json(result);
   } catch (err) {
     next(err);
@@ -99,7 +101,7 @@ router.post('/owner-tenant-html', requireAccess, async (req, res, next) => {
  * POST /api/agreement/request-pdf
  * Body: { email, agreementType, agreementTemplateId, staffVars?, variablesOverride?, tenancyId?, ownerId?, propertyId?, clientId? }
  * agreementType: 'tenant_operator' | 'owner_operator' | 'owner_tenant'
- * Creates agreement row, sends payload to GAS; GAS will call /api/agreement/callback with { id, pdfUrl }.
+ * Creates agreement row and generates PDF with Node (Google Docs + Drive API); returns pdfUrl when ok.
  */
 router.post('/request-pdf', requireAccess, async (req, res, next) => {
   try {
@@ -113,10 +115,14 @@ router.post('/request-pdf', requireAccess, async (req, res, next) => {
       propertyId,
       clientId
     } = req.body || {};
+    const mergedStaff =
+      agreementType === 'tenant_operator' || agreementType === 'owner_operator'
+        ? mergeOperatorStaffVarsForAgreement(staffVars, req.ctx?.staff)
+        : staffVars;
     const result = await requestPdfGeneration({
       agreementType,
       agreementTemplateId,
-      staffVars,
+      staffVars: mergedStaff,
       variablesOverride,
       tenancyId,
       ownerId,
@@ -173,23 +179,6 @@ router.post('/try-prepare-draft', requireAccess, async (req, res, next) => {
     res.json(result);
   } catch (err) {
     next(err);
-  }
-});
-
-/**
- * POST /api/agreement/callback
- * Called by Google Apps Script after PDF is generated. Body: { id, pdfUrl }.
- * No auth (GAS server-to-server). Optional: validate with a shared secret or IP if needed.
- */
-router.post('/callback', async (req, res, next) => {
-  try {
-    const { id, pdfUrl } = req.body || {};
-    const result = await finalizeAgreementPdf(id, pdfUrl);
-    res.json(result);
-  } catch (err) {
-    const msg = err?.message || 'BACKEND_ERROR';
-    console.error('[agreement/callback]', msg, err);
-    res.status(400).json({ ok: false, reason: msg });
   }
 });
 

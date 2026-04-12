@@ -1,0 +1,22 @@
+CREATE TABLE IF NOT EXISTS `owner_review` (
+  `id` varchar(36) NOT NULL,
+  `owner_id` varchar(36) NOT NULL,
+  `owner_email` varchar(255) DEFAULT NULL,
+  `client_id` varchar(36) NOT NULL,
+  `operator_id` varchar(36) DEFAULT NULL,
+  `communication_score` decimal(4,2) NOT NULL DEFAULT 0,
+  `responsibility_score` decimal(4,2) NOT NULL DEFAULT 0,
+  `cooperation_score` decimal(4,2) NOT NULL DEFAULT 0,
+  `overall_score` decimal(4,2) NOT NULL DEFAULT 0,
+  `comment` text DEFAULT NULL,
+  `evidence_json` json DEFAULT NULL,
+  `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  KEY `idx_owner_review_owner` (`owner_id`),
+  KEY `idx_owner_review_client` (`client_id`),
+  KEY `idx_owner_review_operator` (`operator_id`),
+  CONSTRAINT `fk_owner_review_owner` FOREIGN KEY (`owner_id`) REFERENCES `ownerdetail` (`id`) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT `fk_owner_review_client` FOREIGN KEY (`client_id`) REFERENCES `clientdetail` (`id`) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT `fk_owner_review_operator` FOREIGN KEY (`operator_id`) REFERENCES `staffdetail` (`id`) ON DELETE SET NULL ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

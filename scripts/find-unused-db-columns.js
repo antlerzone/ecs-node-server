@@ -15,14 +15,14 @@ const SCRIPTS = path.join(ROOT, 'scripts');
 
 // Full schema: table -> [columns]. Built from 0001_init.sql + all ADD COLUMN in migrations.
 const SCHEMA = {
-  clientdetail: ['id','wix_id','title','email','status','profilephoto','subdomain','expired','pricingplan_wixid','pricingplan_id','currency','admin','created_at','updated_at','integration','profile','pricingplandetail','credit'],
+  operatordetail: ['id','wix_id','title','email','status','profilephoto','subdomain','expired','pricingplan_wixid','pricingplan_id','currency','admin','created_at','updated_at','integration','profile','pricingplandetail','credit'],
   tenantdetail: ['id','wix_id','fullname','nric','address','phone','email','bankname_wixid','bankname_id','bankaccount','accountholder','nricfront','nricback','client_wixid','client_id','account','created_at','updated_at','approval_request_json'],
   client_integration: ['id','client_id','client_wixid','wix_id','key','version','slot','enabled','provider','values_json','einvoice','created_at','updated_at'],
   client_profile: ['id','client_id','client_wixid','wix_id','tin','contact','subdomain','accountholder','ssm','currency','address','accountnumber','bank_id','created_at','updated_at','stripe_connected_account_id','stripe_connect_pending_id','stripe_sandbox','stripe_platform'],
   client_pricingplan_detail: ['id','client_id','client_wixid','wix_id','type','plan_id','title','expired','qty','created_at','updated_at'],
   client_credit: ['id','client_id','client_wixid','wix_id','type','amount','created_at','updated_at'],
   agreementtemplate: ['id','wix_id','client_id','client_wixid','folderurl','title','html','templateurl','created_at','updated_at','mode'],
-  account: ['id','wix_id','bukkuaccounttype','title','accountid','account_json','created_at','updated_at','type','client_wixid','client_id','productid','provider'],
+  account: ['id','wix_id','title','accountid','account_json','created_at','updated_at','type','is_product','uses_platform_collection_gl','client_wixid','client_id','productid','provider'],
   bankdetail: ['id','wix_id','owner_id','swiftcode','bankname','created_at','updated_at'],
   gatewaydetail: ['id','wix_id','owner_id','client_id','client_wixid','locknum','isonline','gatewayid','gatewayname','networkname','type','created_at','updated_at'],
   lockdetail: ['id','wix_id','owner_id','client_id','client_wixid','lockid','lockname','lockalias','gateway_id','gateway_wixid','hasgateway','electricquantity','type','brand','isonline','active','childmeter','created_at','updated_at'],

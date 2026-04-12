@@ -8,7 +8,7 @@ const { getValidTTLockToken } = require('./ttlockToken.service');
 
 /**
  * Get auth for API calls: { clientId (TTLock app), accessToken }.
- * @param {string} clientId - Our client id (clientdetail.id)
+ * @param {string} clientId - Our client id (operatordetail.id)
  * @returns {Promise<{ clientId: string, accessToken: string }>}
  */
 async function getTtlockAuth(clientId) {

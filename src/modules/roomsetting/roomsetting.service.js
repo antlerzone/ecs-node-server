@@ -6,9 +6,20 @@
 
 const { randomUUID } = require('crypto');
 const pool = require('../../config/db');
+const { updateRoomAvailableFromTenancy } = require('../tenancysetting/tenancy-active.service');
+
+async function maybeSyncPropertydetailToCleanlemonsAfter(clientId, propertyId) {
+  if (!clientId || !propertyId) return;
+  try {
+    const { maybeSyncPropertydetailToCleanlemons } = require('../coliving-cleanlemons/coliving-cleanlemons-link.service');
+    await maybeSyncPropertydetailToCleanlemons(clientId, propertyId);
+  } catch (e) {
+    console.warn('[roomsetting] maybeSyncPropertydetailToCleanlemons', e && (e.message || e));
+  }
+}
 
 const DEFAULT_PAGE_SIZE = 20;
-const MAX_PAGE_SIZE = 100;
+const MAX_PAGE_SIZE = 200;
 const CACHE_LIMIT_MAX = 2000;
 
 function orderClause(sort) {
@@ -38,6 +49,20 @@ function listConditions(clientId, opts = {}) {
     conditions.push('(r.title_fld LIKE ? OR r.roomname LIKE ?)');
     const term = `%${keyword}%`;
     params.push(term, term);
+  }
+  const avail = String(opts.availability || opts.roomAvailability || '').trim();
+  if (avail === 'AVAILABLE') {
+    conditions.push('(r.available = 1 AND (r.availablesoon = 0 OR r.availablesoon IS NULL))');
+  } else if (avail === 'AVAILABLE_SOON') {
+    conditions.push('(r.availablesoon = 1)');
+  } else if (avail === 'NON_AVAILABLE') {
+    conditions.push('((r.available = 0 OR r.available IS NULL) AND (r.availablesoon = 0 OR r.availablesoon IS NULL))');
+  }
+  const activeF = String(opts.activeFilter || opts.roomActiveFilter || '').trim();
+  if (activeF === 'ACTIVE') {
+    conditions.push('(r.active = 1)');
+  } else if (activeF === 'INACTIVE') {
+    conditions.push('(r.active = 0 OR r.active IS NULL)');
   }
   return { whereSql: conditions.join(' AND '), params };
 }
@@ -89,7 +114,13 @@ async function getRooms(clientId, opts = {}) {
   if (roomIds.length > 0) {
     const placeholders = roomIds.map(() => '?').join(',');
     const [tenancyRows] = await pool.query(
-      `SELECT room_id FROM tenancy WHERE client_id = ? AND room_id IN (${placeholders}) AND status = 1`,
+      `SELECT room_id
+         FROM tenancy
+        WHERE client_id = ?
+          AND room_id IN (${placeholders})
+          AND COALESCE(status, active, 1) = 1
+          AND DATE(begin) <= DATE(UTC_TIMESTAMP() + INTERVAL 8 HOUR)
+          AND DATE(\`end\`) >= DATE(UTC_TIMESTAMP() + INTERVAL 8 HOUR)`,
       [clientId, ...roomIds]
     );
     (tenancyRows || []).forEach(row => roomIdsWithTenancy.add(row.room_id));
@@ -126,11 +157,23 @@ async function getRooms(clientId, opts = {}) {
 }
 
 /**
+ * Count active rooms (roomdetail.active = 1) for client. Used by Credit Management "Active Rooms" card.
+ */
+async function getActiveRoomCount(clientId) {
+  if (!clientId) return 0;
+  const [rows] = await pool.query(
+    'SELECT COUNT(*) AS total FROM roomdetail WHERE client_id = ? AND active = 1',
+    [clientId]
+  );
+  return Number(rows[0]?.total || 0);
+}
+
+/**
  * Get filter options: properties for dropdown.
  */
 async function getRoomFilters(clientId) {
   const [rows] = await pool.query(
-    'SELECT id, shortname FROM propertydetail WHERE client_id = ? ORDER BY shortname ASC LIMIT 1000',
+    'SELECT id, shortname FROM propertydetail WHERE client_id = ? AND (archived = 0 OR archived IS NULL) ORDER BY shortname ASC LIMIT 1000',
     [clientId]
   );
   const properties = (rows || []).map(p => ({
@@ -145,16 +188,32 @@ async function getRoomFilters(clientId) {
  */
 async function getRoom(clientId, roomId) {
   if (!roomId) return null;
-  const [rows] = await pool.query(
-    `SELECT r.id, r.roomname, r.title_fld, r.description_fld, r.remark, r.price,
-            r.mainphoto, r.media_gallery_json, r.active, r.property_id, r.meter_id, r.smartdoor_id,
-            r.available, r.availablesoon,
-            p.shortname AS property_shortname
-       FROM roomdetail r
-       LEFT JOIN propertydetail p ON p.id = r.property_id
-       WHERE r.id = ? AND r.client_id = ? LIMIT 1`,
-    [roomId, clientId]
-  );
+  let rows;
+  try {
+    [rows] = await pool.query(
+      `SELECT r.id, r.roomname, r.title_fld, r.description_fld, r.remark, r.price,
+              r.mainphoto, r.media_gallery_json, r.active, r.property_id, r.meter_id, r.smartdoor_id,
+              r.available, r.availablesoon, r.cleanlemons_cleaning_tenant_price_myr,
+              p.shortname AS property_shortname
+         FROM roomdetail r
+         LEFT JOIN propertydetail p ON p.id = r.property_id
+         WHERE r.id = ? AND r.client_id = ? LIMIT 1`,
+      [roomId, clientId]
+    );
+  } catch (e) {
+    if (e.code === 'ER_BAD_FIELD_ERROR' || e.errno === 1054) {
+      [rows] = await pool.query(
+        `SELECT r.id, r.roomname, r.title_fld, r.description_fld, r.remark, r.price,
+                r.mainphoto, r.media_gallery_json, r.active, r.property_id, r.meter_id, r.smartdoor_id,
+                r.available, r.availablesoon,
+                p.shortname AS property_shortname
+           FROM roomdetail r
+           LEFT JOIN propertydetail p ON p.id = r.property_id
+           WHERE r.id = ? AND r.client_id = ? LIMIT 1`,
+        [roomId, clientId]
+      );
+    } else throw e;
+  }
   const r = rows && rows[0];
   if (!r) return null;
   return {
@@ -173,24 +232,15 @@ async function getRoom(clientId, roomId) {
     propertyId: r.property_id,
     property: r.property_shortname != null ? { shortname: r.property_shortname, _id: r.property_id } : { _id: r.property_id },
     meter: r.meter_id || null,
-    smartdoor: r.smartdoor_id || null
+    smartdoor: r.smartdoor_id || null,
+    cleanlemonsCleaningTenantPriceMyr:
+      r.cleanlemons_cleaning_tenant_price_myr != null ? Number(r.cleanlemons_cleaning_tenant_price_myr) : null
   };
 }
 
 /**
- * Compute title_fld = property shortname + roomName. propertyId can be room's property_id.
- */
-async function computeRoomTitleFld(propertyId, roomName) {
-  const name = (roomName ?? '').toString().trim();
-  if (!propertyId) return name;
-  const [rows] = await pool.query('SELECT shortname FROM propertydetail WHERE id = ? LIMIT 1', [propertyId]);
-  const shortname = (rows && rows[0] && rows[0].shortname) ? String(rows[0].shortname).trim() : '';
-  return `${shortname} ${name}`.trim() || name;
-}
-
-/**
  * Update room. data: roomName, description_fld, remark, price, property, mainPhoto, mediaGallery, active.
- * title_fld is auto-computed from property shortname + roomName when roomName or property changes.
+ * title_fld mirrors roomname when roomName or property changes.
  * available/availablesoon are system-only (booking/tenancy); not updatable by client here.
  * After update, syncs title_fld to meterdetail.title when room has a meter.
  */
@@ -201,7 +251,7 @@ async function updateRoom(clientId, roomId, data) {
   const roomname = data.roomName != null ? String(data.roomName).trim() : room.roomName;
   const property_id = data.property != null ? data.property : room.propertyId;
   const title_fld = (data.roomName !== undefined || data.property !== undefined)
-    ? await computeRoomTitleFld(property_id, roomname)
+    ? roomname
     : (data.title_fld != null ? String(data.title_fld).trim() : (room.title_fld || roomname));
   const description_fld = data.description_fld != null ? String(data.description_fld) : room.description_fld;
   const remark = data.remark != null ? String(data.remark) : room.remark;
@@ -212,36 +262,78 @@ async function updateRoom(clientId, roomId, data) {
     media_gallery_json = Array.isArray(data.mediaGallery) ? data.mediaGallery : [];
   }
   const active = data.active !== undefined ? (data.active === true || data.active === 1) : room.active;
+  if (active) {
+    const [propRows] = await pool.query(
+      'SELECT active, archived FROM propertydetail WHERE id = ? AND client_id = ? LIMIT 1',
+      [property_id, clientId]
+    );
+    const prop = propRows && propRows[0];
+    if (!prop) {
+      throw new Error('PROPERTY_INACTIVE_CANNOT_ACTIVATE_ROOM');
+    }
+    if (prop.archived === 1 || prop.archived === true) {
+      throw new Error('PROPERTY_ARCHIVED_CANNOT_ACTIVATE_ROOM');
+    }
+    if (!(prop.active === 1 || prop.active === true)) {
+      throw new Error('PROPERTY_INACTIVE_CANNOT_ACTIVATE_ROOM');
+    }
+  }
+
+  let cleaningTenant = null;
+  let hasCleaning = false;
+  if (data.cleanlemonsCleaningTenantPriceMyr !== undefined || data.cleanlemons_cleaning_tenant_price_myr !== undefined) {
+    hasCleaning = true;
+    const raw = data.cleanlemonsCleaningTenantPriceMyr ?? data.cleanlemons_cleaning_tenant_price_myr;
+    cleaningTenant = raw === '' || raw == null ? null : Number(raw);
+    if (cleaningTenant != null && !Number.isFinite(cleaningTenant)) cleaningTenant = null;
+  }
 
   await pool.query(
     `UPDATE roomdetail SET roomname = ?, title_fld = ?, description_fld = ?, remark = ?, price = ?,
       property_id = ?, mainphoto = ?, media_gallery_json = ?, active = ?, updated_at = NOW()
+      ${hasCleaning ? ', cleanlemons_cleaning_tenant_price_myr = ?' : ''}
       WHERE id = ? AND client_id = ?`,
-    [
-      roomname,
-      title_fld,
-      description_fld || null,
-      remark || null,
-      price,
-      property_id || null,
-      mainphoto || null,
-      JSON.stringify(media_gallery_json),
-      active ? 1 : 0,
-      roomId,
-      clientId
-    ]
+    hasCleaning
+      ? [
+          roomname,
+          title_fld,
+          description_fld || null,
+          remark || null,
+          price,
+          property_id || null,
+          mainphoto || null,
+          JSON.stringify(media_gallery_json),
+          active ? 1 : 0,
+          cleaningTenant,
+          roomId,
+          clientId
+        ]
+      : [
+          roomname,
+          title_fld,
+          description_fld || null,
+          remark || null,
+          price,
+          property_id || null,
+          mainphoto || null,
+          JSON.stringify(media_gallery_json),
+          active ? 1 : 0,
+          roomId,
+          clientId
+        ]
   );
   const [r2] = await pool.query('SELECT meter_id FROM roomdetail WHERE id = ? AND client_id = ? LIMIT 1', [roomId, clientId]);
   const currentMeterId = r2 && r2[0] ? r2[0].meter_id : null;
   if (currentMeterId) {
     await pool.query('UPDATE meterdetail SET title = ?, updated_at = NOW() WHERE id = ?', [title_fld || roomname, currentMeterId]);
   }
+  await maybeSyncPropertydetailToCleanlemonsAfter(clientId, property_id);
   return { ok: true, room: await getRoom(clientId, roomId) };
 }
 
 /**
  * Insert rooms (batch). Each: { roomName, property } (property = property_id).
- * title_fld = property shortname + roomName.
+ * title_fld = roomName (same as roomname column).
  * New room: available=1 (vacant, system-only), active=0 (client turns on in Room Management).
  */
 async function insertRooms(clientId, records) {
@@ -249,25 +341,32 @@ async function insertRooms(clientId, records) {
     return { inserted: 0, ids: [] };
   }
   const ids = [];
+  const propertyIds = new Set();
   for (const r of records.slice(0, 500)) {
     const name = (r.roomName || '').trim();
     const propertyId = r.property || null;
     if (!name || !propertyId) continue;
-    const title_fld = await computeRoomTitleFld(propertyId, name);
+    const title_fld = name;
     const id = randomUUID();
     await pool.query(
       `INSERT INTO roomdetail (id, client_id, property_id, roomname, title_fld, active, available, availablesoon, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, 0, 1, 0, NOW(), NOW())`,
-      [id, clientId, propertyId, name, title_fld || name]
+      [id, clientId, propertyId, name, title_fld]
     );
     ids.push(id);
+    propertyIds.add(propertyId);
+  }
+  for (const pid of propertyIds) {
+    await maybeSyncPropertydetailToCleanlemonsAfter(clientId, pid);
   }
   return { inserted: ids.length, ids };
 }
 
 /**
  * Get meter dropdown options: 已绑定的电表 (current item's meter) + 还没被绑定的电表 (unbound meters).
- * When roomId or propertyId is provided, the meter bound to that item is included so the dropdown can show and keep it.
+ * When roomId is set, only that room's meter is force-included (for the room edit dialog).
+ * When only propertyId is set (no roomId), that property's meter is force-included (property Utilities dialog).
+ * Do not pass both for room edit: parent property's meter must not appear as a room option.
  * All option values are returned as strings for reliable dropdown matching.
  */
 async function getMeterDropdownOptions(clientId, roomId = null, propertyId = null) {
@@ -322,13 +421,13 @@ async function getMeterDropdownOptions(clientId, roomId = null, propertyId = nul
       pushMeterOption(m || { id: currentMeterId, title: null });
     }
   }
-  if (propertyId) {
+  if (propertyId && !roomId) {
     const [propMeterRows] = await pool.query(
       'SELECT meter_id FROM propertydetail WHERE id = ? AND client_id = ? AND meter_id IS NOT NULL LIMIT 1',
       [propertyId, clientId]
     );
     const currentMeterId = propMeterRows?.[0]?.meter_id;
-    console.log('[roomsetting.service] getMeterDropdownOptions: propertyId path propMeterRows.length=', propMeterRows?.length, 'currentMeterId=', currentMeterId);
+    console.log('[roomsetting.service] getMeterDropdownOptions: propertyId-only path propMeterRows.length=', propMeterRows?.length, 'currentMeterId=', currentMeterId);
     if (currentMeterId) {
       const m = meterRows.find(m => m.id === currentMeterId);
       pushMeterOption(m || { id: currentMeterId, title: null });
@@ -351,8 +450,9 @@ async function getMeterDropdownOptions(clientId, roomId = null, propertyId = nul
 }
 
 /**
- * Get smart door dropdown options: 原本绑定的门锁 (current item's lock) + 还没绑定的门锁 (unbound locks).
- * When roomId or propertyId is provided, the smart door bound to that item is included.
+ * Get smart door dropdown options: current row's lock (if any) + locks not yet bound.
+ * Excludes any lock already on propertydetail or roomdetail (same exclusivity as meter: one lock → property XOR one room).
+ * When roomId is set, only that room's lock is force-included. When only propertyId is set (no roomId), the property's lock is force-included (Utilities dialog). Never add the parent property's lock when editing a room.
  * All option values are returned as strings for reliable dropdown matching.
  */
 async function getSmartDoorDropdownOptions(clientId, roomId = null, propertyId = null) {
@@ -412,13 +512,13 @@ async function getSmartDoorDropdownOptions(clientId, roomId = null, propertyId =
       pushLockOption(lock || { id: currentLockId, lockalias: null, lockname: null });
     }
   }
-  if (propertyId) {
+  if (propertyId && !roomId) {
     const [propLockRows] = await pool.query(
       'SELECT smartdoor_id FROM propertydetail WHERE id = ? AND client_id = ? AND smartdoor_id IS NOT NULL LIMIT 1',
       [propertyId, clientId]
     );
     const currentLockId = propLockRows?.[0]?.smartdoor_id;
-    console.log('[roomsetting.service] getSmartDoorDropdownOptions: propertyId path propLockRows.length=', propLockRows?.length, 'currentLockId=', currentLockId);
+    console.log('[roomsetting.service] getSmartDoorDropdownOptions: propertyId-only path propLockRows.length=', propLockRows?.length, 'currentLockId=', currentLockId);
     if (currentLockId) {
       const lock = locks.find(l => l.id === currentLockId);
       pushLockOption(lock || { id: currentLockId, lockalias: null, lockname: null });
@@ -514,7 +614,11 @@ async function getTenancyForRoom(clientId, roomId) {
             td.fullname, td.phone
        FROM tenancy t
        LEFT JOIN tenantdetail td ON td.id = t.tenant_id
-       WHERE t.client_id = ? AND t.room_id = ? AND t.status = 1
+       WHERE t.client_id = ?
+         AND t.room_id = ?
+         AND COALESCE(t.status, t.active, 1) = 1
+         AND DATE(t.begin) <= DATE(UTC_TIMESTAMP() + INTERVAL 8 HOUR)
+         AND DATE(t.\`end\`) >= DATE(UTC_TIMESTAMP() + INTERVAL 8 HOUR)
        ORDER BY t.end DESC LIMIT 1`,
     [clientId, roomId]
   );
@@ -535,22 +639,82 @@ async function getTenancyForRoom(clientId, roomId) {
 }
 
 /**
- * Toggle room active (for list view checkbox).
+ * Toggle room active (list / edit). Same semantics as updateRoom active: controls live listing & booking eligibility (with available flags), independent of meter power.
  */
 async function setRoomActive(clientId, roomId, active) {
-  const [roomRows] = await pool.query('SELECT id, meter_id, smartdoor_id FROM roomdetail WHERE id = ? AND client_id = ?', [roomId, clientId]);
+  const [roomRows] = await pool.query('SELECT id, property_id FROM roomdetail WHERE id = ? AND client_id = ?', [roomId, clientId]);
   const room = roomRows && roomRows[0];
   if (!room) throw new Error('ROOM_NOT_FOUND');
-  if (active === false && (room.meter_id || room.smartdoor_id)) {
-    throw new Error('REMOVE_METER_OR_SMART_DOOR_FIRST');
+  if (active) {
+    const [propRows] = await pool.query(
+      'SELECT active, archived FROM propertydetail WHERE id = ? AND client_id = ? LIMIT 1',
+      [room.property_id, clientId]
+    );
+    const prop = propRows && propRows[0];
+    if (!prop) {
+      throw new Error('PROPERTY_INACTIVE_CANNOT_ACTIVATE_ROOM');
+    }
+    if (prop.archived === 1 || prop.archived === true) {
+      throw new Error('PROPERTY_ARCHIVED_CANNOT_ACTIVATE_ROOM');
+    }
+    if (!(prop.active === 1 || prop.active === true)) {
+      throw new Error('PROPERTY_INACTIVE_CANNOT_ACTIVATE_ROOM');
+    }
   }
   await pool.query('UPDATE roomdetail SET active = ?, updated_at = NOW() WHERE id = ? AND client_id = ?', [active ? 1 : 0, roomId, clientId]);
   return { ok: true };
 }
 
+/**
+ * Delete one room only when safe:
+ * 1) no ongoing tenancy (active by status/date),
+ * 2) meter is unbound,
+ * 3) smart door is unbound.
+ */
+async function deleteRoom(clientId, roomId) {
+  if (!roomId) throw new Error('NO_ROOM_ID');
+  const [roomRows] = await pool.query(
+    'SELECT id, meter_id, smartdoor_id FROM roomdetail WHERE id = ? AND client_id = ? LIMIT 1',
+    [roomId, clientId]
+  );
+  const room = roomRows && roomRows[0];
+  if (!room) throw new Error('ROOM_NOT_FOUND');
+
+  if (room.meter_id) throw new Error('ROOM_METER_BOUND');
+  if (room.smartdoor_id) throw new Error('ROOM_SMARTDOOR_BOUND');
+
+  const [tenancyRows] = await pool.query(
+    `SELECT id
+       FROM tenancy
+      WHERE client_id = ?
+        AND room_id = ?
+        AND (status = 1 OR status IS NULL)
+        AND \`end\` >= DATE(UTC_TIMESTAMP() + INTERVAL 8 HOUR)
+      LIMIT 1`,
+    [clientId, roomId]
+  );
+  if (tenancyRows && tenancyRows.length) throw new Error('ROOM_HAS_ONGOING_TENANCY');
+
+  await pool.query('DELETE FROM roomdetail WHERE id = ? AND client_id = ? LIMIT 1', [roomId, clientId]);
+  return { ok: true };
+}
+
+/**
+ * Recompute roomdetail.available / availablesoon / availablefrom from tenancies (same rules as daily cron single-room helper).
+ * Use when flags are stale (e.g. after bugs) — not a manual override; reflects DB truth for "today".
+ */
+async function syncRoomAvailabilityFromTenancy(clientId, roomId) {
+  if (!roomId) throw new Error('NO_ROOM_ID');
+  const room = await getRoom(clientId, roomId);
+  if (!room) throw new Error('ROOM_NOT_FOUND');
+  await updateRoomAvailableFromTenancy(roomId);
+  return { ok: true, room: await getRoom(clientId, roomId) };
+}
+
 module.exports = {
   getRooms,
   getRoomFilters,
+  getActiveRoomCount,
   getRoom,
   updateRoom,
   insertRooms,
@@ -559,5 +723,7 @@ module.exports = {
   updateRoomMeter,
   updateRoomSmartDoor,
   getTenancyForRoom,
-  setRoomActive
+  setRoomActive,
+  deleteRoom,
+  syncRoomAvailabilityFromTenancy
 };

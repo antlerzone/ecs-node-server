@@ -10,7 +10,8 @@ const aws4 = require('aws4');
 const { getSqlAccountCredsFull } = require('../lib/sqlaccountCreds');
 
 const DEFAULT_SERVICE = process.env.SQLACCOUNT_AWS_SERVICE || 'sqlaccount';
-const DEFAULT_REGION = process.env.SQLACCOUNT_AWS_REGION || 'us-east-1';
+const DEFAULT_REGION = process.env.SQLACCOUNT_AWS_REGION || 'ap-southeast-5';
+const SIGV4_MODE = String(process.env.SQLACCOUNT_SIGV4_MODE || 'header').trim().toLowerCase();
 
 /**
  * Call SQL Account API with AWS Sig v4.
@@ -44,7 +45,7 @@ async function sqlaccountrequest({ req = null, method = 'get', path = '', data, 
   const parsed = url.parse(baseUrl);
   const hostname = parsed.hostname || parsed.host;
   const port = parsed.port;
-  const requestUrl = (baseUrl.replace(/\/$/, '') + pathWithQuery);
+  const base = baseUrl.replace(/\/$/, '');
 
   const body = data != null ? (typeof data === 'string' ? data : JSON.stringify(data)) : undefined;
   const opts = {
@@ -60,11 +61,14 @@ async function sqlaccountrequest({ req = null, method = 'get', path = '', data, 
     region: DEFAULT_REGION
   };
   if (port) opts.port = port;
+  if (SIGV4_MODE === 'query') opts.signQuery = true;
 
   aws4.sign(opts, {
     accessKeyId: accessKey,
     secretAccessKey: secretKey
   });
+
+  const requestUrl = base + opts.path;
 
   try {
     const axiosConfig = {

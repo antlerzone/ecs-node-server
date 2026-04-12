@@ -21,7 +21,7 @@ node scripts/run-migration.js src/db/migrations/0040_rentalcollection_import_col
 | property (Wix ID) | property_wixid | 脚本按 propertydetail.wix_id 解析并填 property_id |
 | type (Wix ID) | type_wixid | 脚本按 account.wix_id 解析并填 type_id |
 | client (Wix ID) | client_wixid | 脚本按 clientdetail.wix_id 解析并填 client_id |
-| tenancy (Wix ID) | tenancy_wix_id | 脚本按 tenancy.wix_id 解析并填 tenancy_id |
+| tenancy | tenancy_id | 0087：直接写入，tenancy = tenancy.id |
 | Date | date | datetime |
 | Created Date | created_at | datetime |
 | Updated Date | updated_at | datetime |
@@ -64,7 +64,7 @@ node scripts/import-rentalcollection.js rentalcollection.csv
 - property_id, **property_wixid**（0040）  
 - room_id, **room_wixid**（0040）  
 - tenant_id, **tenant_wixid**（0040）  
-- tenancy_id, tenancy_wix_id  
+- tenancy_id  
 - type_id, **type_wixid**（0040）  
 - title, date, amount, ispaid, paidat  
 - invoiceid, referenceid, description, receipturl, invoiceurl  

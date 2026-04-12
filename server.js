@@ -6,6 +6,17 @@ const _bukkuSub = process.env.BUKKU_SAAS_SUBDOMAIN || process.env.BUKKU_SAAS_BUK
 const _bukkuOk = !!(_bukkuKey && String(_bukkuKey).trim() && _bukkuSub && String(_bukkuSub).trim());
 console.log('[server] BUKKU_SAAS for invoice:', _bukkuOk ? 'configured=yes' : 'configured=no (set BUKKU_SAAS_API_KEY & BUKKU_SAAS_SUBDOMAIN in .env and restart)');
 
+const { getExpectedSaaSPlatformCallbackToken } = require('./src/utils/xenditSaasPlatformCallbackToken');
+const _xenditKey =
+  process.env.XENDIT_PLATFORM_SECRET_KEY ||
+  process.env.XENDIT_PLATFORM_TEST_SECRET_KEY ||
+  '';
+if (String(_xenditKey).trim() && !getExpectedSaaSPlatformCallbackToken()) {
+  console.warn(
+    '[server] SaaS Xendit webhook token not set for current mode — POST /api/payex/callback will reject SaaS callbacks. Set XENDIT_SAAS_PLATFORM_TEST_CALLBACK_TOKEN (sandbox) and/or XENDIT_SAAS_PLATFORM_LIVE_CALLBACK_TOKEN (live), or legacy XENDIT_SAAS_PLATFORM_CALLBACK_TOKEN. Must match Xendit Dashboard Verification Token for that environment. See docs/env-saas-payment.md'
+  );
+}
+
 const express = require('express');
 const cors = require('cors');
 
@@ -45,6 +56,7 @@ const cnyiotPriceRoutes = require('./src/modules/cnyiot/routes/price.routes');
 const cnyiotUserRoutes = require('./src/modules/cnyiot/routes/user.routes');
 const clientroutes = require('./src/modules/client/routes/client.routes');
 const apiAuth = require('./src/middleware/apiAuth');
+const uploadAuthOrLocalhost = require('./src/middleware/uploadAuthOrLocalhost');
 const apiClientScope = require('./src/middleware/apiClientScope');
 const accessroutes = require('./src/modules/access/access.routes');
 const apiUserRoutes = require('./src/modules/api-user/api-user.routes');
@@ -71,6 +83,7 @@ const roomsettingRoutes = require('./src/modules/roomsetting/roomsetting.routes'
 const portalAuthRoutes = require('./src/modules/portal-auth/portal-auth.routes');
 const docsAuthRoutes = require('./src/modules/docs-auth/docs-auth.routes');
 const payexRoutes = require('./src/modules/payex/payex.routes');
+const billplzRoutes = require('./src/modules/billplz/billplz.routes');
 const availableunitRoutes = require('./src/modules/availableunit/availableunit.routes');
 const termsRoutes = require('./src/modules/terms/terms.routes');
 const generatereportRoutes = require('./src/modules/generatereport/generatereport.routes');
@@ -87,15 +100,22 @@ const finverseCallbackRoutes = require('./src/modules/finverse/finverse-callback
 const uploadRoutes = require('./src/modules/upload/upload.routes');
 const downloadRoutes = require('./src/modules/download/download.routes');
 const publicRoutes = require('./src/modules/public/public.routes');
+const cleanlemonRoutes = require('./src/modules/cleanlemon/cleanlemon.routes');
+const cleanlemonAntlerzoneSyncRoutes = require('./src/modules/cleanlemon/cleanlemon-antlerzone-sync.routes');
+const clnOperatorAiSvc = require('./src/modules/cleanlemon/cln-operator-ai.service');
+const { getOperatorMasterTableName } = require('./src/config/operatorMasterTable');
 
 // Google / Facebook OAuth for portal login (strategies register on require)
 require('./src/modules/portal-auth/passport-strategies');
 const passport = require('passport');
 
 const app = express();
+const cleanlemonApiGateEnabled =
+  String(process.env.CLEANLEMON_API_GATE_ENABLED || '').toLowerCase() === '1' ||
+  String(process.env.CLEANLEMON_API_GATE_ENABLED || '').toLowerCase() === 'true';
 
 app.use(cors({
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-request-id', 'X-Request-Id']
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-request-id', 'X-Request-Id', 'x-sync-secret', 'X-Sync-Secret']
 }));
 // Finverse Link (link.prod.finverse.net) XHR to our callback must pass preflight; ensure OPTIONS and GET get CORS.
 app.use('/api/finverse', (req, res, next) => {
@@ -113,7 +133,8 @@ app.use(passport.initialize());
 // Webhooks need raw body for signature verification; mount before express.json()
 // Use type: () => true so we always get Buffer (Stripe may send application/json; charset=utf-8)
 app.post('/api/stripe/webhook', express.raw({ type: () => true, limit: '1mb' }), stripeWebhookHandler);
-app.post('/api/xero/webhook', express.raw({ type: 'application/json' }), xeroWebhookHandler);
+// Xero may send application/json; charset=utf-8 — use same raw capture as Stripe
+app.post('/api/xero/webhook', express.raw({ type: () => true, limit: '1mb' }), xeroWebhookHandler);
 app.use(express.json());
 app.use((req, res, next) => {
   const p = req.path || req.url?.split('?')[0] || '';
@@ -170,7 +191,8 @@ app.use('/api/bank-bulk-transfer', bankBulkTransferRoutes);
 app.use('/api/portal/proxy/billing', billingRoutes);
 app.use('/api/portal/proxy/agreementsetting', apiAuth, apiClientScope, agreementsettingRoutes);
 // OSS logo / company chop (multipart). app.js had these; server.js is production entry — must match Next proxy → /api/upload
-app.use('/api/portal/proxy/upload', apiAuth, uploadRoutes);
+// Loopback: skip apiAuth so Next→Node proxy works without mirroring ECS_API_TOKEN (see uploadAuthOrLocalhost.js)
+app.use('/api/portal/proxy/upload', uploadAuthOrLocalhost, uploadRoutes);
 app.use('/api/portal/proxy/download', downloadRoutes);
 // apiClientScope: operator API can only access data for api_user.client_id (no cross-operator data)
 app.use('/api/contact', apiAuth, apiClientScope, contactRoutes);
@@ -187,7 +209,7 @@ app.use('/api/tenantinvoice', apiAuth, apiClientScope, tenantinvoiceRoutes);
 app.use('/api/smartdoorsetting', apiAuth, apiClientScope, smartdoorsettingRoutes);
 app.use('/api/agreementsetting', apiAuth, apiClientScope, agreementsettingRoutes);
 app.use('/api/companysetting', companysettingRoutes);
-app.use('/api/upload', apiAuth, uploadRoutes);
+app.use('/api/upload', uploadAuthOrLocalhost, uploadRoutes);
 app.use('/api/propertysetting', apiAuth, apiClientScope, propertysettingRoutes);
 app.use('/api/ownersetting', apiAuth, apiClientScope, ownersettingRoutes);
 app.use('/api/roomsetting', apiAuth, apiClientScope, roomsettingRoutes);
@@ -198,6 +220,7 @@ app.use('/api/ownerportal', apiAuth, ownerportalRoutes);
 app.use('/api/portal-auth', portalAuthRoutes);
 app.use('/api/docs-auth', docsAuthRoutes);
 app.use('/api/payex', payexRoutes);
+app.use('/api/billplz', billplzRoutes);
 app.use('/api/sandbox', apiAuth, sandboxRoutes);
 // Enquiry – public (plans, addons, banks, credit-plans, submit); used by portal pricing page
 app.use('/api/enquiry', enquiryRoutes);
@@ -212,9 +235,68 @@ app.use('/api/finverse', finverseCallbackRoutes);
 app.use('/api/pricing', enquiryRoutes);
 app.use('/api/download', downloadRoutes);
 app.use('/api/public', publicRoutes);
+// Antlerzone → cln_property (Bearer secret; not behind CLEANLEMON_API_GATE / apiAuth)
+app.use('/api/cleanlemon-sync', cleanlemonAntlerzoneSyncRoutes);
+// Backfill: single KL calendar day for all operators (does not mark midnight batch)
+app.post('/api/internal/cleanlemon-schedule-ai-daily', async (req, res) => {
+  const want = String(process.env.CLEANLEMON_SCHEDULE_AI_CRON_SECRET || '').trim();
+  const got = String(req.headers['x-internal-secret'] || '').trim();
+  if (!want || got !== want) {
+    return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+  }
+  try {
+    const workingDay = req.body?.workingDay ? String(req.body.workingDay).slice(0, 10) : undefined;
+    const summary = await clnOperatorAiSvc.runDailyScheduleAiAllOperators({ workingDay });
+    return res.json({ ok: true, ...summary });
+  } catch (e) {
+    console.error('[server] cleanlemon-schedule-ai-daily', e);
+    return res.status(500).json({ ok: false, reason: e?.message || 'ERROR' });
+  }
+});
+// Rebalance (progress watch): same secret as daily; optional body.workingDay
+app.post('/api/internal/cleanlemon-schedule-ai-rebalance', async (req, res) => {
+  const want = String(process.env.CLEANLEMON_SCHEDULE_AI_CRON_SECRET || '').trim();
+  const got = String(req.headers['x-internal-secret'] || '').trim();
+  if (!want || got !== want) {
+    return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+  }
+  try {
+    const workingDay = req.body?.workingDay ? String(req.body.workingDay).slice(0, 10) : undefined;
+    const summary = await clnOperatorAiSvc.runRebalanceAllOperatorsWithWatch({ workingDay });
+    return res.json({ ok: true, ...summary });
+  } catch (e) {
+    console.error('[server] cleanlemon-schedule-ai-rebalance', e);
+    return res.status(500).json({ ok: false, reason: e?.message || 'ERROR' });
+  }
+});
+// Midnight batch (KL): horizon days per operator; optional body.anchorYmd (YYYY-MM-DD), body.skipIfAlreadyRan (default true)
+app.post('/api/internal/cleanlemon-schedule-ai-midnight', async (req, res) => {
+  const want = String(process.env.CLEANLEMON_SCHEDULE_AI_CRON_SECRET || '').trim();
+  const got = String(req.headers['x-internal-secret'] || '').trim();
+  if (!want || got !== want) {
+    return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+  }
+  try {
+    const anchorYmd = req.body?.anchorYmd ? String(req.body.anchorYmd).slice(0, 10) : undefined;
+    const skipIfAlreadyRan = req.body?.skipIfAlreadyRan !== false;
+    const summary = await clnOperatorAiSvc.runMidnightScheduleAiBatch({ anchorYmd, skipIfAlreadyRan });
+    return res.json(summary);
+  } catch (e) {
+    console.error('[server] cleanlemon-schedule-ai-midnight', e);
+    return res.status(500).json({ ok: false, reason: e?.message || 'ERROR' });
+  }
+});
 // Available Unit list – public (no login), for portal /available-unit page
 app.use('/api/availableunit', availableunitRoutes);
 app.use('/api/available-unit', availableunitRoutes);
+// Cleanlemons SaaS (cln_* tables; portal.cleanlemons.com → ECS)
+if (cleanlemonApiGateEnabled) {
+  app.use('/api/cleanlemon', apiAuth, cleanlemonRoutes);
+  console.log('[server] CLEANLEMON API gate: enabled');
+} else {
+  app.use('/api/cleanlemon', cleanlemonRoutes);
+  console.log('[server] CLEANLEMON API gate: disabled');
+}
 app.use(errorhandler);
 
 app.get('/', (req, res) => {
@@ -234,4 +316,31 @@ const port = process.env.PORT || 5000;
 app.listen(port, '0.0.0.0', () => {
   console.log(`server running on port ${port}`);
   console.log('[server] availableunit routes mounted: /api/availableunit/list, /api/available-unit/list');
+  getOperatorMasterTableName().catch((e) =>
+    console.warn('[server] operator master table name check failed:', e?.message || e)
+  );
+  const rebalanceMin = Number(process.env.CLEANLEMON_SCHEDULE_AI_REBALANCE_TIMER_MINUTES || 0);
+  if (rebalanceMin > 0) {
+    const ms = Math.max(5, rebalanceMin) * 60 * 1000;
+    setInterval(() => {
+      clnOperatorAiSvc.runRebalanceAllOperatorsWithWatch({}).catch((e) =>
+        console.error('[server] cleanlemon-schedule-ai-rebalance tick', e?.message || e)
+      );
+    }, ms);
+    console.log('[server] Cleanlemon schedule AI rebalance timer: every', rebalanceMin, 'min');
+  }
+  const midnightPollMin = Number(process.env.CLEANLEMON_SCHEDULE_AI_MIDNIGHT_POLL_MINUTES || 0);
+  if (midnightPollMin > 0) {
+    const ms = Math.max(1, midnightPollMin) * 60 * 1000;
+    setInterval(() => {
+      clnOperatorAiSvc.runMidnightScheduleAiTick({}).catch((e) =>
+        console.error('[server] cleanlemon-schedule-ai-midnight tick', e?.message || e)
+      );
+    }, ms);
+    console.log(
+      '[server] Cleanlemon schedule AI midnight window check: every',
+      midnightPollMin,
+      'min (KL 00:00–00:05; or use OS cron POST /api/internal/cleanlemon-schedule-ai-midnight)'
+    );
+  }
 });

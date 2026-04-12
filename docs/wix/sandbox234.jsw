@@ -1,0 +1,609 @@
+// Wix Velo backend — 复制为 backend/sandbox234.jsw
+//
+// 流程（你要的「先 read receipt 再 update」）：
+// 1) **Read receipt** = Bukku **GET /sales/payments/{receiptTransactionId}**（收据即 Sales Payment，没有单独的 /sales/receipts/:id）。
+// 2) 响应里的 **transaction.id** 就是路径上的 id；用 body 里 **contact_id、number、amount、deposit_items、link_items** 等拼 **PUT** body，
+//    只把 **date** 换成 RentalCollection.paidAt（MY 日历 YYYY-MM-DD）。
+// 3) **PUT /sales/payments/{同一 id}**。
+//
+// 解析 Payment id：
+// - **PUT /sales/payments/{id}** 的 `{id}` 必须是 **Sales Payment** 的 transaction id，**不是** Read Invoice 里发票自己的 `transaction.id`。
+// - **Read Invoice** 的 `transaction.linked_items[]`：`type === sale_invoice` 为链到另一张发票，跳过；其余行可用 **`origin_transaction_id`** 作为 **GET /sales/payments** 的候选 id（并做一次 GET 校验）。
+// - 另有 `payments[]` 等数组则一并解析。
+// - 仍找不到：**GET /sales/payments** 分页，找指向本发票 id 的付款单（可选按 RC.amount 匹配）。
+// - 最稳：RC 上存 **bukku_payment_id** 或 **bukku_receipt_id**（与 API 里是同一类 integer id，GET/PUT 都用它）。
+//
+// 前提：paidAt / paidat 正确；至少有 payment id **或** bukku_invoice_id 以便反查 payment。
+//
+// 新开的单：在 receipt.jsw 的 POST payload 里使用
+//   import { paidAtToYmdKualaLumpur } from 'backend/sandbox234.jsw';
+//   date: paidAtToYmdKualaLumpur(items[0].paidAt ?? items[0].paidat)
+// POST 成功后请把 `data.transaction.id` 写回 RentalCollection.bukku_payment_id，否则本文件无法 PUT 改日期。
+//
+// Secrets / 子域与 receipt.jsw 保持一致。
+//
+// 「同步到 Wix」清单（本仓库权威副本路径：**docs/wix/sandbox234.jsw**）：
+// 1) 全选复制 → Velo **backend/sandbox234.jsw** → Publish。
+// 2) **COMPANY_SUBDOMAIN**（下文常量）与 **backend/receipt.jsw** 使用的子域一致。
+// 3) **getSecret('bukkuApiKey')** 的 Secret 名称与 receipt.jsw 一致（站点 Settings → Secrets）。
+// 4) RentalCollection CMS 字段：**bukku_invoice_id**（无 payment id 时反查必需）、**paidAt**/paidat；可选用 **bukku_payment_id** 跳过反查。
+
+import wixData from 'wix-data';
+import { fetch } from 'wix-fetch';
+import { getSecret } from 'wix-secrets-backend';
+
+const BASE_URL = 'https://api.bukku.my';
+const COMPANY_SUBDOMAIN = 'colivingmanagement';
+
+/** 若通过 invoice 反查到 payment id，是否写回 RentalCollection.bukku_payment_id 方便下次 */
+const PERSIST_RESOLVED_PAYMENT_ID = true;
+
+/**
+ * 创建 Payment（POST）时也应传 `date: paidAtToYmdKualaLumpur(rc.paidAt)`，避免 Bukku 用「今天」。
+ * @param {Date|string|number} paidAt
+ * @returns {string} YYYY-MM-DD（Asia/Kuala_Lumpur 日历日）
+ */
+export function paidAtToYmdKualaLumpur(paidAt) {
+  const d = paidAt instanceof Date ? paidAt : new Date(paidAt);
+  if (Number.isNaN(d.getTime())) {
+    throw new Error(`Invalid paidAt: ${paidAt}`);
+  }
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kuala_Lumpur',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(d);
+  const y = parts.find((p) => p.type === 'year')?.value;
+  const m = parts.find((p) => p.type === 'month')?.value;
+  const day = parts.find((p) => p.type === 'day')?.value;
+  if (!y || !m || !day) throw new Error('paidAtToYmdKualaLumpur: formatToParts failed');
+  return `${y}-${m}-${day}`;
+}
+
+function bukkuPaymentIdFromRental(rc) {
+  const raw = rc?.bukku_payment_id ?? rc?.bukkuPaymentId;
+  if (raw == null || String(raw).trim() === '') return null;
+  const n = parseInt(String(raw).trim(), 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+function bukkuInvoiceIdFromRental(rc) {
+  const raw = rc?.bukku_invoice_id ?? rc?.bukkuInvoiceId;
+  if (raw == null || String(raw).trim() === '') return null;
+  const n = parseInt(String(raw).trim(), 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** 收据 / 收款单在 Bukku API 上与 Sales Payment 同 id（若 CMS 单独存一列） */
+function bukkuReceiptTransactionIdFromRental(rc) {
+  const raw =
+    rc?.bukku_receipt_id ??
+    rc?.bukkuReceiptId ??
+    rc?.receipt_transaction_id ??
+    rc?.receiptTransactionId;
+  if (raw == null || String(raw).trim() === '') return null;
+  const n = parseInt(String(raw).trim(), 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+function paidAtFromRental(rc) {
+  return rc?.paidAt ?? rc?.paidat ?? null;
+}
+
+/** @param {unknown} items */
+function normalizeDepositItems(items) {
+  if (!Array.isArray(items)) return [];
+  return items.map((row) => {
+    const o = {
+      payment_method_id: row.payment_method_id,
+      account_id: row.account_id,
+      amount:
+        typeof row.amount === 'number' ? row.amount : parseInt(String(row.amount || 0), 10)
+    };
+    if (row.id != null) o.id = row.id;
+    if (row.number != null) o.number = row.number;
+    if (row.fee_text != null) o.fee_text = row.fee_text;
+    if (row.fee_account_id != null) o.fee_account_id = row.fee_account_id;
+    if (row.status != null) o.status = row.status;
+    return o;
+  });
+}
+
+/** @param {unknown} items */
+function normalizeLinkItems(items) {
+  if (!Array.isArray(items)) return [];
+  return items.map((row) => {
+    const o = {
+      target_transaction_id: row.target_transaction_id,
+      apply_amount:
+        typeof row.apply_amount === 'number'
+          ? row.apply_amount
+          : parseInt(String(row.apply_amount || 0), 10)
+    };
+    if (row.id != null) o.id = row.id;
+    return o;
+  });
+}
+
+/** Bukku GET 响应里取出 transaction 对象 */
+function extractTransaction(getBody) {
+  if (!getBody || typeof getBody !== 'object') return null;
+  if (getBody.transaction && typeof getBody.transaction === 'object') return getBody.transaction;
+  if (getBody.data?.transaction && typeof getBody.data.transaction === 'object') {
+    return getBody.data.transaction;
+  }
+  if (getBody.contact_id != null && getBody.number != null) return getBody;
+  return null;
+}
+
+/**
+ * @param {object} getBody - GET /sales/payments/:id 的 JSON
+ * @param {string} newDateYmd - YYYY-MM-DD
+ */
+function buildPutPayloadFromGet(getBody, newDateYmd) {
+  const t = extractTransaction(getBody);
+  if (!t || typeof t !== 'object') {
+    throw new Error('Bukku GET: could not parse transaction (check API response shape)');
+  }
+  if (t.contact_id == null) throw new Error('Bukku GET: missing contact_id');
+
+  const amount =
+    typeof t.amount === 'number' ? t.amount : parseInt(String(t.amount || 0), 10);
+  const exchange =
+    t.exchange_rate != null && t.exchange_rate !== ''
+      ? Number(t.exchange_rate)
+      : 1;
+
+  const deposit_items = normalizeDepositItems(t.deposit_items);
+  if (!deposit_items.length) {
+    throw new Error('Bukku GET: deposit_items empty — cannot PUT');
+  }
+
+  /** @type {Record<string, unknown>} */
+  const payload = {
+    contact_id: parseInt(String(t.contact_id), 10),
+    number: String(t.number || ''),
+    date: newDateYmd,
+    currency_code: String(t.currency_code || 'MYR'),
+    exchange_rate: exchange,
+    amount,
+    deposit_items
+  };
+
+  if (t.number2 != null && String(t.number2).trim() !== '') {
+    payload.number2 = String(t.number2);
+  }
+  if (t.description != null) {
+    payload.description = String(t.description).slice(0, 255);
+  }
+  if (t.remarks != null) {
+    payload.remarks = t.remarks;
+  }
+
+  const link_items = normalizeLinkItems(t.link_items);
+  if (link_items.length) {
+    payload.link_items = link_items;
+  }
+
+  if (Array.isArray(t.tag_ids) && t.tag_ids.length) {
+    payload.tag_ids = t.tag_ids;
+  }
+
+  return payload;
+}
+
+/**
+ * @param {number} transactionId
+ * @param {string} token
+ */
+/**
+ * GET /sales/invoices/{transactionId} — 读的是**发票**；payment id 可能出现在扩展字段 payments[]，见 Bukku 实际响应。
+ * @param {number} invoiceTransactionId
+ * @param {string} token
+ */
+async function bukkuGetInvoice(invoiceTransactionId, token) {
+  const url = `${BASE_URL}/sales/invoices/${invoiceTransactionId}`;
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Company-Subdomain': COMPANY_SUBDOMAIN,
+      Accept: 'application/json'
+    }
+  });
+  const text = await res.text();
+  let data = {};
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`Bukku Invoice GET non-JSON: ${text.slice(0, 240)}`);
+  }
+  if (!res.ok) {
+    const msg = data?.message || data?.error || text.slice(0, 240);
+    throw new Error(`Bukku Invoice GET ${res.status}: ${msg}`);
+  }
+  return data;
+}
+
+/** 从 Read Invoice 的 transaction 上尽量提取 Sales Payment 的 id（视 API 是否返回） */
+function extractPaymentIdsFromInvoiceTransaction(tx) {
+  const ids = [];
+  if (!tx || typeof tx !== 'object') return ids;
+  const candidates = [
+    tx.payments,
+    tx.payment_transactions,
+    tx.sales_payments,
+    tx.payment_items
+  ];
+  for (const arr of candidates) {
+    if (!Array.isArray(arr)) continue;
+    for (const p of arr) {
+      if (!p || typeof p !== 'object') continue;
+      const raw = p.id ?? p.transaction_id ?? p.payment_id ?? p.sales_payment_id;
+      const n = parseInt(String(raw), 10);
+      if (Number.isFinite(n)) ids.push(n);
+    }
+  }
+  return [...new Set(ids)];
+}
+
+/**
+ * Read Invoice 上 `linked_items`：`origin_transaction_id` 常指向关联单据。
+ * 排除 `type: sale_invoice`（另一张发票）；其余行的 origin_transaction_id 作为 **GET /sales/payments** 的候选 id。
+ * @param {object|null} tx - invoice transaction
+ * @returns {number[]}
+ */
+function extractPaymentIdsFromInvoiceLinkedItems(tx) {
+  const ids = [];
+  const items = tx?.linked_items;
+  if (!Array.isArray(items)) return ids;
+  for (const li of items) {
+    if (!li || typeof li !== 'object') continue;
+    const typ = String(li.type || '').toLowerCase();
+    if (typ === 'sale_invoice') continue;
+    const oid = li.origin_transaction_id;
+    if (oid == null) continue;
+    const n = parseInt(String(oid), 10);
+    if (Number.isFinite(n)) ids.push(n);
+  }
+  return [...new Set(ids)];
+}
+
+function extractPaymentListRows(data) {
+  if (!data || typeof data !== 'object') return [];
+  if (Array.isArray(data.transactions)) return data.transactions;
+  if (Array.isArray(data.data)) return data.data;
+  if (Array.isArray(data.payment_transactions)) return data.payment_transactions;
+  if (Array.isArray(data)) return data;
+  return [];
+}
+
+function paymentRowLinksInvoice(row, invoiceTransactionId) {
+  const inv = parseInt(String(invoiceTransactionId), 10);
+  const lists = [row.link_items, row.linked_items];
+  for (const links of lists) {
+    if (!Array.isArray(links)) continue;
+    for (const li of links) {
+      if (!li || typeof li !== 'object') continue;
+      const tgt = li.target_transaction_id ?? li.origin_transaction_id;
+      if (tgt == null) continue;
+      if (parseInt(String(tgt), 10) === inv) return true;
+    }
+  }
+  return false;
+}
+
+function amountClose(a, b, eps = 0.02) {
+  const x = typeof a === 'number' ? a : parseFloat(String(a));
+  const y = typeof b === 'number' ? b : parseFloat(String(b));
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return true;
+  return Math.abs(x - y) <= eps;
+}
+
+/**
+ * 在 GET invoice 未带 payments[] 时，分页列 payment，用 link 指向发票 id。
+ * @param {number} invoiceTransactionId
+ * @param {string} token
+ * @param {{ amount?: unknown }} rc
+ */
+async function findPaymentIdByListingPayments(invoiceTransactionId, token, rc) {
+  const expected = rc?.amount;
+  for (let page = 1; page <= 25; page++) {
+    const url = `${BASE_URL}/sales/payments?page=${page}&per_page=50`;
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Company-Subdomain': COMPANY_SUBDOMAIN,
+        Accept: 'application/json'
+      }
+    });
+    const text = await res.text();
+    let data = {};
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      break;
+    }
+    if (!res.ok) break;
+
+    const rows = extractPaymentListRows(data);
+    if (!rows.length) break;
+
+    const matches = [];
+    for (const row of rows) {
+      const pid = parseInt(String(row.id ?? row.transaction_id), 10);
+      if (!Number.isFinite(pid)) continue;
+      if (!paymentRowLinksInvoice(row, invoiceTransactionId)) continue;
+      matches.push({ pid, row });
+    }
+
+    if (matches.length === 1) return matches[0].pid;
+
+    if (matches.length > 1) {
+      for (const { pid, row } of matches) {
+        const amt = row.amount;
+        if (amountClose(amt, expected)) return pid;
+      }
+      return matches[0].pid;
+    }
+
+    if (rows.length < 50) break;
+  }
+  return null;
+}
+
+/**
+ * 从发票 id 反查 Sales Payment id。
+ * @param {number} invoiceTransactionId
+ * @param {string} token
+ * @param {object} rc
+ */
+async function resolveSalesPaymentIdFromInvoice(invoiceTransactionId, token, rc) {
+  try {
+    const invBody = await bukkuGetInvoice(invoiceTransactionId, token);
+    const tx = extractTransaction(invBody);
+    if (tx) {
+      const fromLinked = extractPaymentIdsFromInvoiceLinkedItems(tx);
+      if (fromLinked.length === 1) {
+        try {
+          const payBody = await readSalesReceipt(fromLinked[0], token);
+          if (extractTransaction(payBody)) return fromLinked[0];
+        } catch (e) {
+          console.warn('[sandbox234] linked_items candidate not a payment', fromLinked[0], e?.message);
+        }
+      }
+      if (fromLinked.length > 1) {
+        for (const pid of fromLinked) {
+          try {
+            const payBody = await readSalesReceipt(pid, token);
+            const pt = extractTransaction(payBody);
+            if (!pt) continue;
+            if (amountClose(pt.amount, rc?.amount)) return pid;
+          } catch (e) {
+            /* try next */
+          }
+        }
+        try {
+          const payBody = await readSalesReceipt(fromLinked[0], token);
+          if (extractTransaction(payBody)) return fromLinked[0];
+        } catch (e) {
+          /* fall through */
+        }
+      }
+
+      const fromInv = extractPaymentIdsFromInvoiceTransaction(tx);
+      if (fromInv.length === 1) return fromInv[0];
+      if (fromInv.length > 1) {
+        for (const pid of fromInv) {
+          try {
+            const payBody = await readSalesReceipt(pid, token);
+            const pt = extractTransaction(payBody);
+            if (!pt) continue;
+            if (amountClose(pt.amount, rc?.amount)) return pid;
+          } catch (e) {
+            /* try next */
+          }
+        }
+        return fromInv[0];
+      }
+    }
+  } catch (e) {
+    console.warn('[sandbox234] invoice GET for payment resolve failed', e?.message || e);
+  }
+
+  return await findPaymentIdByListingPayments(invoiceTransactionId, token, rc);
+}
+
+/** Read receipt（Sales Payment）— GET /sales/payments/:id */
+async function readSalesReceipt(transactionId, token) {
+  const url = `${BASE_URL}/sales/payments/${transactionId}`;
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Company-Subdomain': COMPANY_SUBDOMAIN,
+      Accept: 'application/json'
+    }
+  });
+  const text = await res.text();
+  let data = {};
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`Bukku GET non-JSON: ${text.slice(0, 240)}`);
+  }
+  if (!res.ok) {
+    const msg = data?.message || data?.error || text.slice(0, 240);
+    throw new Error(`Bukku GET ${res.status}: ${msg}`);
+  }
+  return data;
+}
+
+/** @deprecated 内部别名 */
+async function bukkuGetPayment(transactionId, token) {
+  return readSalesReceipt(transactionId, token);
+}
+
+/**
+ * @param {number} transactionId
+ * @param {string} token
+ * @param {Record<string, unknown>} payload
+ */
+async function bukkuPutPayment(transactionId, token, payload) {
+  const url = `${BASE_URL}/sales/payments/${transactionId}`;
+  const res = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Company-Subdomain': COMPANY_SUBDOMAIN,
+      Accept: 'application/json',
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+  const text = await res.text();
+  let data = {};
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`Bukku PUT non-JSON: ${text.slice(0, 300)}`);
+  }
+  if (!res.ok) {
+    const msg = data?.message || data?.error || text.slice(0, 300);
+    throw new Error(`Bukku PUT ${res.status}: ${msg}`);
+  }
+  return data;
+}
+
+/**
+ * **Read receipt**（GET /sales/payments/:id）拿到完整 transaction，仅供调试或自定义逻辑。
+ * @param {number|string} receiptTransactionId
+ */
+export async function readSalesReceiptById(receiptTransactionId) {
+  const token = await getSecret('bukkuApiKey');
+  const id = parseInt(String(receiptTransactionId).trim(), 10);
+  if (!Number.isFinite(id)) throw new Error('readSalesReceiptById: invalid id');
+  return readSalesReceipt(id, token);
+}
+
+/**
+ * 按该条 RC 的 paidAt：先 **read receipt** → 再 **PUT** 更新 date。
+ * @param {string} rentalCollectionId - RentalCollection _id
+ * @returns {Promise<{ ok: true, rentalId: string, transactionId: number, date: string, paymentIdSource?: string } | { ok: false, rentalId: string, error: string }>}
+ */
+export async function updatePaymentDateFromRentalPaidAt(rentalCollectionId) {
+  const rentalId = String(rentalCollectionId || '').trim();
+  try {
+    const rc = await wixData.get('RentalCollection', rentalId, {
+      suppressHooks: true
+    });
+    if (!rc) {
+      return { ok: false, rentalId, error: 'RentalCollection not found' };
+    }
+
+    const paidRaw = paidAtFromRental(rc);
+    if (!paidRaw) {
+      return { ok: false, rentalId, error: 'Missing paidAt / paidat' };
+    }
+
+    const dateStr = paidAtToYmdKualaLumpur(paidRaw);
+    const token = await getSecret('bukkuApiKey');
+
+    let payId = bukkuPaymentIdFromRental(rc);
+    let paymentIdSource = 'bukku_payment_id';
+
+    if (!payId) {
+      payId = bukkuReceiptTransactionIdFromRental(rc);
+      if (payId) paymentIdSource = 'bukku_receipt_id';
+    }
+
+    if (!payId) {
+      const invId = bukkuInvoiceIdFromRental(rc);
+      if (!invId) {
+        return {
+          ok: false,
+          rentalId,
+          error:
+            'Need bukku_payment_id, bukku_receipt_id, or bukku_invoice_id to resolve receipt (GET /sales/payments/:id)'
+        };
+      }
+      payId = await resolveSalesPaymentIdFromInvoice(invId, token, rc);
+      paymentIdSource = 'resolved_from_invoice';
+      if (!payId) {
+        return {
+          ok: false,
+          rentalId,
+          error: `Could not resolve Sales Payment id from invoice ${invId}. Check Bukku list GET /sales/payments shape or save payment id on RC.`
+        };
+      }
+    }
+
+    const receiptGetBody = await readSalesReceipt(payId, token);
+    const payload = buildPutPayloadFromGet(receiptGetBody, dateStr);
+    await bukkuPutPayment(payId, token, payload);
+
+    if (
+      PERSIST_RESOLVED_PAYMENT_ID &&
+      (paymentIdSource === 'resolved_from_invoice' ||
+        (paymentIdSource === 'bukku_receipt_id' && !bukkuPaymentIdFromRental(rc)))
+    ) {
+      try {
+        const toSave = {
+          ...rc,
+          bukku_payment_id: String(payId)
+        };
+        await wixData.update('RentalCollection', toSave, {
+          suppressHooks: true
+        });
+      } catch (persistErr) {
+        console.warn('[sandbox234] persist bukku_payment_id', persistErr?.message || persistErr);
+      }
+    }
+
+    console.log('[sandbox234] payment date updated', {
+      rentalId,
+      transactionId: payId,
+      date: dateStr,
+      paymentIdSource
+    });
+
+    return {
+      ok: true,
+      rentalId,
+      transactionId: payId,
+      date: dateStr,
+      paymentIdSource
+    };
+  } catch (e) {
+    console.error('[sandbox234] updatePaymentDateFromRentalPaidAt', rentalId, e);
+    return {
+      ok: false,
+      rentalId,
+      error: e?.message || String(e)
+    };
+  }
+}
+
+/** 语义同 updatePaymentDateFromRentalPaidAt：先 read receipt，再 update payment date */
+export const readReceiptAndUpdatePaymentDate = updatePaymentDateFromRentalPaidAt;
+
+/**
+ * 逐条处理（完成一条再下一条）。
+ * @param {string[]} rentalCollectionIds
+ */
+export async function updatePaymentDatesSequential(rentalCollectionIds) {
+  const ids = (rentalCollectionIds || [])
+    .map((x) => String(x).trim())
+    .filter(Boolean);
+  const results = [];
+  for (const id of ids) {
+    results.push(await updatePaymentDateFromRentalPaidAt(id));
+  }
+  return {
+    results,
+    okCount: results.filter((x) => x.ok).length,
+    failCount: results.filter((x) => !x.ok).length
+  };
+}

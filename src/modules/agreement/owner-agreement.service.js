@@ -6,6 +6,27 @@
 
 const { randomUUID } = require('crypto');
 const pool = require('../../config/db');
+const { tryPrepareDraftForAgreement } = require('./agreement.service');
+const { deductClientCreditSpending } = require('../billing/deduction.service');
+
+function parseJson(val) {
+  if (val == null) return null;
+  if (typeof val === 'object') return val;
+  if (typeof val !== 'string') return null;
+  try {
+    return JSON.parse(val);
+  } catch {
+    return null;
+  }
+}
+
+/** Credits per generated agreement from operatordetail.admin.agreementCreationCredits; default 10. */
+function getAgreementCreationCreditAmount(adminJson) {
+  const admin = parseJson(adminJson);
+  if (!admin || typeof admin !== 'object') return 10;
+  const n = Number(admin.agreementCreationCredits);
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : 10;
+}
 
 /**
  * Bind property to owner, optionally create agreement (manual URL or system template).
@@ -25,9 +46,6 @@ async function saveOwnerAgreement(clientId, propertyId, payload) {
   );
   if (!propRows || !propRows.length) throw new Error('PROPERTY_NOT_FOUND');
 
-  // TODO: 后期可在此 deduct credit（如按次扣费）
-  // await deductCredit(clientId, { type: 'owner_agreement', propertyId, staffId: payload.staffId });
-
   let setClause = 'owner_id = ?';
   const setParams = [ownerId];
 
@@ -44,11 +62,40 @@ async function saveOwnerAgreement(clientId, propertyId, payload) {
     setParams.push(agreementUrl);
   } else if (type === 'system' && templateId) {
     const agreementId = randomUUID();
-    await pool.query(
-      `INSERT INTO agreement (id, client_id, property_id, owner_id, agreementtemplate_id, mode, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 'owner_operator', 'pending', NOW(), NOW())`,
-      [agreementId, clientId, propertyId, ownerId, templateId]
-    );
+    const [cRows] = await pool.query('SELECT admin FROM operatordetail WHERE id = ? LIMIT 1', [clientId]);
+    const creditAmount = getAgreementCreationCreditAmount(cRows[0]?.admin);
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      if (creditAmount > 0) {
+        await deductClientCreditSpending(
+          clientId,
+          creditAmount,
+          'Owner agreement creation',
+          payload.staffId != null ? payload.staffId : null,
+          { propertyId, ownerId, templateId: String(templateId).trim(), mode: 'owner_operator', agreementId },
+          conn
+        );
+      }
+      await conn.query(
+        `INSERT INTO agreement (id, client_id, property_id, owner_id, agreementtemplate_id, mode, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'owner_operator', 'pending', NOW(), NOW())`,
+        [agreementId, clientId, propertyId, ownerId, templateId]
+      );
+      await conn.commit();
+    } catch (e) {
+      await conn.rollback();
+      throw e;
+    } finally {
+      conn.release();
+    }
+    // Align with tenancy flow: create draft PDF immediately so operator can sign from Agreements page.
+    try {
+      await tryPrepareDraftForAgreement(agreementId);
+    } catch (e) {
+      // Keep owner binding success even if draft preparation fails (e.g. Google quota/profile incomplete).
+      console.warn('[owner-agreement] tryPrepareDraftForAgreement failed:', agreementId, e?.message || e);
+    }
   }
 
   await pool.query(

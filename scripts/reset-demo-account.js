@@ -1,6 +1,6 @@
 /**
- * Reset Demo Account（12am 排程用）：把 demo 公司 (DEMO_CLIENT_ID) 的 clientdetail 及相關資料還原成 seed 狀態。
- * - clientdetail: email=antlerzone@gmail.com, title=DemoAccount, status=1, expired=2099-12-31, best plan
+ * Reset Demo Account（12am 排程用）：把 demo 公司 (DEMO_CLIENT_ID) 的 operatordetail 及相關資料還原成 seed 狀態。
+ * - operatordetail: email=antlerzone@gmail.com, title=DemoAccount, status=1, expired=2099-12-31, best plan
  * - client_credit: 9999
  * - client_pricingplan_detail: 一筆 plan
  * - staffdetail: 只保留 antlerzone@gmail.com（master），刪除其餘掛在 demo 下的訪客 staff
@@ -32,13 +32,13 @@ async function main() {
     const bestPlanTitle = planRows[0].title || 'Best Plan';
 
     await conn.query(
-      `UPDATE clientdetail SET title = ?, email = ?, status = 1, subdomain = ?, expired = ?, pricingplan_id = ?, currency = 'MYR', updated_at = NOW() WHERE id = ?`,
+      `UPDATE operatordetail SET title = ?, email = ?, status = 1, subdomain = ?, expired = ?, pricingplan_id = ?, currency = 'MYR', updated_at = NOW() WHERE id = ?`,
       [DEMO_COMPANY, DEMO_CLIENT_EMAIL, DEMO_SUBDOMAIN, EXPIRED_FAR, bestPlanId, DEMO_CLIENT_ID]
     );
-    console.log('clientdetail reset:', DEMO_CLIENT_EMAIL);
+    console.log('operatordetail reset:', DEMO_CLIENT_EMAIL);
 
     await conn.query(
-      'UPDATE client_credit SET amount = 9999, updated_at = NOW() WHERE client_id = ?',
+      'UPDATE client_credit SET amount = 99999, updated_at = NOW() WHERE client_id = ?',
       [DEMO_CLIENT_ID]
     );
 

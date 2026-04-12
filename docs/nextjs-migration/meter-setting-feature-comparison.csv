@@ -1,0 +1,14 @@
+功能,Wix (旧),Next (新),Next 状态
+列表,getMeterList(keyword,propertyId,filter,sort,page,pageSize,limit); cache 2000 + server 分页 pageSize 20,getMeterList(search,propertyId,filter,limit 500); 前端 filter 无分页,部分(少 cache/分页)
+筛选,Property 下拉; filter All/Prepaid/Postpaid/Online/Offline/Active/Inactive; 搜索 debounce 300ms,Property + filter(含 SINGLE/PARENT/CHILD/BROTHER); 搜索无 debounce,已有(多 group 筛)
+列表项,title; meterId \| productName mode \| balance kwhz; 在线绿/离线红底; checkbox Active(updateMeterStatus); Topup/Sync/Edit/Detail 四按钮,table: title+meterId; Property/Room; Mode; Group badge; Rate; Active badge; Balance; Actions 下拉,已有(无列表内 Active 切换)
+Sync,buttonsync → syncMeterByCmsMeterId; 刷新 cache 与详情,Sync Meter + Sync All → syncMeter; loadData,已有
+Client Topup,boxtopupclient; inputtopupclient + buttonconfirmtopupclient → clientTopup(meterId,amount) + syncMeterByCmsMeterId,Topup Dialog → meterClientTopup,已有
+详情,sectiondetail; getMeter(id); inputdetailmetername/inputrate/dropdownmode; buttonupdatebox → updateMeter; buttondelete → deleteMeter(先检 metersharing),Detail Dialog 仅展示; Save 未接 updateMeter; 无 Delete,部分(少保存/删除)
+列表 Active 切换,checkboxstatus → updateMeterStatus(meterId,checked),无(仅 Badge 展示),少
+Meter Report,sectionmeterreport; datepicker1/2; getUsageSummary(meterIds,start,end); renderMeterReportText + html1 chart,无此区块,少
+新增电表,sectionnewmeter; repeaternewmeter(meterId,name,mode); buttonsavedetail → insertMetersFromPreview(records),New Meter Dialog 表单; 按钮仅关弹窗未调 insert/insert-from-preview,少
+Meter Group,sectiongroup; loadGroupList → repeatergroup; detail→Report; edit→sectioncreategroup; delete→deleteGroup; submitGroup(mode,groupName,parentId,childIds…),Groups Tab 仅从 list 推导展示; Create/Set Group Mode 弹窗未接 loadGroupList/submitGroup/deleteGroup,部分(UI 有/API 未接)
+Top up (Operator 余额),sectiontopup; getMyBillingInfo/getCreditPlans/startNormalTopup; 金额>1000 submitTicket topup_manual,无(在 Billing/Credit 页),刻意不做
+getMeter,打开详情时 getMeter(id) 取最新,详情用 list 项未再拉,可补
+API 使用,getMeterList/Filters/getMeter/updateMeter/updateMeterStatus/deleteMeter/insertMetersFromPreview/syncMeterByCmsMeterId/clientTopup/getUsageSummary/loadGroupList/deleteGroup/submitGroup,getMeterList/Filters/syncMeter/meterClientTopup/updateMeter/deleteMeter(API 有页面未接); 无 getMeter/updateMeterStatus/insertMetersFromPreview/getUsageSummary/loadGroupList/deleteGroup/submitGroup,部分(少多组 API 与对接)

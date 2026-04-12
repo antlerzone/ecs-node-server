@@ -8,8 +8,8 @@
 
 - **平台规则：**
   - Stripe **processing fees 由 SaaS 吸收**（平台承担）。
-  - 每笔 transaction 从 client 的 **credit 里扣**：**Stripe 实际手续费**（Balance Transaction 的 `fee`）+ **1% 平台 markup**。扣款以**整 credit 计算、无小数点**（如 350 cents → 4 credit，即 `Math.ceil(totalCents/100)`）。**1 credit = 1 RM/SGD**。每次扣款都会写入 **creditlogs** 表（type=`RentRelease`，amount 为负，remark 含 Stripe fee 金额与百分比），client 可在流水里看到扣了什么。
-  - 若 client **credit 不足**上述金额，**不 release** tenant 已付的款项（不向 Connect 账户打款）；款项留在平台，后续可人工处理（退款或等 client 充值后再 release）。
+  - **所有 operator 会收到的租客支付**（租金、发票、电表充值）统一规则：checkout 成功后**先算扣款**（Stripe 实际手续费 + 1% 平台 markup）。**若 credit 足够**：立即扣 credit、写 **creditlogs**（type=`RentRelease`）、并 **release**（Transfer 到 Connect）。**若 credit 不足**：不扣款、不 release，该笔写入 **stripe_rent_pending_release**（hold）；operator **top-up 后**自动按顺序扣 credit、写 creditlog、release（`addClientCredit` 内会触发 `tryReleasePendingRentReleases`）。
+  - 扣款以**整 credit** 计算（`Math.ceil(totalCents/100)`），**1 credit = 1 RM/SGD**。**每次扣除都会写入 creditlogs**（type=`RentRelease`，amount 为负，remark 含 Stripe fee 与百分比；charge_type 为 rental 或 meter）。
 
 ## 环境变量
 
@@ -37,6 +37,11 @@ STRIPE_MY_CONNECT_CLIENT_ID=ca_xxx
 STRIPE_MY_SANDBOX_CONNECT_CLIENT_ID=ca_xxx
 # STRIPE_SG_CONNECT_CLIENT_ID=ca_xxx
 # STRIPE_SG_SANDBOX_CONNECT_CLIENT_ID=ca_xxx
+
+# Coliving Operator SaaS（portal /operator/billing、/operator/credit、/enquiry 付 plan 或充值）— 马来西亚平台 master Checkout，与 per-client Connect 不同
+# 默认 sandbox。生产：COLIVING_SAAS_STRIPE_LIVE=1 或 COLIVING_SAAS_STRIPE_USE_SANDBOX=0，并配 STRIPE_SECRET_KEY（live）与 STRIPE_WEBHOOK_SECRET（live）；生产勿设 FORCE_PAYMENT_SANDBOX。
+# 套餐/充值 Checkout：MYR 无平台 transaction fee 行；SGD 另加一行费用，百分比见 COLIVING_SAAS_STRIPE_TRANSACTION_FEE_PERCENT（默认 10）。
+#COLIVING_SAAS_STRIPE_LIVE=1
 ```
 
 - **Live**：`client_profile.stripe_sandbox = 0` 的 client 使用 `STRIPE_SECRET_KEY`（MY）或 `STRIPE_SG_SECRET_KEY`（SG），Payment Intent / Connect 走真实 Stripe。
@@ -46,7 +51,7 @@ STRIPE_MY_SANDBOX_CONNECT_CLIENT_ID=ca_xxx
 **Stripe Connect + Sandbox / Live 说明**
 
 - 平台用的是 **Stripe Connect**：平台 = master account，client 点 Company Setting 里「Connect Stripe」后平台可向该 client 的 Connect 账户做 Transfer（如租金 release）。
-- **MY（马来西亚）**：Stripe 未在 Onboarding options → Countries 开放 Malaysia，Express 会报错。故 **MY 使用 Standard (OAuth)**：client 用已有或新注册的 Stripe 账号授权连接；需配置 `STRIPE_MY_CONNECT_CLIENT_ID` / `STRIPE_MY_SANDBOX_CONNECT_CLIENT_ID`。**Redirect URI**：若 `.env` 配置了 **`PUBLIC_APP_URL`**（如 `https://api.colivingjb.com`），则 redirect_uri 为 **ECS**（`{PUBLIC_APP_URL}/api/companysetting/stripe-connect-oauth-return`），Stripe 回调 ECS 后由 ECS 换 code 落库并 302 到 Wix，避免 Wix 页被刷新导致 code 丢失；需在 Stripe Dashboard → Connect → OAuth 添加该 ECS URL。未配置 `PUBLIC_APP_URL` 时仍用前端传的 Wix 地址（如 `https://www.colivingjb.com/company-setting`）。可选 **`WIX_COMPANY_SETTING_URL`** 指定 ECS 完成后的跳转页（默认 `https://www.colivingjb.com/company-setting`）。
+- **MY（马来西亚）**：Stripe 未在 Onboarding options → Countries 开放 Malaysia，Express 会报错。故 **MY 使用 Standard (OAuth)**：client 用已有或新注册的 Stripe 账号授权连接；需配置 `STRIPE_MY_CONNECT_CLIENT_ID` / `STRIPE_MY_SANDBOX_CONNECT_CLIENT_ID`。**Redirect URI**：若 `.env` 配置了 **`PUBLIC_APP_URL`**（如 `https://api.colivingjb.com`），则 redirect_uri 为 **ECS**（`{PUBLIC_APP_URL}/api/companysetting/stripe-connect-oauth-return`），Stripe 回调 ECS 后由 ECS 换 code 落库并 302 到 Wix，避免 Wix 页被刷新导致 code 丢失。**必须在 Stripe Dashboard 添加该 URL**：Stripe Dashboard → Connect → Settings → **Redirect URIs** 里新增与代码里使用的 **完全一致** 的 URI（如 `https://api.colivingjb.com/api/companysetting/stripe-connect-oauth-return`），否则会报 `Invalid redirect URI`。若需使用与 `PUBLIC_APP_URL` 不同的地址，可设置 **`STRIPE_CONNECT_OAUTH_REDIRECT_URI`**（完整 redirect URI，不含 query）。未配置 `PUBLIC_APP_URL` 时仍用前端传的 Wix 地址（如 `https://www.colivingjb.com/company-setting`）。可选 **`WIX_COMPANY_SETTING_URL`** 指定 ECS 完成后的跳转页（默认 `https://www.colivingjb.com/company-setting`）。
 - **SG（新加坡）**：仍用 **Express**（AccountLink），Countries 列表含 Singapore。
 - **Client 可以用 sandbox Connect**：当 `client_profile.stripe_sandbox = 1` 时，`getStripeForClient(clientId)` 会用 sandbox key，因此 `createConnectAccountAndLink` 创建的 account 与 AccountLink 都是 **test mode**。即：client 在 sandbox 下可以正常 Connect Stripe，无需切到 live。
 - **四种组合**：Malaysia sandbox、Malaysia live、Singapore sandbox、Singapore live（SG live 待配 key）。由 `stripe_sandbox` + `stripe_platform`（MY/SG）与对应 env 决定。
@@ -62,6 +67,7 @@ STRIPE_MY_SANDBOX_CONNECT_CLIENT_ID=ca_xxx
 - **client_profile.stripe_sandbox**（迁移 `0060`）：`1` = 该 client 使用 Stripe test/sandbox（demo account），`0` = 使用 live。创建 Payment Intent、Connect、Checkout 时按此选择密钥。
 - **client_profile.stripe_platform**（迁移 `0061`）：`MY` = 马来西亚 Stripe 平台（收 MYR），`SG` = 新加坡 Stripe 平台（收 SGD）。Company Setting **#buttonstripeonboard** 点击时：若未设置则按 **clientdetail.currency** 推导（SGD → SG，否则 MY），然后在该平台下创建 Connect 账户（country=sg/my）；SG client 接 SG Stripe，MY client 接 MY Stripe。
 - **stripepayout**（迁移 `0058` + `0059`）：每 client 每日一条（`client_id` + `payout_date` 唯一），记录该日转给该 client 的 Transfer 汇总（`total_amount_cents`、`transfer_ids` JSON）。**estimated_fund_receive_date**（迁移 0059）= payout_date + 2 天，供 accounting 用（payment date / 预计到账日）。供日后 sync 到 account system。
+- **stripe_rent_pending_release**（迁移 `0091` + `0092`）：credit 不足时 hold 的支付（`client_id`、`payment_intent_id`、`charge_type`：rental/invoice/meter）；operator top-up 后自动按顺序扣 credit、写 creditlog、release 并删除该条。**所有 operator 会收到的钱**（租金、发票、电表充值）都走同一套 hold/release。
 
 **creditlogs（RentRelease）**：每次扣 credit 写一条。  
 - **Remark**：`Processing fees X% by local card` / `by foreigner card` / `by FPX` / `by Paylah`（卡类型按 client 币种：MY 用 MYR→local=MY 卡；SG 用 SGD→local=SG 卡；否则 foreigner card）。  
@@ -77,6 +83,8 @@ node scripts/run-migration.js src/db/migrations/0058_create_stripepayout.sql
 node scripts/run-migration.js src/db/migrations/0059_stripepayout_creditlogs_columns.sql
 node scripts/run-migration.js src/db/migrations/0060_client_profile_stripe_sandbox.sql
 node scripts/run-migration.js src/db/migrations/0061_client_profile_stripe_platform.sql
+node scripts/run-migration.js src/db/migrations/0091_stripe_rent_pending_release.sql
+node scripts/run-migration.js src/db/migrations/0092_stripe_rent_pending_release_charge_type.sql
 ```
 
 ## API（Node）

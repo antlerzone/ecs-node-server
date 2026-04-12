@@ -4,19 +4,17 @@ alwaysApply: false
 globs: scripts/import-*.js
 ---
 
-# Import 脚本：wixid → FK + Junction
+# Import 脚本：id 与 FK（0087 后）
 
 ## 必须遵守
 
-1. **凡是 CSV/输入里的 `wix_id` 或 `*_wixid` 列（表示 reference），一律视为旧 Wix ID，必须解析为对应的 `_id`（FK）并写入本行。**
-   - 例：有 `client_wixid` → 用 `clientdetail.wix_id` 查得 `id` → 写入本行 `client_id`。
-   - 列对应关系与「查表」见 `docs/db/import-wixid-to-fk-junction-rule.md` 第一节。
+1. **Import 时 id：** CSV 的 `_id`（Wix 主键）直接写入 `id`，**不生成新 UUID**。只有 API/UI 新建 item 才用 `randomUUID()`。
 
-2. **若解析出的 FK 参与 Junction 表，必须在同一次 import 里写入 Junction。**
-   - 例：import **account** 时若写了 `client_id`，必须同时 `INSERT` **account_client**（account_id, client_id, system）。
-   - 例：import **ownerdetail** 时若写了 `client_id` / `property_id`，必须同步 **owner_client** / **owner_property**（多值时拆成多行）。
+2. **CSV reference 列：** 直接写入对应 `_id` 列（client→client_id、property→property_id 等），无需查表。见 `docs/db/import-wixid-to-fk-junction-rule.md`。
 
-3. **不要**在业务逻辑或 API 里用 `_wixid` 做关联；导入阶段解析成 `_id` 后，后续一律用 `_id`。见 `mysql-fk-use-id-only.mdc`。
+3. **若 FK 参与 Junction 表，必须在同一次 import 里写入 Junction。**
+   - 例：import **account** 时若写了 `client_id`，必须同时 `INSERT` **account_client**。
+   - 例：import **ownerdetail** 时若写了 `client_id` / `property_id`，必须同步 **owner_client** / **owner_property**。
 
 ## 参考
 

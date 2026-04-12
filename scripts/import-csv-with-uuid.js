@@ -3,7 +3,7 @@
  * Usage: node scripts/import-csv-with-uuid.js <table_name> <csv_file_path>
  * Example: node scripts/import-csv-with-uuid.js propertydetail ./propertydetail.csv
  *
- * CSV: 第一行为列名（会转成小写），若列名为 _id 则自动映射到 wix_id；列名 client 映射到 client_wixid，并据 clientdetail.wix_id 解析出 client_id。
+ * CSV: 第一行为列名（会转成小写），若列名为 _id 则自动映射到 wix_id；列名 client 映射到 client_wixid，并据 operatordetail.wix_id 解析出 client_id。
  * TRUE/FALSE 会自动转为 1/0。
  */
 
@@ -97,7 +97,7 @@ async function run() {
       if (!clientWixId || !hasClientId) return null;
       if (clientWixIdToId.has(clientWixId)) return clientWixIdToId.get(clientWixId);
       const [rows] = await conn.query(
-        'SELECT id FROM clientdetail WHERE wix_id = ? LIMIT 1',
+        'SELECT id FROM operatordetail WHERE wix_id = ? LIMIT 1',
         [clientWixId]
       );
       const id = rows.length ? rows[0].id : null;

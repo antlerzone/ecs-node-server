@@ -9,6 +9,13 @@ const router = express.Router();
 const { getData } = require('./availableunit.service');
 
 router.post('/list', async (req, res, next) => {
+  console.log('[availableunit] POST /list hit', {
+    path: req.path,
+    url: req.originalUrl,
+    method: req.method,
+    body: req.body,
+    contentType: req.get('content-type'),
+  });
   try {
     const subdomain = req.body?.subdomain != null ? String(req.body.subdomain).trim() : '';
     const opts = {
@@ -20,11 +27,15 @@ router.post('/list', async (req, res, next) => {
       country: req.body?.country
     };
     const result = await getData(subdomain || null, opts);
+    console.log('[availableunit] getData result', { ok: result.ok, itemsCount: result.items?.length, total: result.total });
     if (!result.ok) {
+      console.log('[availableunit] returning 404', result);
       return res.status(404).json(result);
     }
     res.json(result);
+    console.log('[availableunit] 200 sent');
   } catch (err) {
+    console.error('[availableunit] list error', err);
     next(err);
   }
 });

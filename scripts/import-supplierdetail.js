@@ -1,52 +1,36 @@
 /**
- * 导入 supplierdetail CSV：列对齐、bankName -> bankdetail_wixid/bankdetail_id，client -> client_wixid/client_id。
- * 用法：node scripts/import-supplierdetail.js [csv_path]
- * 默认 csv_path = ./supplierdetail.csv
+ * 导入 supplierdetail CSV。0087：id = CSV ID；client 固定 onboard；contact_id → account（Bukku）。
  */
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 const mysql = require('mysql2/promise');
 const fs = require('fs');
 const path = require('path');
-const { randomUUID } = require('crypto');
+const { resolveId } = require('./import-util');
+const { ONBOARD_OPERATOR_ID, skipCsvColumn, bukkuAccountFromContactId } = require('./onboard-import-helpers');
 
 const csvPath = process.argv[2] || path.join(process.cwd(), 'supplierdetail.csv');
 const table = 'supplierdetail';
 
-// Map CSV header (Excel row 1) to DB column. Supports "ID"/"Biller Code" etc. as in your file.
 const CSV_TO_DB = {
-  _id: 'wix_id',
-  ID: 'wix_id',
-  id: 'wix_id',
-  title: 'title',
-  Title: 'title',
-  bankName: 'bankdetail_wixid',
-  'Bank Name': 'bankdetail_wixid',
-  bankHolder: 'bankholder',
-  'Bank Holder': 'bankholder',
-  bankAccount: 'bankaccount',
-  'Bank Account': 'bankaccount',
+  _id: 'id', ID: 'id', id: 'id',
+  title: 'title', Title: 'title',
+  bankName: 'bankdetail_wixid', 'Bank Name': 'bankdetail_wixid',
+  bankHolder: 'bankholder', 'Bank Holder': 'bankholder',
+  bankAccount: 'bankaccount', 'Bank Account': 'bankaccount',
   email: 'email',
-  billerCode: 'billercode',
-  'Biller Code': 'billercode',
-  client: 'client_wixid',
-  client_wixid: 'client_wixid',
-  _createdDate: 'created_at',
-  _updatedDate: 'updated_at',
-  'Created Date': 'created_at',
-  'Updated Date': 'updated_at',
+  billerCode: 'billercode', 'Biller Code': 'billercode',
+  contact_id: 'contact_id',
+  Contact_id: 'contact_id',
+  client: 'ignore_client',
+  _createdDate: 'created_at', _updatedDate: 'updated_at',
+  'Created Date': 'created_at', 'Updated Date': 'updated_at',
 };
 
 function splitCsvRows(content) {
-  const rows = [];
-  let cur = '';
-  let inQuotes = false;
+  const rows = []; let cur = ''; let inQuotes = false;
   for (let i = 0; i < content.length; i++) {
     const c = content[i];
-    if (c === '"') {
-      inQuotes = !inQuotes;
-      cur += c;
-      continue;
-    }
+    if (c === '"') { inQuotes = !inQuotes; cur += c; continue; }
     if (!inQuotes && (c === '\n' || c === '\r')) {
       if (cur.trim().length > 0) rows.push(cur);
       cur = '';
@@ -60,20 +44,11 @@ function splitCsvRows(content) {
 }
 
 function parseCsvLine(line) {
-  const out = [];
-  let cur = '';
-  let inQuotes = false;
+  const out = []; let cur = ''; let inQuotes = false;
   for (let i = 0; i < line.length; i++) {
     const c = line[i];
-    if (c === '"') {
-      inQuotes = !inQuotes;
-      continue;
-    }
-    if (!inQuotes && c === ',') {
-      out.push(cur.trim());
-      cur = '';
-      continue;
-    }
+    if (c === '"') { inQuotes = !inQuotes; continue; }
+    if (!inQuotes && c === ',') { out.push(cur.trim()); cur = ''; continue; }
     cur += c;
   }
   out.push(cur.trim());
@@ -93,34 +68,20 @@ function normalizeVal(val) {
 
 async function run() {
   const fullPath = path.isAbsolute(csvPath) ? csvPath : path.join(process.cwd(), csvPath);
-  if (!fs.existsSync(fullPath)) {
-    console.error('File not found:', fullPath);
-    console.error('Usage: node scripts/import-supplierdetail.js [csv_path]');
-    process.exit(1);
-  }
-
-  const content = fs.readFileSync(fullPath, 'utf8');
-  const lines = splitCsvRows(content);
-  if (lines.length < 2) {
-    console.error('CSV needs header + at least one data row.');
-    process.exit(1);
-  }
-
+  if (!fs.existsSync(fullPath)) { console.error('File not found:', fullPath); process.exit(1); }
+  const lines = splitCsvRows(fs.readFileSync(fullPath, 'utf8'));
+  if (lines.length < 2) { console.error('CSV needs header + data.'); process.exit(1); }
   const rawHeaders = parseCsvLine(lines[0]);
   const headerToDb = (h) => {
     const trimmed = (h || '').trim();
     const key = CSV_TO_DB[trimmed] || CSV_TO_DB[trimmed.replace(/_date$/i, 'Date')] || trimmed;
-    return (key === '_id' ? 'wix_id' : key).toLowerCase().replace(/^\s+|\s+$/g, '');
+    return String(key).toLowerCase().replace(/^\s+|\s+$/g, '');
   };
 
   const conn = await mysql.createConnection({
-    host: process.env.DB_HOST,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME,
-    charset: 'utf8mb4',
+    host: process.env.DB_HOST, user: process.env.DB_USER, password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME, charset: 'utf8mb4',
   });
-
   const dbName = process.env.DB_NAME;
   const [cols] = await conn.query(
     'SELECT column_name FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position',
@@ -129,14 +90,12 @@ async function run() {
   const tableColumns = new Set(cols.map(c => (c.column_name || c.COLUMN_NAME || '').toLowerCase()));
 
   async function loadWixIdMap(refTable) {
-    const [rows] = await conn.query(
-      'SELECT id, wix_id FROM ' + refTable + ' WHERE wix_id IS NOT NULL'
-    );
-    return new Map(rows.map(r => [r.wix_id, r.id]));
+    try {
+      const [rows] = await conn.query('SELECT id, wix_id FROM ' + refTable + ' WHERE wix_id IS NOT NULL');
+      return new Map(rows.map(r => [r.wix_id, r.id]));
+    } catch (_) { return new Map(); }
   }
-
   const bankMap = await loadWixIdMap('bankdetail');
-  const clientMap = await loadWixIdMap('clientdetail');
   function resolveWixId(map, wixId) {
     if (!wixId) return null;
     const s = String(wixId).trim();
@@ -145,43 +104,32 @@ async function run() {
 
   const usedIds = new Set();
   let inserted = 0;
-
   try {
     for (let i = 1; i < lines.length; i++) {
       const values = parseCsvLine(lines[i]);
       const row = {};
       rawHeaders.forEach((h, idx) => {
+        if (skipCsvColumn(h)) return;
         const dbKey = headerToDb(h);
-        if (dbKey === '_owner') return;
+        if (dbKey === '_owner' || dbKey === 'ignore_client') return;
         row[dbKey] = values[idx] !== undefined ? normalizeVal(values[idx]) : null;
       });
-
-      row.id = (() => {
-        let uid;
-        do { uid = randomUUID(); } while (usedIds.has(uid));
-        usedIds.add(uid);
-        return uid;
-      })();
-
+      row.id = resolveId(row, usedIds);
       const now = new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
       if (!row.created_at) row.created_at = now;
       if (!row.updated_at) row.updated_at = now;
-
-      const hasData = [row.wix_id, row.title].some(
-        v => v !== null && v !== undefined && String(v).trim() !== ''
-      );
+      const hasData = [row.id, row.title].some(v => v !== null && v !== undefined && String(v).trim() !== '');
       if (!hasData) continue;
-
       if (row.bankdetail_wixid) row.bankdetail_id = resolveWixId(bankMap, row.bankdetail_wixid);
-      if (row.client_wixid) row.client_id = resolveWixId(clientMap, row.client_wixid);
-
+      delete row.bankdetail_wixid;
+      row.client_id = ONBOARD_OPERATOR_ID;
+      const acct = bukkuAccountFromContactId(row.contact_id, ONBOARD_OPERATOR_ID);
+      if (acct) row.account = acct;
       const keys = Object.keys(row).filter(k => tableColumns.has(k.toLowerCase()));
       if (keys.length === 0) continue;
-
       const colsList = keys.map(k => '`' + k + '`').join(', ');
       const placeholders = keys.map(() => '?').join(', ');
-      const sql = `INSERT INTO \`${table}\` (${colsList}) VALUES (${placeholders})`;
-      await conn.query(sql, keys.map(k => row[k]));
+      await conn.query('INSERT INTO `' + table + '` (' + colsList + ') VALUES (' + placeholders + ')', keys.map(k => row[k]));
       inserted++;
       if (inserted % 100 === 0) console.log('Inserted', inserted, '...');
     }

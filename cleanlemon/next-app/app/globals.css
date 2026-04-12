@@ -1,0 +1,225 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import 'shadcn/tailwind.css';
+
+@custom-variant dark (&:is(.dark *));
+
+/* Cleanlemons Brand Colors:
+   Cream: #FFF8E5
+   Navy: #1B2A41
+   Yellow: #FBD437
+   Light Blue: #A4C8D8
+   Magenta: #B03060
+*/
+
+:root {
+  --background: #FFF8E5;
+  --foreground: #1B2A41;
+  --card: #FFFFFF;
+  --card-foreground: #1B2A41;
+  --popover: #FFFFFF;
+  --popover-foreground: #1B2A41;
+  --primary: #1B2A41;
+  --primary-foreground: #FFF8E5;
+  --secondary: #A4C8D8;
+  --secondary-foreground: #1B2A41;
+  --muted: #F5F0E1;
+  --muted-foreground: #5A6B7D;
+  --accent: #FBD437;
+  --accent-foreground: #1B2A41;
+  --destructive: #B03060;
+  --destructive-foreground: #FFFFFF;
+  --border: #E5DFD0;
+  --input: #E5DFD0;
+  --ring: #FBD437;
+  --chart-1: #FBD437;
+  --chart-2: #A4C8D8;
+  --chart-3: #1B2A41;
+  --chart-4: #B03060;
+  --chart-5: #FFF8E5;
+  --radius: 0.75rem;
+  --sidebar: #1B2A41;
+  --sidebar-foreground: #FFF8E5;
+  --sidebar-primary: #FBD437;
+  --sidebar-primary-foreground: #1B2A41;
+  --sidebar-accent: #2A3D55;
+  --sidebar-accent-foreground: #FFF8E5;
+  --sidebar-border: #2A3D55;
+  --sidebar-ring: #FBD437;
+  /* CTAs / inline styles (Sync Lock, dialogs) — must be set or var(--brand) is invalid → invisible buttons */
+  --brand: #1b2a41;
+  --brand-foreground: #fff8e5;
+  --brand-light: color-mix(in srgb, #1b2a41 12%, transparent);
+  --brand-muted: color-mix(in srgb, #1b2a41 10%, transparent);
+}
+
+.dark {
+  --background: #1B2A41;
+  --foreground: #FFF8E5;
+  --card: #2A3D55;
+  --card-foreground: #FFF8E5;
+  --popover: #2A3D55;
+  --popover-foreground: #FFF8E5;
+  --primary: #FBD437;
+  --primary-foreground: #1B2A41;
+  --secondary: #3A4D65;
+  --secondary-foreground: #FFF8E5;
+  --muted: #2A3D55;
+  --muted-foreground: #A4C8D8;
+  --accent: #FBD437;
+  --accent-foreground: #1B2A41;
+  --destructive: #B03060;
+  --destructive-foreground: #FFFFFF;
+  --border: #3A4D65;
+  --input: #3A4D65;
+  --ring: #FBD437;
+  --chart-1: #FBD437;
+  --chart-2: #A4C8D8;
+  --chart-3: #FFF8E5;
+  --chart-4: #B03060;
+  --chart-5: #5A6B7D;
+  --sidebar: #0F1A28;
+  --sidebar-foreground: #FFF8E5;
+  --sidebar-primary: #FBD437;
+  --sidebar-primary-foreground: #1B2A41;
+  --sidebar-accent: #2A3D55;
+  --sidebar-accent-foreground: #FFF8E5;
+  --sidebar-border: #2A3D55;
+  --sidebar-ring: #FBD437;
+  --brand: #fbd437;
+  --brand-foreground: #1b2a41;
+  --brand-light: color-mix(in srgb, #fbd437 18%, transparent);
+  --brand-muted: color-mix(in srgb, #fbd437 14%, transparent);
+}
+
+@theme inline {
+  --font-sans: 'Inter', 'Inter Fallback', system-ui, sans-serif;
+  --font-mono: 'Geist Mono', 'Geist Mono Fallback', monospace;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/* Public marketing page: A5 flyer print (portal.cleanlemons.com/{subdomain}) */
+.cln-marketing-flyer-print-only {
+  display: none;
+}
+
+@media print {
+  @page {
+    size: A5 portrait;
+    margin: 10mm;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  .cln-marketing-screen {
+    display: none !important;
+  }
+
+  .cln-marketing-flyer-print-only {
+    display: block !important;
+    width: 100%;
+    max-width: 128mm;
+    margin: 0 auto;
+    color: #1b2a41;
+    font-family: var(--font-sans), system-ui, sans-serif;
+    font-size: 9pt;
+    line-height: 1.35;
+  }
+
+  .flyer-print-header {
+    text-align: center;
+    margin-bottom: 6mm;
+    padding-bottom: 3mm;
+    border-bottom: 2px solid #1b2a41;
+  }
+
+  .flyer-print-title {
+    font-size: 14pt;
+    font-weight: 700;
+    margin: 0;
+  }
+
+  .flyer-print-sub {
+    font-size: 8pt;
+    margin: 2mm 0 0;
+    opacity: 0.85;
+  }
+
+  .flyer-print-contact {
+    font-size: 9pt;
+    font-weight: 600;
+    margin: 2mm 0 0;
+  }
+
+  .flyer-print-address {
+    font-size: 7.5pt;
+    margin: 1.5mm 0 0;
+    opacity: 0.9;
+    white-space: pre-line;
+  }
+
+  .flyer-print-body p {
+    margin: 0 0 1.2mm;
+  }
+
+  .flyer-print-footer {
+    margin-top: 5mm;
+    font-size: 7pt;
+    text-align: center;
+    color: #5a6b7d;
+  }
+
+  .flyer-print-powered {
+    margin-top: 3mm;
+    font-size: 7pt;
+    text-align: center;
+    font-weight: 600;
+    color: #1b2a41;
+  }
+}

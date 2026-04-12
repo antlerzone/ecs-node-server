@@ -1,18 +1,105 @@
 /**
  * Agreement Setting – list/create/update/delete agreement templates from MySQL.
- * Uses table: agreementtemplate (id, client_id, title, templateurl, folderurl, html, mode, created_at, updated_at).
- * HTML preview: calls GAS (Google Apps Script) to convert Google Doc → HTML, then saves to agreementtemplate.html.
+ * Uses table: agreementtemplate (id, client_id, title, templateurl, folderurl, template_oss_url, html, mode, created_at, updated_at).
+ * HTML: Drive API export Google Doc → HTML (OAuth or service account). Preview PDF: Node Docs/Drive API + same auth → OSS on save; download can also generate on the fly.
  * All FK by client_id; no _wixid in business logic.
  */
 
 const { randomUUID } = require('crypto');
 const axios = require('axios');
 const pool = require('../../config/db');
+const { uploadToOss } = require('../upload/oss.service');
+const { exportGoogleDocAsHtml } = require('../agreement/google-docs-pdf');
+const {
+  generateTemplatePreviewPdfUrl,
+  generateTemplatePreviewPdfBuffer,
+  resolveAgreementPdfAuth
+} = require('../agreement/agreement.service');
+
+function extractIdFromUrlOrId(u) {
+  if (!u) return null;
+  const s = String(u).trim();
+  if (/^[\w-]{25,}$/.test(s)) return s;
+  const m = s.match(/[-\w]{25,}/);
+  return m ? m[0] : null;
+}
+
+/**
+ * Build template preview PDF via Node (Docs + Drive API), upload to OSS. Async; called after create/update.
+ */
+async function buildAgreementPreviewPdfFromNode(clientId, templateId) {
+  const [rows] = await pool.query(
+    'SELECT id, title, templateurl, folderurl, mode FROM agreementtemplate WHERE id = ? AND client_id = ? LIMIT 1',
+    [templateId, clientId]
+  );
+  const row = rows[0];
+  if (!row) return;
+  const tu = (row.templateurl || '').trim();
+  const fu = (row.folderurl || '').trim();
+  const title = (row.title || '').trim() || 'Agreement';
+  if (!tu || !fu) {
+    await pool.query(
+      'UPDATE agreementtemplate SET preview_pdf_status = NULL, preview_pdf_oss_url = NULL, preview_pdf_error = NULL WHERE id = ?',
+      [templateId]
+    );
+    return;
+  }
+  const templateDocId = extractIdFromUrlOrId(tu);
+  const folderId = extractIdFromUrlOrId(fu);
+  if (!templateDocId || !folderId) {
+    await pool.query(
+      `UPDATE agreementtemplate SET preview_pdf_status = 'failed', preview_pdf_error = ? WHERE id = ?`,
+      ['Invalid template or folder URL', templateId]
+    );
+    return;
+  }
+  const authForPdf = await resolveAgreementPdfAuth(clientId);
+  if (!authForPdf) {
+    await pool.query(
+      `UPDATE agreementtemplate SET preview_pdf_status = 'failed', preview_pdf_error = ? WHERE id = ?`,
+      [
+        'Connect Google Drive in Company Settings or set GOOGLE_SERVICE_ACCOUNT_JSON / GOOGLE_APPLICATION_CREDENTIALS',
+        templateId
+      ]
+    );
+    return;
+  }
+  await pool.query(
+    `UPDATE agreementtemplate SET preview_pdf_status = 'pending', preview_pdf_oss_url = NULL, preview_pdf_error = NULL WHERE id = ?`,
+    [templateId]
+  );
+  try {
+    const { pdfBuffer: pdfBuf } = await generateTemplatePreviewPdfBuffer(
+      { templateurl: tu, folderurl: fu, title, mode: row.mode || '' },
+      { clientId }
+    );
+    if (!pdfBuf?.length) throw new Error('EMPTY_PDF');
+    const up = await uploadToOss(pdfBuf, `agreement-preview-${String(templateId).slice(0, 8)}.pdf`, clientId);
+    if (!up.ok) throw new Error(up.reason || 'OSS_UPLOAD_FAILED');
+    await pool.query(
+      `UPDATE agreementtemplate SET preview_pdf_oss_url = ?, preview_pdf_status = 'ready', preview_pdf_error = NULL WHERE id = ?`,
+      [up.url, templateId]
+    );
+    console.log('[agreementsetting] preview PDF ready templateId=', templateId);
+  } catch (e) {
+    const msg = (e && e.message) ? String(e.message).slice(0, 500) : 'UNKNOWN';
+    await pool.query(
+      `UPDATE agreementtemplate SET preview_pdf_status = 'failed', preview_pdf_error = ? WHERE id = ?`,
+      [msg, templateId]
+    );
+    console.error('[agreementsetting] buildAgreementPreviewPdfFromNode', templateId, msg);
+  }
+}
+
+function scheduleAgreementPreviewBuild(clientId, templateId) {
+  setImmediate(() => {
+    buildAgreementPreviewPdfFromNode(clientId, templateId).catch((err) =>
+      console.error('[agreementsetting] scheduleAgreementPreviewBuild', err)
+    );
+  });
+}
 
 const DEFAULT_PAGE_SIZE = 10;
-// Same GAS URL as legacy backend/access/agreementhtml.jsw; override via AGREEMENT_HTML_GAS_URL if needed
-const AGREEMENT_HTML_GAS_URL = process.env.AGREEMENT_HTML_GAS_URL ||
-    'https://script.google.com/macros/s/AKfycbxUahMjh8ja-0W2Rlv_hA1ver-Q6w-1TrmReqj1DoO5w-FzPqz3S9jn5cYiPDiMwZlr/exec';
 const MAX_PAGE_SIZE = 100;
 const CACHE_LIMIT_MAX = 500;
 
@@ -70,14 +157,32 @@ async function getAgreementList(clientId, opts = {}) {
   const total = Number(countRows[0]?.total || 0);
   const totalPages = useLimit ? 1 : Math.max(1, Math.ceil(total / pageSize));
 
-  const [rows] = await pool.query(
-    `SELECT a.id, a.title, a.templateurl, a.folderurl, a.mode, a.created_at
-       FROM agreementtemplate a
-       WHERE ${whereSql}
-       ${orderSql}
-       LIMIT ? OFFSET ?`,
-    [...params, pageSize, offset]
-  );
+  let rows;
+  try {
+    [rows] = await pool.query(
+      `SELECT a.id, a.title, a.templateurl, a.folderurl, a.template_oss_url, a.mode, a.created_at,
+              a.preview_pdf_oss_url, a.preview_pdf_status, a.preview_pdf_error
+         FROM agreementtemplate a
+         WHERE ${whereSql}
+         ${orderSql}
+         LIMIT ? OFFSET ?`,
+      [...params, pageSize, offset]
+    );
+  } catch (err) {
+    const msg = (err && err.message) ? String(err.message) : '';
+    if (msg.includes('preview_pdf_oss_url') || msg.includes('Unknown column')) {
+      [rows] = await pool.query(
+        `SELECT a.id, a.title, a.templateurl, a.folderurl, a.template_oss_url, a.mode, a.created_at
+           FROM agreementtemplate a
+           WHERE ${whereSql}
+           ${orderSql}
+           LIMIT ? OFFSET ?`,
+        [...params, pageSize, offset]
+      );
+    } else {
+      throw err;
+    }
+  }
 
   const items = (rows || []).map(r => ({
     _id: r.id,
@@ -85,8 +190,12 @@ async function getAgreementList(clientId, opts = {}) {
     title: r.title || '',
     templateurl: r.templateurl || '',
     folderurl: r.folderurl || '',
+    template_oss_url: r.template_oss_url || '',
     mode: r.mode || null,
-    created_at: r.created_at
+    created_at: r.created_at,
+    preview_pdf_oss_url: r.preview_pdf_oss_url != null ? String(r.preview_pdf_oss_url) : '',
+    preview_pdf_status: r.preview_pdf_status != null ? String(r.preview_pdf_status) : '',
+    preview_pdf_error: r.preview_pdf_error != null ? String(r.preview_pdf_error) : ''
   }));
 
   return { items, totalPages, currentPage: page, total };
@@ -110,10 +219,25 @@ async function getAgreementFilters(clientId) {
  * Get one agreement template by id; must belong to client.
  */
 async function getAgreement(clientId, id) {
-  const [rows] = await pool.query(
-    'SELECT id, title, templateurl, folderurl, mode, created_at FROM agreementtemplate WHERE id = ? AND client_id = ? LIMIT 1',
-    [id, clientId]
-  );
+  let rows;
+  try {
+    [rows] = await pool.query(
+      `SELECT id, title, templateurl, folderurl, template_oss_url, mode, created_at,
+              preview_pdf_oss_url, preview_pdf_status, preview_pdf_error
+         FROM agreementtemplate WHERE id = ? AND client_id = ? LIMIT 1`,
+      [id, clientId]
+    );
+  } catch (err) {
+    const msg = (err && err.message) ? String(err.message) : '';
+    if (msg.includes('preview_pdf_oss_url') || msg.includes('Unknown column')) {
+      [rows] = await pool.query(
+        'SELECT id, title, templateurl, folderurl, template_oss_url, mode, created_at FROM agreementtemplate WHERE id = ? AND client_id = ? LIMIT 1',
+        [id, clientId]
+      );
+    } else {
+      throw err;
+    }
+  }
   const r = rows[0];
   if (!r) return null;
   return {
@@ -122,8 +246,12 @@ async function getAgreement(clientId, id) {
     title: r.title || '',
     templateurl: r.templateurl || '',
     folderurl: r.folderurl || '',
+    template_oss_url: r.template_oss_url || '',
     mode: r.mode || null,
-    created_at: r.created_at
+    created_at: r.created_at,
+    preview_pdf_oss_url: r.preview_pdf_oss_url != null ? String(r.preview_pdf_oss_url) : '',
+    preview_pdf_status: r.preview_pdf_status != null ? String(r.preview_pdf_status) : '',
+    preview_pdf_error: r.preview_pdf_error != null ? String(r.preview_pdf_error) : ''
   };
 }
 
@@ -138,10 +266,13 @@ async function createAgreement(clientId, data) {
   const mode = data.mode || null;
 
   await pool.query(
-    `INSERT INTO agreementtemplate (id, client_id, title, templateurl, folderurl, mode, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+    `INSERT INTO agreementtemplate (id, client_id, title, templateurl, folderurl, template_oss_url, mode, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, NULL, ?, NOW(), NOW())`,
     [id, clientId, title, templateurl, folderurl, mode]
   );
+  if ((templateurl || '').trim() && (folderurl || '').trim()) {
+    scheduleAgreementPreviewBuild(clientId, id);
+  }
 
   return {
     _id: id,
@@ -149,6 +280,7 @@ async function createAgreement(clientId, data) {
     title,
     templateurl,
     folderurl,
+    template_oss_url: '',
     mode,
     created_at: new Date()
   };
@@ -188,6 +320,19 @@ async function updateAgreement(clientId, id, data) {
     `UPDATE agreementtemplate SET ${updates.join(', ')}, updated_at = NOW() WHERE id = ?`,
     params
   );
+  const [after] = await pool.query(
+    'SELECT templateurl, folderurl FROM agreementtemplate WHERE id = ? AND client_id = ? LIMIT 1',
+    [id, clientId]
+  );
+  const ar = after[0];
+  if (ar && (ar.templateurl || '').trim() && (ar.folderurl || '').trim()) {
+    scheduleAgreementPreviewBuild(clientId, id);
+  } else {
+    await pool.query(
+      'UPDATE agreementtemplate SET preview_pdf_oss_url = NULL, preview_pdf_status = NULL, preview_pdf_error = NULL WHERE id = ?',
+      [id]
+    );
+  }
   return { updated: true };
 }
 
@@ -213,7 +358,7 @@ function extractDocId(url) {
 }
 
 /**
- * Generate HTML from Google Doc via GAS and save to agreementtemplate.html.
+ * Generate HTML from Google Doc via Drive API export and save to agreementtemplate.html.
  *
  * @param {string} clientId - for ownership check
  * @param {string} agreementTemplateId
@@ -235,33 +380,81 @@ async function generateAgreementHtmlPreview(clientId, agreementTemplateId) {
   const docId = extractDocId(templateUrl);
   if (!docId) return { ok: false };
 
-  if (!AGREEMENT_HTML_GAS_URL) {
-    console.error('[agreementsetting] AGREEMENT_HTML_GAS_URL not set');
+  const authForPdf = await resolveAgreementPdfAuth(clientId);
+  if (!authForPdf) {
+    console.error('[agreementsetting] generateAgreementHtmlPreview: no Google auth (Company Settings or service account)');
     return { ok: false };
   }
 
   try {
-    const resp = await axios.post(AGREEMENT_HTML_GAS_URL, { mode: 'html', templateId: docId }, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 25000,
-      responseType: 'json',
-      validateStatus: () => true
-    });
-    if (resp.status !== 200) throw new Error(`GAS_HTTP_${resp.status}`);
-    const result = resp.data;
-    if (!result || result.status !== 'ok' || typeof result.html !== 'string') {
-      throw new Error('GAS_STATUS_NOT_OK');
-    }
-
+    const html = await exportGoogleDocAsHtml(docId, authForPdf);
     await pool.query(
       'UPDATE agreementtemplate SET html = ?, updated_at = NOW() WHERE id = ?',
-      [result.html, agreementTemplateId]
+      [html, agreementTemplateId]
     );
-    return { ok: true, htmlLength: result.html.length };
+    return { ok: true, htmlLength: html.length };
   } catch (err) {
     console.error('[agreementsetting generateHtml]', err.message);
     return { ok: false };
   }
+}
+
+/**
+ * Generate preview PDF for a template: replace {{variables}} with sample values and style replaced text red. Returns PDF URL for download.
+ * @param {string} clientId
+ * @param {string} templateId
+ * @returns {Promise<{ ok: true, pdfUrl: string } | { ok: false, reason: string }>}
+ */
+async function previewPdf(clientId, templateId) {
+  if (!templateId) return { ok: false, reason: 'NO_ID' };
+  const item = await getAgreement(clientId, templateId);
+  if (!item) return { ok: false, reason: 'NOT_FOUND' };
+  if (!item.templateurl?.trim()) return { ok: false, reason: 'MISSING_TEMPLATE_URL' };
+  if (!item.folderurl?.trim()) return { ok: false, reason: 'MISSING_FOLDER_URL' };
+  try {
+    const result = await generateTemplatePreviewPdfUrl(
+      {
+        templateurl: item.templateurl,
+        folderurl: item.folderurl,
+        title: item.title || 'Agreement',
+        mode: item.mode || ''
+      },
+      { clientId }
+    );
+    return { ok: true, pdfUrl: result.pdfUrl };
+  } catch (err) {
+    console.error('[agreementsetting previewPdf]', err.message);
+    return { ok: false, reason: err.message || 'PDF_GENERATION_FAILED' };
+  }
+}
+
+/**
+ * Preview PDF for download: prefer OSS copy from last save; if missing, generate on the fly with Node + OAuth/SA (same as agreement PDF).
+ */
+async function previewPdfBuffer(clientId, templateId) {
+  if (!templateId) throw new Error('NO_ID');
+  const item = await getAgreement(clientId, templateId);
+  if (!item) throw new Error('NOT_FOUND');
+  if (!item.templateurl?.trim() || !item.folderurl?.trim()) {
+    throw new Error('MISSING_TEMPLATE_OR_FOLDER');
+  }
+  const preUrl = (item.preview_pdf_oss_url || '').trim();
+  if (preUrl) {
+    const pdfRes = await axios.get(preUrl, { responseType: 'arraybuffer', timeout: 60000, maxRedirects: 5 });
+    if (pdfRes.status !== 200 || !pdfRes.data) throw new Error('PREVIEW_OSS_FETCH_FAILED');
+    return Buffer.from(pdfRes.data);
+  }
+  const { pdfBuffer } = await generateTemplatePreviewPdfBuffer(
+    {
+      templateurl: item.templateurl,
+      folderurl: item.folderurl,
+      title: item.title || 'Agreement',
+      mode: item.mode || ''
+    },
+    { clientId }
+  );
+  if (!pdfBuffer?.length) throw new Error('EMPTY_PDF');
+  return pdfBuffer;
 }
 
 module.exports = {
@@ -271,5 +464,7 @@ module.exports = {
   createAgreement,
   updateAgreement,
   deleteAgreement,
-  generateAgreementHtmlPreview
+  generateAgreementHtmlPreview,
+  previewPdf,
+  previewPdfBuffer
 };

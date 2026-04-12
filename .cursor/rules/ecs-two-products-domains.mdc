@@ -1,0 +1,42 @@
+---
+description: 同一 ECS 上 Coliving / Cleanlemons 两套公网域名与典型端口（改 Nginx、PM2、Portal 部署时必查）
+alwaysApply: true
+---
+
+# 双产品：域名与端口（ECS）
+
+同一仓库、同一台 ECS 上跑 **两套** 产品，靠 **域名 + 不同 PM2 进程 + 不同端口** 区分。详细表与 OAuth 说明见 **`docs/readme/ecs-two-products-domains.md`**。
+
+## 三种站点角色（每套产品各三条域名）
+
+| 角色 | 含义 |
+|------|------|
+| **`api.*`** | **后端**（Node / Express + MySQL），无 Next 站。 |
+| **`portal.*`** | **正式站（live）**：Next 前端，按产品设计 **接真实后端**（经同域 `/api/` 反代或公网 API 等）。 |
+| **`demo.*`** | **Mockup / 演示**：与 portal **同套 Next 构建**，但 **不接后端**（前端 mock / localStorage；Coliving 见 `docs/nextjs-migration/lib/portal-api.ts`，Cleanlemons 见 `cleanlemon/next-app/lib/portal-auth-mock.ts`）。 |
+
+## Coliving（colivingjb.com）
+
+| 公网域名 | 典型反代目标（本仓库文档 / PM2） |
+|----------|-----------------------------------|
+| `api.colivingjb.com` | **后端** Node **`127.0.0.1:5000`**（常见 `api-coliving`） |
+| `portal.colivingjb.com` | **Live** Next **`127.0.0.1:3001`**（`next-coliving`，`docs/nextjs-migration`） |
+| `demo.colivingjb.com` | **Mockup**：与 portal 同套 Next（**3001**），**不接后端**。见 `docs/nextjs-migration/lib/portal-api.ts` |
+
+若你方 Nginx/PM2 实际使用 **3000** 或其它端口，**以线上 `pm2 list` 与 Nginx `proxy_pass` 为准**，本表为仓库默认约定。
+
+## Cleanlemons（cleanlemons.com）
+
+| 公网域名 | 典型反代目标（本仓库文档 / PM2） |
+|----------|-----------------------------------|
+| `api.cleanlemons.com` | **后端** Node **`127.0.0.1:5001`**（常见 `api-cleanlemons`） |
+| `portal.cleanlemons.com` | **Live** Next **`127.0.0.1:3100`**（`next-cleanlemons`，`cleanlemon/next-app`） |
+| `demo.cleanlemons.com` | **Mockup**：与 portal 同套 Next（**3100**），**不接后端**。见 `cleanlemon/next-app/lib/portal-auth-mock.ts` |
+
+**注意：** 若 PM2 上另有 `next-cleanlemons-3000` 等同 cwd 的进程，发布 Portal 须 **一并重启**，见 `scripts/deploy-cleanlemons-portal.sh` 与 `cleanlemon/docs/portal-chunk-prevention.md`。
+
+## Agent 协作提示
+
+- 改 **Coliving** 前端 → `npm run build:portal` + 重启 **`next-coliving`**（及 Nginx 指向的端口）。
+- 改 **Cleanlemons** 前端 → `npm run build:cleanlemons-portal` 或 `./scripts/deploy-cleanlemons-portal.sh`，并重启 **所有** 共用 `cleanlemon/next-app/.next` 的 Next 进程。
+- 不要把 Coliving 的 `portal-api` / 代理逻辑当成 Cleanlemons 默认行为，反之亦然；先确认 **Host / 域名** 属于哪一套产品。

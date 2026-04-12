@@ -78,6 +78,7 @@ async function run() {
     const is0001 = !migrationArg || sqlPath.replace(/\\/g, '/').endsWith('0001_init.sql');
 
     if (!is0001) {
+      console.log('[run-migration] Using database:', dbName || process.env.DB_NAME || '(not set)');
       const connMulti = await mysql.createConnection({
         host: process.env.DB_HOST,
         user: process.env.DB_USER,
@@ -86,7 +87,13 @@ async function run() {
         multipleStatements: true,
         charset: 'utf8mb4'
       });
-      const rawParts = fullSql.split(';').map(s => s.trim()).filter(Boolean);
+      // Strip full-line `--` comments before splitting on `;` — semicolons inside comments would
+      // otherwise break statements (e.g. "Setting; tenant" in 0105).
+      const sqlWithoutLineComments = fullSql
+        .split('\n')
+        .filter((line) => !line.trim().startsWith('--'))
+        .join('\n');
+      const rawParts = sqlWithoutLineComments.split(';').map(s => s.trim()).filter(Boolean);
       const stripCommentLines = (sql) =>
         sql
           .split('\n')
@@ -95,7 +102,17 @@ async function run() {
           .trim();
       const parts = rawParts
         .map(stripCommentLines)
-        .filter((p) => p.length > 0 && /^(CREATE|INSERT|ALTER|SET|UPDATE|DELETE|DROP)\s/i.test(p));
+        .filter((p) => {
+          const t = p.trim();
+          // Include PREPARE/EXECUTE/DEALLOCATE — some migrations use dynamic SQL (avoid silently skipping).
+          // Include SELECT … INTO @var (e.g. 0201 conditional ALTER via user variables).
+          const isSelectIntoUserVar = /^\s*SELECT\b/i.test(t) && /\bINTO\s+@/i.test(t);
+          return (
+            t.length > 0 &&
+            (isSelectIntoUserVar ||
+              /^(CREATE|INSERT|ALTER|SET|UPDATE|DELETE|DROP|RENAME|PREPARE|EXECUTE|DEALLOCATE)\s/i.test(t))
+          );
+        });
       for (const part of parts) {
         if (part.toUpperCase().startsWith('SET ')) {
           await connMulti.query(part + ';');
@@ -106,6 +123,14 @@ async function run() {
         } catch (e) {
           if (e.code === 'ER_DUP_FIELDNAME' || e.errno === 1060) {
             console.log('[skip] duplicate column:', part.slice(0, 60) + '...');
+            continue;
+          }
+          if (e.code === 'ER_DUP_KEYNAME' || e.errno === 1061) {
+            console.log('[skip] duplicate key:', part.slice(0, 60) + '...');
+            continue;
+          }
+          if (e.code === 'ER_FK_DUP_NAME' || e.errno === 1826) {
+            console.log('[skip] duplicate foreign key:', part.slice(0, 60) + '...');
             continue;
           }
           throw e;

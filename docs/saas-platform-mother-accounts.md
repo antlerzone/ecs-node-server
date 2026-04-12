@@ -4,8 +4,8 @@
 
 | 整合 | 母账号用途 | Env 变量 | Client onboard 行为 |
 |------|------------|----------|----------------------|
-| **TTLock** (Smart Door) | TTLock Open Platform 应用 | `TTLOCK_CLIENT_ID`、`TTLOCK_CLIENT_SECRET` | 从平台应用为 client 建 **子账号**（register user），subdomain 作 username，写入 `client_integration`（smartDoor/ttlock） |
-| **CNYIOT** (Meter) | 平台主账号，用于 addUser | `CNYIOT_LOGIN_NAME`、`CNYIOT_LOGIN_PSW`（另需 `CNYIOT_AES_KEY`、`CNYIOT_API_ID`） | **Create 子账号**：用母账号调 addUser，client 的 subdomain 作 tenant group；**Existing**：client 填自己的账号密码存 `client_integration`（meter/cnyiot） |
+| **TTLock** (Smart Door) | TTLock Open Platform 应用 | `TTLOCK_CLIENT_ID`、`TTLOCK_CLIENT_SECRET` | **仅 Create 子账号**：从平台应用为 client 建子账号（register user），subdomain 作 username。Operator 不可连接自己的账号，只能使用平台子账号。 |
+| **CNYIOT** (Meter) | 平台主账号，用于 addUser | `CNYIOT_LOGIN_NAME`、`CNYIOT_LOGIN_PSW`（另需 `CNYIOT_AES_KEY`、`CNYIOT_API_ID`） | **仅 Create 子账号**：用母账号调 addUser，client 的 subdomain 作 tenant group。Operator 不可连接自己的账号，只能使用平台子账号。 |
 | **Stripe** | 平台 Stripe 账号（MY/SG） | `STRIPE_SECRET_KEY`、`STRIPE_SANDBOX_SECRET_KEY`、`STRIPE_SG_*` 等（见 [stripe.md](./stripe.md)） | **Stripe Connect**：为 client 建 Express connected account（Malaysia 或 Singapore），onboarding 完成后可向该 account Transfer（如租金 release） |
 | **Bukku** | 平台 Bukku 开单 | `BUKKU_SAAS_API_KEY`、`BUKKU_SAAS_SUBDOMAIN`、`BUKKU_SAAS_DEFAULT_CONTACT_ID` | Client **不是**从母账号开子账号；每个 client 在 Company Setting 填自己的 **Token + Subdomain** 存 `client_integration`（addonAccount/bukku）。平台 Bukku 仅用于 indoor billing 开单等 |
 

@@ -1,7 +1,7 @@
 /**
  * Monthly active-room credit deduction (cron).
  * Run on the 1st of each month (e.g. from POST /api/cron/daily when date is 1st).
- * Deducts 10 credits per active room per client. "Active room" = roomdetail.active = 1 (招租中), with or without tenancy.
+ * Deducts 10 credits per room per client. 只要在 Room Setting 里有房间就按间数计费，不管是否启用(active)。
  */
 
 const pool = require('../../config/db');
@@ -11,8 +11,8 @@ const { deductMonthlyActiveRoomCredit, ACTIVE_ROOM_MONTHLY_TITLE_PREFIX } = requ
 const CREDITS_PER_ACTIVE_ROOM = 10;
 
 /**
- * Run monthly active-room deduction for all clients that have active rooms.
- * Idempotent: skips client if creditlogs already has "Active room monthly (YYYY-MM)" for this month.
+ * Run monthly room deduction for all clients that have rooms in room setting.
+ * Counts all roomdetail rows per client (ignores active flag). Idempotent: skips client if creditlogs already has "Active room monthly (YYYY-MM)" for this month.
  * @returns {{ deducted: Array<{ clientId, activeRoomCount, amount }>, skipped: Array<{ clientId, reason }>, errors: Array<{ clientId, message }> }}
  */
 async function runMonthlyActiveRoomDeduction() {
@@ -20,7 +20,7 @@ async function runMonthlyActiveRoomDeduction() {
   const yearMonth = today.slice(0, 7); // 'YYYY-MM'
 
   const [clientRows] = await pool.query(
-    `SELECT DISTINCT client_id AS clientId FROM roomdetail WHERE active = 1 AND client_id IS NOT NULL`
+    `SELECT DISTINCT client_id AS clientId FROM roomdetail WHERE client_id IS NOT NULL`
   );
   const clientIds = (clientRows || []).map((r) => r.clientId).filter(Boolean);
   if (clientIds.length === 0) {
@@ -45,12 +45,12 @@ async function runMonthlyActiveRoomDeduction() {
     }
 
     const [roomRows] = await pool.query(
-      'SELECT roomname, title_fld FROM roomdetail WHERE client_id = ? AND active = 1 ORDER BY COALESCE(roomname, title_fld) ASC',
+      'SELECT roomname, title_fld FROM roomdetail WHERE client_id = ? ORDER BY COALESCE(roomname, title_fld) ASC',
       [clientId]
     );
     const activeRoomCount = (roomRows || []).length;
     if (activeRoomCount <= 0) {
-      skipped.push({ clientId, reason: 'no_active_rooms' });
+      skipped.push({ clientId, reason: 'no_rooms' });
       continue;
     }
 

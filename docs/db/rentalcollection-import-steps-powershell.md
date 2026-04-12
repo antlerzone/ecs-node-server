@@ -109,7 +109,7 @@ node scripts/import-rentalcollection.js rentalcollection.csv
 
 脚本会：
 - 把 CSV 的 **ID / _id** 写入列 **wix_id**；主键 **id** 使用新 UUID。
-- 把 tenant/room/property/type/client/tenancy 等列写入对应 **\*_wixid** / **tenancy_wix_id**。
+- 把 tenant/room/property/type/client/tenancy 等列直接写入对应 **_id** 列（0087 后）。
 - 用各表 **wix_id** 解析并填入 FK：**client_id**（clientdetail）、**property_id**（propertydetail）、**room_id**（roomdetail）、**tenant_id**（tenantdetail）、**type_id**（account）、**tenancy_id**（tenancy）。
 
 默认 CSV 路径为 `./rentalcollection.csv`，也可写绝对路径。导入后无需再跑 0041（脚本已做 _id 解析）；若部分行因 wix_id 对不上未填 _id，可再跑 0041 补回。

@@ -1,31 +1,48 @@
 /**
- * 导入 propertydetail CSV：列对齐、reference 用 xxx_wixid 上传并解析 xxx_id，boolean true/false -> 1/0。
+ * 导入 propertydetail CSV。0087 后：id = CSV ID；reference 直接写入 _id 列，无效则 null。
  * 用法：node scripts/import-propertydetail.js [csv_path]
- * 默认 csv_path = ./propertydetail.csv（文件请放在项目目录并命名为 propertydetail.csv）
+ * 默认 csv_path = ./propertydetail.csv
  */
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 const mysql = require('mysql2/promise');
 const fs = require('fs');
 const path = require('path');
-const { randomUUID } = require('crypto');
+const { resolveId } = require('./import-util');
+const { ONBOARD_OPERATOR_ID, skipCsvColumn } = require('./onboard-import-helpers');
 
 const csvPath = process.argv[2] || path.join(process.cwd(), 'propertydetail.csv');
 
 const CSV_TO_DB = {
-  _id: 'wix_id',
+  _id: 'id',
+  ID: 'id',
+  id: 'id',
+  Shortname: 'shortname',
+  shortname: 'shortname',
   unitNumber: 'unitnumber',
+  'Unit Number': 'unitnumber',
   apartmentName: 'apartmentname',
-  agreementtemplate: 'agreementtemplate_wixid',
-  client: 'client_wixid',
-  management: 'management_wixid',
-  internetType: 'internettype_wixid',
-  ownername: 'owner_wixid',
-  meter: 'meter_wixid',
-  smartdoor: 'smartdoor_wixid',
+  'Apartment Name': 'apartmentname',
+  agreementtemplate: 'agreementtemplate_id',
+  Agreementtemplate: 'agreementtemplate_id',
+  client: 'client_id',
+  management: 'management_id',
+  internetType: 'internettype_id',
+  'internet type': 'internettype_id',
+  Ownername: 'ownername',
+  ownername: 'ownername',
+  Owner: 'owner_id',
+  'OwnerDetail_property': 'owner_id',
+  meter: 'meter_id',
+  smartdoor: 'smartdoor_id',
+  wifi: 'wifi_id',
+  'Parking lot': 'parkinglot',
   saj: 'water',
   tnb: 'electric',
+  address: 'address',
   _createdDate: 'created_at',
   _updatedDate: 'updated_at',
+  'Created Date': 'created_at',
+  'Updated Date': 'updated_at',
 };
 
 /** 按行分割 CSV，但引号内的换行不算新行（避免 wifidetail 等单元格内换行被当成多行） */
@@ -103,8 +120,13 @@ async function run() {
   const headerToDb = (h) => {
     const trimmed = (h || '').trim();
     const key = CSV_TO_DB[trimmed] || CSV_TO_DB[trimmed.replace(/_date$/i, 'Date')] || trimmed;
-    return (key === '_id' ? 'wix_id' : key).toLowerCase().replace(/^\s+|\s+$/g, '');
+    return String(key).toLowerCase().replace(/^\s+|\s+$/g, '');
   };
+
+  function stripBrackets(s) {
+    if (s == null || typeof s !== 'string') return s;
+    return String(s).trim().replace(/^\[|\]$/g, '').replace(/"/g, '').trim();
+  }
 
   const conn = await mysql.createConnection({
     host: process.env.DB_HOST,
@@ -123,19 +145,20 @@ async function run() {
   );
   const tableColumns = new Set(cols.map(c => (c.column_name || c.COLUMN_NAME || '').toLowerCase()));
 
-  async function loadWixIdMap(refTable) {
-    const [rows] = await conn.query(
-      'SELECT id, wix_id FROM ' + refTable + ' WHERE wix_id IS NOT NULL'
-    );
-    return new Map(rows.map(r => [r.wix_id, r.id]));
-  }
-
-  const clientMap = await loadWixIdMap('clientdetail');
-  const meterMap = await loadWixIdMap('meterdetail');
-  const agreementMap = await loadWixIdMap('agreementtemplate');
-  const supplierMap = await loadWixIdMap('supplierdetail');
-  const ownerMap = await loadWixIdMap('ownerdetail');
-  const lockMap = await loadWixIdMap('lockdetail');
+  const [clientRows, ownerRows, meterRows, agreementRows, supplierRows, lockRows] = await Promise.all([
+    conn.query('SELECT id FROM operatordetail').then(([r]) => r.map(x => x.id)),
+    conn.query('SELECT id FROM ownerdetail').then(([r]) => r.map(x => x.id)),
+    conn.query('SELECT id FROM meterdetail').then(([r]) => r.map(x => x.id)),
+    conn.query('SELECT id FROM agreementtemplate').then(([r]) => r.map(x => x.id)),
+    conn.query('SELECT id FROM supplierdetail').then(([r]) => r.map(x => x.id)),
+    conn.query('SELECT id FROM lockdetail').then(([r]) => r.map(x => x.id)),
+  ]);
+  const validClientIds = new Set(clientRows);
+  const validOwnerIds = new Set(ownerRows);
+  const validMeterIds = new Set(meterRows);
+  const validAgreementIds = new Set(agreementRows);
+  const validSupplierIds = new Set(supplierRows);
+  const validLockIds = new Set(lockRows);
 
   const usedIds = new Set();
   let inserted = 0;
@@ -145,17 +168,24 @@ async function run() {
       const values = parseCsvLine(lines[i]);
       const row = {};
       rawHeaders.forEach((h, idx) => {
+        if (skipCsvColumn(h)) return;
         const dbKey = headerToDb(h);
         if (dbKey === '_owner') return;
         row[dbKey] = values[idx] !== undefined ? normalizeVal(values[idx]) : null;
       });
 
-      row.id = (() => {
-        let uid;
-        do { uid = randomUUID(); } while (usedIds.has(uid));
-        usedIds.add(uid);
-        return uid;
-      })();
+      row.id = resolveId(row, usedIds);
+      for (const k of ['client_id', 'owner_id', 'meter_id', 'agreementtemplate_id', 'management_id', 'internettype_id', 'smartdoor_id']) {
+        if (row[k] != null) row[k] = stripBrackets(String(row[k])) || null;
+      }
+      if (row.client_id != null && !validClientIds.has(row.client_id)) row.client_id = null;
+      if (row.owner_id != null && !validOwnerIds.has(row.owner_id)) row.owner_id = null;
+      if (row.meter_id != null && !validMeterIds.has(row.meter_id)) row.meter_id = null;
+      if (row.agreementtemplate_id != null && !validAgreementIds.has(row.agreementtemplate_id)) row.agreementtemplate_id = null;
+      if (row.management_id != null && !validSupplierIds.has(row.management_id)) row.management_id = null;
+      if (row.internettype_id != null && !validSupplierIds.has(row.internettype_id)) row.internettype_id = null;
+      if (row.smartdoor_id != null && !validLockIds.has(row.smartdoor_id)) row.smartdoor_id = null;
+      if (tableColumns.has('client_id')) row.client_id = ONBOARD_OPERATOR_ID;
 
       const now = new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
       if (!row.created_at) row.created_at = now;
@@ -163,18 +193,10 @@ async function run() {
       if (row.checkbox === null || row.checkbox === undefined) row.checkbox = 0;
       if (row.active === null || row.active === undefined) row.active = 1;
 
-      const hasData = [row.wix_id, row.shortname, row.unitnumber, row.address].some(
+      const hasData = [row.id, row.shortname, row.unitnumber, row.address].some(
         v => v !== null && v !== undefined && String(v).trim() !== ''
       );
       if (!hasData) continue;
-
-      if (row.client_wixid) row.client_id = clientMap.get(row.client_wixid) || null;
-      if (row.meter_wixid) row.meter_id = meterMap.get(row.meter_wixid) || null;
-      if (row.agreementtemplate_wixid) row.agreementtemplate_id = agreementMap.get(row.agreementtemplate_wixid) || null;
-      if (row.management_wixid) row.management_id = supplierMap.get(row.management_wixid) || null;
-      if (row.internettype_wixid) row.internettype_id = supplierMap.get(row.internettype_wixid) || null;
-      if (row.owner_wixid) row.owner_id = ownerMap.get(row.owner_wixid) || null;
-      if (row.smartdoor_wixid) row.smartdoor_id = lockMap.get(row.smartdoor_wixid) || null;
 
       const keys = Object.keys(row).filter(k => tableColumns.has(k.toLowerCase()));
       if (keys.length === 0) continue;

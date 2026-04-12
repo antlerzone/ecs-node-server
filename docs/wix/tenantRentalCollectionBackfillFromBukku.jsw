@@ -1,0 +1,348 @@
+/**
+ * Wix Velo backend — 从 Bukku 已有 Sales Invoice 回填 RentalCollection（不 POST 新开发票）。
+ *
+ * 场景：invoice 已在 Bukku（例如误删 CMS 行），按 Bukku contact_id 列发票，缺则 insert、有则 skip。
+ *
+ * 部署：复制为 backend/tenantRentalCollectionBackfillFromBukku.jsw；Secrets 与 tenantbukkuinvoicebooking.jsw 一致。
+ *
+ * @typedef {object} BackfillOptions
+ * @property {number|string} contactId - Bukku 联系人 id（如租客 133）
+ * @property {string} [tenancyId] - 可选，指定 Wix Tenancy._id；不填则取该租客在 CMS 下最新一条 Tenancy
+ * @property {string} [defaultTypeTitle] - bukkuid 集合里 title，用于解析 Account type（默认 Rental Income）
+ * @property {boolean} [dryRun] - true 只报告不写库
+ */
+
+import wixData from 'wix-data';
+import { fetch } from 'wix-fetch';
+import { getSecret } from 'wix-secrets-backend';
+
+const BASE_URL = 'https://api.bukku.my';
+const COMPANY_SUBDOMAIN = 'colivingmanagement';
+
+const RENTAL_COLLECTION = 'RentalCollection';
+const BUKKUID_COLLECTION = 'bukkuid';
+const TENANCY_COLLECTION = 'Tenancy';
+const TENANTDETAIL_COLLECTION = 'TenantDetail';
+const ROOMDETAIL_COLLECTION = 'RoomDetail';
+
+async function getToken() {
+  return getSecret('bukkuApiKey');
+}
+
+/**
+ * @param {number|string} contactId
+ * @returns {Promise<object[]>} transactions from list API
+ */
+async function listAllInvoicesForContact(contactId) {
+  const token = await getToken();
+  const cid = parseInt(String(contactId).trim(), 10);
+  if (!Number.isFinite(cid)) throw new Error('Invalid contactId');
+
+  const all = [];
+  let page = 1;
+  const pageSize = 100;
+
+  while (true) {
+    const qs = new URLSearchParams({
+      contact_id: String(cid),
+      page: String(page),
+      page_size: String(pageSize),
+      sort_by: 'date',
+      sort_dir: 'desc'
+    });
+    const url = `${BASE_URL}/sales/invoices?${qs.toString()}`;
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Company-Subdomain': COMPANY_SUBDOMAIN,
+        Accept: 'application/json'
+      }
+    });
+    const text = await res.text();
+    let data = {};
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      throw new Error(`Bukku list non-JSON: ${text.slice(0, 200)}`);
+    }
+    if (!res.ok) {
+      const msg = data?.message || data?.error || text.slice(0, 200);
+      throw new Error(`Bukku GET /sales/invoices ${res.status}: ${msg}`);
+    }
+
+    const rows = data.transactions || data.data?.transactions || [];
+    for (const row of rows) {
+      all.push(row);
+    }
+
+    const pag = data.paging || data.meta?.paging;
+    const total = pag?.total != null ? Number(pag.total) : rows.length;
+    const perPage = pag?.per_page != null ? Number(pag.per_page) : pageSize;
+    if (rows.length === 0 || page * perPage >= total) break;
+    page += 1;
+    if (page > 500) break;
+  }
+
+  return all;
+}
+
+/**
+ * @param {string|number} invId Bukku transaction id
+ * @param {string} invNumber IV-xxxx
+ */
+async function rentalRowExistsForInvoice(invId, invNumber) {
+  const idStr = String(invId).trim();
+  const numStr = invNumber != null ? String(invNumber).trim() : '';
+  const idNum = parseInt(idStr, 10);
+
+  let q1 = await wixData
+    .query(RENTAL_COLLECTION)
+    .eq('bukku_invoice_id', idStr)
+    .limit(1)
+    .find();
+
+  if (q1.items.length === 0 && Number.isFinite(idNum)) {
+    q1 = await wixData
+      .query(RENTAL_COLLECTION)
+      .eq('bukku_invoice_id', idNum)
+      .limit(1)
+      .find();
+  }
+
+  if (q1.items.length > 0) return { exists: true, match: 'bukku_invoice_id', item: q1.items[0] };
+
+  if (numStr) {
+    const q2 = await wixData
+      .query(RENTAL_COLLECTION)
+      .eq('invoiceid', numStr)
+      .limit(1)
+      .find();
+    if (q2.items.length > 0) return { exists: true, match: 'invoiceid', item: q2.items[0] };
+  }
+
+  return { exists: false };
+}
+
+async function getBukkuTypeIdByTitle(title) {
+  const res = await wixData.query(BUKKUID_COLLECTION).eq('title', title).limit(1).find();
+  return res.items[0] || null;
+}
+
+async function findTenantByContactId(contactId) {
+  const n = parseInt(String(contactId).trim(), 10);
+  if (!Number.isFinite(n)) return null;
+
+  let r = await wixData
+    .query(TENANTDETAIL_COLLECTION)
+    .eq('contact_id', n)
+    .limit(1)
+    .find();
+  if (r.items.length) return r.items[0];
+
+  r = await wixData
+    .query(TENANTDETAIL_COLLECTION)
+    .eq('contact_id', String(n))
+    .limit(1)
+    .find();
+  if (r.items.length) return r.items[0];
+
+  return null;
+}
+
+async function resolveTenancy(tenantDoc, tenancyId) {
+  if (tenancyId) {
+    const t = await wixData.get(TENANCY_COLLECTION, tenancyId, { suppressHooks: true });
+    if (!t) throw new Error(`Tenancy not found: ${tenancyId}`);
+    const tid =
+      typeof t.tenant === 'object' && t.tenant._id ? String(t.tenant._id) : String(t.tenant || '');
+    if (tid && tid !== String(tenantDoc._id)) {
+      throw new Error(`Tenancy.tenant ${tid} does not match TenantDetail ${tenantDoc._id}`);
+    }
+    return t;
+  }
+
+  const res = await wixData
+    .query(TENANCY_COLLECTION)
+    .eq('tenant', tenantDoc._id)
+    .descending('_createdDate')
+    .limit(1)
+    .find();
+
+  if (!res.items.length) {
+    throw new Error(`No Tenancy found for tenant ${tenantDoc._id} (${tenantDoc.fullname || ''})`);
+  }
+  return res.items[0];
+}
+
+function roomIdFromTenancy(tenancy) {
+  const r = tenancy.room;
+  if (r == null) return null;
+  return typeof r === 'object' && r._id ? r._id : r;
+}
+
+async function enrichTenancyForInsert(tenancy) {
+  const roomId = roomIdFromTenancy(tenancy);
+  if (!roomId) return { tenancy, propertyId: null };
+
+  const room = await wixData.get(ROOMDETAIL_COLLECTION, roomId, { suppressHooks: true }).catch(() => null);
+  const prop = room?.property;
+  const propertyId = prop == null ? null : typeof prop === 'object' && prop._id ? prop._id : prop;
+
+  return { tenancy, propertyId, roomId };
+}
+
+/**
+ * @param {BackfillOptions} options
+ */
+export async function backfillRentalCollectionsFromBukkuInvoices(options) {
+  const contactId = options.contactId;
+  const tenancyIdOpt = options.tenancyId;
+  const defaultTypeTitle = options.defaultTypeTitle || 'Rental Income';
+  const dryRun = options.dryRun === true;
+
+  const inserted = [];
+  const skipped = [];
+  const errors = [];
+
+  try {
+    const tenantDoc = await findTenantByContactId(contactId);
+    if (!tenantDoc) {
+      return {
+        ok: false,
+        message: `No TenantDetail with contact_id=${contactId}`,
+        inserted,
+        skipped,
+        errors
+      };
+    }
+
+    const tenancy = await resolveTenancy(tenantDoc, tenancyIdOpt);
+    const { propertyId, roomId } = await enrichTenancyForInsert(tenancy);
+
+    const bukkuTypeDoc = await getBukkuTypeIdByTitle(defaultTypeTitle);
+    if (!bukkuTypeDoc) {
+      return {
+        ok: false,
+        message: `No bukuid row with title="${defaultTypeTitle}" — add or change defaultTypeTitle`,
+        inserted,
+        skipped,
+        errors
+      };
+    }
+
+    const typeRef = bukkuTypeDoc._id;
+    const accountId = bukkuTypeDoc.accountid != null ? bukkuTypeDoc.accountid : null;
+    const productId = bukkuTypeDoc.productid != null ? bukkuTypeDoc.productid : null;
+
+    const invoices = await listAllInvoicesForContact(contactId);
+
+    for (const inv of invoices) {
+      const invId = inv.id;
+      const num = inv.number != null ? String(inv.number) : '';
+      const st = inv.status != null ? String(inv.status).toLowerCase() : '';
+
+      if (st === 'void') {
+        skipped.push({ reason: 'void', id: invId, number: num });
+        continue;
+      }
+
+      if (invId == null) {
+        errors.push({ error: 'Invoice missing id', inv });
+        continue;
+      }
+
+      const ex = await rentalRowExistsForInvoice(invId, num);
+      if (ex.exists) {
+        skipped.push({
+          reason: 'already_in_cms',
+          match: ex.match,
+          bukku_invoice_id: invId,
+          number: num,
+          rental_id: ex.item?._id
+        });
+        continue;
+      }
+
+      const amountRaw = inv.amount;
+      const amount =
+        typeof amountRaw === 'number'
+          ? amountRaw
+          : parseFloat(String(amountRaw || 0).replace(/,/g, '')) || 0;
+
+      const dateStr = inv.date != null ? String(inv.date).slice(0, 10) : null;
+      if (!dateStr) {
+        errors.push({ error: 'Invoice missing date', bukku_invoice_id: invId, number: num });
+        continue;
+      }
+
+      const title = inv.title != null ? String(inv.title) : '';
+      const desc = inv.description != null ? String(inv.description) : title;
+
+      /** @type {Record<string, unknown>} */
+      const row = {
+        tenancy: tenancy._id,
+        tenant: tenantDoc._id,
+        room: roomId,
+        type: typeRef,
+        date: dateStr,
+        amount,
+        title: title || desc || `Invoice ${num}`,
+        description: desc,
+        invoiceid: num,
+        invoiceurl: inv.short_link != null ? String(inv.short_link) : '',
+        bukku_invoice_id: String(invId),
+        isPaid: false,
+        ispaid: false
+      };
+
+      if (propertyId) row.property = propertyId;
+      if (tenancy.client != null) {
+        row.client =
+          typeof tenancy.client === 'object' && tenancy.client._id
+            ? tenancy.client._id
+            : tenancy.client;
+      }
+      if (accountId != null && String(accountId).trim() !== '') row.accountId = accountId;
+      if (productId != null && String(productId).trim() !== '') row.productId = productId;
+
+      if (dryRun) {
+        inserted.push({ dryRun: true, wouldInsert: row, bukku_invoice_id: invId, number: num });
+        continue;
+      }
+
+      try {
+        const res = await wixData.insert(RENTAL_COLLECTION, row, { suppressHooks: true });
+        inserted.push({
+          rental_id: res._id,
+          bukku_invoice_id: invId,
+          number: num
+        });
+      } catch (e) {
+        errors.push({
+          bukku_invoice_id: invId,
+          number: num,
+          error: e?.message || String(e)
+        });
+      }
+    }
+
+    return {
+      ok: errors.length === 0,
+      tenant: { _id: tenantDoc._id, fullname: tenantDoc.fullname, contact_id: contactId },
+      tenancy_id: tenancy._id,
+      invoiceCount: invoices.length,
+      inserted,
+      skipped,
+      errors
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      message: e?.message || String(e),
+      inserted,
+      skipped,
+      errors
+    };
+  }
+}

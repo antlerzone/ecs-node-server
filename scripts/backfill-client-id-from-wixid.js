@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Backfill client_id from client_wixid for all tables that have both columns.
- * Uses clientdetail.wix_id = table.client_wixid. Skips tables that don't exist.
+ * Uses operatordetail.wix_id = table.client_wixid. Skips tables that don't exist.
  * Usage: node scripts/backfill-client-id-from-wixid.js
  */
 
@@ -49,7 +49,7 @@ async function main() {
     try {
       const [rows] = await conn.query(
         `UPDATE \`${table}\` t
-         INNER JOIN clientdetail c ON c.wix_id = t.client_wixid
+         INNER JOIN operatordetail c ON c.wix_id = t.client_wixid
          SET t.client_id = c.id
          WHERE t.client_wixid IS NOT NULL AND TRIM(t.client_wixid) != ''`
       );

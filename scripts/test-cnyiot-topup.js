@@ -15,7 +15,7 @@ const clientId = process.env.TEST_CNYIOT_CLIENT_ID || process.argv[2];
 const meterId = process.argv[3] || process.env.METER_ID || '19101920205';
 const amountKwh = Number(process.argv[4] || process.env.AMOUNT_KWH || '10');
 
-const BASE_URL = process.env.CNYIOT_BASE_URL || process.env.CNYIOT_PROXY_BASE || 'https://www.openapi.cnyiot.com/api.ashx';
+const BASE_URL = process.env.CNYIOT_BASE_URL || 'https://www.openapi.cnyiot.com/api.ashx';
 
 async function main() {
   console.log('--- CNYIoT 直连充值测试 ---');

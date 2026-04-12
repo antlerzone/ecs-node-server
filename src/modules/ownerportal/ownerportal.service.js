@@ -1,6 +1,6 @@
 /**
  * Owner Portal – migrated from Wix Owner Detail + CMS.
- * Uses MySQL: ownerdetail, propertydetail, roomdetail, tenancy, tenantdetail, clientdetail,
+ * Uses MySQL: ownerdetail, propertydetail, roomdetail, tenancy, tenantdetail, operatordetail,
  * bankdetail, ownerpayout, bills, agreement, agreementtemplate, client_integration, client_pricingplan_detail.
  * All endpoints require email; owner is resolved by email (ownerdetail.email).
  */
@@ -12,6 +12,7 @@ const contactSync = require('../contact/contact-sync.service');
 const { malaysiaDateRangeToUtcForQuery } = require('../../utils/dateMalaysia');
 const { updatePortalProfile } = require('../portal-auth/portal-auth.service');
 const lockWrapper = require('../ttlock/wrappers/lock.wrapper');
+const lockdetailLog = require('../smartdoorsetting/lockdetail-log.service');
 const { signatureValueToPublicUrl } = require('../upload/signature-image-to-oss-url');
 
 function parseJson(val) {
@@ -60,7 +61,7 @@ async function getLinkedOperatorsForClientIds(clientIds) {
   const [rows] = await pool.query(
     `SELECT c.id AS client_id, c.title,
             TRIM(COALESCE(cp.contact, '')) AS contact
-       FROM clientdetail c
+       FROM operatordetail c
        LEFT JOIN client_profile cp ON cp.client_id = c.id
       WHERE c.id IN (${placeholders})
       ORDER BY COALESCE(c.title, '') ASC, c.id ASC`,
@@ -74,7 +75,7 @@ async function getLinkedOperatorsForClientIds(clientIds) {
 }
 
 /**
- * Enrich approvalpending entries with clientName (clientdetail.title) and propertyShortname (propertydetail.shortname) for owner portal display.
+ * Enrich approvalpending entries with clientName (operatordetail.title) and propertyShortname (propertydetail.shortname) for owner portal display.
  */
 async function enrichApprovalPending(approvalpending) {
   if (!Array.isArray(approvalpending) || approvalpending.length === 0) return approvalpending;
@@ -85,7 +86,7 @@ async function enrichApprovalPending(approvalpending) {
   if (clientIds.length) {
     const placeholders = clientIds.map(() => '?').join(',');
     const [cRows] = await pool.query(
-      `SELECT id, title FROM clientdetail WHERE id IN (${placeholders})`,
+      `SELECT id, title FROM operatordetail WHERE id IN (${placeholders})`,
       clientIds
     );
     (cRows || []).forEach(c => { clientMap[c.id] = { title: c.title || 'Operator' }; });
@@ -237,7 +238,7 @@ async function getTenanciesByRoomIds(roomIds) {
        LEFT JOIN tenantdetail tn ON tn.id = t.tenant_id
        LEFT JOIN roomdetail r ON r.id = t.room_id
        LEFT JOIN propertydetail p ON p.id = r.property_id
-       LEFT JOIN clientdetail c ON c.id = p.client_id
+       LEFT JOIN operatordetail c ON c.id = p.client_id
        WHERE t.room_id IN (${placeholders})`,
     roomIds
   );
@@ -255,13 +256,13 @@ async function getTenanciesByRoomIds(roomIds) {
 }
 
 /**
- * Get clientdetail rows by ids (for operator dropdown). Returns { items: [...] }.
+ * Get operatordetail rows by ids (for operator dropdown). Returns { items: [...] }.
  */
 async function getClientsByIds(clientIds) {
   if (!Array.isArray(clientIds) || clientIds.length === 0) return { items: [] };
   const placeholders = clientIds.map(() => '?').join(',');
   const [rows] = await pool.query(
-    'SELECT id, title, email, currency FROM clientdetail WHERE id IN (' + placeholders + ') ORDER BY title',
+    'SELECT id, title, email, currency FROM operatordetail WHERE id IN (' + placeholders + ') ORDER BY title',
     clientIds
   );
   const items = (rows || []).map(c => ({
@@ -426,7 +427,9 @@ async function getOwnerPayoutList(email, { propertyId, startDate, endDate }) {
 
   const [rows] = await pool.query(
     `SELECT o.id, o.property_id, o.period, o.totalrental, o.totalutility, o.totalcollection, o.expenses, o.netpayout, o.monthlyreport, o.payment_date,
-            p.shortname AS property_shortname
+            o.bukkuinvoice, o.bukkubills,
+            p.shortname AS property_shortname,
+            p.client_id AS property_client_id
        FROM ownerpayout o
        LEFT JOIN propertydetail p ON p.id = o.property_id
        WHERE o.property_id IN (${placeholders}) AND o.period >= ? AND o.period <= ?
@@ -434,6 +437,15 @@ async function getOwnerPayoutList(email, { propertyId, startDate, endDate }) {
     [...targetPropertyIds, fromUtc, toUtc]
   );
   const items = (rows || []).map(r => ({
+    ...(function computeAccountingUrls() {
+      const invoiceRaw = r.bukkuinvoice ? String(r.bukkuinvoice).trim() : '';
+      const billsRaw = r.bukkubills ? String(r.bukkubills).trim() : '';
+      const isXeroBillUrl = /go\.xero\.com\/AccountsPayable\/View\.aspx/i.test(billsRaw);
+      const invoiceUrl = invoiceRaw || null;
+      // Owner portal rule: hide only Xero AP bill links; keep Bukku links visible.
+      const billsUrl = isXeroBillUrl ? null : (billsRaw || null);
+      return { invoiceUrl, billsUrl };
+    })(),
     _id: r.id,
     id: r.id,
     propertyId: r.property_id,
@@ -445,7 +457,13 @@ async function getOwnerPayoutList(email, { propertyId, startDate, endDate }) {
     expenses: r.expenses,
     netpayout: r.netpayout,
     monthlyreport: r.monthlyreport,
-    paymentDate: r.payment_date
+    paymentDate: r.payment_date,
+    bukkuinvoice: null,
+    bukkubills: null
+  })).map((item) => ({
+    ...item,
+    bukkuinvoice: item.invoiceUrl,
+    bukkubills: item.billsUrl
   }));
   return { ok: true, items };
 }
@@ -468,7 +486,7 @@ async function getCostList(email, { propertyId, startDate, endDate, skip = 0, li
               p.shortname AS property_shortname, c.currency AS client_currency
          FROM bills b
          LEFT JOIN propertydetail p ON p.id = b.property_id
-         LEFT JOIN clientdetail c ON c.id = p.client_id
+         LEFT JOIN operatordetail c ON c.id = p.client_id
          WHERE b.property_id = ? AND b.period >= ? AND b.period <= ?
          ORDER BY b.period DESC`,
       [propertyId, fromUtc, toUtc]
@@ -837,7 +855,7 @@ async function syncOwnerForClient(email, { ownerId, clientId }) {
     if (owner._id !== ownerId) return { ok: false, reason: 'OWNER_MISMATCH' };
 
     const [clientRows] = await pool.query(
-      'SELECT id, title, email, currency FROM clientdetail WHERE id = ? LIMIT 1',
+      'SELECT id, title, email, currency FROM operatordetail WHERE id = ? LIMIT 1',
       [clientId]
     );
     const client = clientRows[0];
@@ -1045,6 +1063,18 @@ async function remoteUnlockForOwner(email, itemId) {
   if (!info.lockIds.length) return { ok: false, reason: 'NO_SMARTDOOR' };
   for (const lockId of info.lockIds) {
     await lockWrapper.remoteUnlock(info.clientId, lockId);
+    try {
+      const ldId = await lockdetailLog.findLockdetailIdByColivingClientIdAndTtlockLockId(info.clientId, lockId);
+      if (ldId) {
+        await lockdetailLog.insertLockdetailRemoteUnlockLog({
+          lockdetailId: ldId,
+          actorEmail: email,
+          portalSource: 'coliving_owner_portal',
+        });
+      }
+    } catch (logErr) {
+      console.warn('[ownerportal] lockdetail_log', logErr?.message || logErr);
+    }
   }
   return { ok: true };
 }

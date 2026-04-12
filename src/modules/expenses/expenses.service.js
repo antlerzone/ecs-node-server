@@ -1,14 +1,15 @@
 /**
  * Expenses (UtilityBills) – list/insert/update/delete from MySQL bills table.
- * Data: bills, propertydetail (shortname), supplierdetail (billtype_wixid → supplier title). FK: supplierdetail_id → supplierdetail(id).
+ * Data: bills, propertydetail (shortname), supplierdetail. FK: supplierdetail_id → supplierdetail(id). 0087: no billtype_wixid.
  */
 
 const { randomUUID } = require('crypto');
 const pool = require('../../config/db');
-const { createPurchaseForBills } = require('./expenses-purchase.service');
+const { malaysiaDateRangeToUtcForQuery, malaysiaDateToUtcDatetimeForDb } = require('../../utils/dateMalaysia');
+const { createPurchaseForBills, voidPurchaseForBills } = require('./expenses-purchase.service');
 
 const DEFAULT_PAGE_SIZE = 10;
-const MAX_PAGE_SIZE = 100;
+const MAX_PAGE_SIZE = 1000;
 const CACHE_LIMIT_MAX = 2000;
 
 /**
@@ -34,6 +35,22 @@ function orderClause(sort) {
     default:
       return 'ORDER BY b.period DESC, b.created_at DESC';
   }
+}
+
+function looksLikeUuid(str) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    String(str || '').trim()
+  );
+}
+
+function isYmdOnly(v) {
+  return v != null && /^\d{4}-\d{2}-\d{2}$/.test(String(v).trim());
+}
+
+function buildXeroBillOpenUrl(invoiceId) {
+  const id = invoiceId != null ? String(invoiceId).trim() : '';
+  if (!id) return '';
+  return `https://go.xero.com/AccountsPayable/View.aspx?InvoiceID=${encodeURIComponent(id)}`;
 }
 
 /**
@@ -63,12 +80,12 @@ async function getExpenses(clientId, opts = {}) {
 
   const [rows] = await pool.query(
     `SELECT b.id, b.description, b.amount, b.period, b.billurl, b.paid,
-            b.property_id, b.billtype_wixid,
+            b.property_id, b.supplierdetail_id,
             p.shortname AS property_shortname,
             s.title AS supplier_title
        FROM bills b
        LEFT JOIN propertydetail p ON p.id = b.property_id
-       LEFT JOIN supplierdetail s ON s.wix_id = b.billtype_wixid
+       LEFT JOIN supplierdetail s ON s.id = b.supplierdetail_id
        WHERE ${whereSql}
        ${orderSql}
        LIMIT ? OFFSET ?`,
@@ -81,11 +98,16 @@ async function getExpenses(clientId, opts = {}) {
     description: r.description || '',
     amount: r.amount,
     period: r.period,
-    bukkuurl: r.billurl || '',
+    bukkuurl: (() => {
+      const raw = r.billurl != null ? String(r.billurl).trim() : '';
+      if (/^https?:\/\//i.test(raw)) return raw;
+      if (looksLikeUuid(raw)) return buildXeroBillOpenUrl(raw);
+      return raw;
+    })(),
     paid: !!r.paid,
     propertyId: r.property_id || null,
-    typeWixId: r.billtype_wixid || null,
-    billType: r.supplier_title != null ? { title: r.supplier_title, _id: r.billtype_wixid } : null,
+    typeWixId: r.supplierdetail_id || null,
+    billType: r.supplier_title != null ? { title: r.supplier_title, _id: r.supplierdetail_id } : null,
     property: r.property_shortname != null ? { shortname: r.property_shortname, _id: r.property_id } : null
   }));
 
@@ -106,6 +128,7 @@ function listConditions(clientId, opts = {}) {
   const typeId = opts.type === 'ALL' || !opts.type ? null : opts.type;
   const from = opts.from || null;
   const to = opts.to || null;
+  const paid = opts.paid; // true | false | undefined (all)
   const conditions = ['b.client_id = ?'];
   const params = [clientId];
   if (propertyId) {
@@ -113,16 +136,47 @@ function listConditions(clientId, opts = {}) {
     params.push(propertyId);
   }
   if (typeId) {
-    conditions.push('b.billtype_wixid = ?');
+    conditions.push('b.supplierdetail_id = ?');
     params.push(typeId);
   }
-  if (from) {
-    conditions.push('b.period >= ?');
-    params.push(from);
+  if (from || to) {
+    if (isYmdOnly(from) && isYmdOnly(to)) {
+      const { fromUtc, toUtc } = malaysiaDateRangeToUtcForQuery(String(from).trim(), String(to).trim());
+      if (fromUtc) {
+        conditions.push('b.period >= ?');
+        params.push(fromUtc);
+      }
+      if (toUtc) {
+        conditions.push('b.period <= ?');
+        params.push(toUtc);
+      }
+    } else if (isYmdOnly(from) && !to) {
+      const { fromUtc } = malaysiaDateRangeToUtcForQuery(String(from).trim(), null);
+      if (fromUtc) {
+        conditions.push('b.period >= ?');
+        params.push(fromUtc);
+      }
+    } else if (isYmdOnly(to) && !from) {
+      const { toUtc } = malaysiaDateRangeToUtcForQuery(null, String(to).trim());
+      if (toUtc) {
+        conditions.push('b.period <= ?');
+        params.push(toUtc);
+      }
+    } else {
+      if (from) {
+        conditions.push('b.period >= ?');
+        params.push(from);
+      }
+      if (to) {
+        conditions.push('b.period <= ?');
+        params.push(to);
+      }
+    }
   }
-  if (to) {
-    conditions.push('b.period <= ?');
-    params.push(to);
+  if (paid === true) {
+    conditions.push('b.paid = 1');
+  } else if (paid === false) {
+    conditions.push('(b.paid = 0 OR b.paid IS NULL)');
   }
   if (search) {
     conditions.push('(b.description LIKE ? OR b.listingtitle LIKE ?)');
@@ -133,12 +187,14 @@ function listConditions(clientId, opts = {}) {
 }
 
 /**
- * Get property/type/supplier options for filters and bulk upload (no wixData).
- * Types = supplierdetail from bills (billtype_wixid → supplierdetail.wix_id); fallback: supplierdetail WHERE client_id.
+ * Get property/type/supplier options for filters and bulk upload.
+ * Types = ALL supplierdetail for the client (do NOT derive from existing bills),
+ * because some clients may not yet have bills for every supplierdetail and the UI
+ * would incorrectly show only a subset.
  */
 async function getExpensesFilters(clientId) {
   const [propRows] = await pool.query(
-    'SELECT id, shortname FROM propertydetail WHERE client_id = ? ORDER BY shortname ASC LIMIT 1000',
+    'SELECT id, shortname FROM propertydetail WHERE client_id = ? AND (archived = 0 OR archived IS NULL) ORDER BY shortname ASC LIMIT 1000',
     [clientId]
   );
   const properties = (propRows || []).map(p => ({
@@ -146,23 +202,13 @@ async function getExpensesFilters(clientId) {
     label: p.shortname || p.id
   }));
 
-  let [typeRows] = await pool.query(
-    `SELECT DISTINCT s.wix_id, s.title
-       FROM bills b
-       JOIN supplierdetail s ON s.wix_id = b.billtype_wixid
-       WHERE b.client_id = ? AND b.billtype_wixid IS NOT NULL AND b.billtype_wixid != ''
-       ORDER BY s.title ASC LIMIT 500`,
+  const [typeRows] = await pool.query(
+    'SELECT id, title FROM supplierdetail WHERE client_id = ? ORDER BY title ASC LIMIT 500',
     [clientId]
   );
-  if (!typeRows || typeRows.length === 0) {
-    [typeRows] = await pool.query(
-      'SELECT wix_id, title FROM supplierdetail WHERE client_id = ? AND wix_id IS NOT NULL ORDER BY title ASC LIMIT 500',
-      [clientId]
-    );
-  }
   const types = (typeRows || []).map(t => ({
-    value: t.wix_id || t.id,
-    label: t.title || t.wix_id || ''
+    value: t.id,
+    label: t.title || t.id || ''
   }));
 
   const [supRows] = await pool.query(
@@ -207,21 +253,20 @@ async function getExpensesSelectedTotal(clientId, ids) {
 }
 
 /**
- * Resolve supplierdetail: accept either id or wix_id; return { id, wix_id } for bills.
- * Form dropdown sends wix_id; bulk upload sends supplierdetail.id.
+ * Resolve supplierdetail by id. 0087: id = Wix _id.
  */
 async function resolveSupplierdetail(idOrWixId) {
   if (!idOrWixId) return null;
   const [rows] = await pool.query(
-    'SELECT id, wix_id FROM supplierdetail WHERE id = ? OR wix_id = ? LIMIT 1',
-    [idOrWixId, idOrWixId]
+    'SELECT id FROM supplierdetail WHERE id = ? LIMIT 1',
+    [idOrWixId]
   );
   return rows && rows[0] ? rows[0] : null;
 }
 
 /**
  * Insert expense records. Each: { property, billType, description, amount, period }.
- * billType = supplierdetail.wix_id (form) or supplierdetail.id (bulk); we set supplierdetail_id and billtype_wixid.
+ * billType = supplierdetail.id; we set supplierdetail_id.
  */
 async function insertExpenses(clientId, records) {
   if (!Array.isArray(records) || records.length === 0) {
@@ -235,22 +280,25 @@ async function insertExpenses(clientId, records) {
     ids.push(id);
     let period = null;
     if (r.period != null) {
-      const d = r.period instanceof Date ? r.period : new Date(r.period);
-      period = Number.isFinite(d.getTime()) ? d : null;
+      const raw = r.period;
+      if (typeof raw === 'string' && isYmdOnly(raw)) {
+        period = malaysiaDateToUtcDatetimeForDb(raw.trim());
+      } else {
+        const d = raw instanceof Date ? raw : new Date(raw);
+        period = Number.isFinite(d.getTime()) ? d : null;
+      }
     }
     const billTypeValue = r.billType || null;
     const supplier = billTypeValue ? await resolveSupplierdetail(billTypeValue) : null;
     const supplierdetailId = supplier ? supplier.id : null;
-    const billtypeWixid = supplier ? supplier.wix_id : null;
     await pool.query(
-      `INSERT INTO bills (id, client_id, property_id, supplierdetail_id, billtype_wixid, description, amount, period, paid, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NOW(), NOW())`,
+      `INSERT INTO bills (id, client_id, property_id, supplierdetail_id, description, amount, period, paid, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0, NOW(), NOW())`,
       [
         id,
         clientId,
         r.property || null,
         supplierdetailId,
-        billtypeWixid,
         r.description || '',
         Number(r.amount) || 0,
         period
@@ -266,14 +314,34 @@ async function insertExpenses(clientId, records) {
  */
 async function deleteExpenses(clientId, ids) {
   if (!Array.isArray(ids) || ids.length === 0) {
-    return { deleted: 0 };
+    return { ok: true, deleted: 0 };
+  }
+  let voidResult;
+  try {
+    voidResult = await voidPurchaseForBills(clientId, ids);
+  } catch (e) {
+    console.warn('[expenses] voidPurchaseForBills before delete failed:', e?.message || e);
+    return { ok: false, reason: 'VOID_EXCEPTION', deleted: 0, voidErrors: [e?.message || String(e)] };
+  }
+  if (voidResult?.fatalErrors?.length) {
+    return {
+      ok: false,
+      reason: 'VOID_FAILED',
+      deleted: 0,
+      voidErrors: voidResult.fatalErrors
+    };
   }
   const placeholders = ids.map(() => '?').join(',');
   const [result] = await pool.query(
     `DELETE FROM bills WHERE client_id = ? AND id IN (${placeholders})`,
     [clientId, ...ids]
   );
-  return { deleted: result.affectedRows || 0 };
+  return {
+    ok: true,
+    deleted: result.affectedRows || 0,
+    voided: voidResult?.voided || 0,
+    ...(voidResult?.errors?.length ? { voidWarnings: voidResult.errors } : {})
+  };
 }
 
 /**
@@ -302,9 +370,15 @@ async function updateExpense(clientId, id, data) {
   );
   if (result.affectedRows > 0 && data.paid === true) {
     try {
-      await createPurchaseForBills(clientId, [id], {
+      const accountingResult = await createPurchaseForBills(clientId, [id], {
         paidAt: data.paidat != null ? data.paidat : new Date(),
         paymentMethod: data.paymentmethod != null ? data.paymentmethod : 'Cash'
+      });
+      console.log('[expenses] createPurchaseForBills (single pay) result', {
+        clientId,
+        billId: id,
+        updated: result.affectedRows || 0,
+        accounting: accountingResult
       });
     } catch (e) {
       console.warn('[expenses] createPurchaseForBills (single pay) failed:', e?.message || e);
@@ -330,7 +404,13 @@ async function bulkMarkPaid(clientId, ids, paidAt, paymentMethod) {
   );
   if (result.affectedRows > 0) {
     try {
-      await createPurchaseForBills(clientId, ids, { paidAt: at, paymentMethod: method });
+      const accountingResult = await createPurchaseForBills(clientId, ids, { paidAt: at, paymentMethod: method });
+      console.log('[expenses] createPurchaseForBills (bulk) result', {
+        clientId,
+        requested: ids.length,
+        updated: result.affectedRows || 0,
+        accounting: accountingResult
+      });
     } catch (e) {
       console.warn('[expenses] createPurchaseForBills (bulk) failed:', e?.message || e);
     }

@@ -1,0 +1,3 @@
+# Put your manual screenshots here, e.g.:
+# owner-login.png, owner-profile.png, tenant-dashboard.png, operator-admin.png
+# Then in the .md files replace [SCREENSHOT: ...] with: ![Description](./screenshots/filename.png)

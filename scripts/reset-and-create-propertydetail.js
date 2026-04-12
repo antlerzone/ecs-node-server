@@ -61,7 +61,7 @@ CREATE TABLE propertydetail (
   KEY idx_propertydetail_smartdoor_id (smartdoor_id),
   KEY idx_propertydetail_unitnumber (unitnumber),
   CONSTRAINT fk_propertydetail_client
-    FOREIGN KEY (client_id) REFERENCES clientdetail (id) ON UPDATE CASCADE ON DELETE SET NULL,
+    FOREIGN KEY (client_id) REFERENCES operatordetail (id) ON UPDATE CASCADE ON DELETE SET NULL,
   CONSTRAINT fk_propertydetail_meter
     FOREIGN KEY (meter_id) REFERENCES meterdetail (id) ON UPDATE CASCADE ON DELETE SET NULL,
   CONSTRAINT fk_propertydetail_agreementtemplate

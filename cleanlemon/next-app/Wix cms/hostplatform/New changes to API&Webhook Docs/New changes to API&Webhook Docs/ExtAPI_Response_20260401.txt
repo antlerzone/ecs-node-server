@@ -1,0 +1,36 @@
+{
+    "reservations": [
+        {
+            "code": "E42ZO4T54",
+            "check_in_date": "2025-02-20",
+            "check_out_date": "2025-02-23",
+            "status": "Confirmed",
+            "source": "hostplatform",
+            "remarks": "",
+            "created_at": "2025-02-21T09:28:29.362Z",
+            "guest_details": {
+                "number_of_pax": 1,
+                "first_name": "John",
+                "last_name": "Smith",
+                "contact_no": "0123456789",
+                "email": "test@example.com"
+            },
+            "price_details": {
+                "currency": "MYR",
+                "room": 18000,
+                "cleaning_fee": 0,
+                "extra_guest_fee": 0,
+                "platform_fee": 0
+            },
+            "cleaning_status": "Dirty",
+	    "unit": "C-1-1",
+            "unit_id": "i14p6u1",
+            "unit_long_id": "6253936245d6ee3ef564e7b8",
+            "room_type": "1R1B | C-1-1",
+            "room_type_id": "i14p6r1",
+            "property": "Arte",
+            "property_id": "i14p6",
+            "ota_id": "62305185458ee617c2cfcfb8"
+        }
+    ]
+}

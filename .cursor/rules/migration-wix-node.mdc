@@ -1,18 +1,17 @@
 ---
-description: Wix → Node 迁移约定：不读 CMS，数据在 MySQL，表/列不确定时先与维护者确认
+description: 架构约定：Next.js + Node + MySQL，数据在 MySQL，文件 OSS
 alwaysApply: true
 ---
 
-# 架构与迁移约定
+# 架构约定
 
-- **当前架构：** 前端 Wix / 后端 Node / 数据库 MySQL。**不再使用 Wix CMS**，业务数据全部在 MySQL。
-- **图片 / 文件上传：** 使用阿里云 OSS，不再使用 Wix 存储。
+- **当前架构：** **前端 Next.js**（Portal / Operator / SaaS Admin）/ **后端 Node（ECS）** / **数据库 MySQL**。业务数据全部在 MySQL。
+- **图片 / 文件上传：** 使用阿里云 OSS，表里存 URL。
 
-## 开发与迁移时必须遵守
+## 开发时必须遵守
 
-1. **不要读 Wix CMS。** 所有业务数据从 MySQL 读写；后端只写 Node + MySQL，不依赖 wix-data / Wix CMS。
-2. **若在 Wix 代码里看到 CMS 集合名，但不确定对应 MySQL 哪张表** → **先与维护者确认**，再写或改代码。
-3. **若在 Wix 代码里看到 fieldkey / 字段名，但不确定对应 MySQL 哪一列** → **先与维护者确认**，再写或改代码。
+1. **所有业务数据** 从 MySQL 读写；后端只写 Node + MySQL。
+2. **表/列不确定时** → 先与维护者确认，再写或改代码。
 
-外键约定（一律用 `_id` 不用 `_wixid`）见同目录 `mysql-fk-use-id-only.mdc`。  
-文档详见 `docs/index.md` 开头「架构与数据约定」与「沟通记录」。JSW 代码与约定见 `docs/wix/jsw/`。
+外键约定（一律用 `_id`）见同目录 `mysql-fk-use-id-only.mdc`。  
+文档详见 `docs/index.md`。

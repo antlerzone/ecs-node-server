@@ -6,8 +6,12 @@
  * @returns {Promise<{ accessToken: string, tenantId: string }>}
  */
 const { getValidXeroToken } = require('./xeroToken.service');
+const { getValidXeroTokenForCleanlemonOperator } = require('../../cleanlemon/cleanlemon-xero-token');
 
 async function getXeroCreds(req) {
+  if (req.cleanlemonOperatorId) {
+    return getValidXeroTokenForCleanlemonOperator(String(req.cleanlemonOperatorId));
+  }
   if (!req.client) throw new Error('missing client');
   const clientId = req.client.id;
   if (!clientId) throw new Error('missing client id');

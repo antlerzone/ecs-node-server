@@ -32,5 +32,7 @@ module.exports = async function (req, res, next) {
   }
 
   req.apiUser = user;
+  const path = (req.originalUrl || req.url || req.path || '').split('?')[0];
+  console.log('[apiAuth] OK', req.method, path, 'apiUser.id=', user.id, 'apiUser.client_id=', user.client_id ?? '(null)');
   next();
 };

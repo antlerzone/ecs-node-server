@@ -7,7 +7,7 @@ const xerorequest = require('./xerorequest');
 const { getXeroCreds } = require('../lib/xeroCreds');
 
 /**
- * Create payment(s). POST /Payments. Body: { Payments: [{ Invoice: { InvoiceID }, Account: { Code }, Date, Amount, Reference? }] }
+ * Create payment(s). POST /Payments. Body: { Payments: [{ Invoice: { InvoiceID }, Account: { Code } | { AccountID }, Date, Amount, Reference? }] }
  */
 async function createPayment(req, payload) {
   const { accessToken, tenantId } = await getXeroCreds(req);
@@ -49,8 +49,23 @@ async function getPayment(req, paymentId) {
   });
 }
 
+/**
+ * Reverse/delete payment. POST /Payments/{PaymentID} with { Status: 'DELETED' }.
+ */
+async function deletePayment(req, paymentId) {
+  const { accessToken, tenantId } = await getXeroCreds(req);
+  return xerorequest({
+    method: 'post',
+    endpoint: `/Payments/${encodeURIComponent(paymentId)}`,
+    accessToken,
+    tenantId,
+    data: { Status: 'DELETED' }
+  });
+}
+
 module.exports = {
   createPayment,
   listPayments,
-  getPayment
+  getPayment,
+  deletePayment
 };

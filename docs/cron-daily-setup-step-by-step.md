@@ -2,7 +2,7 @@
 
 ## 功能说明：每天 00:00 (UTC+8) 会做什么
 
-用一个接口 **`POST /api/cron/daily`**，每天跑一次（建议 00:00 马来西亚/新加坡时间），会依次执行下面八件事：
+用一个接口 **`POST /api/cron/daily`**，每天跑一次（建议 00:00 马来西亚/新加坡时间），会依次执行下面**九**件事：
 
 ---
 
@@ -19,12 +19,27 @@
 
 - 在 DB 里查：有没有「**到期日 < 今天**」（严格早于今天）且 **未付** 的 `rentalcollection`。
 - 若有，对该笔租金对应的 **租约（tenancy）** 做：
-  1. **门锁（TTLock）**：把该租约的密码 **设为昨天过期**，租客无法再开门。
+  1. **门锁（TTLock）**：把该租约的密码 **设为昨天过期**（结束日 = 昨天，即即日起失效），租客无法再开门。若物业大门与房间门各有一套 PIN（`passwordid_property` / `passwordid_room`），**两把锁上对应的密码都会**被设为昨天过期；父锁（childmeter）上同名密码也会同步。
   2. **电表（CNYIoT）**：对该房间的电表 **断电**（relay 关）。
   3. **租约状态**：把该 tenancy 的 `active` 设为 `0`，并写入 `inactive_reason`（例如“欠租”）。
 - 之后租客付清欠款并经过你们流程「恢复租约」后，会再开门、供电、`active=1`。
 
 **“今天”的日期**：按 **马来西亚/新加坡 (UTC+8)** 的日历日算，与 datepicker、前台展示一致。
+
+**与「日历到期删密码」的区别**：欠租流程是 **`change` 把密码结束日设为昨天**；下面「功能一点五」对已**超过租约 end 日**且仍存 PIN 的租约会调用 TTLock **`delete` 删除密码**并清空 DB 中的 `password* / passwordid*`（与 Operator **终止租约**时行为一致）。两者不要混用：欠租只管账单未付，不管 `tenancy.end`。
+
+---
+
+### 功能一点五：租约日历已过期（`tenancy.end` &lt; 今天）→ TTLock 删密码 + 清空 DB
+
+**目的**：租约 **按日历已经结束**（`DATE(end) < 今天`，马来西亚日）且 `status = 1`（未走终止接口）、表里仍保存着智能门锁 PIN 时，从 TTLock **删除**对应键盘密码（物业门 + 房门 + 父锁同名），并清空 `tenancy` 的密码相关列，避免旧 PIN 长期留在锁上。
+
+**逻辑**（`runEndedTenancyPasscodeRemoval`，在每日 `POST /api/cron/daily` 里紧接欠租检查之后）：
+
+- 批量查询符合条件的 `tenancy.id`，对每条调用 `removeTenancySmartDoorPasscodes`（与 `terminateTenancy` 内相同）。
+- **幂等**：删完后列已 NULL，次日不会再选中。
+
+**代码**：`src/modules/tenancysetting/tenancy-active.service.js`（`runEndedTenancyPasscodeRemoval`），由 `tenancy-cron.routes.js` 的 `daily` 调用。
 
 ---
 
@@ -94,14 +109,14 @@
 
 ### 功能六：每月 1 号 active room 扣费（10 credit/间）
 
-**目的**：每月 1 号按「招租中」的房间数扣 credit，每间 **10 credit**。**Active room** = `roomdetail.active = 1`（有在招租），不论该房当前是否有 tenancy；没有 tenancy 但 room 仍 active 的也要扣。
+**目的**：每月 1 号按 Room Setting 里的房间数扣 credit，每间 **10 credit**。**只要在 Room Setting 里有房间就按间数计费**，不管该房间是否启用(active)。
 
 **逻辑**：
 
 - **仅当当天是当月 1 号**（按马来西亚/新加坡日期）时才执行。
-- 对每个有至少一间 active room 的 client：
+- 对每个在 roomdetail 里有至少一间房的 client：
   - 若该 client 当月已扣过（creditlogs 中已有同月「Active room monthly (YYYY-MM)」）→ 跳过（幂等）。
-  - 否则统计该 client 的 `roomdetail WHERE active = 1` 数量 N，扣 **10 × N** credit（先扣 core 再扣 flex），并写入 creditlogs（title：`Active room monthly (YYYY-MM)`，payload 含 `source: 'active_room_monthly'`、`yearMonth`、`activeRoomCount`）。
+  - 否则统计该 client 的 **roomdetail 总条数**（不筛 active），数量 N，扣 **10 × N** credit（先扣 core 再扣 flex），并写入 creditlogs（title：`Active room monthly (YYYY-MM)`，payload 含 `source: 'active_room_monthly'`、`yearMonth`、`activeRoomCount`）。
 
 **代码**：`src/modules/billing/active-room-monthly-cron.service.js`、`deduction.service.js`（`deductMonthlyActiveRoomCredit`），由 `POST /api/cron/daily` 在 core credit 到期清空之后、Stripe 入账之前调用（仅 1 号执行）。
 
@@ -145,16 +160,17 @@
 
 | 功能 | 做什么 | 结果 |
 |------|--------|------|
-| **欠租检查** | 找出「到期未付」的租金 → 对应租约 | 锁门、断电、tenancy 设为不活跃 |
+| **欠租检查** | 找出「到期未付」的租金 → 对应租约 | TTLock 密码**结束日改昨天**、断电、tenancy 设为不活跃 |
+| **日历到期删密码** | `tenancy.end` &lt; 今天且仍存 PIN、`status=1` | TTLock **delete** 密码 + 清空 tenancy 密码列 |
 | **Refund deposit** | 租约 end &lt; 今天、未续约、deposit&gt;0、尚无 refunddeposit | 写入 refunddeposit，Admin Dashboard 可见并处理 |
 | **房间可租同步** | 按 tenancy 更新 roomdetail.available / availablesoon / availablefrom | 有租约→available=0；剩 60 天内到期→availablesoon=1 |
 | **Pricing plan 到期** | clientdetail.expired &lt; 今天且未 renew | client 设为 inactive（status=0）；tenant 仍可付，admin 页面 no function |
 | **Core credit 到期** | core 项 expired ≤ 今天 → 从 credit 移除，汇总金额 | 写 creditlogs type=Expired、amount 负值，Billing 流水可见 |
-| **Active room 扣费** | **仅每月 1 号**：按 roomdetail.active=1 数量，每间 10 credit | 扣 client credit，写 creditlogs（幂等：同月不重复扣） |
+| **Active room 扣费** | **仅每月 1 号**：按 Room Setting 里房间总数（不筛 active），每间 10 credit | 扣 client credit，写 creditlogs（幂等：同月不重复扣） |
 | **Stripe 入账** | 找出未做 journal 的 stripepayout → 按 client 会计系统 | 记一笔 DR Bank / CR Stripe，并标记已入账 |
 | **门锁电量 feedback** | 所有 TTLock client 的锁电量 &lt; 20% | 写入 feedback 表（无 tenancy/tenant，description 含房间名、物业名、日期） |
 
-**你只需要设一个定时任务**：每天 00:00 (UTC+8) 调用一次 `POST /api/cron/daily`（带 `X-Cron-Secret`），上面八件事会按顺序执行；其中「Active room 扣费」仅在当天为 1 号时执行。
+**你只需要设一个定时任务**：每天 00:00 (UTC+8) 调用一次 `POST /api/cron/daily`（带 `X-Cron-Secret`），上面九件事会按顺序执行；其中「Active room 扣费」仅在当天为 1 号时执行。
 
 ---
 
@@ -333,11 +349,12 @@ crontab -l
 
 ---
 
-## 两个任务分别做什么
+## 部分子任务说明（摘录）
 
 | 任务 | 说明 |
 |------|------|
-| **1) 欠租检查** | 查所有 `rentalcollection` 里「到期日 ≤ 今天」且未付的；对应租约做：TTLock 密码设为昨天过期、房间电表断电、tenancy `active=0`、`inactive_reason` 写入。 |
+| **1) 欠租检查** | 查所有 `rentalcollection` 里「到期日 &lt; 今天」且未付的；对应租约做：TTLock 密码**结束日改昨天**（双锁都改）、房间电表断电、tenancy `active=0`、`inactive_reason` 写入。 |
+| **1.5) 日历到期删密码** | `tenancy.end` &lt; 今天、`status=1` 且仍存 PIN：TTLock **delete** + 清空 tenancy 密码列（与 Operator 终止租约一致）。 |
 | **2) Stripe settlement 入账** | 查 `stripepayout` 里 `journal_created_at IS NULL` 的列，对每笔在会计系统（Xero/Bukku/AutoCount/SQL）做一笔 journal（DR Bank, CR Stripe），并写回 `journal_created_at`。 |
 
 `stripepayout` 的数据来源：目前是你们在「租客付款成功并 release 到客户 Connect 账户」时写入的；若以后有“从 Stripe API 拉取 payout 再写入”的脚本，也可以，入账逻辑不变，仍是每天跑 `/api/cron/daily` 即可。

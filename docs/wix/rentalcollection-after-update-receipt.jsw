@@ -1,0 +1,26 @@
+// Wix Velo backend — copy into backend/rentalcollection-receipt-hook.jsw (or merge into receipt.jsw).
+// In Wix Dashboard: Settings → CMS → RentalCollection → Hooks → after update → point to this module.
+//
+// WARNING: Fires on every save where isPaid===true and receipturl is still empty. If staff edits
+// other fields on that row, createBukkuPayment may run again. Prefer admin-only flow if Bukku
+// creates duplicate payments, or add a guard field in CMS.
+//
+// Adjust import if your receipt module path differs.
+
+import { createBukkuPayment } from 'backend/receipt.jsw';
+
+function receiptUrlEmpty(item) {
+  const u = item && item.receipturl;
+  return u == null || String(u).trim() === '';
+}
+
+export async function RentalCollection_afterUpdate(item, context) {
+  try {
+    if (!item || item.isPaid !== true) return item;
+    if (!receiptUrlEmpty(item)) return item;
+    await createBukkuPayment({ rcIds: [item._id] });
+  } catch (e) {
+    console.error('[RentalCollection_afterUpdate] createBukkuPayment', e);
+  }
+  return item;
+}

@@ -1,6 +1,6 @@
 /**
  * TTLock API wrapper (SaaS – per client).
- * Use for HTTP routes (via routes) or programmatic calls (clientId = clientdetail.id).
+ * Use for HTTP routes (via routes) or programmatic calls (clientId = operatordetail.id on Coliving, or cln_clientdetail / cln_operatordetail id on Cleanlemons).
  *
  * Programmatic usage:
  *   const ttlock = require('./src/modules/ttlock');

@@ -7,7 +7,7 @@
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 const pool = require('../src/config/db');
 
-/** 所有帶 client_id 的表的刪除順序：先刪有依賴關係的子表，最後刪 clientdetail。 */
+/** 所有帶 client_id 的表的刪除順序：先刪有依賴關係的子表，最後刪 operatordetail。 */
 const TABLES_WITH_CLIENT_ID = [
   'refunddeposit',
   'tenancy',
@@ -59,9 +59,9 @@ async function deleteAllClientData(clientId) {
         throw e;
       }
     }
-    const [r] = await conn.query('DELETE FROM clientdetail WHERE id = ?', [clientId]);
+    const [r] = await conn.query('DELETE FROM operatordetail WHERE id = ?', [clientId]);
     if (r.affectedRows > 0) {
-      console.log('  Deleted clientdetail', clientId);
+      console.log('  Deleted operatordetail', clientId);
     }
   } finally {
     await conn.query('SET FOREIGN_KEY_CHECKS = 1');
@@ -95,7 +95,7 @@ async function runRemoveByEmail(email) {
 
   // 2) 要刪的 client：email 相符 或 剛刪的 staff 曾指向的 client_id
   const [clientByEmail] = await pool.query(
-    'SELECT id, title, email FROM clientdetail WHERE LOWER(TRIM(email)) = ?',
+    'SELECT id, title, email FROM operatordetail WHERE LOWER(TRIM(email)) = ?',
     [normalized]
   );
   const clientIdsToDelete = new Set(clientIdsFromStaff);
@@ -103,7 +103,7 @@ async function runRemoveByEmail(email) {
 
   if (clientIdsToDelete.size) {
     for (const clientId of clientIdsToDelete) {
-      const [info] = await pool.query('SELECT id, title, email FROM clientdetail WHERE id = ?', [clientId]);
+      const [info] = await pool.query('SELECT id, title, email FROM operatordetail WHERE id = ?', [clientId]);
       if (!info.length) continue;
       const c = info[0];
       console.log('Deleting all data for client', clientId, '(', c.title, ',', c.email, ')');

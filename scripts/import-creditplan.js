@@ -88,7 +88,7 @@ async function run() {
   );
   const tableColumns = new Set(cols.map(c => (c.column_name || c.COLUMN_NAME || '').toLowerCase()));
 
-  const [rows] = await conn.query('SELECT id, wix_id FROM clientdetail WHERE wix_id IS NOT NULL');
+  const [rows] = await conn.query('SELECT id, wix_id FROM operatordetail WHERE wix_id IS NOT NULL');
   const clientMap = new Map(rows.map(r => [r.wix_id, r.id]));
   function resolveWixId(wixId) {
     if (!wixId) return null;

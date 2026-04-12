@@ -46,7 +46,7 @@ const DEMO_CREDIT_ID = 'a0000001-0001-4000-8000-000000000011';
 const DEMO_INTEGRATION_ID = 'a0000001-0001-4000-8000-000000000012';
 const DEMO_PRICINGPLAN_DETAIL_ID = 'a0000001-0001-4000-8000-000000000013';
 
-const DEMO_CLIENT_EMAIL = 'antlerzone@gmail.com';  // Demo company (clientdetail) + master admin
+const DEMO_CLIENT_EMAIL = 'antlerzone@gmail.com';  // Demo company (operatordetail) + master admin
 const DEMO_COMPANY = 'DemoAccount';
 const DEMO_SUBDOMAIN = 'demoaccount';             // URL subdomain unchanged
 
@@ -81,9 +81,9 @@ async function main() {
       [DEMO_BANK_ID]
     );
 
-    // 2) clientdetail
+    // 2) operatordetail
     await conn.query(
-      `INSERT INTO clientdetail (id, title, email, status, subdomain, expired, pricingplan_id, currency, created_at, updated_at)
+      `INSERT INTO operatordetail (id, title, email, status, subdomain, expired, pricingplan_id, currency, created_at, updated_at)
        VALUES (?, ?, ?, 1, ?, ?, ?, 'MYR', NOW(), NOW())
        ON DUPLICATE KEY UPDATE title = VALUES(title), email = VALUES(email), status = 1, subdomain = VALUES(subdomain),
          expired = VALUES(expired), pricingplan_id = VALUES(pricingplan_id), currency = VALUES(currency), updated_at = NOW()`,

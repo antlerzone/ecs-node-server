@@ -1,0 +1,59 @@
+-- ============================================================================
+-- 设计稿：Sharing Project（立项后执行，不要在未评审前自动跑 production）
+-- 外键一律指向现有主表 id（CHAR(36) / VARCHAR(36)），与 mysql-fk-use-id-only 约定一致。
+-- ============================================================================
+
+-- 项目头：由 L1（Coliving 集成侧）或 L2 域内规则创建；具体创建者列按产品定
+-- CREATE TABLE IF NOT EXISTS sharing_project (
+--   id CHAR(36) NOT NULL,
+--   created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+--   updated_at DATETIME(3) NULL ON UPDATE CURRENT_TIMESTAMP(3),
+--   name VARCHAR(255) NOT NULL,
+--   status VARCHAR(32) NOT NULL DEFAULT 'active',
+--   coliving_propertydetail_id CHAR(36) NULL,
+--   created_by_coliving_client_id CHAR(36) NULL,
+--   PRIMARY KEY (id),
+--   KEY idx_sharing_project_property (coliving_propertydetail_id)
+-- ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 参与者：多个 cln_operatordetail.id，带邀请 / 接受 / 撤销
+-- CREATE TABLE IF NOT EXISTS sharing_project_participant (
+--   id CHAR(36) NOT NULL,
+--   project_id CHAR(36) NOT NULL,
+--   cln_operator_id CHAR(36) NOT NULL,
+--   status VARCHAR(32) NOT NULL DEFAULT 'invited',
+--   invited_at DATETIME(3) NULL,
+--   accepted_at DATETIME(3) NULL,
+--   PRIMARY KEY (id),
+--   UNIQUE KEY uq_project_operator (project_id, cln_operator_id),
+--   KEY idx_participant_operator (cln_operator_id),
+--   CONSTRAINT fk_participant_project FOREIGN KEY (project_id) REFERENCES sharing_project (id) ON DELETE CASCADE,
+--   CONSTRAINT fk_participant_cln_operator FOREIGN KEY (cln_operator_id) REFERENCES cln_operatordetail (id) ON DELETE CASCADE
+-- ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 资源：锁 / 网关 / 未来扩展（kiosk_qr、security_setting 等）
+-- CREATE TABLE IF NOT EXISTS sharing_project_resource (
+--   id CHAR(36) NOT NULL,
+--   project_id CHAR(36) NOT NULL,
+--   resource_type VARCHAR(32) NOT NULL,
+--   lockdetail_id VARCHAR(36) NULL,
+--   gatewaydetail_id VARCHAR(36) NULL,
+--   PRIMARY KEY (id),
+--   KEY idx_resource_project (project_id),
+--   KEY idx_resource_lock (lockdetail_id),
+--   KEY idx_resource_gateway (gatewaydetail_id),
+--   CONSTRAINT fk_resource_project FOREIGN KEY (project_id) REFERENCES sharing_project (id) ON DELETE CASCADE,
+--   CONSTRAINT fk_resource_lock FOREIGN KEY (lockdetail_id) REFERENCES lockdetail (id) ON DELETE CASCADE,
+--   CONSTRAINT fk_resource_gateway FOREIGN KEY (gatewaydetail_id) REFERENCES gatewaydetail (id) ON DELETE CASCADE
+-- ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------------
+-- 鉴权查询路径（概念）
+-- ---------------------------------------------------------------------------
+-- L3 operator 列表门 / 开门 / 网关时：除现有 scopeRowOwnerWhere（行上 cln_operatorid）外，
+-- 增加 JOIN：
+--   sharing_project_participant p ON p.cln_operator_id = :currentClnOperatorId AND p.status = 'accepted'
+--   sharing_project_resource r ON r.project_id = p.project_id
+--     AND ((r.resource_type = 'lockdetail' AND r.lockdetail_id = lockdetail.id)
+--       OR (r.resource_type = 'gatewaydetail' AND r.gatewaydetail_id = gatewaydetail.id))
+-- 写入 / 删除仍只认 **owner** 行（与 Unmap/删除规则一致）；Project 为 **授权视图**，不把 N 个 operator 挤进单行 `cln_operatorid`。

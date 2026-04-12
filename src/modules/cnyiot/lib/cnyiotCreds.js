@@ -7,7 +7,7 @@ const { getValidCnyIotToken } = require('./cnyiotToken.service');
 
 /**
  * Get raw token for API calls: { apiKey, loginID }.
- * @param {string} clientId - Our client id (clientdetail.id)
+ * @param {string} clientId - Our client id (operatordetail.id)
  */
 async function getCnyIotAuth(clientId) {
   return getValidCnyIotToken(clientId);

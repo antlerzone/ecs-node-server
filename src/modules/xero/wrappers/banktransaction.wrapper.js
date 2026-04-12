@@ -24,6 +24,39 @@ async function createBankTransaction(req, payload) {
   });
 }
 
+/**
+ * Delete (void/remove) a bank transaction by ID.
+ */
+async function deleteBankTransaction(req, bankTransactionId) {
+  const { accessToken, tenantId } = await getXeroCreds(req);
+  return xerorequest({
+    method: 'delete',
+    endpoint: `/BankTransactions/${encodeURIComponent(bankTransactionId)}`,
+    accessToken,
+    tenantId
+  });
+}
+
+/**
+ * Update bank transaction status. Common rollback status: DELETED.
+ */
+async function updateBankTransactionStatus(req, bankTransactionId, status) {
+  const { accessToken, tenantId } = await getXeroCreds(req);
+  const body = {
+    BankTransactionID: bankTransactionId,
+    Status: status
+  };
+  return xerorequest({
+    method: 'post',
+    endpoint: `/BankTransactions/${encodeURIComponent(bankTransactionId)}`,
+    accessToken,
+    tenantId,
+    data: body
+  });
+}
+
 module.exports = {
-  createBankTransaction
+  createBankTransaction,
+  deleteBankTransaction,
+  updateBankTransactionStatus
 };

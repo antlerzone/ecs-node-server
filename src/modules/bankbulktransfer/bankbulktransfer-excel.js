@@ -7,9 +7,11 @@ const XLSX = require('xlsx');
 const archiver = require('archiver');
 const { Writable } = require('stream');
 
-function sanitize20(str) {
+function sanitizeExcelText(str, maxLen = 20) {
   if (!str) return '';
-  return String(str).replace(/[^a-zA-Z0-9]/g, '').substring(0, 20);
+  // Keep spaces and '-' so fields like "date from 2026-01-01 to 2026-01-31" remain readable.
+  const s = String(str).replace(/[^a-zA-Z0-9 \-]/g, '').trim();
+  return s.substring(0, maxLen);
 }
 
 /**
@@ -119,8 +121,8 @@ function generateBulkTransferExcel(rows) {
       '',
       '',
       amount,
-      sanitize20(row.recipientReference),
-      sanitize20(row.otherPaymentDetails),
+      sanitizeExcelText(row.recipientReference, 20),
+      sanitizeExcelText(row.otherPaymentDetails, 20),
       row.email || '',
       null,
       null,
@@ -178,7 +180,7 @@ function buildBankFiles(data, fileIndex = 1) {
   }
   if (data.skippedItems && data.skippedItems.length > 0) {
     const lines = [
-      '以下项目因资料不齐未放入 JomPay / Bulk Transfer，请补全 supplier 或 property 资料后重试。',
+      'The following items were skipped from JomPay / Bulk Transfer due to incomplete supplier or property data. Please complete supplier or property details and retry.',
       '',
       'ID\t项目\t原因',
       ...data.skippedItems.map(s => `${s.id || ''}\t${(s.label || '').replace(/\t/g, ' ')}\t${s.reason || ''}`)
@@ -216,4 +218,29 @@ function zipBuffers(files) {
   });
 }
 
-module.exports = { generatePayBillExcel, generateBulkTransferExcel, buildBankFiles, zipBuffers };
+/**
+ * Generate refund bank file as CSV (Public Bank MY style: Beneficiary Name, Account No, BIC, Amount, Reference).
+ * @param {Array} rows - { holderName, bankAccount, swiftCode, amount, recipientReference? }
+ * @returns {Buffer}
+ */
+function generateRefundCsv(rows) {
+  const header = 'Beneficiary Name,Account No,BIC,Amount,Reference';
+  const escape = (v) => {
+    const s = v != null ? String(v) : '';
+    if (s.includes(',') || s.includes('"') || s.includes('\n')) return '"' + s.replace(/"/g, '""') + '"';
+    return s;
+  };
+  const lines = [header];
+  for (const r of rows) {
+    lines.push([
+      escape(r.holderName),
+      escape(r.bankAccount),
+      escape(r.swiftCode),
+      Number(parseFloat(r.amount || 0).toFixed(2)),
+      escape(r.recipientReference || r.otherPaymentDetails || '')
+    ].join(','));
+  }
+  return Buffer.from(lines.join('\n'), 'utf8');
+}
+
+module.exports = { generatePayBillExcel, generateBulkTransferExcel, buildBankFiles, zipBuffers, generateRefundCsv };

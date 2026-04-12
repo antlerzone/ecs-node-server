@@ -1,5 +1,5 @@
 /**
- * 导入 tenantdetail CSV：reference 用 xxx_wixid 上传并解析 xxx_id。
+ * 导入 tenantdetail CSV。0087 后：id = CSV _id（不生成）；reference 直接写入 _id 列。
  * 用法：node scripts/import-tenantdetail.js [csv_path]
  * 默认 csv_path = ./tenantdetail.csv
  */
@@ -7,27 +7,34 @@ require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') }
 const mysql = require('mysql2/promise');
 const fs = require('fs');
 const path = require('path');
-const { randomUUID } = require('crypto');
+const { resolveId } = require('./import-util');
+const { ONBOARD_OPERATOR_ID, skipCsvColumn, bukkuAccountFromContactId } = require('./onboard-import-helpers');
 
 const csvPath = process.argv[2] || path.join(process.cwd(), 'tenantdetail.csv');
 const table = 'tenantdetail';
 
 const CSV_TO_DB = {
-  _id: 'wix_id',
+  _id: 'id',
+  ID: 'id',
+  id: 'id',
+  Fullname: 'fullname',
   fullname: 'fullname',
   nric: 'nric',
   address: 'address',
   phone: 'phone',
   email: 'email',
-  bankName: 'bankname_wixid',
+  bankName: 'bankname_id',
   bankAccount: 'bankaccount',
   accountholder: 'accountholder',
   nricFront: 'nricfront',
   nricback: 'nricback',
-  client: 'client_wixid',
+  client: 'client_id',
+  contact_id: 'contact_id',
   account: 'account',
   _createdDate: 'created_at',
   _updatedDate: 'updated_at',
+  'Created Date': 'created_at',
+  'Updated Date': 'updated_at',
 };
 
 function splitCsvRows(content) {
@@ -104,8 +111,15 @@ async function run() {
   const headerToDb = (h) => {
     const trimmed = (h || '').trim();
     const key = CSV_TO_DB[trimmed] || CSV_TO_DB[trimmed.replace(/_date$/i, 'Date')] || trimmed;
-    return (key === '_id' ? 'wix_id' : key).toLowerCase().replace(/^\s+|\s+$/g, '');
+    const dbCol = String(key).toLowerCase().replace(/^\s+|\s+$/g, '');
+    if (trimmed.toLowerCase() === 'client') return 'client_id';
+    return dbCol;
   };
+
+  function stripBrackets(s) {
+    if (s == null || typeof s !== 'string') return s;
+    return s.trim().replace(/^\[|\]$/g, '').replace(/"/g, '').trim();
+  }
 
   const conn = await mysql.createConnection({
     host: process.env.DB_HOST,
@@ -122,16 +136,6 @@ async function run() {
   );
   const tableColumns = new Set(cols.map(c => (c.column_name || c.COLUMN_NAME || '').toLowerCase()));
 
-  async function loadWixIdMap(refTable) {
-    const [rows] = await conn.query(
-      'SELECT id, wix_id FROM ' + refTable + ' WHERE wix_id IS NOT NULL'
-    );
-    return new Map(rows.map(r => [r.wix_id, r.id]));
-  }
-
-  const bankMap = await loadWixIdMap('bankdetail');
-  const clientMap = await loadWixIdMap('clientdetail');
-
   const usedIds = new Set();
   let inserted = 0;
 
@@ -140,29 +144,35 @@ async function run() {
       const values = parseCsvLine(lines[i]);
       const row = {};
       rawHeaders.forEach((h, idx) => {
+        if (skipCsvColumn(h)) return;
         const dbKey = headerToDb(h);
-        if (dbKey === '_owner') return;
+        if (dbKey === '_owner' || String(dbKey).toLowerCase() === 'owner') return;
         row[dbKey] = values[idx] !== undefined ? normalizeVal(values[idx]) : null;
       });
 
-      row.id = (() => {
-        let uid;
-        do { uid = randomUUID(); } while (usedIds.has(uid));
-        usedIds.add(uid);
-        return uid;
-      })();
+      row.id = resolveId(row, usedIds);
+
+      row.client_id = ONBOARD_OPERATOR_ID;
+
+      const acct = bukkuAccountFromContactId(row.contact_id, ONBOARD_OPERATOR_ID);
+      if (acct) row.account = acct;
+      if (row.contact_id != null && row.contact_id !== '') {
+        const cn = parseInt(String(row.contact_id).trim(), 10);
+        if (!Number.isNaN(cn) && String(cn) === String(row.contact_id).trim()) {
+          row.contact_id = cn;
+        }
+      } else {
+        row.contact_id = null;
+      }
 
       const now = new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
       if (!row.created_at) row.created_at = now;
       if (!row.updated_at) row.updated_at = now;
 
-      const hasData = [row.wix_id, row.fullname, row.email].some(
+      const hasData = [row.id, row.fullname, row.email].some(
         v => v !== null && v !== undefined && String(v).trim() !== ''
       );
       if (!hasData) continue;
-
-      if (row.bankname_wixid) row.bankname_id = bankMap.get(row.bankname_wixid) || null;
-      if (row.client_wixid) row.client_id = clientMap.get(row.client_wixid) || null;
 
       const keys = Object.keys(row).filter(k => tableColumns.has(k.toLowerCase()));
       if (keys.length === 0) continue;
@@ -171,6 +181,19 @@ async function run() {
       const placeholders = keys.map(() => '?').join(', ');
       const sql = `INSERT INTO \`${table}\` (${colsList}) VALUES (${placeholders})`;
       await conn.query(sql, keys.map(k => row[k]));
+      try {
+        await conn.query(
+          'INSERT IGNORE INTO tenant_client (tenant_id, client_id, created_at) VALUES (?, ?, NOW())',
+          [row.id, ONBOARD_OPERATOR_ID]
+        );
+      } catch (_) {
+        try {
+          await conn.query(
+            'INSERT IGNORE INTO tenant_client (id, tenant_id, client_id, created_at) VALUES (UUID(), ?, ?, NOW())',
+            [row.id, ONBOARD_OPERATOR_ID]
+          );
+        } catch (_) { /* tenant_client schema variant */ }
+      }
       inserted++;
       if (inserted % 100 === 0) console.log('Inserted', inserted, '...');
     }

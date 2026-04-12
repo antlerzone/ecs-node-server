@@ -1,23 +1,46 @@
 /**
- * SQL Account API: Agent (example resource; exact path from Postman collection).
- * @see https://docs.sql.com.my/sqlacc/integration/sql-account-api/setup-configuration
+ * SQL Account API: Agent (Postman → /agent).
+ * Bukku/Xero-style: list, read, create, update, remove.
  */
 
 const sqlaccountrequest = require('./sqlaccountrequest');
+const { agent: PATH } = require('../lib/postmanPaths');
 
-/**
- * Get agents list. Path may need to match SQL Account API (e.g. /Agent).
- * @param {object} [req] - Express request
- * @returns {Promise<{ ok: boolean, data?: any, status?: number, error?: any }>}
- */
+function codePath(code) {
+  const c = encodeURIComponent(String(code ?? '').trim());
+  return `${PATH}/${c}`;
+}
+
+async function list(req, params = {}) {
+  return sqlaccountrequest({ req, method: 'get', path: PATH, params });
+}
+
+async function read(req, code) {
+  return sqlaccountrequest({ req, method: 'get', path: codePath(code) });
+}
+
+async function create(req, payload) {
+  return sqlaccountrequest({ req, method: 'post', path: PATH, data: payload || {} });
+}
+
+async function update(req, code, payload) {
+  return sqlaccountrequest({ req, method: 'put', path: codePath(code), data: payload || {} });
+}
+
+async function remove(req, code) {
+  return sqlaccountrequest({ req, method: 'delete', path: codePath(code) });
+}
+
+/** @deprecated use list */
 async function getAgents(req) {
-  return sqlaccountrequest({
-    req,
-    method: 'get',
-    path: '/Agent'
-  });
+  return list(req, {});
 }
 
 module.exports = {
+  list,
+  read,
+  create,
+  update,
+  remove,
   getAgents
 };

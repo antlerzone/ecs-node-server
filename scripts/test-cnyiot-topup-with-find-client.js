@@ -12,7 +12,7 @@ const meterId = process.argv[2] || process.env.METER_ID || '19101920205';
 const amountKwh = Number(process.argv[3] || process.env.AMOUNT_KWH || '10');
 
 const pool = require('../src/config/db');
-const BASE_URL = process.env.CNYIOT_BASE_URL || process.env.CNYIOT_PROXY_BASE || 'https://www.openapi.cnyiot.com/api.ashx';
+const BASE_URL = process.env.CNYIOT_BASE_URL || 'https://www.openapi.cnyiot.com/api.ashx';
 
 async function findClientWithCnyiot() {
   const [rows] = await pool.query(

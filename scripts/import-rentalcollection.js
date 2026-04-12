@@ -1,31 +1,35 @@
 /**
- * 导入 rentalcollection CSV（Wix 导出）。
- * - CSV 的 ID/_id 写入列 wix_id；主键 id 用新 UUID。
- * - client_id / property_id / room_id / tenant_id / type_id / tenancy_id 由各表 wix_id 解析填入。
- * 用法：node scripts/import-rentalcollection.js [csv_path]
- * 默认 csv_path = ./rentalcollection.csv
+ * 导入 rentalcollection CSV（Wix 导出）。0087 后：id = CSV _id；reference 直接写入 _id 列。
+ * 用法：node scripts/import-rentalcollection.js [csv_path] [bukkuid_csv]
+ * 默认 csv_path = ./rentalcollection.csv；bukkuid 默认 cleanlemon/next-app/Wix cms/bukkuid (2).csv
  * 导入前清空表请先跑：node scripts/truncate-rentalcollection.js
  */
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 const mysql = require('mysql2/promise');
 const fs = require('fs');
 const path = require('path');
-const { randomUUID } = require('crypto');
+const { resolveId } = require('./import-util');
+const { ONBOARD_OPERATOR_ID, skipCsvColumn } = require('./onboard-import-helpers');
+const { buildWixAccountIdToCanonicalMap } = require('./lib/account-canonical-map');
 
 const csvPath = process.argv[2] || path.join(process.cwd(), 'rentalcollection.csv');
+/** 可选：bukkuid CSV，用于把 Wix type UUID 映射到 canonical account.id */
+const bukkuidCsvPath =
+  process.argv[3] ||
+  path.join(process.cwd(), 'cleanlemon/next-app/Wix cms/bukkuid (2).csv');
 const table = 'rentalcollection';
 
-// Wix 导出列名 → MySQL 列名。ID/_id 写入 wix_id，主键 id 由脚本生成
+// Wix 导出列名 → MySQL 列名。0087：_id→id；reference 直接→_id 列
 const CSV_HEADER_TO_DB = {
-  id: 'wix_id',
-  _id: 'wix_id',
+  id: 'id',
+  _id: 'id',
   title: 'title',
-  tenant: 'tenant_wixid',
-  room: 'room_wixid',
-  property: 'property_wixid',
-  type: 'type_wixid',
-  client: 'client_wixid',
-  tenancy: 'tenancy_wix_id',
+  tenant: 'tenant_id',
+  room: 'room_id',
+  property: 'property_id',
+  type: 'type_id',
+  client: 'client_id',
+  tenancy: 'tenancy_id',
   date: 'date',
   'created date': 'created_at',
   _createddate: 'created_at',
@@ -42,7 +46,6 @@ const CSV_HEADER_TO_DB = {
   bukku_invoice_id: 'bukku_invoice_id',
   accountid: 'accountid',
   productid: 'productid',
-  wix_id: 'wix_id',
 };
 
 function stripBrackets(s) {
@@ -143,25 +146,17 @@ async function run() {
   );
   const tableColumns = new Set(cols.map(c => (c.column_name || c.COLUMN_NAME || '').toLowerCase()));
 
-  // 各表 wix_id → id，用于把 *_wixid 解析为 *_id
-  async function loadWixIdMap(refTable) {
-    const [rows] = await conn.query(
-      'SELECT id, wix_id FROM ' + refTable + ' WHERE wix_id IS NOT NULL AND TRIM(wix_id) != ""'
-    );
-    const byWixId = new Map();
-    for (const r of rows) {
-      const w = stripBrackets(r.wix_id);
-      if (w) byWixId.set(w, r.id);
-    }
-    return byWixId;
-  }
-  const clientMap = await loadWixIdMap('clientdetail');
-  const propertyMap = await loadWixIdMap('propertydetail');
-  const roomMap = await loadWixIdMap('roomdetail');
-  const tenantMap = await loadWixIdMap('tenantdetail');
-  const typeMap = await loadWixIdMap('account');
-  const tenancyMap = await loadWixIdMap('tenancy');
+  const [tenancyRows] = await conn.query('SELECT id FROM tenancy');
+  const [tenantRows] = await conn.query('SELECT id FROM tenantdetail');
+  const [accountRows] = await conn.query('SELECT id FROM account');
+  const validTenancyIds = new Set(tenancyRows.map(r => r.id));
+  const validTenantIds = new Set(tenantRows.map(r => r.id));
+  const validAccountIds = new Set(accountRows.map(r => r.id));
 
+  const wixToCanonical = buildWixAccountIdToCanonicalMap(bukkuidCsvPath);
+  console.log('Wix account id → canonical map size:', wixToCanonical.size, 'from', bukkuidCsvPath);
+
+  const usedIds = new Set();
   let inserted = 0;
   let skipped = 0;
 
@@ -170,26 +165,36 @@ async function run() {
       const values = parseCsvLine(lines[i]);
       const row = {};
       rawHeaders.forEach((h, idx) => {
+        if (skipCsvColumn(h)) return;
         const dbKey = headerToDb(h);
         if (!dbKey) return;
         row[dbKey] = values[idx] !== undefined ? normalizeVal(values[idx]) : null;
       });
 
-      const wixIdFromCsv = row.wix_id != null ? String(row.wix_id).trim() : '';
-      if (!wixIdFromCsv) {
+      row.id = resolveId(row, usedIds);
+
+      const hasData = [row.id, row.client_id, row.property_id, row.tenant_id].some(
+        v => v != null && String(v).trim() !== ''
+      );
+      if (!hasData) {
         skipped++;
         continue;
       }
 
-      row.id = randomUUID();
-      row.wix_id = stripBrackets(wixIdFromCsv) || wixIdFromCsv;
-
-      if (row.client_wixid) row.client_id = clientMap.get(stripBrackets(row.client_wixid)) || null;
-      if (row.property_wixid) row.property_id = propertyMap.get(stripBrackets(row.property_wixid)) || null;
-      if (row.room_wixid) row.room_id = roomMap.get(stripBrackets(row.room_wixid)) || null;
-      if (row.tenant_wixid) row.tenant_id = tenantMap.get(stripBrackets(row.tenant_wixid)) || null;
-      if (row.type_wixid) row.type_id = typeMap.get(stripBrackets(row.type_wixid)) || null;
-      if (row.tenancy_wix_id) row.tenancy_id = tenancyMap.get(stripBrackets(row.tenancy_wix_id)) || null;
+      const toId = (v) => { const s = stripBrackets(String(v || '')); return s && s.trim() ? s.trim() : null; };
+      if (row.client_id != null) row.client_id = toId(row.client_id);
+      if (row.property_id != null) row.property_id = toId(row.property_id);
+      if (row.room_id != null) row.room_id = toId(row.room_id);
+      if (row.tenant_id != null) row.tenant_id = toId(row.tenant_id);
+      if (row.type_id != null) row.type_id = toId(row.type_id);
+      if (row.type_id != null && wixToCanonical.has(row.type_id)) {
+        row.type_id = wixToCanonical.get(row.type_id);
+      }
+      if (row.tenancy_id != null) row.tenancy_id = toId(row.tenancy_id);
+      if (row.tenancy_id != null && !validTenancyIds.has(row.tenancy_id)) row.tenancy_id = null;
+      if (row.tenant_id != null && !validTenantIds.has(row.tenant_id)) row.tenant_id = null;
+      if (row.type_id != null && !validAccountIds.has(row.type_id)) row.type_id = null;
+      row.client_id = ONBOARD_OPERATOR_ID;
 
       const now = new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
       if (tableColumns.has('created_at') && (row.created_at === null || row.created_at === undefined)) row.created_at = now;
@@ -210,7 +215,6 @@ async function run() {
       if (inserted % 100 === 0) console.log('Inserted', inserted, '...');
     }
     console.log('Done. Inserted', inserted, 'rows into', table + (skipped ? '; skipped ' + skipped + ' rows.' : '.'));
-    console.log('wix_id = CSV ID; id = new UUID; client_id/property_id/room_id/tenant_id/type_id/tenancy_id resolved from *_wixid via tables.');
   } catch (err) {
     console.error('Import failed:', err.message);
     process.exit(1);

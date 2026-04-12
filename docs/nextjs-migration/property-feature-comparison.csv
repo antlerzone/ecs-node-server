@@ -1,0 +1,31 @@
+功能,Wix (旧),Next (新),状态
+权限,permission.propertylisting \|\| admin; credit<0 强制 Topup,operator 路由登录,已有
+列表,getPropertyList(keyword, propertyId, page, pageSize),getPropertyList(keyword, filter, pageSize: 200),已有
+筛选 keyword,inputlistviewsearch + debounce → keyword,keyword 搜索框,已有
+筛选 filter,services: All / Active only / Inactive only,filter 下拉 All / Active only / Inactive only,已有
+筛选 propertyId,getPropertyFilters → Property 下拉 (dropdownlistviewproperty),无 Property 下拉,少
+分页,20 条/页 + paginationlistview 翻页,单次 200 条无分页,少
+列表展示,Repeater shortname; 底色 by isPropertyFullyOccupied,Card shortname/address/apartmentName,已有
+占用状态 + 底色,满租 #dff5f2 / 否则 #fde2e2,满租绿底 + Badge "Full occupied",已有
+列表 Active 开关,每行 #checkboxstatus → setPropertyActive,每卡 Active 标签 + Switch → setPropertyActive,已有
+Action Edit,buttonupdatedetail → 进编辑 section (含 utility 字段),Actions 下拉 → Edit → 弹窗 基本信息+Owner 协议,已有
+Action Parking Lot,buttondetail → getParkingLotsByProperty → boxdetail 弹窗 repeater 增删 + saveParkingLots,Actions 下拉 → Parking lot → 弹窗多行增删保存,已有
+Action Edit utility,编辑 section 内 unitNumber/apartmentName/tnb/saj/wifi/internetType/percentage/address/remark/folder + Meter/Smart Door/Management 下拉 + Update,Actions 下拉 → Edit utility → 弹窗 TNB/SAJ/Wifi/Internet type/Management/Percentage/Remark/Folder/Meter/Smart door,已有
+编辑 基本信息,unitNumber apartmentName address,Edit 弹窗 shortname apartmentName address unitNumber,已有
+TNB (Electric),#inputtnb → updateProperty(tnb),Edit utility 弹窗 tnb,已有
+SAJ (Water),#inputsaj → updateProperty(saj),Edit utility 弹窗 saj,已有
+Wifi,#inputwifi + #dropdownwifi (internetType),Edit utility 弹窗 wifi + internetType (suppliers),已有
+Percentage,#inputpercentage,Edit utility 弹窗 percentage,已有
+Address,#inputaddress,Edit 弹窗 address,已有
+Remark,#inputremark,Edit utility 弹窗 remark,已有
+Report Folder,#inputfolder,Edit utility 弹窗 folder,已有
+Meter 下拉,getMeterDropdownOptions(null propertyId) → updateProperty(meter),Edit utility 弹窗 meter (getRoomMeterOptions(undefined propertyId)),已有
+Smart Door 下拉,getSmartDoorDropdownOptions(null propertyId) → updateProperty(smartdoor),Edit utility 弹窗 smartdoor (getRoomSmartDoorOptions(undefined propertyId)),已有
+Management 下拉,getSupplierOptions → #dropdownmanagement,Edit utility 弹窗 management (suppliers),已有
+Owner + 协议,getOwnerOptions + getAgreementTemplateOptions + saveOwnerAgreement; system/manual + template 或 URL,Edit 弹窗内 Owner 下拉 + Agreement type + template/URL + savePropertyOwnerAgreement,已有
+Open agreement 链接,有 signagreement 时显示 Open,Edit 内 "Open current agreement" 链接,已有
+Apartment names,getApartmentNames() → 下拉,buildingNames 从列表推导 + Add new 本地; 未调 getApartmentNames API,部分(实现不同)
+Add Property,sectionnewproperty repeater 多行 unitNumber+apartmentName → insertProperties(records),Add Property 弹窗单行 unitNumber+apartmentName → insertProperty([...]),已有(单条)
+批量新增物业,repeater 多行 加行 → insertProperties(records),无,刻意不做
+Topup Section,buttontopup / Credit plans / Checkout,无 (在 Credit 页),刻意不做
+Link to Room,buttonroom 同页切 section 到 listview,Operator 左侧有 Room 菜单,可接受

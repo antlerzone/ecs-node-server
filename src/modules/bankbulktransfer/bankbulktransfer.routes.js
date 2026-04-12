@@ -8,7 +8,7 @@ const router = express.Router();
 const { getAccessContextByEmail } = require('../access/access.service');
 const { getClientAddonCapabilities } = require('../billing/billing.service');
 const { getBankBulkTransferData, MAX_ITEMS_PER_FILE } = require('./bankbulktransfer.service');
-const { buildBankFiles, zipBuffers } = require('./bankbulktransfer-excel');
+const { buildBankFiles, zipBuffers, generateRefundCsv } = require('./bankbulktransfer-excel');
 const downloadStore = require('../download/download.store');
 
 function getEmail(req) {
@@ -193,6 +193,13 @@ router.post('/download-url', async (req, res, next) => {
       if (!result || !result.success) {
         return res.json({ urls: [] });
       }
+      if (type === 'refund' && result.bulkTransfers && result.bulkTransfers.length > 0) {
+        const csvBuffer = generateRefundCsv(result.bulkTransfers);
+        const dateStr = String(new Date().getDate()).padStart(2, '0') + String(new Date().getMonth() + 1).padStart(2, '0') + String(new Date().getFullYear()).slice(-2);
+        const csvFilename = `refund-publicbank-${dateStr}.csv`;
+        const token = downloadStore.set(csvBuffer, csvFilename, 'text/csv');
+        return res.json({ urls: [{ filename: csvFilename, url: `${baseUrl}/api/download/${token}` }] });
+      }
       const built = buildBankFiles(result, baseIndex);
       let urls = [];
       if (built.length > 1) {
@@ -235,7 +242,7 @@ router.post('/download-url', async (req, res, next) => {
     }
     if (allSkipped.length > 0) {
       const lines = [
-        '以下项目因资料不齐未放入 JomPay / Bulk Transfer，请补全 supplier 或 property 资料后重试。',
+        'The following items were skipped from JomPay / Bulk Transfer due to incomplete supplier or property data. Please complete supplier or property details and retry.',
         '',
         'ID\t项目\t原因',
         ...allSkipped.map(s => `${s.id || ''}\t${(s.label || '').replace(/\t/g, ' ')}\t${s.reason || ''}`)

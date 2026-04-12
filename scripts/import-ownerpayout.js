@@ -6,17 +6,18 @@ require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') }
 const mysql = require('mysql2/promise');
 const fs = require('fs');
 const path = require('path');
-const { randomUUID } = require('crypto');
+const { resolveId } = require('./import-util');
+const { ONBOARD_OPERATOR_ID, skipCsvColumn } = require('./onboard-import-helpers');
 
-const csvPath = process.argv[2] || path.join(process.cwd(), 'OwnerPayout.csv');
+const csvPath = process.argv[2] || path.join(process.cwd(), 'ownerpayout.csv');
 const table = 'ownerpayout';
 
 const CSV_TO_DB = {
-  _id: 'wix_id',
-  ID: 'wix_id',
-  id: 'wix_id',
-  property: 'property_wixid',
-  Property: 'property_wixid',
+  _id: 'id',
+  ID: 'id',
+  id: 'id',
+  property: 'property_id',
+  Property: 'property_id',
   period: 'period',
   Period: 'period',
   title: 'title',
@@ -29,10 +30,9 @@ const CSV_TO_DB = {
   Bukkubills: 'bukkubills',
   Bukkuinvoice: 'bukkuinvoice',
   monthlyreport: 'monthlyreport',
-  client: 'client_wixid',
-  Client: 'client_wixid',
-  CLIENT: 'client_wixid',
-  client_wixid: 'client_wixid',
+  client: 'client_id',
+  Client: 'client_id',
+  CLIENT: 'client_id',
   paid: 'paid',
   Paid: 'paid',
   _createdDate: 'created_at',
@@ -93,11 +93,13 @@ async function run() {
   const headerToDb = (h) => {
     const trimmed = (h || '').trim();
     const key = CSV_TO_DB[trimmed] || CSV_TO_DB[trimmed.replace(/_date$/i, 'Date')] || trimmed;
-    let dbCol = (key === '_id' ? 'wix_id' : key).toLowerCase().replace(/^\s+|\s+$/g, '');
-    if (trimmed.toLowerCase() === 'client') dbCol = 'client_wixid';
-    if (trimmed.toLowerCase() === 'property') dbCol = 'property_wixid';
-    return dbCol;
+    return String(key).toLowerCase().replace(/^\s+|\s+$/g, '');
   };
+
+  function stripBrackets(s) {
+    if (s == null || typeof s !== 'string') return s;
+    return String(s).trim().replace(/^\[|\]$/g, '').replace(/"/g, '').trim();
+  }
 
   const conn = await mysql.createConnection({
     host: process.env.DB_HOST,
@@ -113,18 +115,6 @@ async function run() {
   );
   const tableColumns = new Set(cols.map(c => (c.column_name || c.COLUMN_NAME || '').toLowerCase()));
 
-  async function loadWixIdMap(refTable) {
-    const [rows] = await conn.query('SELECT id, wix_id FROM ' + refTable + ' WHERE wix_id IS NOT NULL');
-    return new Map(rows.map(r => [r.wix_id, r.id]));
-  }
-  function resolveWixId(map, wixId) {
-    if (!wixId) return null;
-    const s = String(wixId).trim();
-    return map.get(s) || map.get(s.replace(/^!/, '')) || null;
-  }
-  const propertyMap = await loadWixIdMap('propertydetail');
-  const clientMap = await loadWixIdMap('clientdetail');
-
   const usedIds = new Set();
   let inserted = 0;
   try {
@@ -132,19 +122,20 @@ async function run() {
       const values = parseCsvLine(lines[i]);
       const row = {};
       rawHeaders.forEach((h, idx) => {
+        if (skipCsvColumn(h)) return;
         const dbKey = headerToDb(h);
         if (dbKey === '_owner') return;
         row[dbKey] = values[idx] !== undefined ? normalizeVal(values[idx]) : null;
       });
-      row.id = (() => { let uid; do { uid = randomUUID(); } while (usedIds.has(uid)); usedIds.add(uid); return uid; })();
+      row.id = resolveId(row, usedIds);
+      if (row.property_id != null) row.property_id = stripBrackets(String(row.property_id)) || null;
+      row.client_id = ONBOARD_OPERATOR_ID;
       const now = new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
       if (!row.created_at) row.created_at = now;
       if (!row.updated_at) row.updated_at = now;
       if (row.paid === null || row.paid === undefined) row.paid = 0;
-      const hasData = [row.wix_id, row.title, row.period].some(v => v !== null && v !== undefined && String(v).trim() !== '');
+      const hasData = [row.id, row.title, row.period].some(v => v !== null && v !== undefined && String(v).trim() !== '');
       if (!hasData) continue;
-      if (row.property_wixid) row.property_id = resolveWixId(propertyMap, row.property_wixid);
-      if (row.client_wixid) row.client_id = resolveWixId(clientMap, row.client_wixid);
       const keys = Object.keys(row).filter(k => tableColumns.has(k.toLowerCase()));
       if (keys.length === 0) continue;
       const colsList = keys.map(k => '`' + k + '`').join(', ');

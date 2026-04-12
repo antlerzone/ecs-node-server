@@ -33,7 +33,7 @@ CREATE TABLE tenantdetail (
   KEY idx_tenantdetail_bankname_id (bankname_id),
   KEY idx_tenantdetail_email (email),
   CONSTRAINT fk_tenantdetail_client
-    FOREIGN KEY (client_id) REFERENCES clientdetail (id) ON UPDATE CASCADE ON DELETE SET NULL,
+    FOREIGN KEY (client_id) REFERENCES operatordetail (id) ON UPDATE CASCADE ON DELETE SET NULL,
   CONSTRAINT fk_tenantdetail_bankname
     FOREIGN KEY (bankname_id) REFERENCES bankdetail (id) ON UPDATE CASCADE ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci

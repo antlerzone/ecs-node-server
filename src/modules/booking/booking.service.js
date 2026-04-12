@@ -1,44 +1,47 @@
 /**
  * Booking – create tenancy from Wix Booking page.
- * Uses MySQL: clientdetail (admin), staffdetail, tenantdetail, tenant_client, propertydetail,
+ * Uses MySQL: operatordetail (admin), staffdetail, tenantdetail, tenant_client, propertydetail,
  * roomdetail, tenancy, rentalcollection, account (type_id), parkinglot.
  * All functions that need auth use email and resolve via getAccessContextByEmail.
  */
 
 const { randomUUID } = require('crypto');
 const pool = require('../../config/db');
+const { upsertCommissionReleaseForTenancy } = require('../commission-release/commission-release.service');
 const { getAccessContextByEmail } = require('../access/access.service');
 const { createInvoicesForRentalRecords } = require('../rentalcollection-invoice/rentalcollection-invoice.service');
+const {
+  getTodayMalaysiaDate,
+  utcDatetimeFromDbToMalaysiaDateOnly,
+  tenancyBeginEndToMysql
+} = require('../../utils/dateMalaysia');
 
-/** Convert date (ISO string or Date) to MySQL datetime 'YYYY-MM-DD HH:MM:SS'. */
-function toMysqlDatetime(val) {
-  if (val == null) return null;
-  const d = val instanceof Date ? val : new Date(val);
-  if (Number.isNaN(d.getTime())) return null;
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  const h = String(d.getHours()).padStart(2, '0');
-  const min = String(d.getMinutes()).padStart(2, '0');
-  const s = String(d.getSeconds()).padStart(2, '0');
-  return `${y}-${m}-${day} ${h}:${min}:${s}`;
+/** roomdetail.availablefrom: DATE/DATETIME → Malaysia YYYY-MM-DD for comparisons */
+function roomAvailableFromToMalaysiaYmd(raw) {
+  if (raw == null) return null;
+  if (typeof raw === 'string') {
+    const s = raw.trim().substring(0, 10);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  }
+  return utcDatetimeFromDbToMalaysiaDateOnly(raw);
 }
 
-// BUKKUID = 以前 Wix 的 wix_id；插入 rentalcollection 时用 account.id（通过 wix_id 查）
+/** Canonical account template ids — migrations 0154 + 0155 */
 const BUKKUID_WIX = {
-  FORFEIT_DEPOSIT: '1c7e41b6-9d57-4c03-8122-a76baad3b592',
-  MAINTENANCE_FEES: 'ae94f899-7f34-4aba-b6ee-39b97496e2a3',
-  TOPUP_AIRCOND: '18ba3daf-7208-46fc-8e97-43f34e898401',
+  FORFEIT_DEPOSIT: '2020b22b-028e-4216-906c-c816dcb33a85',
+  MAINTENANCE_FEES: '94b4e060-3999-4c76-8189-f969615c0a7d',
+  TOPUP_AIRCOND: 'a1b2c3d4-1001-4000-8000-000000000101',
   OWNER_COMMISSION: '86da59c0-992c-4e40-8efd-9d6d793eaf6a',
-  TENANT_COMMISSION: '94b4e060-3999-4c76-8189-f969615c0a7d',
-  RENTAL_INCOME: 'cf4141b1-c24e-4fc1-930e-cfea4329b178',
-  REFERRAL_FEES: 'e4fd92bb-de15-4ca0-9c6b-05e410815c58',
-  PARKING_FEES: 'bdf3b91c-d2ca-4e42-8cc7-a5f19f271e00',
-  MANAGEMENT_FEES: '620b2d43-4b3a-448f-8a5b-99eb2c3209c7',
-  DEPOSIT: 'd3f72d51-c791-4ef0-aeec-3ed1134e5c86',
-  AGREEMENT_FEES: '3411c69c-bfec-4d35-a6b9-27929f9d5bf6',
-  OWNER_PAYOUT: 'e053b254-5a3c-4b82-8ba0-fd6d0df231d3',
-  OTHER: 'bf502145-6ec8-45bd-a703-13c810cfe186'
+  TENANT_COMMISSION: 'e1b2c3d4-2002-4000-8000-000000000302',
+  RENTAL_INCOME: 'ae94f899-7f34-4aba-b6ee-39b97496e2a3',
+  REFERRAL_FEES: 'e1b2c3d4-2006-4000-8000-000000000306',
+  PARKING_FEES: 'e1b2c3d4-2004-4000-8000-000000000304',
+  MANAGEMENT_FEES: 'a1b2c3d4-0002-4000-8000-000000000002',
+  DEPOSIT: '18ba3daf-7208-46fc-8e97-43f34e898401',
+  AGREEMENT_FEES: 'e1b2c3d4-2003-4000-8000-000000000303',
+  OWNER_PAYOUT: 'a1b2c3d4-0003-4000-8000-000000000003',
+  OTHER: '94b4e060-3999-4c76-8189-f969615c0a7d',
+  PROCESSING_FEES: 'e1b2c3d4-2007-4000-8000-000000000307'
 };
 
 function parseJson(val) {
@@ -54,7 +57,7 @@ function parseJson(val) {
 
 async function getAccountIdByWixId(wixId) {
   if (!wixId) return null;
-  const [rows] = await pool.query('SELECT id FROM account WHERE wix_id = ? LIMIT 1', [wixId]);
+  const [rows] = await pool.query('SELECT id FROM account WHERE id = ? LIMIT 1', [wixId]);
   return rows[0] ? rows[0].id : null;
 }
 
@@ -68,11 +71,11 @@ async function requireCtx(email, permissionKey = 'booking') {
 }
 
 /**
- * Get client admin rules (clientdetail.admin JSON).
+ * Get client admin rules (operatordetail.admin JSON).
  */
 async function getAdminRules(email) {
   const ctx = await requireCtx(email);
-  const [rows] = await pool.query('SELECT admin FROM clientdetail WHERE id = ? LIMIT 1', [ctx.client.id]);
+  const [rows] = await pool.query('SELECT admin FROM operatordetail WHERE id = ? LIMIT 1', [ctx.client.id]);
   const admin = rows[0] ? parseJson(rows[0].admin) : null;
   return { ok: true, admin };
 }
@@ -82,7 +85,44 @@ async function getAdminRules(email) {
  */
 async function getStaff(email) {
   const ctx = await requireCtx(email);
-  return { ok: true, staff: ctx.staff };
+  const clientId = ctx.client.id;
+  let rows = [];
+  try {
+    const [r] = await pool.query(
+      `SELECT id, name, email, active
+       FROM staffdetail
+       WHERE client_id = ?
+       ORDER BY active DESC, name ASC, email ASC
+       LIMIT 1000`,
+      [clientId]
+    );
+    rows = r;
+  } catch (e) {
+    const msg = String(e?.sqlMessage || e?.message || '');
+    const isMissingActiveColumn =
+      (e?.code === 'ER_BAD_FIELD_ERROR' || e?.errno === 1054 || /Unknown column/i.test(msg)) &&
+      /active/i.test(msg);
+    if (isMissingActiveColumn) {
+      const [r] = await pool.query(
+        `SELECT id, name, email
+         FROM staffdetail
+         WHERE client_id = ?
+         ORDER BY name ASC, email ASC
+         LIMIT 1000`,
+        [clientId]
+      );
+      rows = r;
+    } else {
+      throw e;
+    }
+  }
+  const items = rows.map((r) => ({
+    id: r.id,
+    name: r.name || '',
+    email: r.email || '',
+    active: r.active == null ? true : Number(r.active || 0) === 1
+  }));
+  return { ok: true, items, currentStaffId: ctx.staffDetailId || ctx.staff?.id || null };
 }
 
 /**
@@ -103,7 +143,7 @@ async function getAvailableRooms(email, keyword = '') {
   }
 
   const placeholders = propertyIds.map(() => '?').join(',');
-  let sql = `SELECT id, title_fld, price, property_id FROM roomdetail WHERE client_id = ? AND property_id IN (${placeholders}) AND (active = 1) AND (available = 1 OR availablesoon = 1)`;
+  let sql = `SELECT id, title_fld, price, property_id, available, availablesoon, availablefrom FROM roomdetail WHERE client_id = ? AND property_id IN (${placeholders}) AND (active = 1) AND (available = 1 OR availablesoon = 1)`;
   const params = [clientId, ...propertyIds];
 
   if (keyword && String(keyword).trim()) {
@@ -114,7 +154,30 @@ async function getAvailableRooms(email, keyword = '') {
   sql += ' ORDER BY title_fld ASC LIMIT 500';
 
   const [roomRows] = await pool.query(sql, params);
-  const items = roomRows.map((r) => ({ _id: r.id, title_fld: r.title_fld || '', value: r.id, label: r.title_fld || r.id }));
+  const todayMy = getTodayMalaysiaDate();
+  const items = roomRows.map((r) => {
+    let available = Number(r.available) === 1;
+    let availablesoon = Number(r.availablesoon) === 1;
+    let availableFrom = roomAvailableFromToMalaysiaYmd(r.availablefrom);
+
+    // Stale flags: "available soon" date on or before today (MY) → vacancy already started; list as available now.
+    if (!available && availablesoon && availableFrom && availableFrom <= todayMy) {
+      available = true;
+      availablesoon = false;
+      availableFrom = null;
+    }
+
+    const title = r.title_fld || '';
+    return {
+      _id: r.id,
+      title_fld: title,
+      value: r.id,
+      label: title || r.id,
+      available,
+      availablesoon,
+      availableFrom
+    };
+  });
   return { ok: true, items };
 }
 
@@ -246,10 +309,117 @@ async function getRoom(email, roomId) {
 /**
  * Parking lots by property.
  */
+/**
+ * After operator enters tenant email: profile + tenant_review + tenancy flags for this client.
+ * Used by booking UI to tag New / Returning (avg score) / Former.
+ */
+async function lookupTenantForBooking(email, tenantEmailRaw) {
+  const ctx = await requireCtx(email);
+  const clientId = ctx.client.id;
+  const emailNorm = String(tenantEmailRaw || '')
+    .trim()
+    .toLowerCase();
+  if (!emailNorm || !emailNorm.includes('@')) {
+    return { ok: true, hasValidEmail: false };
+  }
+
+  const [tenantRows] = await pool.query(
+    'SELECT id, fullname, email, phone FROM tenantdetail WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+    [emailNorm]
+  );
+
+  if (!tenantRows.length) {
+    return {
+      ok: true,
+      hasValidEmail: true,
+      hasRecord: false,
+      tenantId: null,
+      fullname: null,
+      approvedForClient: false,
+      hasActiveTenancy: false,
+      hasPastTenancy: false,
+      reviewCount: 0,
+      averageOverallScore: null,
+      latestReview: null
+    };
+  }
+
+  const t = tenantRows[0];
+  const tenantId = t.id;
+
+  const [tc] = await pool.query(
+    'SELECT 1 FROM tenant_client WHERE tenant_id = ? AND client_id = ? LIMIT 1',
+    [tenantId, clientId]
+  );
+  const approvedForClient = tc.length > 0;
+
+  const [activeRows] = await pool.query(
+    `SELECT COUNT(*) AS c FROM tenancy
+     WHERE tenant_id = ? AND client_id = ?
+       AND DATE(\`begin\`) <= DATE(UTC_TIMESTAMP() + INTERVAL 8 HOUR) AND DATE(\`end\`) >= DATE(UTC_TIMESTAMP() + INTERVAL 8 HOUR)
+       AND (active = 1 OR active IS NULL)`,
+    [tenantId, clientId]
+  );
+  const hasActiveTenancy = Number(activeRows[0]?.c || 0) > 0;
+
+  const [pastRows] = await pool.query(
+    `SELECT COUNT(*) AS c FROM tenancy
+     WHERE tenant_id = ? AND client_id = ?
+       AND DATE(\`end\`) < DATE(UTC_TIMESTAMP() + INTERVAL 8 HOUR)`,
+    [tenantId, clientId]
+  );
+  const hasPastTenancy = Number(pastRows[0]?.c || 0) > 0;
+
+  const [revAgg] = await pool.query(
+    `SELECT COUNT(*) AS cnt, AVG(overall_score) AS avg_overall
+     FROM tenant_review WHERE tenant_id = ? AND client_id = ?`,
+    [tenantId, clientId]
+  );
+  const reviewCount = Number(revAgg[0]?.cnt || 0);
+  let averageOverallScore = null;
+  if (revAgg[0]?.avg_overall != null && reviewCount > 0) {
+    averageOverallScore = Number(Number(revAgg[0].avg_overall).toFixed(2));
+  }
+
+  let latestReview = null;
+  if (reviewCount > 0) {
+    const [lr] = await pool.query(
+      `SELECT overall_score, payment_score_final, unit_care_score, created_at
+       FROM tenant_review WHERE tenant_id = ? AND client_id = ? ORDER BY created_at DESC LIMIT 1`,
+      [tenantId, clientId]
+    );
+    if (lr[0]) {
+      latestReview = {
+        overallScore: Number(lr[0].overall_score || 0),
+        paymentScoreFinal: Number(lr[0].payment_score_final || 0),
+        unitCareScore: Number(lr[0].unit_care_score || 0),
+        communicationScore: 0,
+        createdAt: lr[0].created_at
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    hasValidEmail: true,
+    hasRecord: true,
+    tenantId,
+    fullname: t.fullname || '',
+    email: t.email || '',
+    phone: t.phone || '',
+    approvedForClient,
+    hasActiveTenancy,
+    hasPastTenancy,
+    reviewCount,
+    averageOverallScore,
+    latestReview
+  };
+}
+
 async function getParkingLotsByProperty(email, propertyId) {
   const ctx = await requireCtx(email);
   const [rows] = await pool.query(
-    'SELECT id, parkinglot FROM parkinglot WHERE client_id = ? AND property_id = ? ORDER BY parkinglot ASC',
+    'SELECT id, parkinglot FROM parkinglot WHERE client_id = ? AND property_id = ? AND (available = 1 OR available IS NULL) ORDER BY parkinglot ASC',
     [ctx.client.id, propertyId]
   );
   const items = rows.map((p) => ({ _id: p.id, parkinglot: p.parkinglot || '', value: p.id, label: p.parkinglot || p.id }));
@@ -264,10 +434,10 @@ async function createBooking(email, payload) {
   const clientId = ctx.client.id;
   const staffId = ctx.staff?.id;
   if (!staffId) throw new Error('NO_STAFF');
-
   const {
     tenantIdSelected,
     emailInput,
+    tenantBookingKind,
     roomId,
     beginDate,
     endDate,
@@ -279,13 +449,37 @@ async function createBooking(email, payload) {
     addOns = [],
     billingBlueprint = [],
     commissionSnapshot = [],
-    adminRules
+    adminRules,
+    submitbyStaffId
   } = payload;
+  /** tenancy.submitby_id FK → staffdetail.id only. Never use client_user.id (same email may not exist in staffdetail). */
+  let submitbyIdForFk = null;
+  const preferredSubmitbyId = String(submitbyStaffId || '').trim();
+  if (preferredSubmitbyId) {
+    const [selected] = await pool.query(
+      'SELECT id FROM staffdetail WHERE id = ? AND client_id = ? LIMIT 1',
+      [preferredSubmitbyId, clientId]
+    );
+    if (!selected.length) throw new Error('INVALID_SUBMITBY_STAFF_ID');
+    submitbyIdForFk = selected[0].id;
+  }
+  const [sdByEmail] = await pool.query(
+    'SELECT id FROM staffdetail WHERE client_id = ? AND LOWER(TRIM(email)) = LOWER(TRIM(?)) LIMIT 1',
+    [clientId, email]
+  );
+  if (!submitbyIdForFk && sdByEmail.length) {
+    submitbyIdForFk = sdByEmail[0].id;
+  } else if (!submitbyIdForFk && ctx.staffDetailId) {
+    const [sd] = await pool.query('SELECT id FROM staffdetail WHERE id = ? AND client_id = ? LIMIT 1', [
+      ctx.staffDetailId,
+      clientId
+    ]);
+    if (sd.length) submitbyIdForFk = sd[0].id;
+  }
 
   if (!roomId || !beginDate || !endDate) throw new Error('ROOM_AND_DATES_REQUIRED');
 
-  const beginMysql = toMysqlDatetime(beginDate);
-  const endMysql = toMysqlDatetime(endDate);
+  const { beginMysql, endMysql } = tenancyBeginEndToMysql(beginDate, endDate);
   if (!beginMysql || !endMysql) throw new Error('INVALID_BEGIN_OR_END_DATE');
 
   const tenantRes = await ensureTenantForBooking(email, {
@@ -308,7 +502,11 @@ async function createBooking(email, payload) {
   const tenancyStatusJson = JSON.stringify([
     { key: 'contact_approval', label: 'Pending contact approval', status: alreadyApproved ? 'completed' : 'pending', updatedAt: now }
   ]);
-  const remarkJson = JSON.stringify([{ type: 'booking_created', by: staffId, at: now, note: 'Booking created by admin' }]);
+  const remark0 = { type: 'booking_created', by: staffId, at: now, note: 'Booking created by admin' };
+  if (tenantBookingKind && String(tenantBookingKind).trim()) {
+    remark0.tenantBookingKind = String(tenantBookingKind).trim();
+  }
+  const remarkJson = JSON.stringify([remark0]);
 
   await pool.query(
     `INSERT INTO tenancy (id, tenant_id, room_id, client_id, submitby_id, begin, \`end\`, rental, deposit, title, status,
@@ -319,7 +517,7 @@ async function createBooking(email, payload) {
       tenantObj._id,
       roomId,
       clientId,
-      staffId,
+      submitbyIdForFk,
       beginMysql,
       endMysql,
       rental || 0,
@@ -336,13 +534,25 @@ async function createBooking(email, payload) {
     ]
   );
 
+  try {
+    await upsertCommissionReleaseForTenancy(clientId, tenancyId);
+  } catch (e) {
+    console.warn('[booking] upsertCommissionReleaseForTenancy', e?.message || e);
+  }
+
   if (alreadyApproved) {
     await generateFromTenancy(email, tenancyId);
   }
 
   await pool.query('UPDATE roomdetail SET available = 0, availablesoon = 0, updated_at = NOW() WHERE id = ?', [roomId]);
   for (const parkingId of selectedParkingLots) {
-    await pool.query('UPDATE parkinglot SET available = 0, updated_at = NOW() WHERE id = ?', [parkingId]);
+    const [r] = await pool.query(
+      'UPDATE parkinglot SET available = 0, updated_at = NOW() WHERE id = ? AND client_id = ? AND property_id = ? AND (available = 1 OR available IS NULL)',
+      [parkingId, clientId, room.property_id]
+    );
+    if (!r || r.affectedRows === 0) {
+      throw new Error('PARKING_NOT_AVAILABLE');
+    }
   }
 
   return { ok: true, tenancyId };
@@ -418,6 +628,12 @@ async function generateFromTenancy(email, tenancyId) {
     }
   }
 
+  try {
+    await upsertCommissionReleaseForTenancy(tenancy.client_id, tenancyId);
+  } catch (e) {
+    console.warn('[booking] upsertCommissionReleaseForTenancy after generateFromTenancy', e?.message || e);
+  }
+
   return { ok: true, inserted: records.length };
 }
 
@@ -491,6 +707,12 @@ async function generateFromTenancyByTenancyId(tenancyId, tenantId) {
     }
   }
 
+  try {
+    await upsertCommissionReleaseForTenancy(tenancy.client_id, tenancyId);
+  } catch (e) {
+    console.warn('[booking] upsertCommissionReleaseForTenancy after generateFromTenancyByTenancyId', e?.message || e);
+  }
+
   return { ok: true, inserted: records.length };
 }
 
@@ -500,6 +722,7 @@ module.exports = {
   getAvailableRooms,
   searchTenants,
   getTenant,
+  lookupTenantForBooking,
   getRoom,
   getParkingLotsByProperty,
   createBooking,

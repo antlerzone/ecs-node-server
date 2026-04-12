@@ -1,59 +1,58 @@
 /**
- * SQL Account API: Purchase Invoice / Cash Purchase.
- * Paths per Postman Collection (download from SQL Account); confirm with https://wiki.sql.com.my/wiki/SQL_Accounting_Linking
+ * SQL Account API: Purchase Invoice (Postman → /purchaseinvoice).
+ * Aligns with Bukku/Xero naming: list, read, create, update, remove.
  */
 
 const sqlaccountrequest = require('./sqlaccountrequest');
+const { purchaseInvoice: PATH } = require('../lib/postmanPaths');
 
-/**
- * List purchases. GET /Purchase or path from Postman.
- */
+function docPath(dockey) {
+  const d = encodeURIComponent(String(dockey ?? '').trim());
+  return `${PATH}/${d}`;
+}
+
+async function list(req, params = {}) {
+  return sqlaccountrequest({ req, method: 'get', path: PATH, params });
+}
+
+async function read(req, dockey) {
+  return sqlaccountrequest({ req, method: 'get', path: docPath(dockey) });
+}
+
+async function create(req, payload) {
+  return sqlaccountrequest({ req, method: 'post', path: PATH, data: payload || {} });
+}
+
+async function update(req, dockey, payload) {
+  return sqlaccountrequest({ req, method: 'put', path: docPath(dockey), data: payload || {} });
+}
+
+async function remove(req, dockey) {
+  return sqlaccountrequest({ req, method: 'delete', path: docPath(dockey) });
+}
+
 async function listPurchases(req, params = {}) {
-  return sqlaccountrequest({
-    req,
-    method: 'get',
-    path: '/Purchase',
-    params
-  });
+  return list(req, params);
 }
 
-/**
- * Get single purchase. GET /Purchase/{id}
- */
 async function getPurchase(req, purchaseId) {
-  return sqlaccountrequest({
-    req,
-    method: 'get',
-    path: `/Purchase/${encodeURIComponent(purchaseId)}`
-  });
+  return read(req, purchaseId);
 }
 
-/**
- * Create purchase. POST /Purchase
- * @param {object} payload - Purchase payload per SQL Account API
- */
 async function createPurchase(req, payload) {
-  return sqlaccountrequest({
-    req,
-    method: 'post',
-    path: '/Purchase',
-    data: payload || {}
-  });
+  return create(req, payload);
 }
 
-/**
- * Update purchase. PUT /Purchase/{id}
- */
 async function updatePurchase(req, purchaseId, payload) {
-  return sqlaccountrequest({
-    req,
-    method: 'put',
-    path: `/Purchase/${encodeURIComponent(purchaseId)}`,
-    data: payload || {}
-  });
+  return update(req, purchaseId, payload);
 }
 
 module.exports = {
+  list,
+  read,
+  create,
+  update,
+  remove,
   listPurchases,
   getPurchase,
   createPurchase,

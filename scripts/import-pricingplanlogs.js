@@ -120,7 +120,7 @@ async function run() {
     const s = String(wixId).trim();
     return map.get(s) || map.get(s.replace(/^!/, '')) || null;
   }
-  const clientMap = await loadMap('clientdetail');
+  const clientMap = await loadMap('operatordetail');
   const staffMap = await loadMap('staffdetail');
   const planMap = await loadMap('pricingplan');
 

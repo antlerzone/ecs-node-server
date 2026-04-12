@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Backfill RentalCollection receipturl</title>
+  <style>
+    body {
+      font-family: ui-monospace, monospace;
+      max-width: 720px;
+      margin: 1rem auto;
+      padding: 0 1rem;
+    }
+    label { display: block; margin-top: 0.75rem; }
+    input, button { font: inherit; padding: 0.35rem 0.5rem; }
+    #text1 {
+      display: block;
+      width: 100%;
+      min-height: 280px;
+      margin-top: 1rem;
+      padding: 0.75rem;
+      background: #1e1e1e;
+      color: #d4d4d4;
+      border: 1px solid #333;
+      border-radius: 4px;
+      font-size: 13px;
+      line-height: 1.4;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    button#button1 {
+      margin-top: 0.75rem;
+      cursor: pointer;
+    }
+    .row { margin-bottom: 0.5rem; }
+  </style>
+</head>
+<body>
+  <h1>Backfill receipturl (isPaid, no receipturl)</h1>
+  <p>Finds RentalCollection with <code>isPaid = true</code> and empty <code>receipturl</code>, then fills receipturl from Bukku (using <code>paidAt</code>).</p>
+  <div class="row">
+    <label>API base URL (e.g. https://api.yoursite.com)</label>
+    <input type="text" id="apiBase" placeholder="leave empty for same origin" style="width: 100%;" />
+  </div>
+  <div class="row">
+    <label>Email (staff email) or Client ID</label>
+    <input type="text" id="email" placeholder="staff@example.com or client UUID" style="width: 100%;" />
+  </div>
+  <div class="row">
+    <label>API Token (Bearer)</label>
+    <input type="password" id="apiToken" placeholder="optional if same-origin with session" style="width: 100%;" />
+  </div>
+  <div class="row">
+    <label>X-API-Username</label>
+    <input type="text" id="apiUsername" placeholder="optional" style="width: 100%;" />
+  </div>
+  <button type="button" id="button1">Run backfill</button>
+  <pre id="text1"></pre>
+
+  <script>
+    (function () {
+      const text1 = document.getElementById('text1');
+      const button1 = document.getElementById('button1');
+      const apiBase = document.getElementById('apiBase');
+      const email = document.getElementById('email');
+      const apiToken = document.getElementById('apiToken');
+      const apiUsername = document.getElementById('apiUsername');
+
+      function log(line) {
+        text1.textContent += line + '\n';
+        text1.scrollTop = text1.scrollHeight;
+      }
+
+      function clear() {
+        text1.textContent = '';
+      }
+
+      button1.addEventListener('click', async function () {
+        const base = (apiBase.value || '').trim() || (window.location.origin || '');
+        const url = base.replace(/\/$/, '') + '/api/sandbox/backfill-receipturl';
+        const raw = (email.value || '').trim();
+        if (!raw) {
+          log('[ERROR] Email or Client ID is required.');
+          return;
+        }
+        const body = /^[0-9a-fA-F-]{36}$/.test(raw) ? { clientId: raw } : { email: raw };
+        clear();
+        log('Request: POST ' + url);
+        log('Body: ' + JSON.stringify(body));
+        log('---');
+        button1.disabled = true;
+        try {
+          const headers = { 'Content-Type': 'application/json' };
+          const token = (apiToken.value || '').trim();
+          const username = (apiUsername.value || '').trim();
+          if (token) headers['Authorization'] = 'Bearer ' + token;
+          if (username) headers['X-API-Username'] = username;
+
+          const res = await fetch(url, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(body)
+          });
+          const data = await res.json().catch(() => ({}));
+
+          if (!res.ok) {
+            log('HTTP ' + res.status + ' ' + res.statusText);
+            log(JSON.stringify(data, null, 2));
+            return;
+          }
+
+          const total = data.total != null ? data.total : 0;
+          const success = data.success != null ? data.success : 0;
+          const failed = data.failed != null ? data.failed : 0;
+
+          log('Total:  ' + total);
+          log('Success: ' + success);
+          log('Failed:  ' + failed);
+          log('---');
+          if (Array.isArray(data.items) && data.items.length) {
+            data.items.forEach(function (item) {
+              if (item.status === 'ok') {
+                log('[OK] id=' + item.id + ' receipturl=' + (item.receipturl || ''));
+              } else {
+                log('[FAIL] id=' + item.id + ' reason=' + (item.reason || ''));
+              }
+            });
+          }
+        } catch (err) {
+          log('[ERROR] ' + (err.message || err));
+        } finally {
+          button1.disabled = false;
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

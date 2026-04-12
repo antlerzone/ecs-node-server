@@ -18,34 +18,48 @@ const {
   getActiveMeterProvidersByClient,
   getUsageSummary,
   syncMeterByCmsMeterId,
+  syncAllMeters,
   clientTopup,
+  clearMeterKwh,
   loadGroupList,
   deleteGroup,
   submitGroup,
   previewNewMeters,
-  insertMetersFromPreview
+  insertMetersFromPreview,
+  bindMeterToProperty
 } = require('./metersetting.service');
 const { requestNewToken, getValidCnyIotTokenForPlatform } = require('../cnyiot/lib/cnyiotToken.service');
 const { callCnyIotWithToken } = require('../cnyiot/wrappers/cnyiotRequest');
 const { getClientTel } = require('../cnyiot/lib/getClientTel');
+const { getClientSubdomain } = require('../cnyiot/lib/cnyiotSubuser');
 
 function getEmail(req) {
   return req.body?.email ?? req.query?.email ?? null;
 }
 
 async function requireClient(req, res, next) {
+  if (req.clientId != null && req.client) {
+    req.ctx = { client: req.client };
+    return next();
+  }
   const email = getEmail(req);
-  if (!email) {
-    return res.status(400).json({ ok: false, reason: 'NO_EMAIL' });
+  if (req.apiUser && !email) {
+    return res.status(403).json({ ok: false, reason: 'API_USER_NOT_BOUND_TO_CLIENT', message: 'API user must be bound to a client to access this resource' });
   }
+  if (req.apiUser && email) {
+    const ctx = await getAccessContextByEmail(email);
+    if (!ctx.ok) return res.status(403).json({ ok: false, reason: ctx.reason || 'ACCESS_DENIED' });
+    const clientId = ctx.client?.id;
+    if (!clientId) return res.status(403).json({ ok: false, reason: 'NO_CLIENT' });
+    req.ctx = ctx;
+    req.clientId = clientId;
+    return next();
+  }
+  if (!email) return res.status(400).json({ ok: false, reason: 'NO_EMAIL' });
   const ctx = await getAccessContextByEmail(email);
-  if (!ctx.ok) {
-    return res.status(403).json({ ok: false, reason: ctx.reason || 'ACCESS_DENIED' });
-  }
+  if (!ctx.ok) return res.status(403).json({ ok: false, reason: ctx.reason || 'ACCESS_DENIED' });
   const clientId = ctx.client?.id;
-  if (!clientId) {
-    return res.status(403).json({ ok: false, reason: 'NO_CLIENT' });
-  }
+  if (!clientId) return res.status(403).json({ ok: false, reason: 'NO_CLIENT' });
   req.ctx = ctx;
   req.clientId = clientId;
   next();
@@ -131,16 +145,25 @@ router.post('/update', requireClient, async (req, res, next) => {
   }
 });
 
-/** POST /api/metersetting/update-status – body: { email, meterId, status } */
+/** POST /api/metersetting/update-status – body: { email, meterId, status } → setRelay + hint for UI */
 router.post('/update-status', requireClient, async (req, res, next) => {
   try {
     const meterId = req.body?.meterId;
-    const status = req.body?.status !== false;
+    const s = req.body?.status;
+    const active =
+      s === true || s === 1 || s === '1' || s === 'true'
+        ? true
+        : s === false || s === 0 || s === '0' || s === 'false'
+          ? false
+          : null;
     if (!meterId) {
       return res.status(400).json({ ok: false, reason: 'NO_METER_ID' });
     }
-    await updateMeterStatus(req.clientId, meterId, status);
-    res.json({ ok: true });
+    if (active === null) {
+      return res.status(400).json({ ok: false, reason: 'STATUS_REQUIRED' });
+    }
+    const result = await updateMeterStatus(req.clientId, meterId, !!active);
+    res.json(result);
   } catch (err) {
     if (err.message === 'METER_NOT_FOUND') return res.status(404).json({ ok: false, reason: err.message });
     next(err);
@@ -158,6 +181,16 @@ router.post('/delete', requireClient, async (req, res, next) => {
     res.json({ ok: true });
   } catch (err) {
     if (err.message === 'METER_NOT_FOUND') return res.status(404).json({ ok: false, reason: err.message });
+    if (err.message === 'METER_PLATFORM_ID_MISSING') {
+      return res.status(400).json({ ok: false, reason: err.message });
+    }
+    if (String(err.message || '').startsWith('CNYIOT_DELETE_FAILED')) {
+      return res.status(400).json({
+        ok: false,
+        reason: err.message,
+        message: `CNYIOT refused to delete this meter (${err.message}). Fix on CNYIOT or try again.`
+      });
+    }
     next(err);
   }
 });
@@ -289,6 +322,7 @@ router.post('/debug-insert', requireClient, async (req, res, next) => {
         }
 
         const tel = await getClientTel(req.clientId).catch(() => '0');
+        const cnySub = (await getClientSubdomain(req.clientId).catch(() => null)) || '';
 
         // --- Step 1: getMetList_Simple (主账号) ---
         stepLog.push('1) getMetList_Simple: start');
@@ -308,16 +342,20 @@ router.post('/debug-insert', requireClient, async (req, res, next) => {
           const prepaid = (r) => (r.mode || 'prepaid') === 'prepaid';
           return records
             .filter((r) => (r.meterId || r.meterID || '').toString().trim() && (r.title || r.name || '').toString().trim())
-            .map((r, idx) => ({
-              MeterID: String(r.meterId || r.meterID || '').trim(),
-              MeterModel: prepaid(r) ? 0 : 1,
-              Name: String(r.title || r.name || '').trim() || `电表_${idx + 1}`,
-              PriceID: String(priceIdVal),
-              Tel: tel || '0',
-              Note: '',
-              UserID: userIdInMts,
-              index: String(indexBase + idx)
-            }));
+            .map((r, idx) => {
+              const mid = String(r.meterId || r.meterID || '').trim();
+              const nameOnPlatform = cnySub ? `${cnySub}${mid}` : mid;
+              return {
+                MeterID: mid,
+                MeterModel: prepaid(r) ? 0 : 1,
+                Name: nameOnPlatform || `电表_${idx + 1}`,
+                PriceID: String(priceIdVal),
+                Tel: tel || '0',
+                Note: '',
+                UserID: userIdInMts,
+                index: String(indexBase + idx)
+              };
+            });
         };
         const mts = buildMts(priceId);
         if (mts.length === 0) {
@@ -573,6 +611,7 @@ router.post('/debug-insert-step', requireClient, async (req, res, next) => {
         stepLog.push('【售电员试】addMeter 用 loginName=' + loginName + ' 的 token，body 仅 login id 不同');
       }
       const tel = await getClientTel(req.clientId).catch(() => '0');
+      const cnySub = (await getClientSubdomain(req.clientId).catch(() => null)) || '';
       const pricesRes = await callCnyIotWithToken({
         rawApiKey: addMeterToken.apiKey,
         loginID: addMeterToken.loginID,
@@ -599,16 +638,20 @@ router.post('/debug-insert-step', requireClient, async (req, res, next) => {
         const prepaid = (r) => (r.mode || 'prepaid') === 'prepaid';
         return records
           .filter((r) => (r.meterId || r.meterID || '').toString().trim() && (r.title || r.name || '').toString().trim())
-          .map((r, idx) => ({
-            MeterID: String(r.meterId || r.meterID || '').trim(),
-            MeterModel: prepaid(r) ? 0 : 1,
-            Name: String(r.title || r.name || '').trim() || `电表_${idx + 1}`,
-            PriceID: String(priceIdVal),
-            Tel: tel || '0',
-            Note: '',
-            UserID: userIdInMts,
-            index: String(indexBase + idx)
-          }));
+          .map((r, idx) => {
+            const mid = String(r.meterId || r.meterID || '').trim();
+            const nameOnPlatform = cnySub ? `${cnySub}${mid}` : mid;
+            return {
+              MeterID: mid,
+              MeterModel: prepaid(r) ? 0 : 1,
+              Name: nameOnPlatform || `电表_${idx + 1}`,
+              PriceID: String(priceIdVal),
+              Tel: tel || '0',
+              Note: '',
+              UserID: userIdInMts,
+              index: String(indexBase + idx)
+            };
+          });
       };
       const mts = buildMts(priceId);
       if (mts.length === 0) return res.json({ stepLog, error: 'NO_VALID_RECORDS' });
@@ -683,6 +726,18 @@ router.post('/insert-from-preview', requireClient, async (req, res, next) => {
     const records = req.body?.records || [];
     const result = await insertMetersFromPreview(req.clientId, records);
     return res.json({ ok: true, ...result });
+  } catch (err) {
+    return res.status(400).json({ ok: false, reason: err.message || String(err) });
+  }
+});
+
+/** POST /api/metersetting/bind-to-property – body: { meterId: cms UUID, propertyId } — whole unit, no room */
+router.post('/bind-to-property', requireClient, async (req, res, next) => {
+  try {
+    const meterId = req.body?.meterId;
+    const propertyId = req.body?.propertyId;
+    await bindMeterToProperty(req.clientId, meterId, propertyId);
+    return res.json({ ok: true });
   } catch (err) {
     return res.status(400).json({ ok: false, reason: err.message || String(err) });
   }
@@ -837,6 +892,23 @@ router.post('/usage-summary', requireClient, async (req, res, next) => {
   }
 });
 
+/** POST /api/metersetting/sync-all – sync every meter for this operator (CNYIoT → meterdetail) */
+router.post('/sync-all', requireClient, async (req, res, next) => {
+  try {
+    const result = await syncAllMeters(req.clientId);
+    res.json(result);
+  } catch (err) {
+    const msg = err?.message || '';
+    if (msg === 'CLIENT_ID_REQUIRED') {
+      return res.status(400).json({ ok: false, reason: msg });
+    }
+    if (msg === 'CNYIOT_NOT_CONFIGURED') {
+      return res.status(400).json({ ok: false, reason: 'CNYIOT_NOT_CONFIGURED' });
+    }
+    next(err);
+  }
+});
+
 /** POST /api/metersetting/sync – body: { email, meterId } (meterId = 11-digit CMS meterid) */
 router.post('/sync', requireClient, async (req, res, next) => {
   const body = { email: req.body?.email ? req.body.email.slice(0, 8) + '***' : undefined, meterId: req.body?.meterId };
@@ -866,16 +938,41 @@ router.post('/sync', requireClient, async (req, res, next) => {
 /** POST /api/metersetting/client-topup – body: { email, meterId, amount } */
 router.post('/client-topup', requireClient, async (req, res, next) => {
   try {
+    const meterCmsId = req.body?.meterCmsId || req.body?.meterDetailId;
     const meterId = req.body?.meterId;
     const amount = Number(req.body?.amount);
-    if (!meterId || Number.isNaN(amount) || amount <= 0) {
+    if ((!meterId && !meterCmsId) || Number.isNaN(amount) || amount <= 0) {
       return res.status(400).json({ ok: false, reason: 'INVALID_METER_OR_AMOUNT' });
     }
-    await clientTopup(req.clientId, meterId, amount);
-    res.json({ ok: true });
+    const result = await clientTopup(req.clientId, { meterCmsId, platformMid: meterId }, amount);
+    res.json(result);
   } catch (err) {
     if (err.message === 'TOPUP_PENDING_NO_IDX') {
       return res.status(400).json({ ok: false, reason: err.message });
+    }
+    next(err);
+  }
+});
+
+/** POST /api/metersetting/clear-kwh – body: { email, meterId } CMS UUID; prepaid only; CNYIOT clearKwh */
+router.post('/clear-kwh', requireClient, async (req, res, next) => {
+  try {
+    const meterId = req.body?.meterId;
+    if (!meterId) {
+      return res.status(400).json({ ok: false, reason: 'NO_METER_ID' });
+    }
+    const result = await clearMeterKwh(req.clientId, meterId);
+    res.json(result);
+  } catch (err) {
+    if (err.message === 'METER_NOT_FOUND') return res.status(404).json({ ok: false, reason: err.message });
+    if (err.message === 'CLEAR_KWH_PREPAID_ONLY') {
+      return res.status(400).json({ ok: false, reason: err.message, message: 'Clear kWh only applies to prepaid meters.' });
+    }
+    if (err.message === 'METER_PLATFORM_ID_MISSING') {
+      return res.status(400).json({ ok: false, reason: err.message });
+    }
+    if (String(err.message || '').startsWith('CNYIOT_CLEAR_KWH_FAILED_')) {
+      return res.status(400).json({ ok: false, reason: err.message, message: 'CNYIOT refused or failed to clear balance. Try Sync Meter.' });
     }
     next(err);
   }

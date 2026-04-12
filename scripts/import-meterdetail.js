@@ -1,21 +1,23 @@
 /**
- * Import meterdetail CSV. room, property, client, parentmeter -> _wixid/_id. Childmeter/Metersharing -> json.
+ * Import meterdetail CSV。0087 后：id = CSV ID；room/property/client/parentmeter 直接写入 _id 列，无效则 null。
  * Usage: node scripts/import-meterdetail.js [path], default ./meterdetail.csv
  */
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 const mysql = require('mysql2/promise');
 const fs = require('fs');
 const path = require('path');
-const { randomUUID } = require('crypto');
+const { resolveId } = require('./import-util');
+const { ONBOARD_OPERATOR_ID, skipCsvColumn } = require('./onboard-import-helpers');
 
 const csvPath = process.argv[2] || path.join(process.cwd(), 'meterdetail.csv');
 const table = 'meterdetail';
 
 const CSV_TO_DB = {
-  _id: 'wix_id', ID: 'wix_id', id: 'wix_id',
+  _id: 'id', ID: 'id', id: 'id',
   meterId: 'meterid', meterid: 'meterid',
-  room: 'room_wixid', Room: 'room_wixid', room_wixid: 'room_wixid',
-  property: 'property_wixid', Property: 'property_wixid', property_wixid: 'property_wixid',
+  cnyiotmeterid: 'cnyiotmeterid',
+  room: 'room_id', Room: 'room_id',
+  property: 'property_id', Property: 'property_id',
   mode: 'mode', balance: 'balance', rate: 'rate',
   lastSyncAt: 'lastsyncat', lastsyncat: 'lastsyncat',
   title: 'title', Title: 'title',
@@ -23,9 +25,9 @@ const CSV_TO_DB = {
   Productname: 'productname', productname: 'productname',
   Isonline: 'isonline', isonline: 'isonline',
   Status: 'status', status: 'status',
-  client: 'client_wixid', Client: 'client_wixid', CLIENT: 'client_wixid', client_wixid: 'client_wixid',
+  client: 'client_id', Client: 'client_id', CLIENT: 'client_id',
   Childmeter: 'childmeter_json', childmeter_json: 'childmeter_json',
-  Parentmeter: 'parentmeter_wixid', parentmeter_wixid: 'parentmeter_wixid',
+  Parentmeter: 'parentmeter_id', parentmeter_id: 'parentmeter_id',
   Metersharing: 'metersharing_json', metersharing_json: 'metersharing_json',
   _createdDate: 'created_at', _updatedDate: 'updated_at', 'Created Date': 'created_at', 'Updated Date': 'updated_at',
 };
@@ -77,21 +79,15 @@ async function run() {
   if (lines.length < 2) { console.error('CSV needs header + data.'); process.exit(1); }
   const rawHeaders = parseCsvLine(lines[0]);
   const headerToDb = (h) => {
-    const t = (h || '').trim();
+    const t = (h || '').trim().replace(/^"|"$/g, '');
     const k = CSV_TO_DB[t] || CSV_TO_DB[t.replace(/_date$/i, 'Date')] || t;
-    let col = (k === '_id' ? 'wix_id' : k).toLowerCase().replace(/^\s+|\s+$/g, '');
-    if (t.toLowerCase() === 'client') col = 'client_wixid';
-    if (t.toLowerCase() === 'room') col = 'room_wixid';
-    if (t.toLowerCase() === 'property') col = 'property_wixid';
-    if (t.toLowerCase() === 'parentmeter') col = 'parentmeter_wixid';
-    if (t.toLowerCase() === 'childmeter') col = 'childmeter_json';
-    if (t.toLowerCase() === 'metersharing') col = 'metersharing_json';
-    if (t.toLowerCase() === 'lastsyncat') col = 'lastsyncat';
-    if (t.toLowerCase() === 'customname') col = 'customname';
-    if (t.toLowerCase() === 'productname') col = 'productname';
-    if (t.toLowerCase() === 'isonline') col = 'isonline';
-    return col;
+    return String(k).toLowerCase().replace(/^\s+|\s+$/g, '');
   };
+
+  function stripBrackets(s) {
+    if (s == null || typeof s !== 'string') return s;
+    return String(s).trim().replace(/^\[|\]$/g, '').replace(/"/g, '').trim();
+  }
 
   const conn = await mysql.createConnection({
     host: process.env.DB_HOST,
@@ -107,19 +103,16 @@ async function run() {
   );
   const tableColumns = new Set(cols.map(c => (c.column_name || c.COLUMN_NAME || '').toLowerCase()));
 
-  async function loadMap(tbl) {
-    const [r] = await conn.query('SELECT id, wix_id FROM ' + tbl + ' WHERE wix_id IS NOT NULL');
-    return new Map(r.map(x => [x.wix_id, x.id]));
-  }
-  function resolve(map, wixId) {
-    if (!wixId) return null;
-    const s = String(wixId).trim();
-    return map.get(s) || map.get(s.replace(/^!/, '')) || null;
-  }
-  const roomMap = await loadMap('roomdetail');
-  const propertyMap = await loadMap('propertydetail');
-  const clientMap = await loadMap('clientdetail');
-  const meterMap = await loadMap('meterdetail');
+  const [roomRows, propertyRows, clientRows, meterRows] = await Promise.all([
+    conn.query('SELECT id FROM roomdetail').then(([r]) => r.map(x => x.id)),
+    conn.query('SELECT id FROM propertydetail').then(([r]) => r.map(x => x.id)),
+    conn.query('SELECT id FROM operatordetail').then(([r]) => r.map(x => x.id)),
+    conn.query('SELECT id FROM meterdetail').then(([r]) => r.map(x => x.id)),
+  ]);
+  const validRoomIds = new Set(roomRows);
+  const validPropertyIds = new Set(propertyRows);
+  const validClientIds = new Set(clientRows);
+  const validMeterIds = new Set(meterRows);
 
   const usedIds = new Set();
   let inserted = 0;
@@ -128,26 +121,31 @@ async function run() {
       const values = parseCsvLine(lines[i]);
       const row = {};
       rawHeaders.forEach((h, idx) => {
-        const dbKey = headerToDb(h);
+        if (skipCsvColumn(h)) return;
+        const dbKey = headerToDb((h || '').toString().replace(/^"|"$/g, ''));
         if (dbKey === '_owner') return;
         row[dbKey] = values[idx] !== undefined ? normalizeVal(values[idx]) : null;
       });
-      row.id = (() => { let u; do { u = randomUUID(); } while (usedIds.has(u)); usedIds.add(u); return u; })();
+      row.id = resolveId(row, usedIds);
+      for (const k of ['room_id', 'property_id', 'client_id', 'parentmeter_id']) {
+        if (row[k] != null) row[k] = stripBrackets(String(row[k])) || null;
+      }
+      if (row.room_id != null && !validRoomIds.has(row.room_id)) row.room_id = null;
+      if (row.property_id != null && !validPropertyIds.has(row.property_id)) row.property_id = null;
+      if (row.client_id != null && !validClientIds.has(row.client_id)) row.client_id = null;
+      row.client_id = ONBOARD_OPERATOR_ID;
+      if (row.parentmeter_id != null && !validMeterIds.has(row.parentmeter_id)) row.parentmeter_id = null;
       const now = new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
       if (!row.created_at) row.created_at = now;
       if (!row.updated_at) row.updated_at = now;
       if (row.isonline === null || row.isonline === undefined) row.isonline = 0;
       if (row.status === null || row.status === undefined) row.status = 1;
-      if (row.room_wixid) row.room_id = resolve(roomMap, row.room_wixid);
-      if (row.property_wixid) row.property_id = resolve(propertyMap, row.property_wixid);
-      if (row.client_wixid) row.client_id = resolve(clientMap, row.client_wixid);
-      if (row.parentmeter_wixid) row.parentmeter_id = resolve(meterMap, row.parentmeter_wixid);
       for (const key of ['childmeter_json', 'metersharing_json']) {
         if (row[key] != null && typeof row[key] === 'string' && row[key].trim()) {
           try { JSON.parse(row[key]); } catch (e) { row[key] = null; }
         }
       }
-      const hasData = [row.wix_id, row.meterid, row.title].some(v => v != null && String(v).trim() !== '');
+      const hasData = [row.id, row.meterid, row.title].some(v => v != null && String(v).trim() !== '');
       if (!hasData) continue;
       const keys = Object.keys(row).filter(k => tableColumns.has(k.toLowerCase()));
       if (!keys.length) continue;

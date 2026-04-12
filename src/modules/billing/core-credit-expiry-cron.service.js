@@ -6,7 +6,7 @@
 const pool = require('../../config/db');
 const { randomUUID } = require('crypto');
 const { getTodayMalaysiaDate } = require('../../utils/dateMalaysia');
-const { syncSubtablesFromClientdetail } = require('../../services/client-subtables');
+const { syncSubtablesFromOperatordetail } = require('../../services/client-subtables');
 const { clearBillingCacheByClientId } = require('./billing.service');
 
 function parseJson(val) {
@@ -23,7 +23,7 @@ async function runCoreCreditExpiryCheck() {
   const today = getTodayMalaysiaDate(); // 'YYYY-MM-DD'
 
   const [rows] = await pool.query(
-    `SELECT id, credit FROM clientdetail WHERE credit IS NOT NULL AND TRIM(credit) != '' AND TRIM(credit) != '[]'`
+    `SELECT id, credit FROM operatordetail WHERE credit IS NOT NULL AND TRIM(credit) != '' AND TRIM(credit) != '[]'`
   );
 
   const expiredByClient = [];
@@ -65,8 +65,8 @@ async function runCoreCreditExpiryCheck() {
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
-      await conn.query('UPDATE clientdetail SET credit = ?, updated_at = ? WHERE id = ?', [JSON.stringify(newCredit), now, clientId]);
-      await syncSubtablesFromClientdetail(conn, clientId);
+      await conn.query('UPDATE operatordetail SET credit = ?, updated_at = ? WHERE id = ?', [JSON.stringify(newCredit), now, clientId]);
+      await syncSubtablesFromOperatordetail(conn, clientId);
       await conn.query(
         `INSERT INTO creditlogs (id, title, type, amount, client_id, staff_id, reference_number, payload, remark, created_at, updated_at)
          VALUES (?, ?, 'Expired', ?, ?, NULL, ?, ?, ?, ?, ?)`,

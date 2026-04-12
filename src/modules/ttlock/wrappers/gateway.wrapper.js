@@ -32,7 +32,11 @@ async function renameGateway(clientId, gatewayId, gatewayName) {
   const auth = await getTtlockAuth(clientId);
   const data = await ttlockPost('/gateway/rename', auth, { gatewayId, gatewayName });
   if (data?.errcode !== 0 && data?.errcode !== undefined) {
-    throw new Error(`TTLOCK_GATEWAY_RENAME_FAILED: ${data?.errmsg || 'unknown'}`);
+    const msg = data?.errmsg || 'unknown';
+    if (/identical Name|already exists/i.test(String(msg))) {
+      throw new Error(`TTLOCK_DUPLICATE_GATEWAY_NAME: ${msg}`);
+    }
+    throw new Error(`TTLOCK_GATEWAY_RENAME_FAILED: ${msg}`);
   }
   return data;
 }

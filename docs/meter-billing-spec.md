@@ -4,7 +4,7 @@
 
 ---
 
-## 1. 基础统一规则
+## 1. 基础统一规则（含 CNYIoT 调用模型）
 
 ### 基本公式
 
@@ -17,7 +17,10 @@ sharedUsage     = parentUsage − totalChildUsage   （不低于 0）
 - **AUTO**：`sharedUsage = max(parentUsage − totalChildUsage, 0)`（系统按主表与子表读数自动算「剩余用量」）。
 - **MANUAL**：`sharedUsage = parentUsage`（不扣子表，以管理员输入的 TNB 总账单对应主表用量为基数）。
 
-**Remark**：用量数据来源统一为 CNYIoT `getMonthBill`（见 `src/modules/cnyiot/wrappers/meter.wrapper.js` → `getUsageSummary`），按 `meterIds` 与 `start/end` 取各表用量，得到 `children[meterId]` 与 `total`。
+**Remark**：
+
+- 用量数据来源统一为 CNYIoT `getMonthBill`（见 `src/modules/cnyiot/wrappers/meter.wrapper.js` → `getUsageSummary`），按 `meterIds` 与 `start/end` 取各表用量，得到 `children[meterId]` 与 `total`。
+- **CNYIoT 调用一律使用平台主账号**：后端通过 env `CNYIOT_LOGIN_NAME` / `CNYIOT_LOGIN_PSW` 获取平台账号，统一登录并缓存 token；每个 client 只在本地维护 `meterdetail`、`client_integration` 中的配置（如 `cnyiot_subuser_id`），**不再需要为每个 client 单独存 CNYIOT username/password**。
 
 ---
 

@@ -6,30 +6,28 @@ require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') }
 const mysql = require('mysql2/promise');
 const fs = require('fs');
 const path = require('path');
-const { randomUUID } = require('crypto');
+const { resolveId } = require('./import-util');
+const { ONBOARD_OPERATOR_ID, skipCsvColumn } = require('./onboard-import-helpers');
 
 const csvPath = process.argv[2] || path.join(process.cwd(), 'Tenancy.csv');
 const table = 'tenancy';
 
 const CSV_TO_DB = {
-  _id: 'wix_id',
-  ID: 'wix_id',
-  id: 'wix_id',
-  tenant: 'tenant_wixid',
-  Tenant: 'tenant_wixid',
-  tenant_wixid: 'tenant_wixid',
-  room: 'room_wixid',
-  Room: 'room_wixid',
-  room_wixid: 'room_wixid',
+  _id: 'id',
+  ID: 'id',
+  id: 'id',
+  tenant: 'tenant_id',
+  Tenant: 'tenant_id',
+  room: 'room_id',
+  Room: 'room_id',
   begin: 'begin',
   Begin: 'begin',
   end: 'end',
   End: 'end',
   rental: 'rental',
   Rental: 'rental',
-  submitby: 'submitby_wixid',
-  Submitby: 'submitby_wixid',
-  submitby_wixid: 'submitby_wixid',
+  submitby: 'submitby_id',
+  Submitby: 'submitby_id',
   title: 'title',
   Title: 'title',
   billurl: 'billsurl',
@@ -57,10 +55,9 @@ const CSV_TO_DB = {
   remark: 'remark',
   Payment: 'payment',
   payment: 'payment',
-  client: 'client_wixid',
-  Client: 'client_wixid',
-  CLIENT: 'client_wixid',
-  client_wixid: 'client_wixid',
+  client: 'client_id',
+  Client: 'client_id',
+  CLIENT: 'client_id',
   _createdDate: 'created_at',
   _updatedDate: 'updated_at',
   'Created Date': 'created_at',
@@ -123,13 +120,21 @@ async function run() {
   const headerToDb = (h) => {
     const trimmed = (h || '').trim();
     const key = CSV_TO_DB[trimmed] || CSV_TO_DB[trimmed.replace(/_date$/i, 'Date')] || trimmed;
-    let dbCol = (key === '_id' ? 'wix_id' : key).toLowerCase().replace(/^\s+|\s+$/g, '');
-    if (trimmed.toLowerCase() === 'client') dbCol = 'client_wixid';
-    if (trimmed.toLowerCase() === 'tenant') dbCol = 'tenant_wixid';
-    if (trimmed.toLowerCase() === 'room') dbCol = 'room_wixid';
-    if (trimmed.toLowerCase() === 'submitby') dbCol = 'submitby_wixid';
-    return dbCol;
+    return String(key).toLowerCase().replace(/^\s+|\s+$/g, '');
   };
+
+  function stripBrackets(s) {
+    if (s == null || typeof s !== 'string') return s;
+    return String(s).trim().replace(/^\[|\]$/g, '').replace(/"/g, '').trim();
+  }
+
+  const datetimeRegex = /^\d{4}-\d{2}-\d{2}([T\s][\d.:]+Z?)?$/i;
+  function sanitizeDatetime(val) {
+    if (val == null || val === '') return null;
+    const s = String(val).trim();
+    if (!datetimeRegex.test(s)) return null;
+    return s.replace('T', ' ').replace(/\.\d+Z?$/i, '').replace(/Z$/i, '');
+  }
 
   const conn = await mysql.createConnection({
     host: process.env.DB_HOST,
@@ -145,19 +150,16 @@ async function run() {
   );
   const tableColumns = new Set(cols.map(c => (c.column_name || c.COLUMN_NAME || '').toLowerCase()));
 
-  async function loadWixIdMap(refTable) {
-    const [rows] = await conn.query('SELECT id, wix_id FROM ' + refTable + ' WHERE wix_id IS NOT NULL');
-    return new Map(rows.map(r => [r.wix_id, r.id]));
-  }
-  function resolveWixId(map, wixId) {
-    if (!wixId) return null;
-    const s = String(wixId).trim();
-    return map.get(s) || map.get(s.replace(/^!/, '')) || null;
-  }
-  const tenantMap = await loadWixIdMap('tenantdetail');
-  const roomMap = await loadWixIdMap('roomdetail');
-  const staffMap = await loadWixIdMap('staffdetail');
-  const clientMap = await loadWixIdMap('clientdetail');
+  const [[t], [r], [s], [c]] = await Promise.all([
+    conn.query('SELECT id FROM tenantdetail').then(([rows]) => [rows.map(x => x.id)]),
+    conn.query('SELECT id FROM roomdetail').then(([rows]) => [rows.map(x => x.id)]),
+    conn.query('SELECT id FROM staffdetail').then(([rows]) => [rows.map(x => x.id)]),
+    conn.query('SELECT id FROM operatordetail').then(([rows]) => [rows.map(x => x.id)]),
+  ]);
+  const validTenantIds = new Set(t);
+  const validRoomIds = new Set(r);
+  const validStaffIds = new Set(s);
+  const validClientIds = new Set(c);
 
   const usedIds = new Set();
   let inserted = 0;
@@ -166,24 +168,42 @@ async function run() {
       const values = parseCsvLine(lines[i]);
       const row = {};
       rawHeaders.forEach((h, idx) => {
+        if (skipCsvColumn(h)) return;
         const dbKey = headerToDb(h);
         if (dbKey === '_owner') return;
         row[dbKey] = values[idx] !== undefined ? normalizeVal(values[idx]) : null;
       });
-      row.id = (() => { let uid; do { uid = randomUUID(); } while (usedIds.has(uid)); usedIds.add(uid); return uid; })();
+      row.id = resolveId(row, usedIds);
+      if (row.tenant_id != null) row.tenant_id = stripBrackets(String(row.tenant_id)) || null;
+      if (row.room_id != null) row.room_id = stripBrackets(String(row.room_id)) || null;
+      if (row.submitby_id != null) row.submitby_id = stripBrackets(String(row.submitby_id)) || null;
+      if (row.client_id != null) row.client_id = stripBrackets(String(row.client_id)) || null;
+      if (row.tenant_id != null && !validTenantIds.has(row.tenant_id)) row.tenant_id = null;
+      if (row.room_id != null && !validRoomIds.has(row.room_id)) row.room_id = null;
+      if (row.submitby_id != null && !validStaffIds.has(row.submitby_id)) row.submitby_id = null;
+      if (row.client_id != null && !validClientIds.has(row.client_id)) row.client_id = null;
+      row.client_id = ONBOARD_OPERATOR_ID;
       const now = new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
-      if (!row.created_at) row.created_at = now;
-      if (!row.updated_at) row.updated_at = now;
-      if (row.signagreement === null || row.signagreement === undefined) row.signagreement = 0;
-      if (row.checkbox === null || row.checkbox === undefined) row.checkbox = 0;
-      if (row.status === null || row.status === undefined) row.status = 1;
-      if (row.payment === null || row.payment === undefined) row.payment = 0;
-      const hasData = [row.wix_id, row.tenant_wixid, row.room_wixid, row.begin, row.title].some(v => v !== null && v !== undefined && String(v).trim() !== '');
+      row.created_at = sanitizeDatetime(row.created_at) || now;
+      row.updated_at = sanitizeDatetime(row.updated_at) || now;
+      const tinyint01 = (v, def) => { const n = parseInt(String(v || ''), 10); return (n === 0 || n === 1) ? n : def; };
+      row.signagreement = tinyint01(row.signagreement, 0);
+      row.checkbox = tinyint01(row.checkbox, 0);
+      row.status = tinyint01(row.status, 1);
+      row.payment = tinyint01(row.payment, 0);
+      const hasData = [row.id, row.tenant_id, row.room_id, row.begin, row.title].some(v => v !== null && v !== undefined && String(v).trim() !== '');
       if (!hasData) continue;
-      if (row.tenant_wixid) row.tenant_id = resolveWixId(tenantMap, row.tenant_wixid);
-      if (row.room_wixid) row.room_id = resolveWixId(roomMap, row.room_wixid);
-      if (row.submitby_wixid) row.submitby_id = resolveWixId(staffMap, row.submitby_wixid);
-      if (row.client_wixid) row.client_id = resolveWixId(clientMap, row.client_wixid);
+      if (row.title != null && String(row.title).length > 255) row.title = String(row.title).substring(0, 255);
+      if (row.billsurl != null && String(row.billsurl).length > 255) row.billsurl = String(row.billsurl).substring(0, 255);
+      if (row.billsid != null && String(row.billsid).length > 100) row.billsid = String(row.billsid).substring(0, 100);
+      if (row.rental != null && row.rental !== '') {
+        const n = parseFloat(String(row.rental).trim());
+        if (Number.isNaN(n)) row.rental = null; else row.rental = n;
+      }
+      if (row.begin != null || row.end != null) {
+        row.begin = sanitizeDatetime(row.begin);
+        row.end = sanitizeDatetime(row.end);
+      }
       const keys = Object.keys(row).filter(k => tableColumns.has(k.toLowerCase()));
       if (keys.length === 0) continue;
       const colsList = keys.map(k => '`' + k + '`').join(', ');

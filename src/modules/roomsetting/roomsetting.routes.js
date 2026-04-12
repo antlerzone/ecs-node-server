@@ -5,10 +5,12 @@
 
 const express = require('express');
 const router = express.Router();
-const { getAccessContextByEmail } = require('../access/access.service');
+const pool = require('../../config/db');
+const { getAccessContextByEmail, getAccessContextByEmailAndClient } = require('../access/access.service');
 const {
   getRooms,
   getRoomFilters,
+  getActiveRoomCount,
   getRoom,
   updateRoom,
   insertRooms,
@@ -17,7 +19,9 @@ const {
   updateRoomMeter,
   updateRoomSmartDoor,
   getTenancyForRoom,
-  setRoomActive
+  setRoomActive,
+  deleteRoom,
+  syncRoomAvailabilityFromTenancy
 } = require('./roomsetting.service');
 
 function getEmail(req) {
@@ -25,7 +29,57 @@ function getEmail(req) {
 }
 
 async function requireClient(req, res, next) {
+  if (req.clientId != null && req.client) {
+    req.ctx = { client: req.client };
+    return next();
+  }
   const email = getEmail(req);
+  const bodyClientId = req.body?.clientId ?? req.query?.clientId ?? null;
+
+  // When API user has no client_id (e.g. portal proxy), resolve client from body email or clientId.
+  if (req.apiUser && !email) {
+    return res.status(403).json({ ok: false, reason: 'API_USER_NOT_BOUND_TO_CLIENT', message: 'API user must be bound to a client to access this resource' });
+  }
+  if (req.apiUser && email) {
+    const ctx = await getAccessContextByEmail(email);
+    if (!ctx.ok) {
+      // Operator dashboard: allow through with empty data when email has no context (e.g. not in staff/saasadmin yet).
+      req.clientId = null;
+      req.noClientAllowEmpty = true;
+      return next();
+    }
+    let clientId = ctx.client?.id;
+    if (clientId) {
+      req.ctx = ctx;
+      req.clientId = clientId;
+      return next();
+    }
+    // No client from context (e.g. SaaS admin or staff not yet resolved): try body clientId.
+    if (bodyClientId) {
+      const ctxWithClient = await getAccessContextByEmailAndClient(email, bodyClientId);
+      if (ctxWithClient.ok && ctxWithClient.client?.id) {
+        req.ctx = ctxWithClient;
+        req.clientId = ctxWithClient.client.id;
+        return next();
+      }
+      // SaaS admin can act as any client: allow if client exists and is active.
+      if (ctx.isSaasAdmin) {
+        const [[row]] = await pool.query(
+          'SELECT id, title, status FROM operatordetail WHERE id = ? LIMIT 1',
+          [bodyClientId]
+        );
+        if (row && (row.status === 1 || row.status === true)) {
+          req.ctx = { client: { id: row.id, title: row.title }, isSaasAdmin: true };
+          req.clientId = row.id;
+          return next();
+        }
+      }
+    }
+    // No client and no body clientId: allow through with empty data (operator dashboard no selection).
+    req.clientId = null;
+    req.noClientAllowEmpty = true;
+    return next();
+  }
   if (!email) {
     return res.status(400).json({ ok: false, reason: 'NO_EMAIL' });
   }
@@ -42,16 +96,21 @@ async function requireClient(req, res, next) {
   next();
 }
 
-/** POST /api/roomsetting/list – body: { email, keyword?, propertyId?, sort?, page?, pageSize?, limit? } */
+/** POST /api/roomsetting/list – body: { email, clientId?, keyword?, propertyId?, sort?, page?, pageSize?, limit? } */
 router.post('/list', requireClient, async (req, res, next) => {
   try {
+    if (req.noClientAllowEmpty) {
+      return res.json({ items: [], total: 0, totalPages: 0, currentPage: 1 });
+    }
     const opts = {
       keyword: req.body?.keyword,
       propertyId: req.body?.propertyId,
       sort: req.body?.sort,
       page: req.body?.page,
       pageSize: req.body?.pageSize,
-      limit: req.body?.limit
+      limit: req.body?.limit,
+      availability: req.body?.availability,
+      activeFilter: req.body?.activeFilter
     };
     console.log('[roomsetting] POST /list clientId=', req.clientId, 'opts=', JSON.stringify(opts));
     const result = await getRooms(req.clientId, opts);
@@ -62,13 +121,29 @@ router.post('/list', requireClient, async (req, res, next) => {
   }
 });
 
-/** POST /api/roomsetting/filters – body: { email } → { properties } */
+/** POST /api/roomsetting/filters – body: { email, clientId? } → { properties } */
 router.post('/filters', requireClient, async (req, res, next) => {
   try {
+    if (req.noClientAllowEmpty) {
+      return res.json({ properties: [] });
+    }
     console.log('[roomsetting] POST /filters clientId=', req.clientId);
     const result = await getRoomFilters(req.clientId);
     console.log('[roomsetting] GET /filters properties.length=', result.properties?.length);
     res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** POST /api/roomsetting/active-room-count – body: { email, clientId? } → { activeRoomCount } */
+router.post('/active-room-count', requireClient, async (req, res, next) => {
+  try {
+    if (req.noClientAllowEmpty) {
+      return res.json({ ok: true, activeRoomCount: 0 });
+    }
+    const count = await getActiveRoomCount(req.clientId);
+    res.json({ ok: true, activeRoomCount: count });
   } catch (err) {
     next(err);
   }
@@ -87,6 +162,29 @@ router.post('/get', requireClient, async (req, res, next) => {
     }
     res.json(room);
   } catch (err) {
+    next(err);
+  }
+});
+
+/** POST /api/roomsetting/sync-availability – body: { email, roomId } — recompute available flags from tenancy rows (not a free-form override) */
+router.post('/sync-availability', requireClient, async (req, res, next) => {
+  try {
+    if (req.noClientAllowEmpty) {
+      return res.status(403).json({ ok: false, reason: 'NO_CLIENT' });
+    }
+    const roomId = req.body?.roomId;
+    if (!roomId) {
+      return res.status(400).json({ ok: false, reason: 'NO_ROOM_ID' });
+    }
+    const result = await syncRoomAvailabilityFromTenancy(req.clientId, roomId);
+    res.json(result);
+  } catch (err) {
+    if (err.message === 'ROOM_NOT_FOUND') {
+      return res.status(404).json({ ok: false, reason: err.message });
+    }
+    if (err.message === 'NO_ROOM_ID') {
+      return res.status(400).json({ ok: false, reason: err.message });
+    }
     next(err);
   }
 });
@@ -113,6 +211,9 @@ router.post('/update', requireClient, async (req, res, next) => {
   } catch (err) {
     if (err.message === 'ROOM_NOT_FOUND') {
       return res.status(404).json({ ok: false, reason: err.message });
+    }
+    if (err.message === 'PROPERTY_INACTIVE_CANNOT_ACTIVATE_ROOM' || err.message === 'PROPERTY_ARCHIVED_CANNOT_ACTIVATE_ROOM') {
+      return res.status(400).json({ ok: false, reason: err.message });
     }
     next(err);
   }
@@ -146,7 +247,30 @@ router.post('/set-active', requireClient, async (req, res, next) => {
     if (err.message === 'ROOM_NOT_FOUND') {
       return res.status(404).json({ ok: false, reason: err.message });
     }
-    if (err.message === 'REMOVE_METER_OR_SMART_DOOR_FIRST') {
+    if (err.message === 'PROPERTY_INACTIVE_CANNOT_ACTIVATE_ROOM' || err.message === 'PROPERTY_ARCHIVED_CANNOT_ACTIVATE_ROOM') {
+      return res.status(400).json({ ok: false, reason: err.message });
+    }
+    next(err);
+  }
+});
+
+/** POST /api/roomsetting/delete – body: { email, roomId } */
+router.post('/delete', requireClient, async (req, res, next) => {
+  try {
+    const roomId = req.body?.roomId;
+    if (!roomId) {
+      return res.status(400).json({ ok: false, reason: 'NO_ROOM_ID' });
+    }
+    await deleteRoom(req.clientId, roomId);
+    res.json({ ok: true });
+  } catch (err) {
+    if ([
+      'ROOM_NOT_FOUND',
+      'ROOM_HAS_ONGOING_TENANCY',
+      'ROOM_METER_BOUND',
+      'ROOM_SMARTDOOR_BOUND',
+      'NO_ROOM_ID'
+    ].includes(err.message)) {
       return res.status(400).json({ ok: false, reason: err.message });
     }
     next(err);

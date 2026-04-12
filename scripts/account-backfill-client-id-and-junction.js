@@ -1,5 +1,5 @@
 /**
- * 1) 第一层 junction：用 account.client_wixid 回填 account.client_id（clientdetail.wix_id → clientdetail.id）
+ * 1) 第一层 junction：用 account.client_wixid 回填 account.client_id（operatordetail.wix_id → operatordetail.id）
  * 2) 第二层：用 account.account_json 回填 account_client，其中 clientId/wix_id 解析为 client_id 再写入
  * 全部使用列名 client_id，不用 client。
  * ECS 执行: cd /home/ecs-user/app && node scripts/account-backfill-client-id-and-junction.js
@@ -41,7 +41,7 @@ async function run() {
   const [accountRows] = await conn.query(
     'SELECT id, client_wixid FROM account WHERE client_wixid IS NOT NULL AND TRIM(client_wixid) != ""'
   );
-  const [clientRows] = await conn.query('SELECT id, wix_id FROM clientdetail WHERE wix_id IS NOT NULL');
+  const [clientRows] = await conn.query('SELECT id, wix_id FROM operatordetail WHERE wix_id IS NOT NULL');
   const wixIdToId = new Map(clientRows.map((r) => [String(r.wix_id).trim(), r.id]));
 
   let step1Updated = 0;

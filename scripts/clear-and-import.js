@@ -1,7 +1,7 @@
 /**
  * 先清空表数据，再导入 CSV。
  * 用法：node scripts/clear-and-import.js <表名> [csv路径]
- * 表名：clientdetail | propertydetail | ownerdetail | tenantdetail
+ * 表名：operatordetail | propertydetail | ownerdetail | tenantdetail
  * 默认 csv 路径：./<表名>.csv
  *
  * 例：node scripts/clear-and-import.js tenantdetail
@@ -15,7 +15,7 @@ const table = process.argv[2];
 const csvPath = process.argv[3] || path.join(process.cwd(), table + '.csv');
 
 const ALLOWED = {
-  clientdetail: { truncate: 'truncate-clientdetail.js', import: 'import-clientdetail.js' },
+  operatordetail: { truncate: 'truncate-operatordetail.js', import: 'import-operatordetail.js' },
   propertydetail: { truncate: 'truncate-propertydetail.js', import: 'import-propertydetail.js' },
   ownerdetail: { truncate: 'truncate-ownerdetail.js', import: 'import-ownerdetail.js' },
   tenantdetail: { truncate: 'truncate-tenantdetail.js', import: 'import-tenantdetail.js' },
@@ -23,7 +23,7 @@ const ALLOWED = {
 
 if (!table || !ALLOWED[table]) {
   console.error('Usage: node scripts/clear-and-import.js <table> [csv_path]');
-  console.error('Table must be one of: clientdetail, propertydetail, ownerdetail, tenantdetail');
+  console.error('Table must be one of: operatordetail, propertydetail, ownerdetail, tenantdetail');
   process.exit(1);
 }
 

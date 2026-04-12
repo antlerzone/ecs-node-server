@@ -17,7 +17,7 @@ async function getClientSubdomain(clientId) {
   );
   if (profileRows.length > 0) return String(profileRows[0].subdomain).trim().toLowerCase();
   const [clientRows] = await pool.query(
-    'SELECT subdomain FROM clientdetail WHERE id = ? LIMIT 1',
+    'SELECT subdomain FROM operatordetail WHERE id = ? LIMIT 1',
     [clientId]
   );
   if (clientRows.length > 0 && clientRows[0].subdomain) {
@@ -99,7 +99,7 @@ async function ensureTTLockSubuser(clientId, defaultPassword = DEFAULT_PASSWORD)
   });
 
   await pool.query(
-    'UPDATE clientdetail SET ttlock_username = ?, ttlock_manual = 0, updated_at = NOW() WHERE id = ?',
+    'UPDATE operatordetail SET ttlock_username = ?, ttlock_manual = 0, updated_at = NOW() WHERE id = ?',
     [username, clientId]
   );
   return { username, created: true };

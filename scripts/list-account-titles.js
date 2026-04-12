@@ -15,17 +15,16 @@ async function run() {
   });
   try {
     const [rows] = await conn.query(
-      'SELECT id, title, type, bukkuaccounttype FROM account ORDER BY title ASC'
+      'SELECT id, title, type FROM account ORDER BY title ASC'
     );
     console.log('# Default account items (from account table)\n');
-    console.log('| id | title | type | bukkuaccounttype |');
-    console.log('|----|-------|------|------------------|');
+    console.log('| id | title | type |');
+    console.log('|----|-------|------|');
     for (const r of rows) {
       const id = (r.id || '').substring(0, 8) + '…';
       const title = String(r.title || '').replace(/\|/g, '\\|');
       const type = String(r.type || '');
-      const bukku = String(r.bukkuaccounttype || '');
-      console.log(`| ${id} | ${title} | ${type} | ${bukku} |`);
+      console.log(`| ${id} | ${title} | ${type} |`);
     }
     console.log('\n# Titles only (for doc)\n');
     rows.forEach((r) => console.log('-', r.title || '(no title)'));

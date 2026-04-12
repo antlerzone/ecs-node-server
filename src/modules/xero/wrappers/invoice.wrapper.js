@@ -72,9 +72,16 @@ async function getOnlineInvoiceUrl(req, invoiceId) {
     tenantId
   });
   if (!res.ok) return { ok: false, error: res.error?.Message || res.error || 'XERO_ONLINE_INVOICE_FAILED' };
-  const url = res.data?.OnlineInvoices?.OnlineInvoice?.OnlineInvoiceUrl
-    ?? res.data?.OnlineInvoice?.OnlineInvoiceUrl
-    ?? res.data?.OnlineInvoiceUrl;
+  const oi = res.data?.OnlineInvoices;
+  const url =
+    // Common shape: { OnlineInvoices: [ { OnlineInvoiceUrl } ] }
+    (Array.isArray(oi) ? oi[0]?.OnlineInvoiceUrl : null) ??
+    // Alternative shape: { OnlineInvoices: { OnlineInvoice: { OnlineInvoiceUrl } } }
+    oi?.OnlineInvoice?.OnlineInvoiceUrl ??
+    // Alternative shape: { OnlineInvoice: { OnlineInvoiceUrl } }
+    res.data?.OnlineInvoice?.OnlineInvoiceUrl ??
+    // Direct fallback
+    res.data?.OnlineInvoiceUrl;
   return url ? { ok: true, url: String(url) } : { ok: false, error: 'NO_ONLINE_INVOICE_URL' };
 }
 

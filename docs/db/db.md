@@ -93,7 +93,7 @@ database design (draft)
 > 原 clientdetail 的 status、expired、pricingplanid、currency 等统一小写处理。  
 > 集合中的数组字段与复杂结构会拆到子表。
 
-**可选（migration 0002）**：为 clientdetail 增加四列 `integration`、`profile`、`pricingplandetail`、`credit`（TEXT），用于在主表存 JSON；服务 `syncSubtablesFromClientdetail` 可据此从主表同步到 4 张子表。详见 [import-clientdetail.md](./import-clientdetail.md)。
+**可选（migration 0002）**：为 clientdetail 增加四列 `integration`、`profile`、`pricingplandetail`、`credit`（TEXT），用于在主表存 JSON；服务 `syncSubtablesFromOperatordetail` 可据此从主表同步到 4 张子表。详见 [import-operatordetail.md](./import-operatordetail.md)。
 
 ### clientdetail 相关子表（拆分数组 / 对象）
 

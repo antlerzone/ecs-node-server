@@ -1,0 +1,31 @@
+---
+description: Cleanlemons 运营商主键 — 一律 cln_operatordetail.id（UUID）
+globs: cleanlemon/**/*,src/modules/cleanlemon/**/*,src/db/migrations/*.sql
+alwaysApply: false
+---
+
+# Cleanlemons 运营商主表：`cln_operatordetail`
+
+- **`cln_operatordetail.id`**（`CHAR(36)`，与 Wix/CMS UUID 同形）是 **Cleanlemons 侧唯一的「公司 / 运营商」主键**。迁移 **0198** 由 `cln_operator` 改名而来。
+- **凡属运营商维度下的业务数据**，都必须能追溯到这张主表，**不得**用未落库的虚构 id、也不得用其它表代替「谁是运营商」。
+
+## 必须挂主表 UUID 的典型域（示例）
+
+- **Accounting / 科目与映射**：Bukku/Xero 等映射、operator 级 account 配置 — `operator_id` / 关联列指向 `cln_operatordetail.id`。
+- **Staff**：`cln_employeedetail`（人员主档）+ `cln_employee_operator`（`operator_id`、`staff_role`）→ `cln_operatordetail.id`。
+- **Agreement template**：`cln_operator_agreement_template.operator_id` → `cln_operatordetail.id`（0197 / 0199）。
+- **Property**：`cln_property.operator_id` 语义同上（应为 UUID；若列为 VARCHAR 仅兼容历史，新写入仍用主表 `id`）。
+- **Schedule / team / calendar**：如 `cln_operator_team`、日历与排班相关表 — `operator_id` / `operatordetail_id` → `cln_operatordetail.id`。
+- **Invoice / 计费 / 订阅**：运营商发票、套餐、`cln_operator_subscription.operator_id` — **0200** 起 FK → `cln_operatordetail.id`。
+
+## 列名约定（与全库 `_id` 规则一致）
+
+- 指向运营商主表时，代码与迁移里常见 **`operatordetail_id`** 或 **`operator_id`** 两种列名；**语义相同**：均为 **FK → `cln_operatordetail.id`**。
+- 新建表或新列：优先与邻近 `cln_*` 表保持一致；**必须**在能确定时加 InnoDB FK，避免孤儿行。
+
+## Node / Portal
+
+- 解析主表名用 **`resolveClnOperatordetailTable()`**（`src/config/clnOperatordetailTable.js`）；生产目标表为 **`cln_operatordetail`**。
+- 写入订阅等前须有主表行（参见 **`assertClnOperatorMasterRowExists`** / `OPERATORDETAIL_REQUIRED`）。
+
+与 Coliving 的 **`operatordetail`**（`client_id`）平行：Cleanlemons 运营商主表 **`cln_operatordetail`**，勿混用 `cln_clientdetail`（B2B 客户）与运营商主表。

@@ -60,8 +60,32 @@ async function uploadToOss(buffer, originalFilename, clientId) {
   try {
     const client = getClient();
     const key = objectName(originalFilename, safeClientId);
-    await client.put(key, buffer);
-    const url = client.signatureUrl(key, { expires: SIGNED_URL_EXPIRES });
+    // Helps browsers/Google Docs treat it as an image when uploading from base64.
+    const ext = (path.extname(originalFilename || '').toLowerCase() || '');
+    const contentType =
+      ext === '.png'
+        ? 'image/png'
+        : (ext === '.jpg' || ext === '.jpeg') ? 'image/jpeg'
+          : ext === '.webp' ? 'image/webp'
+            : ext === '.gif' ? 'image/gif'
+              : ext === '.mp4' || ext === '.m4v' ? 'video/mp4'
+                : ext === '.webm' ? 'video/webm'
+                  : ext === '.mov' ? 'video/quicktime'
+                    : ext === '.mkv' ? 'video/x-matroska'
+                      : ext === '.avi' ? 'video/x-msvideo'
+                        : ext === '.3gp' ? 'video/3gpp'
+                          : ext === '.ogv' ? 'video/ogg'
+                            : null;
+    if (contentType) {
+      await client.put(key, buffer, { contentType });
+    } else {
+      await client.put(key, buffer);
+    }
+    let url = client.signatureUrl(key, { expires: SIGNED_URL_EXPIRES });
+    // Portal is HTTPS — http:// OSS links trigger mixed-content / blocked loads in browsers
+    if (typeof url === 'string' && url.startsWith('http://')) {
+      url = url.replace(/^http:\/\//i, 'https://');
+    }
     return { ok: true, url, key };
   } catch (err) {
     console.error('[oss] upload failed', err?.message || err);
@@ -93,7 +117,21 @@ async function getSignedUrl(key, expires = 3600) {
   }
 }
 
+/**
+ * Read object as a stream (for proxying PDF/images without exposing signed URLs / iframe-safe headers).
+ * @param {string} key - OSS object key
+ * @returns {Promise<{ stream: import('stream').Readable, res: object }>}
+ */
+async function getObjectStream(key) {
+  if (!key || typeof key !== 'string' || !key.trim()) {
+    throw new Error('KEY_REQUIRED');
+  }
+  const client = getClient();
+  return client.getStream(key.trim());
+}
+
 module.exports = {
   uploadToOss,
-  getSignedUrl
+  getSignedUrl,
+  getObjectStream
 };

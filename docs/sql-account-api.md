@@ -23,7 +23,7 @@ Demo 凭证仅用于本地/测试环境配置，勿写入正式环境。
   https://download.sql.com.my/customer/Fairy/APICollection.zip  
 
 - **认证方式**  
-  AWS Signature Version 4（Query Parameters）  
+  AWS Signature Version 4（Authorization Header 或 Query Parameters）  
   https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html  
 
 ## Demo 凭证（仅测试）
@@ -36,6 +36,7 @@ Demo 凭证仅用于本地/测试环境配置，勿写入正式环境。
 
 测试时可在 `.env` 中设置（或为测试 client 配置 addonAccount）：  
 `SQLACCOUNT_BASE_URL`、`SQLACCOUNT_ACCESS_KEY`、`SQLACCOUNT_SECRET_KEY`（用上列 Demo 值）。
+如需与 Postman 的 query 签名对齐，可设置：`SQLACCOUNT_SIGV4_MODE=query`。
 
 ## 费用说明
 

@@ -50,11 +50,10 @@
 
 - **何时生成**：  
   - 先 **INSERT agreement** 行（status=pending，pdf_generating=1），  
-  - 再调 GAS 或 Node 的 **generatePdfFromTemplate** 生成 PDF；  
+  - 再调 Node **generatePdfFromTemplate** 生成 PDF；  
   - 生成完成后 **finalizeAgreementPdf** 把 url 写回 agreement、status 改为 completed、pdf_generating=0。
 - **何时返回**：  
-  - 若用 Node 同步生成：requestPdfGeneration 里直接返回 **pdfUrl**（及 agreementId）；  
-  - 若用 GAS 异步：GAS callback 调 `/api/agreement/callback` 更新 agreement 后，前端可再拉 agreement 取 url。  
+  - requestPdfGeneration 同步生成后直接返回 **pdfUrl**（及 agreementId），并写库。  
 - **结论**：这里是**先生成合约（PDF）并落库、再可供签署/使用**；返回时机是 PDF 生成完成时（同步则当场返回，异步则 callback 后）。
 
 ### 小结
@@ -62,7 +61,7 @@
 | 流程 | 何时生成 agreement 行 | 何时生成合约内容 | 何时返回给前端 |
 |------|------------------------|------------------|----------------|
 | Owner Setting 邀请（owner_operator） | 保存邀请时 INSERT | 业主在 Portal **打开**该协议时按 template 生成 HTML | 打开时 getAgreementTemplate + getOwnerAgreementContext 返回 HTML/变量 |
-| Tenancy / PDF（requestPdfGeneration） | 请求 PDF 时 INSERT | 紧接着调 GAS/Node 生成 PDF，callback 或同步写 url | PDF 生成完成时（同步则接口直接返回 pdfUrl，异步则 callback 后取 agreement.url） |
+| Tenancy / PDF（requestPdfGeneration） | 请求 PDF 时 INSERT | Node 生成 PDF，同步写 url | 接口直接返回 pdfUrl |
 
 所以：  
 - **没有**统一的「先生成合约再让两方 signing」：Owner 流程是**打开时现生成 HTML**；PDF 流程是**先生成 PDF 再可用**。  

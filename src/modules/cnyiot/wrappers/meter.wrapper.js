@@ -14,11 +14,15 @@ async function getMeters(clientId, mt = 1) {
   return callCnyIot({ clientId, method: 'getMetList_Simple', body: { mt } });
 }
 
+/**
+ * Get meter status (balance, etc). Uses platform master account; client does not need to bind CNYIoT.
+ */
 async function getMeterStatus(clientId, meterId) {
   return callCnyIot({
     clientId,
     method: 'getMetStatusByMetId',
-    body: { metid: String(meterId) }
+    body: { metid: String(meterId) },
+    usePlatformAccount: true
   });
 }
 
@@ -139,11 +143,17 @@ async function addMetersNoBind(clientId, meters) {
   return res;
 }
 
+/** 与 addMetersNoBind 一致：主账号 deleteMeter，否则无权删平台侧电表 */
 async function deleteMeters(clientId, meterIds) {
+  const ids = (Array.isArray(meterIds) ? meterIds : [meterIds])
+    .map((id) => String(id ?? '').trim())
+    .filter(Boolean);
+  if (ids.length === 0) return { result: 200, value: [] };
   return callCnyIot({
     clientId,
     method: 'deleteMeter',
-    body: { MetID: meterIds }
+    body: { MetID: ids },
+    usePlatformAccount: true
   });
 }
 
@@ -171,11 +181,13 @@ async function editMeterSafe(clientId, { meterId, meterName, priceId }, opts = {
 }
 
 /* ---------- CONTROL ---------- */
-async function setRelay(clientId, meterId, val = 2) {
+/** setRelay: Val 2 = connect (power on), Val 1 = disconnect (power off). */
+async function setRelay(clientId, meterId, val = 2, opts = {}) {
   return callCnyIot({
     clientId,
     method: 'setRelay',
-    body: { MetID: String(meterId), Val: String(val), iswifi: '1' }
+    body: { MetID: String(meterId), Val: String(val), iswifi: '1' },
+    ...opts
   });
 }
 
@@ -228,29 +240,55 @@ async function confirmTopup(clientId, meterId, idx) {
   });
 }
 
+/**
+ * 电量清零 (clearKwh) — prepaid remaining kWh on platform. §19 OpenAPI.
+ */
+async function clearKwh(clientId, platformMeterId, opts = {}) {
+  const mid = String(platformMeterId || '').trim();
+  return callCnyIot({
+    clientId,
+    method: 'clearKwh',
+    body: { metid: mid, MetID: mid, iswifi: '1' },
+    usePlatformAccount: true,
+    ...opts
+  });
+}
+
 /* ---------- DATA / REPORT ---------- */
+/**
+ * Usage records. Uses platform master account; client does not need to bind CNYIoT.
+ */
 async function getUsageRecords(clientId, meterId, st, et, mYMD = 1) {
   return callCnyIot({
     clientId,
     method: 'getRecord_Simple',
-    body: { metID: String(meterId), st, et, mYMD }
+    body: { metID: String(meterId), st, et, mYMD },
+    usePlatformAccount: true
   });
 }
 
+/**
+ * Month bill. Uses platform master account; client does not need to bind CNYIoT.
+ */
 async function getMonthBill(clientId, meterIds, st, et, mYMD = 2) {
   const metID = Array.isArray(meterIds) ? meterIds.join(',') : meterIds;
   return callCnyIot({
     clientId,
     method: 'getMonthBill',
-    body: { metID, st, et, mYMD }
+    body: { metID, st, et, mYMD },
+    usePlatformAccount: true
   });
 }
 
+/**
+ * Operation history. Uses platform master account; client does not need to bind CNYIoT.
+ */
 async function getOperationHistory(clientId, st, et) {
   return callCnyIot({
     clientId,
     method: 'getHist',
-    body: { st, et }
+    body: { st, et },
+    usePlatformAccount: true
   });
 }
 
@@ -270,6 +308,7 @@ function formatDate(d) {
 
 /**
  * Usage summary: total, per-meter, daily records.
+ * Uses platform master account (CNYIOT_LOGIN_NAME/PSW); client does not need to bind CNYIoT.
  */
 async function getUsageSummary(clientId, { meterIds, start, end }) {
   const st = formatDate(start);
@@ -280,7 +319,8 @@ async function getUsageSummary(clientId, { meterIds, start, end }) {
   const res = await callCnyIot({
     clientId,
     method: 'getMonthBill',
-    body: { metID: meterIds.join(','), st, et, mYMD: 2 }
+    body: { metID: meterIds.join(','), st, et, mYMD: 2 },
+    usePlatformAccount: true
   });
 
   if (!Array.isArray(res?.value)) {
@@ -361,8 +401,8 @@ async function resolveOrCreatePriceIdByRate(clientId, rate, opts = {}) {
 }
 
 /**
- * Update meter rate on CNYIOT only (platform name unchanged). getPrices → find or create price → editMeter(PriceID).
- * currentMeterName: name to send to editMeter (keep backend system name unchanged).
+ * Update meter rate on CNYIOT: editMeter(PriceID + MeterName).
+ * currentMeterName: editMeter 的 MeterName；metersetting 传 client subdomain only（非 Portal title）。
  * usePlatformAccount: true = use main account token (no client_integration required).
  */
 async function updateMeterNameAndRate(clientId, { meterId, currentMeterName, rate, usePlatformAccount = false }) {
@@ -375,7 +415,7 @@ async function updateMeterNameAndRate(clientId, { meterId, currentMeterName, rat
   const priceId = await resolveOrCreatePriceIdByRate(clientId, rate, opts);
   const meterName = (currentMeterName != null && String(currentMeterName).trim() !== '') ? String(currentMeterName).trim() : '';
 
-  console.log('[updateMeterNameAndRate] editMeterSafe meterId=%s priceId=%s usePlatformAccount=%s (platform name unchanged)', meterId, priceId, usePlatformAccount);
+  console.log('[updateMeterNameAndRate] editMeterSafe meterId=%s meterName=%s priceId=%s usePlatformAccount=%s', meterId, meterName, priceId, usePlatformAccount);
   await editMeterSafe(clientId, { meterId, meterName, priceId }, opts);
   return { ok: true, rate: priceValue, priceId };
 }
@@ -393,6 +433,7 @@ module.exports = {
   setRatio,
   createPendingTopup,
   confirmTopup,
+  clearKwh,
   getUsageRecords,
   getMonthBill,
   getOperationHistory,

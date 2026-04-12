@@ -1,6 +1,6 @@
 /**
  * Daily cron: check client pricing plan (subscription) expiry.
- * If clientdetail.expired (billing cycle end) is before today and client has not renewed,
+ * If operatordetail.expired (billing cycle end) is before today and client has not renewed,
  * set client status = 0 (inactive). Tenant can still pay; admin pages will no function (handled by permission/access elsewhere).
  */
 
@@ -9,14 +9,14 @@ const { getTodayMalaysiaDate } = require('../../utils/dateMalaysia');
 
 /**
  * Find all active clients whose plan expired (expired date < today) and set them inactive.
- * Uses clientdetail.expired (set on renew/upgrade via handlePricingPlanPaymentSuccess).
+ * Uses operatordetail.expired (set on renew/upgrade via handlePricingPlanPaymentSuccess).
  * @returns {{ inactived: number, clientIds: string[] }}
  */
 async function runPricingPlanExpiryCheck() {
   const today = getTodayMalaysiaDate(); // 'YYYY-MM-DD'
 
   const [rows] = await pool.query(
-    `SELECT id FROM clientdetail
+    `SELECT id FROM operatordetail
      WHERE status = 1 AND expired IS NOT NULL AND DATE(expired) < ?
      ORDER BY id`,
     [today]
@@ -28,7 +28,7 @@ async function runPricingPlanExpiryCheck() {
   }
 
   const [result] = await pool.query(
-    `UPDATE clientdetail SET status = 0, updated_at = NOW()
+    `UPDATE operatordetail SET status = 0, updated_at = NOW()
      WHERE status = 1 AND expired IS NOT NULL AND DATE(expired) < ?`,
     [today]
   );

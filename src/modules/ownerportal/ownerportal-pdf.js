@@ -132,7 +132,9 @@ async function generateCostPdf({ items = [], propertyName = 'Unknown Property' }
     period: formatMonth(i.period),
     property: i.listingTitle || (i.property && i.property.shortname) || '',
     description: i.description || '',
-    amount: typeof i.amount === 'number' ? `${i.client?.currency || 'MYR'} ${i.amount}` : (i.amount || '')
+    amount: typeof i.amount === 'number'
+      ? `${i.client?.currency ? String(i.client.currency).trim().toUpperCase() + ' ' : ''}${i.amount}`
+      : (i.amount || '')
   }));
   return buildTablePdf({
     columns,

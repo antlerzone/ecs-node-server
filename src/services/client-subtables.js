@@ -1,7 +1,7 @@
 /**
  * 把 client 的 integration / profile / pricingplandetail / credit 同步到 4 张子表。
  * 供 import 脚本和 API 共用。
- * syncSubtablesFromClientdetail: 从 clientdetail 表读这 4 列（JSON text）并同步到子表，插入/更新 clientdetail 后调用即可。
+ * syncSubtablesFromOperatordetail: 从 operatordetail 表读这 4 列（JSON text）并同步到子表，插入/更新 operatordetail 后调用即可。
  */
 const { randomUUID } = require('crypto');
 const JSON5 = require('json5');
@@ -49,9 +49,9 @@ async function syncIntegration(conn, clientId, clientWixId, arr) {
     const valuesJson = it.values ? JSON.stringify(it.values) : null;
     const einvoice = it.einvoice === true || it.einvoice === 1 ? 1 : null;
     await conn.query(
-      `INSERT INTO client_integration (id, client_id, client_wixid, \`key\`, version, slot, enabled, provider, values_json, einvoice, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, clientId, clientWixId, key, version, slot, enabled, provider, valuesJson, einvoice, now, now]
+      `INSERT INTO client_integration (id, client_id, \`key\`, version, slot, enabled, provider, values_json, einvoice, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, clientId, key, version, slot, enabled, provider, valuesJson, einvoice, now, now]
     );
   }
   console.log('[client-subtables] client_integration: inserted', arr.length, 'rows');
@@ -66,10 +66,10 @@ async function syncProfile(conn, clientId, clientWixId, arr, bankWixIdToId) {
     const bankId = it.bankId ? (bankWixIdToId && bankWixIdToId.get(it.bankId)) || null : null;
     const subdomain = it.subdomain ? String(it.subdomain).trim().toLowerCase() : null;
     await conn.query(
-      `INSERT INTO client_profile (id, client_id, client_wixid, tin, contact, subdomain, accountholder, ssm, currency, address, accountnumber, bank_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO client_profile (id, client_id, tin, contact, subdomain, accountholder, ssm, currency, address, accountnumber, bank_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        id, clientId, clientWixId,
+        id, clientId,
         it.tin || null, it.contact || null, subdomain,
         it.accountHolder || it.accountholder || null, it.ssm || null, it.currency || null,
         it.address || null, it.accountNumber || it.accountnumber || null, bankId,
@@ -93,16 +93,23 @@ async function syncPricingplanDetail(conn, clientId, clientWixId, arr, planWixId
     const expired = toMysqlDatetime(it.expired);
     const qty = it.qty != null ? Number(it.qty) : null;
     await conn.query(
-      `INSERT INTO client_pricingplan_detail (id, client_id, client_wixid, type, plan_id, title, expired, qty, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, clientId, clientWixId, type, planId, title, expired, qty, now, now]
+      `INSERT INTO client_pricingplan_detail (id, client_id, type, plan_id, title, expired, qty, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, clientId, type, planId, title, expired, qty, now, now]
     );
   }
   console.log('[client-subtables] client_pricingplan_detail: inserted', arr.length, 'rows');
 }
 
 async function syncCredit(conn, clientId, clientWixId, arr) {
-  if (!Array.isArray(arr) || arr.length === 0) return;
+  if (!Array.isArray(arr)) return;
+  // Empty array = balance zero in operatordetail.credit — must still DELETE stale client_credit rows,
+  // otherwise UI (SUM client_credit) stays high while creditlogs / operatordetail JSON show deductions.
+  if (arr.length === 0) {
+    await conn.query('DELETE FROM client_credit WHERE client_id = ?', [clientId]);
+    console.log('[client-subtables] client_credit: cleared (empty credit array) clientId=', clientId);
+    return;
+  }
   await conn.query('DELETE FROM client_credit WHERE client_id = ?', [clientId]);
   const now = new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
   for (const it of arr) {
@@ -110,9 +117,9 @@ async function syncCredit(conn, clientId, clientWixId, arr) {
     const type = it.type || 'flex';
     const amount = Number(it.amount) || 0;
     await conn.query(
-      `INSERT INTO client_credit (id, client_id, client_wixid, type, amount, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [id, clientId, clientWixId, type, amount, now, now]
+      `INSERT INTO client_credit (id, client_id, type, amount, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [id, clientId, type, amount, now, now]
     );
   }
   console.log('[client-subtables] client_credit: inserted', arr.length, 'rows');
@@ -120,22 +127,22 @@ async function syncCredit(conn, clientId, clientWixId, arr) {
 
 /**
  * 同步 4 张子表。payload 为 { integration?, profile?, pricingplandetail?, credit? }，均为数组。
- * clientId + clientWixId 必填其一；若只传 clientWixId 会先查 clientdetail 取 clientId。
+ * clientId + clientWixId 必填其一；若只传 clientWixId 会先查 operatordetail 取 clientId。
  */
 async function syncAll(conn, payload) {
   const { clientId: rawClientId, clientWixId, integration, profile, pricingplandetail, credit } = payload;
   let clientId = rawClientId;
   if (!clientId && clientWixId) {
-    const [rows] = await conn.query('SELECT id FROM clientdetail WHERE wix_id = ? LIMIT 1', [clientWixId]);
+    const [rows] = await conn.query('SELECT id FROM operatordetail WHERE id = ? LIMIT 1', [clientWixId]);
     if (!rows.length) throw new Error('client not found: ' + clientWixId);
     clientId = rows[0].id;
   }
   if (!clientId) throw new Error('clientId or clientWixId required');
 
-  const [bankRows] = await conn.query('SELECT id, wix_id FROM bankdetail WHERE wix_id IS NOT NULL');
-  const bankWixIdToId = new Map(bankRows.map(r => [r.wix_id, r.id]));
-  const [planRows] = await conn.query('SELECT id, wix_id FROM pricingplan WHERE wix_id IS NOT NULL');
-  const planWixIdToId = new Map(planRows.map(r => [r.wix_id, r.id]));
+  const [bankRows] = await conn.query('SELECT id FROM bankdetail');
+  const bankWixIdToId = new Map(bankRows.map(r => [r.id, r.id]));
+  const [planRows] = await conn.query('SELECT id FROM pricingplan');
+  const planWixIdToId = new Map(planRows.map(r => [r.id, r.id]));
 
   console.log('[client-subtables] syncAll clientId=', clientId, 'integration=', integration?.length ?? 0, 'profile=', profile?.length ?? 0, 'pricingplandetail=', pricingplandetail?.length ?? 0, 'credit=', credit?.length ?? 0);
   if (Array.isArray(integration)) await syncIntegration(conn, clientId, clientWixId || null, integration);
@@ -147,15 +154,15 @@ async function syncAll(conn, payload) {
 }
 
 /**
- * 从 clientdetail 表读取 integration / profile / pricingplandetail / credit 列（JSON text），解析后同步到 4 张子表。
- * 每次 insert/update clientdetail 后调用此方法即可自动写入 client_integration、client_profile、client_pricingplan_detail、client_credit。
+ * 从 operatordetail 表读取 integration / profile / pricingplandetail / credit 列（JSON text），解析后同步到 4 张子表。
+ * 每次 insert/update operatordetail 后调用此方法即可自动写入 client_integration、client_profile、client_pricingplan_detail、client_credit。
  * @param {import('mysql2/promise').Connection} conn
- * @param {string} clientId - clientdetail.id
+ * @param {string} clientId - operatordetail.id
  * @returns {Promise<{ clientId, clientWixId } | null>} 若该 client 无记录则返回 null
  */
-async function syncSubtablesFromClientdetail(conn, clientId) {
+async function syncSubtablesFromOperatordetail(conn, clientId) {
   const [rows] = await conn.query(
-    'SELECT id, wix_id, integration, profile, pricingplandetail, credit FROM clientdetail WHERE id = ? LIMIT 1',
+    'SELECT id, integration, profile, pricingplandetail, credit FROM operatordetail WHERE id = ? LIMIT 1',
     [clientId]
   );
   if (!rows.length) return null;
@@ -164,16 +171,16 @@ async function syncSubtablesFromClientdetail(conn, clientId) {
   const profile = toArray(parseJsonSafe(r.profile));
   const pricingplandetail = toArray(parseJsonSafe(r.pricingplandetail));
   const credit = toArray(parseJsonSafe(r.credit));
-  if (!integration && !profile && !pricingplandetail && !credit) return { clientId, clientWixId: r.wix_id || null };
+  if (!integration && !profile && !pricingplandetail && !credit) return { clientId: r.id };
   await syncAll(conn, {
     clientId: r.id,
-    clientWixId: r.wix_id || null,
+    clientWixId: r.id,
     integration: integration || undefined,
     profile: profile || undefined,
     pricingplandetail: pricingplandetail || undefined,
     credit: credit || undefined,
   });
-  return { clientId: r.id, clientWixId: r.wix_id || null };
+  return { clientId: r.id };
 }
 
-module.exports = { syncAll, syncSubtablesFromClientdetail, syncIntegration, syncProfile, syncPricingplanDetail, syncCredit };
+module.exports = { syncAll, syncSubtablesFromOperatordetail, syncIntegration, syncProfile, syncPricingplanDetail, syncCredit };

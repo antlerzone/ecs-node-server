@@ -47,6 +47,10 @@ Create row (pending, 必带 agreementtemplate_id)
 **说明：**  
 - owner_operator 仍在 ownersetting 发邀请时创建（已有 agreementtemplate_id、pending）。  
 - Property 若日后支持 manual upload，插入时带 url 并设 status=completed、columns_locked=1 即可（与 tenancy manual upload 一致）。
+- **Tenancy 模板创建扣平台 credits：** `POST /api/tenancysetting/agreement-insert` 在 **有 templateId 且无手动 url** 时，需 body **`confirmCreditDeduction: true`**；服务端在同一事务内调用 `deductClientCreditSpending`，扣费数量来自 **`clientdetail.admin` JSON 的 `agreementCreationCredits`**（缺省 **10**）。手动上传（带 url）不扣费。重试 draft PDF 不重复扣费。
+- **双方签完后需生成 Final PDF：** `generateFinalPdfAndComplete` 会读 `operator_signed_at` / `operator_signed_hash`（**0090**）。若库未跑 **0090**，旧环境会打日志并降级 SELECT；仍建议在 ECS 执行 **`0090_agreement_operator_signed_at_hash.sql`**。未跑 0090 时，租客签完可能曾在日志出现 `afterSignUpdate Unknown column 'operator_signed_at'`，协议卡在 `locked` +「双方已签」，Operator 列表若误把 **Sign** 开放给 `pending_signatures` 会看起来像「要再签一次」——前端已改为仅在 **Awaiting Operator**（`pending_operator`）显示 Sign。
+- **租客门户下载：** Tenant `/tenant/agreement` 仅当 **`agreement.status === 'completed'`** 时允许 **Download final**；仅租客已签（`locked` / `ready`）时只显示「You signed」日期，不提供最终下载。租客签名时间写入 **`tenant_signed_at`**（迁移 **`0133_agreement_tenant_signed_at.sql`**）；未跑迁移时可用 **`agreement.updated_at`** 作近似显示。若双方已签仍非 `completed`，多为 **`generateFinalPdfAndComplete` 失败**（Google/Drive/OAuth/配额）；`afterSignUpdate` 现已打错误日志。运营可在 **Operator → Agreements** 对 **Signatures pending** 行点 **Finalize**，调用 **`POST /api/admindashboard/agreement/retry-final-pdf`** 重试生成最终 PDF。
+- **排障日志（发给开发）：** 在 ECS 上 `pm2 logs`（或应用 stdout）里 **grep `agreement-final-pdf`**。每条是一行 **JSON**，字段含 `phase`（如 `afterSignUpdate`、`generateFinalPdfAndComplete`、`retryAgreementFinalPdf`）、`outcome`、`reason`、`agreementId`、`status`、`mode`、各签名字段是否已写入（`has_tenantsign` / `has_operatorsign` / `has_ownersign`，**不含**签名内容）、Google 失败时的 `errorMessage` / `stack` 摘要等。复制**整行 JSON**即可定位「未触发 finalize」还是「Google/Drive/模板/凭证」问题。
 
 ---
 
@@ -123,10 +127,11 @@ Create row (pending, 必带 agreementtemplate_id)
 
 - **唯一入口**：`src/modules/agreement/google-docs-pdf.js`
   - **getAuth()**：从环境变量取 `GOOGLE_SERVICE_ACCOUNT_JSON` 或 `GOOGLE_APPLICATION_CREDENTIALS`，返回 Google Auth，无则返回 null。
-  - **generatePdfFromTemplate({ templateId, folderId, filename, variables })**：用 Docs API 复制模板、替换 `{{key}}` 与图片占位（sign/ownersign/tenantsign/operatorsign/nricfront/nricback/clientchop），再 Drive export PDF、上传、设 anyone reader、返回 `{ pdfUrl, hash }`。
+  - **generatePdfFromTemplate({ templateId, folderId, filename, variables })**：用 Docs API 复制模板、替换 `{{key}}` 与图片占位；**签名类占位**（`sign` / `ownersign` / `tenantsign` / `operatorsign`）在无图片 URL 时**不删除**，草稿 PDF 仍保留 `{{…}}` 文案，避免终稿无法插入签名图。NRIC/chop 等无 URL 时仍会清空占位。
+  - **终稿**：`generateFinalPdfAndComplete` 用 `returnBufferOnly` 生成主 PDF → **pdf-lib** 合并 **Execution & audit schedule** 尾页（`agreement-pdf-appendix.js`：`hash_draft`、主文 SHA-256、operator_signed_at/hash/IP、owner/tenant IP 等）→ 再上传 Drive；**hash_final** = 整份合并后 PDF 的 SHA-256。
 - **调用方**：仅 **agreement.service.js** 引用该模块，用于：
   - **prepareAgreementForSignature**（draft PDF + hash_draft）
-  - **generateFinalPdfAndComplete**（final PDF + hash_final）
+  - **generateFinalPdfAndComplete**（final PDF + 审计尾页 + hash_final）
   - **requestPdfGeneration**（Node 分支，有 getAuth 时直接出 PDF）
-- **环境**：配置好上述任一 Google 凭证即可；未配置时 prepare/final 会报 `GOOGLE_CREDENTIALS_REQUIRED`，request-pdf 会走 GAS。
+- **环境**：配置好上述任一 Google 凭证即可；未配置时 prepare/final 与 request-pdf 会报 `GOOGLE_CREDENTIALS_REQUIRED`（已无 GAS 回退）。
 - **结论**：Agreement 相关的 Google Docs / Drive 逻辑都集中在一个模块内，对外只暴露 `generatePdfFromTemplate` 和 `getAuth`，是完整封装。

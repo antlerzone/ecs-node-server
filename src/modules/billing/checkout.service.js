@@ -1,12 +1,11 @@
 /**
  * Checkout – migrated from Wix backend/billing/checkout.jsw.
- * Stripe only (no Payex). Uses MySQL: clientdetail, pricingplan, pricingplanaddon, pricingplanlogs, client_pricingplan_detail.
+ * Operator pricing plan pay-in: Coliving SaaS platform Stripe (Malaysia test `STRIPE_SANDBOX_SECRET_KEY`), MYR or SGD from operatordetail.
  */
 
 const pool = require('../../config/db');
 const { randomUUID } = require('crypto');
-const { syncSubtablesFromClientdetail } = require('../../services/client-subtables');
-const { getAccessContextByEmail } = require('../access/access.service');
+const { getAccessContextByEmail, getAccessContextByEmailAndClient } = require('../access/access.service');
 
 function parseJson(val) {
   if (val == null) return null;
@@ -37,8 +36,12 @@ function parseAddonYearlyCredit(raw) {
 
 function normalizeRedirectUrl(url) {
   if (!url || typeof url !== 'string') return null;
-  if (!url.startsWith('https://www.colivingjb.com')) return null;
-  return url;
+  const s = String(url).trim();
+  if (s.startsWith('https://portal.colivingjb.com')) return s;
+  const portalBase = process.env.PORTAL_APP_URL && String(process.env.PORTAL_APP_URL).trim();
+  if (portalBase && s.startsWith(portalBase)) return s;
+  if (s.startsWith('https://www.colivingjb.com')) return s;
+  return null;
 }
 
 function resolveNewExpiredDate({ scenario, today, currentExpiredDate }) {
@@ -86,17 +89,21 @@ async function resolvePricingPlanAmount({ client, plan }) {
 /**
  * Preview pricing plan change. Same contract as JSW previewPricingPlan.
  */
-async function previewPricingPlan(email, { planId }) {
-  const access = await getAccessContextByEmail(email);
+async function previewPricingPlan(email, { planId, clientId: optsClientId }) {
+  const access = optsClientId
+    ? await getAccessContextByEmailAndClient(email, optsClientId)
+    : await getAccessContextByEmail(email);
   if (!access.ok) throw new Error(access.reason);
   const clientId = access.client.id;
   const [clientRows] = await pool.query(
-    'SELECT id, title, status, currency, expired, credit, pricingplandetail FROM clientdetail WHERE id = ? LIMIT 1',
+    'SELECT id, title, status, currency, expired, credit, pricingplandetail FROM operatordetail WHERE id = ? LIMIT 1',
     [clientId]
   );
   if (!clientRows.length || clientRows[0].status !== 1 && clientRows[0].status !== true) throw new Error('CLIENT_INVALID');
   const client = clientRows[0];
-  const currency = String(client.currency || '').toUpperCase() === 'SGD' ? 'SGD' : 'MYR';
+  const currency = String(client.currency || '').trim().toUpperCase();
+  if (!currency) throw new Error('CLIENT_CURRENCY_MISSING');
+  if (!['MYR', 'SGD'].includes(currency)) throw new Error('UNSUPPORTED_CLIENT_CURRENCY');
   const [planRows] = await pool.query('SELECT id, title, sellingprice, corecredit FROM pricingplan WHERE id = ? LIMIT 1', [planId]);
   if (!planRows.length) throw new Error('PLAN_NOT_FOUND');
   const plan = planRows[0];
@@ -178,25 +185,29 @@ async function previewPricingPlan(email, { planId }) {
   };
 }
 
-/** Amount (in client currency) above which we do not use Stripe; manual invoice and manual plan update. */
-const PRICING_PLAN_STRIPE_MAX_AMOUNT = 1000;
-
 /**
- * Confirm pricing plan: insert pricingplanlogs (pending). If amount < 1000, create Stripe Checkout; else return provider 'manual' and create a help ticket for visibility.
+ * Confirm pricing plan: insert pricingplanlogs (pending), then Stripe Checkout (Malaysia platform; sandbox vs live: COLIVING_SAAS_STRIPE_* env).
  */
-async function confirmPricingPlan(email, { planId, returnUrl }) {
-  const access = await getAccessContextByEmail(email);
+async function confirmPricingPlan(email, { planId, returnUrl, clientId: optsClientId }) {
+  const access = optsClientId
+    ? await getAccessContextByEmailAndClient(email, optsClientId)
+    : await getAccessContextByEmail(email);
   if (!access.ok) throw new Error(access.reason);
-  if (!access.staff?.permission?.billing && !access.staff?.permission?.admin) throw new Error('NO_PERMISSION');
   const clientId = access.client.id;
-  const staffId = access.staff.id;
+  // pricingplanlogs.staff_id FK → staffdetail.id; client_user 身份没有 staffdetail 行，必须用 staffDetailId 或 NULL
+  const staffId =
+    access.staffDetailId != null && String(access.staffDetailId).trim()
+      ? String(access.staffDetailId).trim()
+      : null;
   const [clientRows] = await pool.query(
-    'SELECT id, title, status, currency, pricingplandetail FROM clientdetail WHERE id = ? LIMIT 1',
+    'SELECT id, title, status, currency, pricingplandetail FROM operatordetail WHERE id = ? LIMIT 1',
     [clientId]
   );
   if (!clientRows.length || clientRows[0].status !== 1 && clientRows[0].status !== true) throw new Error('CLIENT_INVALID');
   const client = clientRows[0];
-  const currency = String(client.currency || '').toUpperCase() === 'SGD' ? 'SGD' : 'MYR';
+  const currency = String(client.currency || '').trim().toUpperCase();
+  if (!currency) throw new Error('CLIENT_CURRENCY_MISSING');
+  if (!['MYR', 'SGD'].includes(currency)) throw new Error('UNSUPPORTED_CLIENT_CURRENCY');
   const [planRows] = await pool.query('SELECT id, title, sellingprice, corecredit FROM pricingplan WHERE id = ? LIMIT 1', [planId]);
   if (!planRows.length) throw new Error('PLAN_NOT_FOUND');
   const pricingplan = planRows[0];
@@ -252,57 +263,47 @@ async function confirmPricingPlan(email, { planId, returnUrl }) {
   const samePageUrl = normalizeRedirectUrl(returnUrl);
   if (!samePageUrl) throw new Error('INVALID_RETURN_URL');
   const logId = randomUUID();
+  const sep = samePageUrl.includes('?') ? '&' : '?';
+  const returnUrlWithFinalize = `${samePageUrl}${sep}plan_finalize=${encodeURIComponent(logId)}`;
+  const successSep = returnUrlWithFinalize.includes('?') ? '&' : '?';
+  const successUrl = `${returnUrlWithFinalize}${successSep}session_id={CHECKOUT_SESSION_ID}`;
   const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
   await pool.query(
     `INSERT INTO pricingplanlogs (id, client_id, staff_id, plan_id, scenario, amount, amountcents, referencenumber, status, title, addondeductamount, addons_json, newexpireddate, redirecturl, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)`,
     [
       logId, clientId, staffId, pricingplan.id, scenario, amount, amountCents, referenceNumber,
-      pricingplan.title, addonDeductAmount, JSON.stringify(addons), planEnd, samePageUrl, now, now
+      pricingplan.title, addonDeductAmount, JSON.stringify(addons), planEnd, returnUrlWithFinalize, now, now
     ]
   );
 
-  if (amount >= PRICING_PLAN_STRIPE_MAX_AMOUNT) {
+  const { createColivingSaasPlatformCheckoutSession } = require('../stripe/stripe.service');
+  const stripeCurrency = currency === 'SGD' ? 'sgd' : 'myr';
+  try {
+    const { url } = await createColivingSaasPlatformCheckoutSession({
+      amountCents: amountCents,
+      stripeCurrency,
+      email: access.staff?.email || '',
+      description: `Pricing plan: ${pricingplan.title}`,
+      successUrl,
+      cancelUrl: samePageUrl,
+      metadata: {
+        type: 'pricingplan',
+        pricingplanlog_id: logId,
+        client_id: String(clientId),
+        plan_id: String(pricingplan.id),
+        planId: String(pricingplan.id)
+      }
+    });
+    return { provider: 'stripe', url, referenceNumber, pricingplanlogId: logId };
+  } catch (e) {
     try {
-      const { recordManualBillingTicket } = require('../help/help.service');
-      await recordManualBillingTicket(clientId, access.staff?.email, {
-        scenario,
-        referenceNumber,
-        amount,
-        currency,
-        planTitle: pricingplan.title
-      });
-    } catch (err) {
-      console.warn('[checkout] recordManualBillingTicket failed', err?.message);
+      await pool.query("DELETE FROM pricingplanlogs WHERE id = ? AND status = 'pending'", [logId]);
+    } catch (delErr) {
+      console.warn('[checkout] confirmPricingPlan cleanup pending log failed', logId, delErr?.message);
     }
-    return {
-      provider: 'manual',
-      referenceNumber,
-      pricingplanlogId: logId,
-      amount,
-      currency,
-      message: 'Amount 1000 or above: we will send you an invoice; please pay manually. We will update your plan after payment.'
-    };
+    throw e;
   }
-
-  const { createCheckoutSession } = require('../stripe/stripe.service');
-  const stripeRes = await createCheckoutSession({
-    amountCents,
-    currency: currency.toLowerCase(),
-    email: access.staff.email,
-    description: `Pricing Plan: ${pricingplan.title}`,
-    returnUrl: samePageUrl,
-    cancelUrl: samePageUrl,
-    clientId,
-    metadata: {
-      type: 'pricingplan',
-      pricingplanlog_id: logId,
-      scenario,
-      planId: pricingplan.id,
-      client_id: clientId
-    }
-  });
-  return { provider: 'stripe', url: stripeRes.url, referenceNumber };
 }
 
 /**
@@ -310,7 +311,7 @@ async function confirmPricingPlan(email, { planId, returnUrl }) {
  */
 async function handlePricingPlanPaymentSuccess({ pricingplanlogId, clientId }) {
   const [rows] = await pool.query(
-    'SELECT id, client_id, plan_id, scenario, amount, addondeductamount, addons_json, newexpireddate, status FROM pricingplanlogs WHERE id = ? LIMIT 1',
+    'SELECT id, client_id, staff_id, plan_id, scenario, amount, addondeductamount, addons_json, newexpireddate, status FROM pricingplanlogs WHERE id = ? LIMIT 1',
     [pricingplanlogId]
   );
   if (!rows.length) return { ok: false, reason: 'log_not_found' };
@@ -329,7 +330,7 @@ async function handlePricingPlanPaymentSuccess({ pricingplanlogId, clientId }) {
       [now, now, pricingplanlogId]
     );
     const [clientRows] = await conn.query(
-      'SELECT id, credit, pricingplandetail FROM clientdetail WHERE id = ? LIMIT 1',
+      'SELECT id, credit, pricingplandetail, currency FROM operatordetail WHERE id = ? LIMIT 1',
       [clientId]
     );
     if (!clientRows.length) throw new Error('client not found');
@@ -380,9 +381,34 @@ async function handlePricingPlanPaymentSuccess({ pricingplanlogId, clientId }) {
       ...Object.entries(addonsObj).map(([planId, qty]) => ({ type: 'addon', planId, qty: Number(qty) || 0 }))
     ];
     await conn.query(
-      'UPDATE clientdetail SET credit = ?, pricingplandetail = ?, expired = ?, updated_at = ? WHERE id = ?',
+      'UPDATE operatordetail SET credit = ?, pricingplandetail = ?, expired = ?, status = 1, updated_at = ? WHERE id = ?',
       [JSON.stringify(creditList), JSON.stringify(newPricingplandetail), expiredStr, now, clientId]
     );
+    if (coreGrant > 0) {
+      const currency = String(client.currency || '').trim().toUpperCase();
+      if (!currency) throw new Error('CLIENT_CURRENCY_MISSING');
+      if (!['MYR', 'SGD'].includes(currency)) throw new Error('UNSUPPORTED_CLIENT_CURRENCY');
+      const creditLogId = randomUUID();
+      const ref = `PLAN-CREDIT-${creditLogId}`;
+      await conn.query(
+        `INSERT INTO creditlogs (id, title, type, client_id, staff_id, currency, amount, is_paid, reference_number, pricingplanlog_id, sourplan_id, paiddate, created_at, updated_at)
+         VALUES (?, ?, 'Topup', ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)`,
+        [
+          creditLogId,
+          `Pricing plan: ${plan.title} (core credit)`,
+          clientId,
+          log.staff_id || null,
+          currency,
+          coreGrant,
+          ref,
+          pricingplanlogId,
+          plan.id,
+          now,
+          now,
+          now
+        ]
+      );
+    }
     const { syncAll } = require('../../services/client-subtables');
     await syncAll(conn, {
       clientId,
@@ -390,6 +416,18 @@ async function handlePricingPlanPaymentSuccess({ pricingplanlogId, clientId }) {
       credit: creditList
     });
     await conn.commit();
+    try {
+      const { clearBillingCacheByClientId } = require('./billing.service');
+      clearBillingCacheByClientId(clientId);
+    } catch (e) {
+      console.warn('[checkout] clearBillingCacheByClientId after plan success', e?.message || e);
+    }
+    try {
+      const { ensureMasterAdminUserForClient } = require('./indoor-admin.service');
+      await ensureMasterAdminUserForClient(clientId);
+    } catch (e) {
+      console.warn('[checkout] ensureMasterAdminUserForClient after plan success', e?.message || e);
+    }
     return { ok: true, planId: log.plan_id, expired: log.newexpireddate };
   } catch (err) {
     await conn.rollback();

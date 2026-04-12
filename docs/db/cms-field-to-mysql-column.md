@@ -51,11 +51,11 @@
 | PropertyDetail | owner | propertydetail | owner_id | import-propertydetail (ownername→owner_wixid/owner_id) |
 | PropertyDetail | management | propertydetail | management_wixid + management_id (FK→supplierdetail) | import-propertydetail；0024 用 wix_id 回填 |
 | clientdetail | _id | clientdetail | id | 迁移/通用 |
-| clientdetail | title | clientdetail | title | import-clientdetail / db.md |
+| clientdetail | title | clientdetail | title | import-operatordetail / db.md |
 | clientdetail | email | clientdetail | email | 同上 |
 | clientdetail | currency | clientdetail | currency | 同上 |
 | clientdetail | profile | clientdetail | profile (TEXT/JSON) | 0002_clientdetail / client_profile 子表也可用 |
-| clientdetail.profile[0] | ssm, address, contact, subdomain, accountNumber | client_profile 或 profile JSON | ssm, address, contact, subdomain, accountnumber | db.md / import-clientdetail |
+| clientdetail.profile[0] | ssm, address, contact, subdomain, accountNumber | client_profile 或 profile JSON | ssm, address, contact, subdomain, accountnumber | db.md / import-operatordetail |
 | meterdetail | _id | meterdetail | id | 迁移/通用 |
 | meterdetail | meterId | meterdetail | meterid | 0017_meterdetail_columns / import-meterdetail |
 | OwnerDetail | _id | ownerdetail | id | 迁移/通用 |
@@ -98,7 +98,7 @@
 | OwnerDetail（OwnerPayout.owner） | name / ownerName | ownerdetail | ownername | import-ownerdetail |
 | OwnerDetail | bankName | ownerdetail | bankname_id | 同上 |
 | OwnerDetail | bankAccount, accountholder, email | ownerdetail | bankaccount, accountholder, email | 同上 |
-| clientdetail | profile[0].accountNumber | client_profile 或 clientdetail.profile | accountnumber / profile JSON | db.md / import-clientdetail |
+| clientdetail | profile[0].accountNumber | client_profile 或 clientdetail.profile | accountnumber / profile JSON | db.md / import-operatordetail |
 
 ---
 

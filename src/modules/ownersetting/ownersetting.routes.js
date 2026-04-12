@@ -5,7 +5,7 @@
 
 const express = require('express');
 const router = express.Router();
-const { getAccessContextByEmail } = require('../access/access.service');
+const { getAccessContextByEmail, getAccessContextByEmailAndClient } = require('../access/access.service');
 const {
   getOwnerList,
   getOwnerFilters,
@@ -27,6 +27,20 @@ async function requireCtx(req, res) {
   if (!email) {
     res.status(400).json({ ok: false, reason: 'NO_EMAIL' });
     return null;
+  }
+  const bodyClientId = req.body?.clientId ?? req.query?.clientId ?? null;
+  /** Align with /api/contact: when operator switches company, body.clientId must win over default client_user row */
+  if (bodyClientId) {
+    const ctx = await getAccessContextByEmailAndClient(String(email).trim(), String(bodyClientId).trim());
+    if (!ctx.ok) {
+      res.status(403).json({ ok: false, reason: ctx.reason || 'ACCESS_DENIED' });
+      return null;
+    }
+    if (!ctx.client?.id) {
+      res.status(403).json({ ok: false, reason: 'NO_CLIENT' });
+      return null;
+    }
+    return ctx;
   }
   const ctx = await getAccessContextByEmail(email);
   if (!ctx.ok) {
@@ -123,14 +137,15 @@ router.post('/properties-without-owner', async (req, res, next) => {
   }
 });
 
-/** POST /api/ownersetting/save-invitation – body: { email, ownerId?, email: ownerEmail, propertyId, agreementId, editingPendingContext? } */
+/** POST /api/ownersetting/save-invitation – body: { email: operator, clientId?, ownerEmail, ownerId?, propertyId, agreementId?, editingPendingContext? } */
 router.post('/save-invitation', async (req, res, next) => {
   try {
     const ctx = await requireCtx(req, res);
     if (!ctx) return;
+    const invitee = String(req.body?.ownerEmail ?? '').trim();
     const payload = {
       ownerId: req.body?.ownerId,
-      email: req.body?.email,
+      email: invitee,
       propertyId: req.body?.propertyId,
       agreementId: req.body?.agreementId,
       editingPendingContext: req.body?.editingPendingContext

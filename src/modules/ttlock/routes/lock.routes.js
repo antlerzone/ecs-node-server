@@ -7,6 +7,7 @@ const express = require('express');
 const router = express.Router();
 const validate = require('../../../middleware/validate');
 const lockWrapper = require('../wrappers/lock.wrapper');
+const lockdetailLog = require('../../smartdoorsetting/lockdetail-log.service');
 const {
   params_lock_id_schema,
   rename_lock_schema,
@@ -125,7 +126,21 @@ router.put('/:lockId/passcodes', validate(params_lock_id_schema, 'params'), vali
 /* remote unlock */
 router.post('/:lockId/unlock', validate(params_lock_id_schema, 'params'), async (req, res) => {
   try {
-    const data = await lockWrapper.remoteUnlock(clientId(req), req.params.lockId);
+    const cid = clientId(req);
+    const lockId = req.params.lockId;
+    const data = await lockWrapper.remoteUnlock(cid, lockId);
+    try {
+      const ldId = await lockdetailLog.findLockdetailIdByColivingClientIdAndTtlockLockId(cid, lockId);
+      if (ldId) {
+        await lockdetailLog.insertLockdetailRemoteUnlockLog({
+          lockdetailId: ldId,
+          actorEmail: '(unknown)',
+          portalSource: 'coliving_ttlock_api',
+        });
+      }
+    } catch (logErr) {
+      console.warn('[ttlock/locks] lockdetail_log', logErr?.message || logErr);
+    }
     res.json({ ok: true, data });
   } catch (err) {
     handleErr(res, err);

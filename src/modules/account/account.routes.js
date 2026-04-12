@@ -32,7 +32,8 @@ router.post('/resolve', async (req, res, next) => {
 router.post('/list', async (req, res, next) => {
   try {
     const email = getEmail(req);
-    const items = await listAccountTemplates(email);
+    const clientId = req.clientId ?? req.body?.clientId ?? req.query?.clientId ?? null;
+    const items = await listAccountTemplates(email, clientId);
     console.log('[account] /list response', { itemCount: items.length, firstId: items[0]?._id || null });
     res.json({ ok: true, items });
   } catch (err) {
@@ -49,8 +50,9 @@ router.post('/get', async (req, res, next) => {
   try {
     const email = getEmail(req);
     const id = req.body?.id ?? req.body?.accountId ?? req.query?.id;
+    const clientId = req.clientId ?? req.body?.clientId ?? req.query?.clientId ?? null;
     if (!id) return res.status(400).json({ ok: false, reason: 'MISSING_ID' });
-    const item = await getAccountById(email, id);
+    const item = await getAccountById(email, id, clientId);
     res.json({ ok: true, item });
   } catch (err) {
     if (err.message === 'NOT_FOUND') return res.status(404).json({ ok: false, reason: err.message });
@@ -83,7 +85,8 @@ router.post('/save', async (req, res, next) => {
 router.post('/sync', async (req, res, next) => {
   try {
     const email = getEmail(req);
-    const result = await syncAccounts(email);
+    const clientId = req.body?.clientId ?? req.query?.clientId ?? null;
+    const result = await syncAccounts(email, clientId);
     res.json(result);
   } catch (err) {
     next(err);

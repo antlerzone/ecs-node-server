@@ -48,6 +48,20 @@ All four return an **invoice id** (for payment tracking and e-invoice). **URL** 
    - Resolve client accounting (plan + addonAccount).
    - For each record: get account mapping (`type_id` → accountid/productId), get contact (owner or tenant), create credit invoice with due date = `record.date`, then `UPDATE rentalcollection SET invoiceid = ?, invoiceurl = ?, bukku_invoice_id = ?`.
 
+## Commission in accounting (debit / credit)
+
+When we **create a credit invoice** for a rental collection item (including commission), the accounting system records:
+
+| When | Debit | Credit |
+|------|--------|--------|
+| **Invoice created** | Accounts receivable (tenant or owner, by contact) | **Commission income** — account from Account Setting mapping for this `type_id` (Tenant Commission / Owner Commission) |
+| **Payment received** | Cash/Bank | Accounts receivable |
+
+- **Tenant commission**: Invoice **to tenant**. Dr Tenant receivable, Cr **Tenant Commission Income** (account mapped in Company → Account Setting for “Tenant Commission”).
+- **Owner commission**: Invoice **to owner**. Dr Owner receivable, Cr **Owner Commission Income** (account mapped for “Owner Commission”).
+
+The `accountId` we pass to `createCreditInvoice` (from `getAccountMapping(clientId, type_id, provider)`) is the **revenue account** = **Credit** side. The **Debit** (receivable) is implied by the contact in Bukku/Xero/AutoCount/SQL when the invoice is created.
+
 ## Dependencies
 
 - `client_pricingplan_detail` (plan allows accounting)

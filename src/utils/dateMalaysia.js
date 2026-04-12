@@ -92,6 +92,54 @@ function getTodayPlusDaysMalaysia(days) {
   return d.toISOString().substring(0, 10);
 }
 
+/**
+ * Malaysia calendar: first day of the current month `YYYY-MM-01` (from "today" in MY).
+ */
+function getMalaysiaMonthStartYmd() {
+  const today = getTodayMalaysiaDate();
+  const [y, m] = today.split('-').map(Number);
+  return `${y}-${String(m).padStart(2, '0')}-01`;
+}
+
+/**
+ * Malaysia calendar: `YYYY-MM-01` for the month that is `monthsAgo` months before the **start**
+ * of the current MY month (e.g. `11` → first day of the month 11 months back → 12‑month window).
+ */
+function getMalaysiaMonthStartMonthsAgo(monthsAgo) {
+  const n = Math.max(0, Math.floor(Number(monthsAgo) || 0));
+  const startThis = getMalaysiaMonthStartYmd();
+  const d = new Date(startThis + 'T12:00:00+08:00');
+  d.setMonth(d.getMonth() - n);
+  const y = d.getFullYear();
+  const mo = d.getMonth() + 1;
+  return `${y}-${String(mo).padStart(2, '0')}-01`;
+}
+
+/**
+ * Calendar YYYY-MM-DD in Asia/Singapore (UTC+8) for an instant.
+ * Use when building rentalcollection.date → createInvoicesForRentalRecords / Bukku so invoice date matches business day.
+ */
+function toSingaporeCalendarYmd(instant) {
+  const d = instant instanceof Date ? instant : new Date(instant);
+  if (Number.isNaN(d.getTime())) return getTodayMalaysiaDate();
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Singapore',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).formatToParts(d);
+    const y = parts.find((p) => p.type === 'year')?.value;
+    const m = parts.find((p) => p.type === 'month')?.value;
+    const day = parts.find((p) => p.type === 'day')?.value;
+    if (y && m && day) return `${y}-${m}-${day}`;
+  } catch (_) {
+    /* ignore */
+  }
+  const myMs = d.getTime() + MY_OFFSET_MS;
+  return new Date(myMs).toISOString().substring(0, 10);
+}
+
 /** API 返回中常见的日期/时间字段名，读出表后一律按 UTC+8 转成 YYYY-MM-DD 再给前端 */
 const DEFAULT_DATE_KEYS = [
   'created_at', 'updated_at', '_createdDate', 'period', 'date', 'startDate', 'endDate',
@@ -154,14 +202,113 @@ function malaysiaDateRangeToUtcForQuery(fromYYYYMMDD, toYYYYMMDD) {
   return { fromUtc, toUtc };
 }
 
+/**
+ * Malaysia wall-clock calendar date + HH:mm (no DST) → UTC `YYYY-MM-DD HH:mm:ss.000` for MySQL DATETIME(3).
+ * Used when UI means "this local time in Malaysia" (e.g. Cleanlemons schedule working_day).
+ */
+function malaysiaWallClockToUtcDatetimeForDb(ymd, hh, mm) {
+  const p = parseDateParts(ymd);
+  if (!p) return null;
+  const h = Math.min(23, Math.max(0, Number(hh) || 0));
+  const mi = Math.min(59, Math.max(0, Number(mm) || 0));
+  const utcMs = Date.UTC(p.y, p.m - 1, p.d, h, mi, 0, 0) - MY_OFFSET_MS;
+  const d = new Date(utcMs);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  const hs = String(d.getUTCHours()).padStart(2, '0');
+  const mins = String(d.getUTCMinutes()).padStart(2, '0');
+  const ss = String(d.getUTCSeconds()).padStart(2, '0');
+  return `${y}-${m}-${day} ${hs}:${mins}:${ss}.000`;
+}
+
+/**
+ * Legacy: non–YYYY-MM-DD booking inputs → MySQL datetime using UTC clock parts (aligns with +00:00 session).
+ * @param {string|Date} val
+ * @returns {string|null}
+ */
+function legacyMysqlDatetimeUtcFromInput(val) {
+  if (val == null || val === '') return null;
+  const d = val instanceof Date ? val : new Date(val);
+  if (Number.isNaN(d.getTime())) return null;
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  const h = String(d.getUTCHours()).padStart(2, '0');
+  const min = String(d.getUTCMinutes()).padStart(2, '0');
+  const s = String(d.getUTCSeconds()).padStart(2, '0');
+  return `${y}-${m}-${day} ${h}:${min}:${s}`;
+}
+
+/**
+ * Booking UI: YYYY-MM-DD = Malaysia calendar day → UTC for tenancy.begin / tenancy.end columns.
+ * Non–date-only inputs fall back to legacy UTC parts (same as historical booking.service).
+ * @returns {{ beginMysql: string|null, endMysql: string|null }}
+ */
+function tenancyBeginEndToMysql(beginDate, endDate) {
+  const b = String(beginDate || '').trim();
+  const e = String(endDate || '').trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(b) && /^\d{4}-\d{2}-\d{2}$/.test(e)) {
+    const beginMysql = malaysiaDateToUtcDatetimeForDb(b);
+    const { toUtc: endMysql } = malaysiaDateRangeToUtcForQuery(null, e);
+    return { beginMysql, endMysql };
+  }
+  return {
+    beginMysql: legacyMysqlDatetimeUtcFromInput(beginDate),
+    endMysql: legacyMysqlDatetimeUtcFromInput(endDate)
+  };
+}
+
+/**
+ * Tenancy `end` only (extend / change room): MY calendar YYYY-MM-DD → end of MY day in UTC (same as booking end).
+ * @param {string} endYmd
+ * @returns {string|null}
+ */
+function tenancyEndYmdToMysqlDatetime(endYmd) {
+  const e = String(endYmd || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(e)) return null;
+  const { toUtc } = malaysiaDateRangeToUtcForQuery(null, e);
+  return toUtc;
+}
+
+/**
+ * Operator edit tenancy checkout: Malaysia calendar YYYY-MM-DD, or `YYYY-MM-DDTHH:mm` as Malaysia wall clock → UTC for MySQL.
+ * @param {string|Date|null|undefined} val
+ * @returns {string|null}
+ */
+function tenancyEndInputToMysqlDatetime(val) {
+  if (val == null || val === '') return null;
+  const s = String(val).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    return tenancyEndYmdToMysqlDatetime(s);
+  }
+  const m = s.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}):(\d{2})/);
+  if (m) {
+    const raw = malaysiaWallClockToUtcDatetimeForDb(m[1], m[2], m[3]);
+    return raw ? raw.replace(/\.000$/, '') : null;
+  }
+  const d = val instanceof Date ? val : new Date(s);
+  if (Number.isNaN(d.getTime())) return null;
+  const ymd = utcDatetimeFromDbToMalaysiaDateOnly(d);
+  if (ymd) return tenancyEndYmdToMysqlDatetime(ymd);
+  return null;
+}
+
 module.exports = {
   malaysiaDateToUtcDatetimeForDb,
+  malaysiaWallClockToUtcDatetimeForDb,
   utcDatetimeFromDbToMalaysiaDateOnly,
   utcDatetimeFromDbToMalaysiaDate,
   malaysiaDateRangeToUtcForQuery,
   parseDateParts,
   getTodayMalaysiaDate,
   getTodayPlusDaysMalaysia,
+  getMalaysiaMonthStartYmd,
+  getMalaysiaMonthStartMonthsAgo,
+  toSingaporeCalendarYmd,
   formatApiResponseDates,
-  DEFAULT_DATE_KEYS
+  DEFAULT_DATE_KEYS,
+  tenancyBeginEndToMysql,
+  tenancyEndYmdToMysqlDatetime,
+  tenancyEndInputToMysqlDatetime
 };

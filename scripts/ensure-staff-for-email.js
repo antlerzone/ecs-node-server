@@ -28,17 +28,17 @@ async function main() {
 
   if (!clientId) {
     const [clientByEmail] = await pool.query(
-      'SELECT id, status FROM clientdetail WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+      'SELECT id, status FROM operatordetail WHERE LOWER(TRIM(email)) = ? LIMIT 1',
       [email]
     );
     if (clientByEmail.length) {
       clientId = clientByEmail[0].id;
       if (clientByEmail[0].status !== 1 && clientByEmail[0].status !== true) {
-        await pool.query('UPDATE clientdetail SET status = 1, updated_at = NOW() WHERE id = ?', [clientId]);
+        await pool.query('UPDATE operatordetail SET status = 1, updated_at = NOW() WHERE id = ?', [clientId]);
         console.log('Client', clientId, 'was inactive; set status=1.');
       }
     } else {
-      const [demoClient] = await pool.query('SELECT id FROM clientdetail WHERE id = ? LIMIT 1', [DEMO_CLIENT_ID]);
+      const [demoClient] = await pool.query('SELECT id FROM operatordetail WHERE id = ? LIMIT 1', [DEMO_CLIENT_ID]);
       if (!demoClient.length) {
         console.error('No client for email and demo client not found. Run seed-demo-account.js first or pass clientId.');
         process.exit(1);
@@ -80,7 +80,7 @@ async function main() {
   }
 
   const [ctx] = await pool.query(
-    'SELECT s.id, s.email, s.status, s.client_id, c.title, c.status AS client_status FROM staffdetail s JOIN clientdetail c ON c.id = s.client_id WHERE LOWER(TRIM(s.email)) = ? LIMIT 1',
+    'SELECT s.id, s.email, s.status, s.client_id, c.title, c.status AS client_status FROM staffdetail s JOIN operatordetail c ON c.id = s.client_id WHERE LOWER(TRIM(s.email)) = ? LIMIT 1',
     [email]
   );
   if (ctx.length) {

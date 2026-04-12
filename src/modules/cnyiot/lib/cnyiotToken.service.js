@@ -8,7 +8,7 @@
 const crypto = require('crypto');
 const pool = require('../../../config/db');
 
-const BASE_URL = process.env.CNYIOT_BASE_URL || process.env.CNYIOT_PROXY_BASE || 'https://www.openapi.cnyiot.com/api.ashx';
+const BASE_URL = process.env.CNYIOT_BASE_URL || 'https://www.openapi.cnyiot.com/api.ashx';
 const LOGIN_URL = `${BASE_URL}?Method=login&api=${process.env.CNYIOT_API_ID || 'coliman'}`;
 const TOKEN_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 

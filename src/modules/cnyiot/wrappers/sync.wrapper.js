@@ -5,10 +5,13 @@
 
 const pool = require('../../../config/db');
 const { callCnyIot } = require('./cnyiotRequest');
+const meterWrapper = require('./meter.wrapper');
 
 async function syncMeterByCmsMeterId(clientId, meterId) {
   if (!clientId) throw new Error('CLIENT_ID_REQUIRED');
   if (!meterId) throw new Error('METER_ID_REQUIRED');
+
+  console.log('[sync] sync.wrapper version=portal-balance-guard+prepaid-zero-relay-off');
 
   const [rows] = await pool.query(
     'SELECT * FROM meterdetail WHERE meterid = ? AND client_id = ? LIMIT 1',
@@ -61,13 +64,47 @@ async function syncMeterByCmsMeterId(clientId, meterId) {
 
   const s = Number(d.s);
   const isOnline = s === 3 || s === 4 || String(d.met_status || d.s).includes('在线');
+  /** s=3/4 = device reports definitive on/off. s=6「等待下发」等 = platform/指令未同步到表，此时用设备字段会覆盖 portal 刚 topup/clear 的结果。 */
+  const deviceRelayDefinitive = s === 3 || s === 4;
   let status = false;
   if (s === 3) status = true;
   else if (s === 4) status = false;
   else status = isOnline;
-  console.log('[sync] parsed d.s=', d.s, 's(Number)=', s, 'isOnline=', isOnline, 'status(Active)=', status, 'balance=', balance);
 
-  const updateParams = [title ?? meter.title, mode ?? meter.mode, balance, isOnline ? 1 : 0, status ? 1 : 0, meter.id];
+  let balanceUse = balance;
+  let statusUse = status ? 1 : 0;
+  if (!deviceRelayDefinitive) {
+    balanceUse = meter.balance != null ? Number(meter.balance) : balance;
+    statusUse = meter.status ? 1 : 0;
+    console.log(
+      '[sync] s=%s not 3/4 (e.g. 等待下发) — keep portal balance=%s status=%s, not device balance=%s status=%s',
+      d.s,
+      balanceUse,
+      statusUse,
+      balance,
+      status ? 1 : 0
+    );
+  } else {
+    console.log('[sync] parsed d.s=', d.s, 'isOnline=', isOnline, 'status(Active)=', status, 'balance=', balance);
+  }
+
+  const modeStr = String(mode || meter.mode || 'prepaid').toLowerCase() === 'postpaid' ? 'postpaid' : 'prepaid';
+  const balanceUseNum = Number(balanceUse);
+  /** Prepaid & no kWh left → Active must be false and relay open (Val 1), even if device briefly reports s=3. */
+  let zeroBalanceForcedRelayOff = false;
+  if (modeStr === 'prepaid' && !Number.isNaN(balanceUseNum) && balanceUseNum <= 0) {
+    if (statusUse !== 0) {
+      console.log(
+        '[sync] prepaid zero balance: forcing status OFF (was %s) — CNYIOT/merged balance=%s',
+        statusUse,
+        balanceUseNum
+      );
+    }
+    statusUse = 0;
+    zeroBalanceForcedRelayOff = true;
+  }
+
+  const updateParams = [title ?? meter.title, mode ?? meter.mode, balanceUse, isOnline ? 1 : 0, statusUse, meter.id];
   const [updateResult] = await pool.query(
     `UPDATE meterdetail SET title = ?, mode = ?, balance = ?, isonline = ?, status = ?, lastsyncat = NOW(), updated_at = NOW() WHERE id = ?`,
     updateParams
@@ -78,8 +115,33 @@ async function syncMeterByCmsMeterId(clientId, meterId) {
     console.warn('[sync] UPDATE meterdetail affected 0 rows - table may not be updated');
   }
 
+  if (zeroBalanceForcedRelayOff && metidToUse) {
+    try {
+      await meterWrapper.setRelay(clientId, metidToUse, 1);
+      console.log('[sync] setRelay Val=1 (disconnect) OK for prepaid zero balance metid=%s', metidToUse);
+    } catch (e) {
+      try {
+        await meterWrapper.setRelay(clientId, metidToUse, 1, { usePlatformAccount: true });
+        console.log('[sync] setRelay Val=1 (platform retry) OK metid=%s', metidToUse);
+      } catch (e2) {
+        console.warn('[sync] setRelay disconnect for zero balance failed', metidToUse, e?.message || e, e2?.message || e2);
+      }
+    }
+  }
+
   const [afterRows] = await pool.query('SELECT * FROM meterdetail WHERE id = ? LIMIT 1', [meter.id]);
-  const after = afterRows && afterRows[0] ? afterRows[0] : { ...meter, title, mode, balance, isonline: isOnline ? 1 : 0, status: status ? 1 : 0, lastsyncat: new Date() };
+  const after =
+    afterRows && afterRows[0]
+      ? afterRows[0]
+      : {
+          ...meter,
+          title,
+          mode,
+          balance: balanceUse,
+          isonline: isOnline ? 1 : 0,
+          status: statusUse,
+          lastsyncat: new Date()
+        };
 
   return {
     ok: true,
@@ -87,7 +149,8 @@ async function syncMeterByCmsMeterId(clientId, meterId) {
     meterid: metidToUse,
     before: meter,
     after,
-    raw: d
+    raw: d,
+    prepaidZeroBalanceRelayOff: zeroBalanceForcedRelayOff
   };
 }
 

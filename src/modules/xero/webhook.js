@@ -7,12 +7,21 @@
 
 const crypto = require('crypto');
 
-const WEBHOOK_KEY = process.env.XERO_WEBHOOK_KEY;
+/** Coliving default; Cleanlemons host should set CLEANLEMON_XERO_WEBHOOK_KEY for its own Xero app. */
+function resolveWebhookKey(req) {
+  const host = String(req.headers.host || '').toLowerCase();
+  const cleanKey = String(process.env.CLEANLEMON_XERO_WEBHOOK_KEY || '').trim();
+  const fallback = String(process.env.XERO_WEBHOOK_KEY || '').trim();
+  if (host.includes('cleanlemons')) {
+    return cleanKey || fallback;
+  }
+  return fallback;
+}
 
-function verifySignature(rawBody, signature) {
-  if (!WEBHOOK_KEY || !signature || typeof signature !== 'string') return false;
+function verifySignature(rawBody, signature, webhookKey) {
+  if (!webhookKey || !signature || typeof signature !== 'string') return false;
   const payload = typeof rawBody === 'string' ? rawBody : (Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : (rawBody?.toString?.() ?? ''));
-  const hash = crypto.createHmac('sha256', WEBHOOK_KEY).update(payload).digest('base64');
+  const hash = crypto.createHmac('sha256', webhookKey).update(payload).digest('base64');
   if (signature.length !== hash.length) return false;
   try {
     return crypto.timingSafeEqual(Buffer.from(signature, 'utf8'), Buffer.from(hash, 'utf8'));
@@ -27,12 +36,13 @@ function verifySignature(rawBody, signature) {
 function webhookHandler(req, res) {
   const signature = req.headers['x-xero-signature'];
   const rawBody = req.body;
+  const webhookKey = resolveWebhookKey(req);
 
-  if (!WEBHOOK_KEY) {
+  if (!webhookKey) {
     return res.status(501).send('XERO_WEBHOOK_KEY not configured');
   }
 
-  if (!verifySignature(rawBody, signature)) {
+  if (!verifySignature(rawBody, signature, webhookKey)) {
     return res.status(401).send('Invalid signature');
   }
 

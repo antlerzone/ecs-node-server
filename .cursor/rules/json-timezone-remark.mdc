@@ -1,0 +1,42 @@
+---
+description: JSON 内时间字段须标明 IANA 时区；MySQL DATETIME 与 filter 约定互参
+alwaysApply: true
+---
+
+# JSON 与 MySQL 时间约定
+
+## MySQL（业务 DATETIME / TIMESTAMP）
+
+- 连接池 timezone: '+00:00'：存库为 UTC 瞬时；筛选 between 时用户日期按 UTC+8（马来西亚）理解，服务端用 src/utils/dateMalaysia.js（如 malaysiaDateRangeToUtcForQuery / malaysiaDateToUtcDatetimeForDb）再查库。
+- 详见 docs/date-timezone-convention.md。
+
+## JSON 列 / JSON 字段（LONGTEXT 存 JSON）
+
+凡在 JSON 中写入可解释为多地区歧义的时间信息，须在同一对象内标明 IANA 时区（推荐 Asia/Kuala_Lumpur），便于后期多区域与审计。
+
+须带时区说明的典型内容：
+
+- 日历时钟：HH:mm、HH:mm:ss、仅 YYYY-MM-DD 表示营业日/工作日而非 UTC 瞬时。
+- 排班 / 休息日：如 team 的 rest_days_json 若含日期或时段。
+- AI / 调度偏好：schedule_prefs_json 等与每日几点相关的配置。
+
+推荐字段（二选一，新写入优先）：
+
+- businessTimeZone: "Asia/Kuala_Lumpur"
+- 或 timeZone: 同上
+
+缺省：若历史数据无该字段，读路径默认 Asia/Kuala_Lumpur（与产品主市场一致），新代码写入时应补全 businessTimeZone，勿静默混用浏览器本地时区。
+
+纯 UTC 瞬时：若 JSON 内存的是 ISO 8601 带 Z 的完整时间（已与 UTC 对齐），可不再重复标时区，但须在代码或注释说明为 UTC。
+
+## 仓库中常见 JSON 落点（含时间时须遵守上文）
+
+- Cleanlemons cln_operator_settings.settings_json → companyProfile（如 workingHourFrom / workingHourTo、out-of-hours 等）。
+- Cleanlemons cln_operator_team：rest_days_json 等。
+- Cleanlemons cln_operator_ai：schedule_prefs_json（调度/AI 与时间窗口相关）。
+- Coliving operatordetail.admin：各类运营 JSON（若新增带日期的配置，同上）。
+- 其他 *_json / remark_json / billing_json：一旦加入日期或日钟字符串，在同一对象内加 businessTimeZone 或文档约定。
+
+## 与 Next 前端
+
+- Portal 展示：UTC+8（Asia/Kuala_Lumpur）或与 businessTimeZone 一致；不要假设 JSON 内 HH:mm 为 UTC。

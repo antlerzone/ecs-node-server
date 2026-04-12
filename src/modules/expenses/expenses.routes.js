@@ -24,6 +24,27 @@ function getEmail(req) {
   return req.body?.email ?? req.query?.email ?? null;
 }
 
+function getPaidAtFromBody(body) {
+  return (
+    body?.paidAt ??
+    body?.paidat ??
+    body?.datepickerpayment ??
+    body?.paymentDate ??
+    body?.date ??
+    new Date()
+  );
+}
+
+function getPaymentMethodFromBody(body) {
+  return (
+    body?.paymentMethod ??
+    body?.paymentmethod ??
+    body?.dropdownpaymentmethod ??
+    body?.method ??
+    'Cash'
+  );
+}
+
 /**
  * POST /api/expenses/list
  * Body: { email, property?, type?, from?, to?, search?, sort?, page?, pageSize?, limit? }
@@ -51,7 +72,8 @@ router.post('/list', async (req, res, next) => {
       sort: req.body?.sort,
       page: req.body?.page,
       pageSize: req.body?.pageSize,
-      limit: req.body?.limit
+      limit: req.body?.limit,
+      paid: req.body?.paid
     };
     const clientId = ctx.client?.id;
     if (!clientId) {
@@ -213,8 +235,8 @@ router.post('/update', async (req, res, next) => {
     }
     const result = await updateExpense(ctx.clientId, id, {
       paid: req.body?.paid,
-      paidat: req.body?.paidat,
-      paymentmethod: req.body?.paymentmethod
+      paidat: getPaidAtFromBody(req.body),
+      paymentmethod: getPaymentMethodFromBody(req.body)
     });
     res.json(result);
   } catch (err) {
@@ -231,8 +253,8 @@ router.post('/bulk-mark-paid', async (req, res, next) => {
     if (!Array.isArray(ids)) {
       return res.status(400).json({ ok: false, reason: 'NO_IDS' });
     }
-    const paidAt = req.body?.paidAt != null ? req.body.paidAt : new Date();
-    const paymentMethod = req.body?.paymentMethod ?? 'Bulk';
+    const paidAt = getPaidAtFromBody(req.body);
+    const paymentMethod = getPaymentMethodFromBody(req.body);
     const result = await bulkMarkPaid(ctx.clientId, ids, paidAt, paymentMethod);
     res.json(result);
   } catch (err) {

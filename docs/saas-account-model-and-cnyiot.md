@@ -36,7 +36,7 @@
 ### 3.1 创建 / 导入 **Client**（子户口）
 
 - **有**：Client 主数据与子表（含 integration）的导入与同步。  
-  - [docs/db/import-clientdetail.md](./db/import-clientdetail.md)：clientdetail CSV 导入、清空、子表同步。  
+  - [docs/db/import-operatordetail.md](./db/import-operatordetail.md)：clientdetail CSV 导入、清空、子表同步。  
   - [docs/db/db.md](./db/db.md)：clientdetail、client_integration 结构；integration 里可配 meter/cnyiot（cnyiot_username、cnyiot_password），即该 client 的 CNYIoT 登入。  
 - **没有**：单独的「在管理后台点一下创建新 client」的 step-by-step；目前是通过 **导入 clientdetail + 配置 client_integration** 得到新 client（子户口）。
 
@@ -70,7 +70,7 @@
 | 总户口看到所有、子户口只看自己 | 已通过 client_id 隔离与 clientresolver 实现。 |
 | Client 有自己户口、可登入、多电表 | 已支持：一个 client = 一个 CNYIoT 房东账号，多电表。 |
 | Client 是不是我们的 tenant | **不是**；client 是客户，tenant 是 client 的租客。 |
-| 创建 client（子户口） | 有：import-clientdetail + client_integration 配置；无：单独「创建新 client」界面步骤。 |
+| 创建 client（子户口） | 有：import-operatordetail + client_integration 配置；无：单独「创建新 client」界面步骤。 |
 | 创建租客（我们系统） | 有：import-tenantdetail；无：界面「新建租客」步骤。 |
 | 在 CNYIoT 创建租客并绑定电表 | 已实现：getUsers、addUser、link2User 等；ensure-subuser 为 client 建子账号。 |
 | 租客支付后充值 | 已有：createPendingTopup + confirmTopup，按 client_id + meterId 调用即可。 |

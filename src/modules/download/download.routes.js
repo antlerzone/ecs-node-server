@@ -12,7 +12,9 @@ router.get('/:token', (req, res) => {
   if (!entry) {
     return res.status(404).send('Not found or expired');
   }
-  const disposition = `attachment; filename="${encodeURIComponent(entry.filename)}"`;
+  const preview = String(req.query?.preview || '').trim();
+  const mode = preview === '1' || preview.toLowerCase() === 'true' ? 'inline' : 'attachment';
+  const disposition = `${mode}; filename="${encodeURIComponent(entry.filename)}"`;
   res.setHeader('Content-Disposition', disposition);
   res.setHeader('Content-Type', entry.mimeType);
   res.send(entry.buffer);

@@ -1,0 +1,24 @@
+功能,Wix (旧),Next (新),Next 状态
+权限,permission.tenantdetail \|\| admin; getAccessContext,operator 路由登录,已有
+列表,getContactList(type, search, sort, page, pageSize, limit),getContactList(search, pageSize: 500),已有
+筛选,下拉 type: A>z / Z>a / Owner / Tenant / Supplier + 搜索 inputcontact,Tab All/Owner/Tenant/Supplier + Search 框 + 排序 A↔Z,已有
+排序,sort 传 API 或 cache 排序,sortBy 前端排序 (az/za),已有
+分页,10 条/页; cache 最多 500 超则 server 分页,无分页 单次 500 条,少(可补)
+列表展示,Repeater 卡片 text/role/type; 每卡 Edit/Delete,Card 列表 name/type/email/phone; Edit / Edit Account ID / Delete,已有
+Add Owner,#buttonowner → #inputemail2 → submitOwnerApproval(email),Add Contact → Add Owner → 填 email → submitOwnerApproval,已有
+Add Tenant,#buttontenant → #inputemail2 → submitTenantApproval(email),Add Contact → Add Tenant → 填 email → submitTenantApproval,已有
+Add Supplier,#buttonsupplier → 表单 name/email/Jompay|Bank/billerCode|bankName+account+holder → createSupplier,Add Contact → Add Supplier → 表单 name/email/Jompay|Bank → createSupplier,已有
+Edit Owner,点 Edit → getOwner → 仅 #inputbukkuid → updateOwnerAccount,Edit → 仅 Edit Account ID 弹窗 (Owner 无完整编辑),已有
+Edit Tenant,点 Edit → getTenant → 仅 #inputbukkuid → updateTenantAccount,View 只读 (tenant 跨 operator 共享),已有
+Edit Supplier,点 Edit → getSupplier → name/email/billerCode/bank/dropdownmode/contactId/productid → updateSupplier,Edit → 完整表单 name/email/Jompay|Bank → updateSupplier,已有
+Delete Owner,deleteOwnerOrCancel(ownerId isPending); Pending 时按钮 Cancel,Delete/Cancel 确认 → deleteOwnerOrCancel(entityId pending),已有
+Delete Tenant,deleteTenantOrCancel(tenantId isPending); Pending 时 Cancel,同上 deleteTenantOrCancel,已有
+Delete Supplier,deleteSupplierAccount(supplierId),Delete 确认 → deleteSupplierAccount(entityId),已有
+Pending 状态,列表 __pending; 卡片黄底; Delete 按钮文案 Cancel,列表 name 后缀 " (Pending Approval)"; 删除确认文案 "Cancel pending approval",已有
+Edit Account ID,#inputbukkuid → updateOwnerAccount/updateTenantAccount/updateSupplier(contactId); getAccountSystem 无则 disable,Edit Account ID 弹窗 → contactId + productid(Supplier); accountingConnected 无则隐藏,已有
+银行下拉,getBanks() → #dropdownbank (bankdetail),getBanks() → bankOptions 用于 Add/Edit Supplier,已有
+会计系统,getAccountSystem() → contactHasAccountSystem 无则 disable #inputbukkuid,getOnboardStatus() → accountingConnected 无则隐藏 Edit Account ID,已有
+Supplier productid,#inputproductid 在 Supplier 编辑/创建,Edit Account ID 弹窗内 Product ID (optional),已有
+Sync to Bukku 单独,文档说可选单独调用 upsertContactTransit,无单独按钮; createSupplier 内部已同步,可接受
+Topup Section,#buttontopup / Credit plans / Checkout,无 (在 Credit 页),刻意不做
+Mobile,Please setting on pc version,响应式,新更好

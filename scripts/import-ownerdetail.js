@@ -8,6 +8,7 @@ const mysql = require('mysql2/promise');
 const fs = require('fs');
 const path = require('path');
 const { resolveId } = require('./import-util');
+const { ONBOARD_OPERATOR_ID, skipCsvColumn, bukkuAccountFromContactId } = require('./onboard-import-helpers');
 
 const csvPath = process.argv[2] || path.join(process.cwd(), 'ownerdetail.csv');
 const table = 'ownerdetail';
@@ -36,7 +37,7 @@ const CSV_TO_DB = {
   property: 'property_ref',
   profile: 'profile',
   account: 'account',
-  contact_id: 'contact_id', // 仅用于生成 account，不写入表
+  contact_id: 'contact_id',
   _createdDate: 'created_at',
   _updatedDate: 'updated_at',
   'Created Date': 'created_at',
@@ -141,7 +142,7 @@ async function run() {
   const tableColumns = new Set(cols.map(c => (c.column_name || c.COLUMN_NAME || '').toLowerCase()));
 
   const [clientRows, propertyRows, bankRows] = await Promise.all([
-    conn.query('SELECT id FROM clientdetail').then(([r]) => r.map(x => x.id)),
+    conn.query('SELECT id FROM operatordetail').then(([r]) => r.map(x => x.id)),
     conn.query('SELECT id FROM propertydetail').then(([r]) => r.map(x => x.id)),
     conn.query('SELECT id FROM bankdetail').then(([r]) => r.map(x => x.id)),
   ]);
@@ -157,6 +158,7 @@ async function run() {
       const values = parseCsvLine(lines[i]);
       const row = {};
       rawHeaders.forEach((h, idx) => {
+        if (skipCsvColumn(h)) return;
         const dbKey = headerToDb(h);
         if (dbKey === '_owner') return;
         row[dbKey] = values[idx] !== undefined ? normalizeVal(values[idx]) : null;
@@ -170,16 +172,15 @@ async function run() {
       if (row.property_ref != null && !validPropertyIds.has(row.property_ref)) row.property_ref = null;
       if (row.bankname_id != null && !validBankIds.has(row.bankname_id)) row.bankname_id = null;
 
-      // contact_id（数字）→ account：该 client 下的 Bukku contact，格式同 tenantdetail
-      const contactIdNum = row.contact_id != null && row.contact_id !== '' ? parseInt(String(row.contact_id).trim(), 10) : NaN;
-      if (!Number.isNaN(contactIdNum) && row.client_ref) {
-        row.account = JSON.stringify([{ clientId: row.client_ref, provider: 'bukku', id: contactIdNum }]);
-      }
-      delete row.contact_id;
+      // contact_id → account JSON（Bukku）；固定 operator
+      const acct = bukkuAccountFromContactId(row.contact_id, ONBOARD_OPERATOR_ID);
+      if (acct) row.account = acct;
       const clientRef = row.client_ref || null;
       const propertyRef = row.property_ref || null;
       delete row.client_ref;
       delete row.property_ref;
+
+      if (tableColumns.has('client_id')) row.client_id = ONBOARD_OPERATOR_ID;
 
       const now = new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
       if (!row.created_at) row.created_at = now;
@@ -197,15 +198,12 @@ async function run() {
       const placeholders = keys.map(() => '?').join(', ');
       const sql = `INSERT INTO \`${table}\` (${colsList}) VALUES (${placeholders})`;
       await conn.query(sql, keys.map(k => row[k]));
-      // 0087+/0142: owner relation source-of-truth is junction tables + propertydetail.owner_id.
-      if (clientRef) {
-        try {
-          await conn.query(
-            'INSERT IGNORE INTO owner_client (id, owner_id, client_id, created_at) VALUES (UUID(), ?, ?, NOW())',
-            [row.id, clientRef]
-          );
-        } catch (_) { /* owner_client may not exist on older schemas */ }
-      }
+      try {
+        await conn.query(
+          'INSERT IGNORE INTO owner_client (id, owner_id, client_id, created_at) VALUES (UUID(), ?, ?, NOW())',
+          [row.id, ONBOARD_OPERATOR_ID]
+        );
+      } catch (_) { /* owner_client */ }
       if (propertyRef) {
         try {
           await conn.query(

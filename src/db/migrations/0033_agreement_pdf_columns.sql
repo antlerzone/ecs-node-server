@@ -1,5 +1,5 @@
 -- Agreement PDF flow: mode, property/tenancy refs, url, status, pdf_generating, sign fields.
--- Used by agreement PDF generation (GAS) and callback finalize.
+-- Used by agreement PDF generation (Node + Google API) and finalize.
 
 ALTER TABLE agreement
   ADD COLUMN mode varchar(50) DEFAULT NULL AFTER client_wixid,

@@ -1,7 +1,7 @@
 /**
  * 將 account.account_json 裡的 client 對應遷移到 account_client。
  * account_json 為 JSON 陣列，每項 { clientId/client_id, system, accountid, productId }。
- * clientId/client_id 可能是 clientdetail.id 或 clientdetail.wix_id，會先以 id 查再以 wix_id 查。
+ * clientId/client_id 可能是 operatordetail.id 或 operatordetail.wix_id，會先以 id 查再以 wix_id 查。
  * 執行：node scripts/migrate-account-json-to-account-client.js
  */
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
@@ -49,10 +49,10 @@ async function run() {
       }
       const clientKeyStr = String(clientKey).trim();
 
-      const [[byId]] = await conn.query('SELECT id FROM clientdetail WHERE id = ? LIMIT 1', [clientKeyStr]);
+      const [[byId]] = await conn.query('SELECT id FROM operatordetail WHERE id = ? LIMIT 1', [clientKeyStr]);
       let clientId = byId ? byId.id : null;
       if (!clientId) {
-        const [[byWix]] = await conn.query('SELECT id FROM clientdetail WHERE wix_id = ? LIMIT 1', [clientKeyStr]);
+        const [[byWix]] = await conn.query('SELECT id FROM operatordetail WHERE wix_id = ? LIMIT 1', [clientKeyStr]);
         clientId = byWix ? byWix.id : null;
       }
       if (!clientId) {

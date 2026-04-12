@@ -12,7 +12,7 @@ const { getCnyiotSubuserId, getClientSubdomain } = require('../cnyiot/lib/cnyiot
 const { getValidCnyIotToken } = require('../cnyiot/lib/cnyiotToken.service');
 
 const DEFAULT_PAGE_SIZE = 20;
-const MAX_PAGE_SIZE = 100;
+const MAX_PAGE_SIZE = 200;
 const CACHE_LIMIT_MAX = 2000;
 
 function orderClause(sort) {
@@ -90,9 +90,18 @@ async function getMeters(clientId, opts = {}) {
   const [rows] = await pool.query(
     `SELECT m.id, m.meterid, m.title, m.meter_type, m.mode, m.rate, m.balance, m.productname, m.isonline, m.status,
             m.client_id, m.room_id, m.property_id, m.metersharing_json, m.lastsyncat,
-            p.shortname AS property_shortname
+            p.shortname AS property_shortname,
+            COALESCE(r.title_fld,
+              (SELECT r2.title_fld FROM roomdetail r2
+                WHERE r2.meter_id = m.id AND r2.client_id = m.client_id LIMIT 1)
+            ) AS room_title,
+            COALESCE(m.room_id,
+              (SELECT r2.id FROM roomdetail r2
+                WHERE r2.meter_id = m.id AND r2.client_id = m.client_id LIMIT 1)
+            ) AS room_id_effective
        FROM meterdetail m
        LEFT JOIN propertydetail p ON p.id = m.property_id
+       LEFT JOIN roomdetail r ON r.id = m.room_id
        WHERE ${whereSql}
        ${orderSql}
        LIMIT ? OFFSET ?`,
@@ -111,7 +120,8 @@ async function getMeters(clientId, opts = {}) {
     productName: r.productname || '',
     isOnline: !!r.isonline,
     status: !!r.status,
-    room: r.room_id || null,
+    room: r.room_id_effective || null,
+    roomTitle: r.room_title || null,
     property: r.property_id || null,
     propertyShortname: r.property_shortname || null,
     metersharing: parseJson(r.metersharing_json),
@@ -164,7 +174,14 @@ async function getMeter(clientId, meterId) {
     `SELECT m.id, m.meterid, m.title, m.meter_type, m.mode, m.rate, m.balance, m.productname, m.isonline, m.status,
             m.room_id, m.property_id, m.metersharing_json, m.lastsyncat,
             p.shortname AS property_shortname,
-            r.title_fld AS room_title
+            COALESCE(r.title_fld,
+              (SELECT r2.title_fld FROM roomdetail r2
+                WHERE r2.meter_id = m.id AND r2.client_id = m.client_id LIMIT 1)
+            ) AS room_title,
+            COALESCE(m.room_id,
+              (SELECT r2.id FROM roomdetail r2
+                WHERE r2.meter_id = m.id AND r2.client_id = m.client_id LIMIT 1)
+            ) AS room_id_effective
        FROM meterdetail m
        LEFT JOIN propertydetail p ON p.id = m.property_id
        LEFT JOIN roomdetail r ON r.id = m.room_id
@@ -185,7 +202,7 @@ async function getMeter(clientId, meterId) {
     productName: r.productname || '',
     isOnline: !!r.isonline,
     status: !!r.status,
-    room: r.room_id || null,
+    room: r.room_id_effective || null,
     property: r.property_id || null,
     propertyShortname: r.property_shortname || null,
     roomName: r.room_title || null,
@@ -202,27 +219,36 @@ async function updateMeter(clientId, meterId, data) {
   if (!meter) throw new Error('METER_NOT_FOUND');
 
   const title = data.title != null ? String(data.title).trim() : meter.title;
-  const rate = data.rate != null ? (Number(data.rate) || null) : meter.rate;
+  let rate = meter.rate;
+  const rateProvided =
+    data.rate !== undefined && data.rate !== null && String(data.rate).trim() !== '';
+  if (rateProvided) {
+    rate = Number(data.rate);
+    if (Number.isNaN(rate) || rate <= 0) {
+      throw new Error('INVALID_RATE');
+    }
+  }
   const mode = data.mode != null ? data.mode : meter.mode;
   const status = data.status !== undefined ? (data.status === true || data.status === 1) : meter.status;
 
-  if (rate !== null && (Number.isNaN(rate) || rate <= 0)) {
-    throw new Error('INVALID_RATE');
-  }
-
-  // Table: title + rate. CNYIOT: only update rate (PriceID); do not change backend system name. #inputdetailmetername → table only.
-  console.log('[updateMeter] clientId=%s meterId=%s title(table)=%s rate=%s', clientId, meterId, title, rate);
-  if (rate != null && !Number.isNaN(rate) && rate > 0 && meter.meterId) {
+  // Table: title + rate。CNYIOT editMeter：仅在本请求显式传了 rate 且有效时同步电价（避免只改 status 仍调 editMeter）。
+  console.log('[updateMeter] clientId=%s meterId=%s title(table)=%s rate=%s rateProvided=%s', clientId, meterId, title, rate, rateProvided);
+  if (rateProvided && rate != null && !Number.isNaN(rate) && rate > 0 && meter.meterId) {
     const platformMeterId = String(meter.meterId).trim();
     if (platformMeterId) {
       try {
-        await meterWrapper.updateMeterNameAndRate(clientId, {
-          meterId: platformMeterId,
-          currentMeterName: meter.title,
-          rate,
-          usePlatformAccount: true
-        });
-        console.log('[updateMeter] updateMeterNameAndRate OK (platform name unchanged, main account)');
+        const cnyiotMeterName = await cnyiotEditMeterNameOnly(clientId);
+        if (!cnyiotMeterName) {
+          console.warn('[updateMeter] skip CNYIOT editMeter: CLIENT_SUBDOMAIN_REQUIRED (set company subdomain)');
+        } else {
+          await meterWrapper.updateMeterNameAndRate(clientId, {
+            meterId: platformMeterId,
+            currentMeterName: cnyiotMeterName,
+            rate,
+            usePlatformAccount: true
+          });
+          console.log('[updateMeter] updateMeterNameAndRate OK (CNYIOT MeterName=subdomain only: %s)', cnyiotMeterName);
+        }
       } catch (e) {
         if (e?.message === 'RATE_NOT_IN_PRICE_LIST' || e?.message === 'RATE_CREATE_FAILED') throw e;
         console.warn('[updateMeter] CNYIoT sync failed, continuing CMS update', e?.message);
@@ -244,11 +270,52 @@ async function updateMeter(clientId, meterId, data) {
 }
 
 /**
- * Delete meter: clear metersharing from all meters in same group(s), then delete.
+ * CNYIOT deleteMeter codes we treat as success: meter already removed / not on platform — still delete DB row.
+ * (Operators often remove on CNYIOT first, then clear our CMS row.)
+ */
+const CNYIOT_DELETE_SKIP_DB_STILL = new Set([5003]);
+
+/**
+ * Delete meter: 1) CNYIOT deleteMeter (platform account) 2) then MySQL + room/property unbind.
  */
 async function deleteMeter(clientId, meterId) {
   const meter = await getMeter(clientId, meterId);
   if (!meter) throw new Error('METER_NOT_FOUND');
+
+  const platformMid = String(meter.meterId || '').trim();
+  if (!platformMid) throw new Error('METER_PLATFORM_ID_MISSING');
+
+  console.log('[deleteMeter] CNYIOT deleteMeter first metid=%s cmsId=%s', platformMid, meterId);
+  const cnyRes = await meterWrapper.deleteMeters(clientId, [platformMid]);
+  const resNum = Number(cnyRes?.result);
+  const cnyOk = resNum === 0 || resNum === 200;
+  const rawVal = cnyRes?.value;
+  const valueArr = Array.isArray(rawVal) ? rawVal : rawVal != null ? [rawVal] : [];
+  const failed = valueArr.filter((v) => {
+    if (!v) return false;
+    const code = Number(v.val);
+    if (code === 0 || code === 200) return false;
+    if (CNYIOT_DELETE_SKIP_DB_STILL.has(code)) return false;
+    return true;
+  });
+
+  if (!cnyOk) {
+    if (CNYIOT_DELETE_SKIP_DB_STILL.has(resNum)) {
+      console.warn(
+        '[deleteMeter] CNYIOT deleteMeter result=%s (meter absent on platform), continuing MySQL delete cmsId=%s',
+        cnyRes?.result,
+        meterId
+      );
+    } else {
+      console.error('[deleteMeter] CNYIOT deleteMeter failed result=%s', cnyRes?.result);
+      throw new Error(`CNYIOT_DELETE_FAILED_${cnyRes?.result ?? 'UNKNOWN'}`);
+    }
+  } else if (failed.length > 0) {
+    const codes = failed.map((v) => v.val).join(',');
+    console.error('[deleteMeter] CNYIOT deleteMeter per-item failure codes=%s', codes);
+    throw new Error(`CNYIOT_DELETE_FAILED_${codes}`);
+  }
+  console.log('[deleteMeter] CNYIOT OK (or skipped absent meter), deleting MySQL cmsId=%s', meterId);
 
   const sharing = meter.metersharing || [];
   for (const row of sharing) {
@@ -267,8 +334,46 @@ async function deleteMeter(clientId, meterId) {
     }
   }
 
+  await pool.query(
+    'UPDATE roomdetail SET meter_id = NULL, updated_at = NOW() WHERE meter_id = ? AND client_id = ?',
+    [meterId, clientId]
+  );
+  await pool.query(
+    'UPDATE propertydetail SET meter_id = NULL, updated_at = NOW() WHERE meter_id = ? AND client_id = ?',
+    [meterId, clientId]
+  ).catch(() => {});
+
   await pool.query('DELETE FROM meterdetail WHERE id = ? AND client_id = ?', [meterId, clientId]);
   return { ok: true };
+}
+
+/**
+ * One physical meter ID → at most one client in our DB. Prevents operator A from claiming B's meter.
+ */
+async function getMeterIdOwnerClientId(meterId) {
+  const mid = String(meterId || '').trim();
+  if (!mid) return null;
+  const [rows] = await pool.query(
+    'SELECT client_id FROM meterdetail WHERE meterid = ? LIMIT 1',
+    [mid]
+  );
+  return rows && rows[0] ? rows[0].client_id : null;
+}
+
+/**
+ * CNYIOT addMeter 等平台名：subdomain + MeterID（与 insertMetersFromPreview 一致）。
+ */
+async function cnyiotOperatorMeterDisplayName(clientId, platformMeterId) {
+  const sub = await getClientSubdomain(clientId);
+  const mid = String(platformMeterId || '').trim();
+  if (!mid) return '';
+  return sub ? `${String(sub).trim()}${mid}` : mid;
+}
+
+/** editMeter 的 MeterName：只用 client subdomain（公司标识），不用 Portal title、也不拼 meterId。 */
+async function cnyiotEditMeterNameOnly(clientId) {
+  const sub = await getClientSubdomain(clientId);
+  return sub ? String(sub).trim() : '';
 }
 
 /**
@@ -298,6 +403,7 @@ async function insertMeters(clientId, records) {
   const cnyiotMeters = [];
   let idxCounter = 1;
   let skipped = 0;
+  let subdomainForNew = null;
 
   for (const rec of records) {
     const meterId = String(rec.meterId || '').trim();
@@ -305,15 +411,26 @@ async function insertMeters(clientId, records) {
     const mode = rec.mode || 'prepaid';
     if (!meterId || !title) continue;
 
-    const [existing] = await pool.query(
-      'SELECT id, title, mode FROM meterdetail WHERE client_id = ? AND meterid = ? LIMIT 1',
-      [clientId, meterId]
-    );
-    if (existing && existing.length > 0) {
+    const ownerClientId = await getMeterIdOwnerClientId(meterId);
+    if (ownerClientId && ownerClientId !== clientId) {
+      console.warn('[metersetting-add] reject meterId=%s other client', meterId);
+      throw new Error(
+        'This meter ID is already registered to another operator account. Each meter can only belong to one company.'
+      );
+    }
+    if (ownerClientId === clientId) {
       console.log('[metersetting-add] service duplicate skip meterId=', meterId);
       skipped += 1;
       continue;
     }
+
+    if (subdomainForNew === null) {
+      subdomainForNew = await getClientSubdomain(clientId);
+      if (!subdomainForNew) {
+        throw new Error('CLIENT_SUBDOMAIN_REQUIRED');
+      }
+    }
+    const nameOnPlatform = `${subdomainForNew}${meterId}`;
 
     const id = randomUUID();
     await pool.query(
@@ -326,7 +443,7 @@ async function insertMeters(clientId, records) {
     cnyiotMeters.push({
       MeterID: meterId,
       MeterModel: mode === 'prepaid' ? 0 : 1,
-      Name: title,
+      Name: nameOnPlatform,
       PriceID: '1',
       UserID: String(stationIndex),
       index: String(idxCounter++)
@@ -366,6 +483,7 @@ async function getAddMeterRequestBody(clientId, records) {
   const subuserId = await getCnyiotSubuserId(clientId);
   const client = await getClientStationIndex(clientId);
   const stationIndex = client?.stationIndex ?? (subuserId ? String(subuserId) : '0');
+  const subdomain = await getClientSubdomain(clientId);
   let idxCounter = 1;
   const cnyiotMeters = [];
   for (const rec of records || []) {
@@ -373,10 +491,11 @@ async function getAddMeterRequestBody(clientId, records) {
     const title = String(rec.title || rec.name || '').trim();
     const mode = rec.mode || 'prepaid';
     if (!meterId || !title) continue;
+    const nameOnPlatform = subdomain ? `${subdomain}${meterId}` : meterId;
     cnyiotMeters.push({
       MeterID: meterId,
       MeterModel: mode === 'prepaid' ? 0 : 1,
-      Name: title,
+      Name: nameOnPlatform,
       PriceID: '1',
       UserID: String(stationIndex),
       index: String(idxCounter++),
@@ -439,16 +558,162 @@ async function syncMeterByCmsMeterId(clientId, meterId) {
   return syncWrapper.syncMeterByCmsMeterId(clientId, String(meterId));
 }
 
+const SYNC_ALL_MAX = 500;
+
 /**
- * Client topup: create pending then confirm. meterId = 11-digit meterid.
- * amount = 金额 (sellMoney)，按元充值；simple=2 只传 sellMoney。
+ * Sync all meters for client (CNYIoT → meterdetail). Sequential to reduce API pressure.
+ * @returns {{ ok: boolean, total: number, succeeded: number, failed: number, errors: Array<{ meterId: string, reason: string }>, message?: string }}
  */
-async function clientTopup(clientId, meterId, amount) {
-  const pending = await meterWrapper.createPendingTopup(clientId, String(meterId), Number(amount), { byMoney: true });
+async function syncAllMeters(clientId) {
+  if (!clientId) throw new Error('CLIENT_ID_REQUIRED');
+  const [rows] = await pool.query(
+    `SELECT meterid FROM meterdetail WHERE client_id = ? AND meterid IS NOT NULL AND TRIM(COALESCE(meterid, '')) != '' ORDER BY id ASC LIMIT ?`,
+    [clientId, SYNC_ALL_MAX]
+  );
+  const ids = [...new Set((rows || []).map((r) => String(r.meterid).trim()).filter(Boolean))];
+  if (ids.length === 0) {
+    return { ok: true, total: 0, succeeded: 0, failed: 0, errors: [], message: 'NO_METERS_TO_SYNC' };
+  }
+  const errors = [];
+  let succeeded = 0;
+  for (const mid of ids) {
+    try {
+      const r = await syncMeterByCmsMeterId(clientId, mid);
+      if (r && r.ok !== false) succeeded += 1;
+      else errors.push({ meterId: mid, reason: String(r?.reason || 'SYNC_FAILED') });
+    } catch (e) {
+      errors.push({ meterId: mid, reason: String(e?.message || e) });
+    }
+  }
+  const failed = errors.length;
+  const allOk = failed === 0;
+  return {
+    ok: allOk || succeeded > 0,
+    total: ids.length,
+    succeeded,
+    failed,
+    errors: errors.slice(0, 50),
+    ...(allOk ? {} : { partial: true }),
+    ...(succeeded === 0 && failed > 0 ? { reason: 'ALL_SYNC_FAILED' } : {})
+  };
+}
+
+/**
+ * Client topup: (1) CNYIOT sellByApi + sellByApiOk (2) DB balance += top-up kWh
+ * (3) prepaid + newBal>0 → Active ON + setRelay 通电（含平台账号重试）; postpaid → 仍接通继电器。
+ * Do NOT run syncMeterByCmsMeterId here — it overwrites balance/status from device while readings still lag.
+ */
+async function clientTopup(clientId, opts, amount) {
+  const meterCmsIdIn = opts?.meterCmsId ? String(opts.meterCmsId).trim() : '';
+  const platformMidIn = opts?.platformMid != null ? String(opts.platformMid).trim() : '';
+  const amountNum = Number(amount);
+  if (Number.isNaN(amountNum) || amountNum <= 0) throw new Error('INVALID_TOPUP_AMOUNT');
+
+  let meterRow;
+  if (meterCmsIdIn) {
+    const [rows] = await pool.query(
+      'SELECT id, meterid, balance, rate, mode FROM meterdetail WHERE id = ? AND client_id = ? LIMIT 1',
+      [meterCmsIdIn, clientId]
+    );
+    meterRow = rows && rows[0];
+  } else if (platformMidIn) {
+    const [rows] = await pool.query(
+      'SELECT id, meterid, balance, rate, mode FROM meterdetail WHERE client_id = ? AND meterid = ? LIMIT 1',
+      [clientId, platformMidIn]
+    );
+    meterRow = rows && rows[0];
+  }
+  if (!meterRow) throw new Error('METER_NOT_FOUND');
+
+  const meterCmsId = meterRow.id;
+  const platformMid = String(meterRow.meterid || '').trim();
+  if (!platformMid) throw new Error('METER_PLATFORM_ID_MISSING');
+
+  const mode = String(meterRow.mode || 'prepaid').toLowerCase() === 'postpaid' ? 'postpaid' : 'prepaid';
+  const oldBalance = Number(meterRow.balance) || 0;
+  const rate = Number(meterRow.rate) || 0;
+  const addKwh = rate > 0 ? amountNum / rate : amountNum;
+  const newBal = Math.round((oldBalance + addKwh) * 10000) / 10000;
+
+  const pending = await meterWrapper.createPendingTopup(clientId, platformMid, amountNum, { byMoney: true });
   const idx = pending?.value?.idx ?? pending?.idx;
   if (idx == null) throw new Error('TOPUP_PENDING_NO_IDX');
-  await meterWrapper.confirmTopup(clientId, String(meterId), idx);
-  return { ok: true };
+  await meterWrapper.confirmTopup(clientId, platformMid, idx);
+
+  const statusAfter = mode === 'prepaid' && newBal <= 0 ? 0 : 1;
+  await pool.query(
+    'UPDATE meterdetail SET balance = ?, status = ?, lastsyncat = NOW(), updated_at = NOW() WHERE id = ? AND client_id = ?',
+    [newBal, statusAfter, meterCmsId, clientId]
+  );
+
+  try {
+    if (mode === 'prepaid') {
+      if (newBal > 0) {
+        await connectRelayAfterPrepaidTopupIfHasBalance(clientId, meterCmsId, platformMid, newBal);
+      } else {
+        await updateMeterStatus(clientId, meterCmsId, false);
+      }
+    } else {
+      await updateMeterStatus(clientId, meterCmsId, true);
+    }
+  } catch (e) {
+    console.warn('[clientTopup] relay / status failed', meterCmsId, e?.message || e);
+  }
+
+  const [afterRows] = await pool.query(
+    'SELECT balance, status FROM meterdetail WHERE id = ? AND client_id = ? LIMIT 1',
+    [meterCmsId, clientId]
+  );
+  const after = afterRows && afterRows[0];
+  return {
+    ok: true,
+    balance: after != null ? Number(after.balance) : newBal,
+    status: !!(after && after.status),
+    synced: false
+  };
+}
+
+/**
+ * Clear prepaid: (1) CNYIOT clearKwh (2) balance=0 (3) active=false + relay disconnect (close current).
+ * meterCmsId = meterdetail.id (UUID).
+ * Does not change roomdetail.active — room listing stays independent of meter power.
+ */
+async function clearMeterKwh(clientId, meterCmsId) {
+  const meter = await getMeter(clientId, meterCmsId);
+  if (!meter) throw new Error('METER_NOT_FOUND');
+  if (String(meter.mode || '').toLowerCase() !== 'prepaid') {
+    throw new Error('CLEAR_KWH_PREPAID_ONLY');
+  }
+  const platformMid = String(meter.meterId || '').trim();
+  if (!platformMid) throw new Error('METER_PLATFORM_ID_MISSING');
+
+  const cnyRes = await meterWrapper.clearKwh(clientId, platformMid);
+  const ok = cnyRes?.result === 0 || cnyRes?.result === 200;
+  if (!ok) {
+    throw new Error(`CNYIOT_CLEAR_KWH_FAILED_${cnyRes?.result ?? 'UNKNOWN'}`);
+  }
+
+  await pool.query(
+    'UPDATE meterdetail SET balance = 0, status = 0, lastsyncat = NOW(), updated_at = NOW() WHERE id = ? AND client_id = ?',
+    [meterCmsId, clientId]
+  );
+
+  const st = await updateMeterStatus(clientId, meterCmsId, false);
+  if (!st.relayOk && platformMid) {
+    console.warn('[clearMeterKwh] setRelay OFF not confirmed for meter=%s', platformMid);
+  }
+
+  const [rowArr] = await pool.query(
+    'SELECT balance, status FROM meterdetail WHERE id = ? AND client_id = ? LIMIT 1',
+    [meterCmsId, clientId]
+  );
+  const row = rowArr && rowArr[0];
+  return {
+    ok: true,
+    balance: row != null ? Number(row.balance) : 0,
+    status: !!(row && row.status),
+    clearedKwh: true
+  };
 }
 
 /**
@@ -568,28 +833,76 @@ async function submitGroup(clientId, payload) {
 }
 
 /**
- * Update meter status only (checkbox toggle).
- * Also calls setRelay: status false → Val 1 (断开), status true → Val 2 (闭合).
+ * Update meter status only (Active 开关 — meterdetail.status + CNYIOT setRelay).
+ * setRelay: Active (on) → Val 2 = connect; deactivate (off) → Val 1 = disconnect.
+ *
+ * **Never** updates roomdetail.active or calls roomsetting — a room may stay Active in the portal
+ * (listing/booking) while this meter is power-off (relay open). Product rule: meter power ≠ room listing.
  */
 async function updateMeterStatus(clientId, meterId, status) {
   const [rows] = await pool.query(
-    'SELECT id, meterid FROM meterdetail WHERE id = ? AND client_id = ? LIMIT 1',
+    'SELECT id, meterid, balance, mode FROM meterdetail WHERE id = ? AND client_id = ? LIMIT 1',
     [meterId, clientId]
   );
   if (!rows || !rows.length) throw new Error('METER_NOT_FOUND');
   const row = rows[0];
+  const balance = Number(row.balance) || 0;
+  const mode = String(row.mode || 'prepaid').toLowerCase() === 'postpaid' ? 'postpaid' : 'prepaid';
+
   await pool.query('UPDATE meterdetail SET status = ?, updated_at = NOW() WHERE id = ? AND client_id = ?', [status ? 1 : 0, meterId, clientId]);
   const platformMeterId = row.meterid ? String(row.meterid).trim() : '';
+  let relayOk = !platformMeterId;
   if (platformMeterId) {
-    const val = status ? 2 : 1; // 2 闭合(开), 1 断开(关)
+    // CNYIOT setRelay (per operator UI): Active ON → Val 2 connect, OFF → Val 1 disconnect
+    const val = status ? 2 : 1;
     try {
       await meterWrapper.setRelay(clientId, platformMeterId, val);
+      relayOk = true;
       console.log('[updateMeterStatus] setRelay clientId=%s meterId=%s status=%s val=%s', clientId, platformMeterId, status, val);
     } catch (e) {
-      console.warn('[updateMeterStatus] setRelay failed (DB already updated)', clientId, platformMeterId, e?.message || e);
+      try {
+        await meterWrapper.setRelay(clientId, platformMeterId, val, { usePlatformAccount: true });
+        relayOk = true;
+        console.log('[updateMeterStatus] setRelay (platform) OK meterId=%s', platformMeterId);
+      } catch (e2) {
+        relayOk = false;
+        console.warn('[updateMeterStatus] setRelay failed (DB already updated)', clientId, platformMeterId, e?.message || e, e2?.message || e2);
+      }
     }
   }
-  return { ok: true };
+
+  let hint = 'POWER_OFF';
+  if (status) {
+    if (mode === 'postpaid') {
+      hint = 'ON_POSTPAID';
+    } else if (balance > 0) {
+      hint = 'ON_PREPAID_HAS_BALANCE';
+    } else {
+      hint = 'ON_PREPAID_ZERO_BALANCE';
+    }
+  }
+
+  return { ok: true, relayOk, hint, balance, mode };
+}
+
+/**
+ * After prepaid top-up with positive kWh balance: ensure Active ON + setRelay Val=2 (通电).
+ * If first setRelay fails, retries with usePlatformAccount (same pattern as updateMeterStatus).
+ */
+async function connectRelayAfterPrepaidTopupIfHasBalance(clientId, meterCmsId, platformMid, newBal) {
+  if (!platformMid || newBal <= 0) {
+    return { ok: true, relayOk: true, skipped: true, hint: 'SKIP_NO_BALANCE', balance: newBal, mode: 'prepaid' };
+  }
+  const st = await updateMeterStatus(clientId, meterCmsId, true);
+  if (st.relayOk) return st;
+  try {
+    await meterWrapper.setRelay(clientId, platformMid, 2, { usePlatformAccount: true });
+    console.log('[prepaid topup] setRelay Val=2 platform retry OK meter=%s', platformMid);
+    return { ok: true, relayOk: true, hint: st.hint, balance: st.balance, mode: st.mode };
+  } catch (e2) {
+    console.warn('[prepaid topup] setRelay Val=2 platform retry failed', platformMid, e2?.message || e2);
+    return st;
+  }
 }
 
 /**
@@ -637,9 +950,15 @@ async function insertMetersFromPreview(clientId, records) {
     const meterId = String(rec.meterId || '').trim();
     const mode = rec.mode || 'prepaid';
     if (!meterId) continue;
-    const [existing] = await pool.query('SELECT id FROM meterdetail WHERE client_id = ? AND meterid = ? LIMIT 1', [clientId, meterId]);
-    if (existing && existing.length > 0) {
-      console.log('[insertMetersFromPreview] skip already exists meterId=%s', meterId);
+    const ownerClientId = await getMeterIdOwnerClientId(meterId);
+    if (ownerClientId && ownerClientId !== clientId) {
+      console.warn('[insertMetersFromPreview] reject meterId=%s owned by other client', meterId);
+      throw new Error(
+        'This meter ID is already registered to another operator account. Each meter can only belong to one company.'
+      );
+    }
+    if (ownerClientId === clientId) {
+      console.log('[insertMetersFromPreview] skip already in your account meterId=%s', meterId);
       continue;
     }
     const nameOnPlatform = subdomain + meterId;
@@ -661,7 +980,13 @@ async function insertMetersFromPreview(clientId, records) {
     const failedCodes = valueArr.filter((v) => v && Number(v.val) !== 0 && Number(v.val) !== 200).map((v) => v.val);
     const isAlreadyExists = failedCodes.length > 0 && failedCodes.every((c) => c === 4132 || c === 4142);
     console.log('[insertMetersFromPreview] addMetersNoBind result=%s value=%j failedCodes=%j isAlreadyExists=%s', cnyRes?.result, valueArr, failedCodes, isAlreadyExists);
-    if (!ok || (failedCodes.length > 0 && !isAlreadyExists)) {
+    if (isAlreadyExists) {
+      console.error('[insertMetersFromPreview] CNYIOT says meter already on platform — refuse to bind to this operator');
+      throw new Error(
+        'This meter already exists on CNYIOT under another registration. It cannot be added to your account here.'
+      );
+    }
+    if (!ok || failedCodes.length > 0) {
       const codes = failedCodes.length ? failedCodes.join(',') : (cnyRes?.result ?? 'UNKNOWN');
       console.error('[insertMetersFromPreview] CNYIOT addMeter failed, NOT writing to table. codes=%s', codes);
       throw new Error(`CNYIOT_ADD_FAILED_${codes}`);
@@ -683,22 +1008,50 @@ async function insertMetersFromPreview(clientId, records) {
   return { inserted: ids.length, ids };
 }
 
+/**
+ * Bind meter to property only (whole unit / parent meter — no room).
+ * meterCmsId = meterdetail.id (UUID).
+ */
+async function bindMeterToProperty(clientId, meterCmsId, propertyId) {
+  const pid = String(propertyId || '').trim();
+  if (!pid) throw new Error('PROPERTY_ID_REQUIRED');
+  const [[m]] = await pool.query(
+    'SELECT id FROM meterdetail WHERE id = ? AND client_id = ? LIMIT 1',
+    [meterCmsId, clientId]
+  );
+  if (!m) throw new Error('METER_NOT_FOUND');
+  const [[p]] = await pool.query(
+    'SELECT id FROM propertydetail WHERE id = ? AND client_id = ? LIMIT 1',
+    [pid, clientId]
+  );
+  if (!p) throw new Error('PROPERTY_NOT_FOUND');
+  await pool.query(
+    'UPDATE meterdetail SET property_id = ?, room_id = NULL, updated_at = NOW() WHERE id = ? AND client_id = ?',
+    [pid, meterCmsId, clientId]
+  );
+  return { ok: true };
+}
+
 module.exports = {
   getMeters,
   getMeterFilters,
   getMeter,
   updateMeter,
   updateMeterStatus,
+  connectRelayAfterPrepaidTopupIfHasBalance,
   deleteMeter,
   insertMeters,
   getAddMeterRequestBody,
   getActiveMeterProvidersByClient,
   getUsageSummary,
   syncMeterByCmsMeterId,
+  syncAllMeters,
   clientTopup,
+  clearMeterKwh,
   loadGroupList,
   deleteGroup,
   submitGroup,
   previewNewMeters,
-  insertMetersFromPreview
+  insertMetersFromPreview,
+  bindMeterToProperty
 };

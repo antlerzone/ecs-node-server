@@ -5,6 +5,7 @@
  * All operations require email → access context → client_id.
  */
 
+const { formatIntegrationApiError } = require('../../utils/formatIntegrationApiError');
 const pool = require('../../config/db');
 const { getAccessContextByEmail, ACCOUNTING_PLAN_IDS } = require('../access/access.service');
 const bukkurequest = require('../bukku/wrappers/bukkurequest');
@@ -116,12 +117,18 @@ async function getContactListInner(clientId, opts) {
       fromJunction.forEach((r) => approvedOwnerIdSet.add(r.owner_id));
     } catch (_) { /* owner_client 表可能不存在 */ }
     const [allOwners] = await pool.query(
-      'SELECT id, ownername, email, account, approvalpending FROM ownerdetail'
+      'SELECT id, ownername, email, account, approvalpending, mobilenumber, bankname_id, bankaccount, accountholder, nric, profile FROM ownerdetail'
     );
     const pendingOwnerIds = new Set();
     for (const o of allOwners) {
       const arr = parseJson(o.approvalpending);
-      if (Array.isArray(arr) && arr.some((r) => r.clientId === clientId && r.status === 'pending')) {
+      if (
+        Array.isArray(arr) &&
+        arr.some((r) => {
+          const cid = r.clientId ?? r.clientid;
+          return cid === clientId && String(r.status || '').toLowerCase() === 'pending';
+        })
+      ) {
         pendingOwnerIds.add(o.id);
       }
     }
@@ -129,7 +136,7 @@ async function getContactListInner(clientId, opts) {
     if (ownerIdsToLoad.size > 0) {
       const placeholders = '?,'.repeat(ownerIdsToLoad.size).slice(0, -1);
       const [ownerRows] = await pool.query(
-        `SELECT id, ownername, email, account, approvalpending FROM ownerdetail WHERE id IN (${placeholders})`,
+        `SELECT id, ownername, email, account, approvalpending, mobilenumber, bankname_id, bankaccount, accountholder, nric, profile FROM ownerdetail WHERE id IN (${placeholders})`,
         [...ownerIdsToLoad]
       );
       for (const o of ownerRows) {
@@ -143,7 +150,24 @@ async function getContactListInner(clientId, opts) {
           searchText: fullText,
           role: 'Owner',
           roleColor: isPending ? '#D32F2F' : '#2F80ED',
-          raw: { _id: o.id, ownerName: o.ownername, email: o.email, account: parseJson(o.account), approvalRequest: parseJson(o.approvalpending) },
+          raw: {
+            _id: o.id,
+            ownerName: o.ownername,
+            email: o.email,
+            phone: o.mobilenumber != null ? String(o.mobilenumber) : undefined,
+            bankName: o.bankname_id != null ? String(o.bankname_id) : undefined,
+            bankAccount: o.bankaccount != null ? String(o.bankaccount) : undefined,
+            bankHolder: o.accountholder != null ? String(o.accountholder) : undefined,
+            nric: o.nric != null && String(o.nric).trim() ? String(o.nric).trim() : undefined,
+            idType: (() => {
+              const prof = parseJson(o.profile);
+              if (!prof || typeof prof !== 'object') return undefined;
+              const t = prof.id_type ?? prof.reg_no_type;
+              return t != null && String(t).trim() ? String(t).trim() : undefined;
+            })(),
+            account: parseJson(o.account),
+            approvalRequest: parseJson(o.approvalpending)
+          },
           __pending: isPending
         });
       }
@@ -164,9 +188,20 @@ async function getContactListInner(clientId, opts) {
     const [fromTenantLegacy] = await pool.query('SELECT id FROM tenantdetail WHERE client_id = ?', [clientId]);
     fromTenantLegacy.forEach((r) => approvedTenantIdSet.add(r.id));
 
-    const [tenantRows] = await pool.query(
-      'SELECT id, fullname, email, account, approval_request_json FROM tenantdetail'
-    );
+    let tenantRows;
+    try {
+      [tenantRows] = await pool.query(
+        'SELECT id, fullname, email, phone, account, approval_request_json, nric, profile FROM tenantdetail'
+      );
+    } catch (e) {
+      if (isSchemaError(e) && /Unknown column.*profile/i.test(e?.sqlMessage || e?.message || '')) {
+        [tenantRows] = await pool.query(
+          'SELECT id, fullname, email, phone, account, approval_request_json, nric FROM tenantdetail'
+        );
+      } else {
+        throw e;
+      }
+    }
     const tenantPending = new Set();
     for (const t of tenantRows) {
       const arr = parseJson(t.approval_request_json);
@@ -188,7 +223,21 @@ async function getContactListInner(clientId, opts) {
         searchText: fullText,
         role: 'Tenant',
         roleColor: isPending ? '#D32F2F' : '#27AE60',
-        raw: { _id: t.id, fullname: t.fullname, email: t.email, account: parseJson(t.account), approvalRequest: parseJson(t.approval_request_json) },
+        raw: {
+          _id: t.id,
+          fullname: t.fullname,
+          email: t.email,
+          phone: t.phone != null ? String(t.phone) : undefined,
+          nric: t.nric != null && String(t.nric).trim() ? String(t.nric).trim() : undefined,
+          idType: (() => {
+            const prof = parseJson(t.profile);
+            if (!prof || typeof prof !== 'object') return undefined;
+            const ty = prof.id_type ?? prof.reg_no_type;
+            return ty != null && String(ty).trim() ? String(ty).trim() : undefined;
+          })(),
+          account: parseJson(t.account),
+          approvalRequest: parseJson(t.approval_request_json)
+        },
         __pending: isPending
       });
     }
@@ -299,7 +348,7 @@ async function getContactListInner(clientId, opts) {
   const total = list.length;
 
   // --- Limit (cache mode: first N items + total)
-  const limit = opts.limit != null ? Math.min(2000, Math.max(1, parseInt(opts.limit, 10) || 0)) : null;
+  const limit = opts.limit != null ? Math.min(10000, Math.max(1, parseInt(opts.limit, 10) || 0)) : null;
   if (limit != null && limit > 0) {
     return {
       ok: true,
@@ -312,7 +361,7 @@ async function getContactListInner(clientId, opts) {
 
   // --- Page + pageSize (server filter mode)
   const page = Math.max(1, parseInt(opts.page, 10) || 1);
-  const pageSize = Math.min(100, Math.max(1, parseInt(opts.pageSize, 10) || 10));
+  const pageSize = Math.min(200, Math.max(1, parseInt(opts.pageSize, 10) || 10));
   const start = (page - 1) * pageSize;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   return {
@@ -334,7 +383,7 @@ async function getOwner(email, ownerId, overrideClientId) {
   const clientId = await resolveClientId(email, overrideClientId);
   if (!clientId) return null;
   const [rows] = await pool.query(
-    'SELECT id, ownername, email, account, approvalpending FROM ownerdetail WHERE id = ? LIMIT 1',
+    'SELECT id, ownername, email, account, approvalpending, bankname_id, bankaccount, accountholder FROM ownerdetail WHERE id = ? LIMIT 1',
     [ownerId]
   );
   if (!rows.length) return null;
@@ -343,9 +392,40 @@ async function getOwner(email, ownerId, overrideClientId) {
     _id: o.id,
     ownerName: o.ownername,
     email: o.email,
+    bankName: o.bankname_id != null ? String(o.bankname_id) : '',
+    bankAccount: o.bankaccount != null ? String(o.bankaccount) : '',
+    bankHolder: o.accountholder != null ? String(o.accountholder) : '',
     account: parseJson(o.account),
     approvalRequest: parseJson(o.approvalpending)
   };
+}
+
+async function assertOwnerEditableForClient(ownerId, clientId) {
+  try {
+    const [r] = await pool.query('SELECT 1 FROM owner_client WHERE owner_id = ? AND client_id = ? LIMIT 1', [ownerId, clientId]);
+    if (r.length) return true;
+  } catch (_) {}
+  const [rows] = await pool.query('SELECT approvalpending FROM ownerdetail WHERE id = ? LIMIT 1', [ownerId]);
+  if (!rows.length) return false;
+  const arr = parseJson(rows[0].approvalpending);
+  return Array.isArray(arr) && arr.some((x) => x.clientId === clientId && x.status === 'pending');
+}
+
+/** Operator: owner bank (bankdetail id + account + holder). Jompay N/A for owner. */
+async function updateOwnerBankFields(email, { ownerId, bankName, bankAccount, bankHolder }, overrideClientId) {
+  const clientId = await resolveClientId(email, overrideClientId);
+  if (!clientId) return { ok: false, reason: 'NO_CLIENT_ID' };
+  if (!ownerId) return { ok: false, reason: 'NO_OWNER_ID' };
+  const allowed = await assertOwnerEditableForClient(ownerId, clientId);
+  if (!allowed) return { ok: false, reason: 'OWNER_NOT_FOUND' };
+  const bankId = bankName != null && String(bankName).trim() !== '' ? String(bankName).trim() : null;
+  const acct = bankAccount != null ? String(bankAccount).trim() : '';
+  const holder = bankHolder != null ? String(bankHolder).trim() : '';
+  await pool.query(
+    'UPDATE ownerdetail SET bankname_id = ?, bankaccount = ?, accountholder = ?, updated_at = NOW() WHERE id = ?',
+    [bankId, acct || null, holder || null, ownerId]
+  );
+  return { ok: true };
 }
 
 async function getTenant(email, tenantId, overrideClientId) {
@@ -369,10 +449,10 @@ async function getTenant(email, tenantId, overrideClientId) {
 async function getSupplier(email, supplierId, overrideClientId) {
   const clientId = await resolveClientId(email, overrideClientId);
   if (!clientId) return null;
-  const [rows] = await pool.query(
-    'SELECT id, title, email, billercode, bankaccount, bankholder, bankdetail_id, account, productid FROM supplierdetail WHERE id = ? AND client_id = ? LIMIT 1',
-    [supplierId, clientId]
-  );
+  const params = [supplierId, clientId];
+  const sql =
+    'SELECT id, title, email, billercode, bankaccount, bankholder, bankdetail_id, account FROM supplierdetail WHERE id = ? AND client_id = ? LIMIT 1';
+  const [rows] = await pool.query(sql, params);
   if (!rows.length) return null;
   const s = rows[0];
   const account = parseJson(s.account) || [];
@@ -384,7 +464,7 @@ async function getSupplier(email, supplierId, overrideClientId) {
     bankName: s.bankdetail_id,
     bankAccount: s.bankaccount,
     bankHolder: s.bankholder,
-    productid: s.productid != null ? String(s.productid).trim() || null : null,
+    productid: null,
     client: [clientId],
     account
   };
@@ -396,6 +476,273 @@ function mergeAccount(arr, next) {
     (a) => !(a.provider === next.provider && a.clientId === next.clientId)
   );
   return [...others, next];
+}
+
+/**
+ * Push current DB name/email to accounting when account[] already has remote id for (clientId, provider).
+ * @param {{ preserveLegalName?: boolean }} [opts] - If true (operator linking owner/tenant id only), do not overwrite remote legal/display name with profile fields.
+ */
+async function syncAccountingFromMergedAccount(clientId, kind, entityId, mergedAccount, opts = {}) {
+  try {
+    const [planRows] = await pool.query(
+      `SELECT plan_id FROM client_pricingplan_detail WHERE client_id = ? AND type = 'plan' ORDER BY id LIMIT 1`,
+      [clientId]
+    );
+    const planId = planRows[0]?.plan_id;
+    if (!planId || !ACCOUNTING_PLAN_IDS.includes(planId)) return;
+
+    const [intRows] = await pool.query(
+      `SELECT provider FROM client_integration WHERE client_id = ? AND \`key\` IN ('Account', 'addonAccount') AND enabled = 1 LIMIT 1`,
+      [clientId]
+    );
+    const provider = intRows[0]?.provider;
+    if (!provider || !ACCOUNT_PROVIDERS.includes(provider)) return;
+
+    const account = Array.isArray(mergedAccount) ? mergedAccount : [];
+    const mapping = account.find((a) => a.clientId === clientId && a.provider === provider);
+    const existingId = mapping?.id ?? mapping?.contactId;
+    if (existingId == null || String(existingId).trim() === '') return;
+
+    let record;
+    let role;
+    if (kind === 'owner') {
+      role = 'owner';
+      const [rows] = await pool.query('SELECT ownername, email, mobilenumber FROM ownerdetail WHERE id = ? LIMIT 1', [entityId]);
+      if (!rows.length) return;
+      const o = rows[0];
+      record = {
+        name: (o.ownername || '').trim(),
+        fullname: (o.ownername || '').trim(),
+        email: (o.email || '').trim().toLowerCase(),
+        phone: (o.mobilenumber || '').trim()
+      };
+    } else if (kind === 'tenant') {
+      role = 'tenant';
+      const [rows] = await pool.query('SELECT fullname, email, phone FROM tenantdetail WHERE id = ? LIMIT 1', [entityId]);
+      if (!rows.length) return;
+      const t = rows[0];
+      record = {
+        name: (t.fullname || '').trim(),
+        fullname: (t.fullname || '').trim(),
+        email: (t.email || '').trim().toLowerCase(),
+        phone: (t.phone || '').trim()
+      };
+    } else if (kind === 'staff') {
+      role = 'staff';
+      const [rows] = await pool.query('SELECT name, email FROM staffdetail WHERE id = ? AND client_id = ? LIMIT 1', [entityId, clientId]);
+      if (!rows.length) return;
+      const s = rows[0];
+      const portalPhone = await contactSync.resolvePortalPhoneForEmail(s.email);
+      record = {
+        name: (s.name || '').trim(),
+        fullname: (s.name || '').trim(),
+        email: (s.email || '').trim().toLowerCase(),
+        phone: portalPhone
+      };
+    } else {
+      return;
+    }
+
+    const syncRes = await contactSync.ensureContactInAccounting(clientId, provider, role, record, existingId, {
+      preserveLegalName: opts.preserveLegalName === true
+    });
+    if (!syncRes.ok) {
+      console.warn('[contact] syncAccountingFromMergedAccount failed', kind, entityId, syncRes.reason);
+      return;
+    }
+    const newId = syncRes.contactId;
+    if (newId && String(newId) !== String(existingId)) {
+      if (kind === 'owner') await contactSync.writeOwnerAccount(entityId, clientId, provider, newId);
+      else if (kind === 'tenant') await contactSync.writeTenantAccount(entityId, clientId, provider, newId);
+      else await contactSync.writeStaffAccount(entityId, clientId, provider, newId);
+    }
+  } catch (e) {
+    console.warn('[contact] syncAccountingFromMergedAccount', e?.message || e);
+  }
+}
+
+async function updatePortalPhoneForEmailIfExists(emailNorm, phone) {
+  const e = String(emailNorm || '').trim().toLowerCase();
+  if (!e) return;
+  const p = phone != null ? String(phone).trim() : '';
+  try {
+    const [r] = await pool.query('SELECT id FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1', [e]);
+    if (!r.length) return;
+    await pool.query('UPDATE portal_account SET phone = ?, updated_at = NOW() WHERE LOWER(TRIM(email)) = ?', [p, e]);
+  } catch (_) {}
+}
+
+/** Operator may only set portal phone for emails that already appear as a contact of this client. */
+async function isContactEmailForClient(clientId, emailNorm) {
+  const e = String(emailNorm || '').trim().toLowerCase();
+  if (!e || !clientId) return false;
+  const [s] = await pool.query(
+    'SELECT 1 FROM staffdetail WHERE client_id = ? AND LOWER(TRIM(email)) = ? LIMIT 1',
+    [clientId, e]
+  );
+  if (s.length) return true;
+  const [sup] = await pool.query(
+    'SELECT 1 FROM supplierdetail WHERE client_id = ? AND LOWER(TRIM(email)) = ? LIMIT 1',
+    [clientId, e]
+  );
+  if (sup.length) return true;
+  try {
+    const [o] = await pool.query(
+      `SELECT 1 FROM ownerdetail od
+       INNER JOIN owner_client oc ON oc.owner_id = od.id AND oc.client_id = ?
+       WHERE LOWER(TRIM(od.email)) = ? LIMIT 1`,
+      [clientId, e]
+    );
+    if (o.length) return true;
+  } catch (_) {}
+  try {
+    const [t] = await pool.query(
+      `SELECT 1 FROM tenantdetail td
+       INNER JOIN tenant_client tc ON tc.tenant_id = td.id AND tc.client_id = ?
+       WHERE LOWER(TRIM(td.email)) = ? LIMIT 1`,
+      [clientId, e]
+    );
+    if (t.length) return true;
+  } catch (_) {}
+  try {
+    const [tl] = await pool.query(
+      'SELECT 1 FROM tenantdetail WHERE client_id = ? AND LOWER(TRIM(email)) = ? LIMIT 1',
+      [clientId, e]
+    );
+    if (tl.length) return true;
+  } catch (_) {}
+  const [pendingO] = await pool.query('SELECT approvalpending FROM ownerdetail WHERE LOWER(TRIM(email)) = ? LIMIT 1', [e]);
+  if (pendingO.length) {
+    const arr = parseJson(pendingO[0].approvalpending);
+    if (Array.isArray(arr) && arr.some((r) => r.clientId === clientId && r.status === 'pending')) return true;
+  }
+  const [pendingT] = await pool.query('SELECT approval_request_json FROM tenantdetail WHERE LOWER(TRIM(email)) = ? LIMIT 1', [e]);
+  if (pendingT.length) {
+    const arr = parseJson(pendingT[0].approval_request_json);
+    if (Array.isArray(arr) && arr.some((r) => r.clientId === clientId && r.status === 'pending')) return true;
+  }
+  return false;
+}
+
+/**
+ * Update portal_account.phone when the contact email belongs to this operator client (staff sync / list).
+ * @param {string} operatorEmail - portal operator (req body email)
+ * @param {{ contactEmail?: string, phone?: string }} payload - contact row email + new phone
+ */
+async function updatePortalPhoneForClientContact(operatorEmail, { contactEmail, phone }, overrideClientId) {
+  const clientId = await resolveClientId(operatorEmail, overrideClientId);
+  if (!clientId) return { ok: false, reason: 'NO_CLIENT_ID' };
+  const e = String(contactEmail || '').trim().toLowerCase();
+  if (!e) return { ok: false, reason: 'NO_EMAIL' };
+  const allowed = await isContactEmailForClient(clientId, e);
+  if (!allowed) return { ok: false, reason: 'EMAIL_NOT_A_CONTACT' };
+  await updatePortalPhoneForEmailIfExists(e, phone);
+  return { ok: true };
+}
+
+/**
+ * Portal profile saved fullname/email: update accounting for each operator link that already has a contact id.
+ */
+async function syncAccountingContactsForProfileEmail(normalizedEmail) {
+  const email = String(normalizedEmail || '').trim().toLowerCase();
+  if (!email) return;
+
+  const [tRows] = await pool.query(
+    'SELECT id, fullname, email, phone, account FROM tenantdetail WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+    [email]
+  );
+  if (tRows.length) {
+    const t = tRows[0];
+    let tcRows = [];
+    try {
+      const [r] = await pool.query('SELECT client_id FROM tenant_client WHERE tenant_id = ?', [t.id]);
+      tcRows = r || [];
+    } catch (_) {
+      tcRows = [];
+    }
+    for (const row of tcRows) {
+      const cid = row.client_id;
+      if (!cid) continue;
+      const account = parseJson(t.account) || [];
+      await syncAccountingFromMergedAccount(cid, 'tenant', t.id, account);
+    }
+  }
+
+  const [oRows] = await pool.query(
+    'SELECT id, ownername, email, mobilenumber, account FROM ownerdetail WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+    [email]
+  );
+  if (oRows.length) {
+    const o = oRows[0];
+    let ocRows = [];
+    try {
+      const [r] = await pool.query('SELECT client_id FROM owner_client WHERE owner_id = ?', [o.id]);
+      ocRows = r || [];
+    } catch (_) {
+      ocRows = [];
+    }
+    for (const row of ocRows) {
+      const cid = row.client_id;
+      if (!cid) continue;
+      const account = parseJson(o.account) || [];
+      await syncAccountingFromMergedAccount(cid, 'owner', o.id, account);
+    }
+  }
+
+  const [sRows] = await pool.query('SELECT id, client_id FROM staffdetail WHERE LOWER(TRIM(email)) = ?', [email]);
+  for (const s of sRows) {
+    try {
+      await contactSync.syncStaffForClient(s.id, s.client_id);
+    } catch (e) {
+      console.warn('[contact] syncAccountingContactsForProfileEmail staff', e?.message || e);
+    }
+  }
+}
+
+/** After supplier update: push name/email to accounting (create or update remote). */
+async function pushSupplierAccountingAfterUpdate(clientId, supplierId, payload, mergedAccount, emailForRecord) {
+  try {
+    const [planRows] = await pool.query(
+      `SELECT plan_id FROM client_pricingplan_detail WHERE client_id = ? AND type = 'plan' ORDER BY id LIMIT 1`,
+      [clientId]
+    );
+    const planId = planRows[0]?.plan_id;
+    if (!planId || !ACCOUNTING_PLAN_IDS.includes(planId)) return;
+
+    const [intRows] = await pool.query(
+      `SELECT provider FROM client_integration WHERE client_id = ? AND \`key\` IN ('Account', 'addonAccount') AND enabled = 1 LIMIT 1`,
+      [clientId]
+    );
+    const provider = intRows[0]?.provider;
+    if (!provider || !ACCOUNT_PROVIDERS.includes(provider)) return;
+
+    const account = Array.isArray(mergedAccount) ? mergedAccount : [];
+    const mapping = account.find((a) => a.clientId === clientId && a.provider === provider);
+    const existingId = mapping?.id ?? mapping?.contactId ?? null;
+
+    const record = {
+      name: (payload.name || '').trim(),
+      fullname: (payload.name || '').trim(),
+      email: (emailForRecord || '').trim().toLowerCase(),
+      phone: (payload.phone || '').trim()
+    };
+
+    const syncRes = await contactSync.ensureContactInAccounting(clientId, provider, 'supplier', record, existingId || null);
+    if (!syncRes.ok) {
+      console.warn('[contact] pushSupplierAccountingAfterUpdate', supplierId, syncRes.reason);
+      return;
+    }
+    if (syncRes.contactId && String(syncRes.contactId) !== String(existingId || '')) {
+      const merged2 = mergeAccount(account, { clientId, provider, id: String(syncRes.contactId) });
+      await pool.query('UPDATE supplierdetail SET account = ?, updated_at = NOW() WHERE id = ? AND client_id = ?', [
+        JSON.stringify(merged2),
+        supplierId,
+        clientId
+      ]);
+    }
+  } catch (e) {
+    console.warn('[contact] pushSupplierAccountingAfterUpdate', e?.message || e);
+  }
 }
 
 async function updateOwnerAccount(email, { ownerId, contactId }, overrideClientId) {
@@ -413,6 +760,7 @@ async function updateOwnerAccount(email, { ownerId, contactId }, overrideClientI
     JSON.stringify(merged),
     ownerId
   ]);
+  await syncAccountingFromMergedAccount(clientId, 'owner', ownerId, merged, { preserveLegalName: true });
   return { ok: true };
 }
 
@@ -431,6 +779,7 @@ async function updateTenantAccount(email, { tenantId, contactId }, overrideClien
     JSON.stringify(merged),
     tenantId
   ]);
+  // Persist accounting contact id in MySQL only — do not push tenantdetail profile (name/email/phone) to accounting.
   return { ok: true };
 }
 
@@ -450,6 +799,7 @@ async function updateStaffAccount(email, { staffId, contactId }, overrideClientI
     staffId,
     clientId
   ]);
+  await syncAccountingFromMergedAccount(clientId, 'staff', staffId, merged);
   return { ok: true };
 }
 
@@ -684,8 +1034,11 @@ async function upsertContactTransit(email, payload, overrideClientId) {
   const subdomain = values?.bukku_subdomain;
   if (!token || !subdomain) return { ok: false, reason: 'NO_ACCOUNT_INTEGRATION' };
 
+  /** Align with `bukku/validators/contact.validator.js` (entity_type, legal_name, types[]). */
   const body = {
-    legal_name: payload.name || '',
+    entity_type: 'MALAYSIAN_COMPANY',
+    legal_name: String(payload.name || '').trim().slice(0, 100) || 'Supplier',
+    types: ['supplier'],
     email: payload.email || '',
     phone_no: payload.phone || ''
   };
@@ -699,8 +1052,32 @@ async function upsertContactTransit(email, payload, overrideClientId) {
     subdomain,
     data: body
   });
-  const contactId = res?.data?.id ?? res?.id;
-  if (!res || !contactId) return { ok: false, reason: 'BUKKU_CONTACT_FAILED' };
+  try {
+    console.log(
+      '[bukku/contact]',
+      JSON.stringify({
+        op: 'upsertContactTransit',
+        method: 'POST',
+        path: '/contacts',
+        sent: body,
+        response: {
+          ok: res.ok,
+          status: res.status,
+          data: res.data,
+          error: res.error
+        }
+      })
+    );
+  } catch (_) {
+    /* ignore log serialization errors */
+  }
+  if (!res.ok) {
+    const err = res.error;
+    const msg = typeof err === 'string' ? err : JSON.stringify(err);
+    return { ok: false, reason: msg || 'BUKKU_CONTACT_FAILED' };
+  }
+  const contactId = res.data?.id ?? res.data?.data?.id;
+  if (!contactId) return { ok: false, reason: 'BUKKU_CONTACT_FAILED' };
   return { ok: true, provider: 'bukku', contactId: String(contactId) };
 }
 
@@ -1018,6 +1395,8 @@ async function updateSupplier(email, supplierId, payload, overrideClientId) {
       throw e;
     }
   }
+  const supplierEmailFinal = supplierEmail !== undefined ? supplierEmail : (supplier.email || '');
+  await pushSupplierAccountingAfterUpdate(clientId, supplierId, payload, merged, supplierEmailFinal);
   return { ok: true };
 }
 
@@ -1057,6 +1436,12 @@ async function createStaffContact(email, payload, overrideClientId) {
     ]
   );
 
+  try {
+    await contactSync.syncStaffForClient(id, clientId);
+  } catch (e) {
+    console.warn('[contact] createStaffContact syncStaffForClient', e?.message || e);
+  }
+
   return { ok: true, staffId: id };
 }
 
@@ -1085,11 +1470,274 @@ async function updateStaffContact(email, staffId, payload, overrideClientId) {
     [name || staffEmail.split('@')[0] || '', staffEmail, staffId, clientId]
   );
 
+  try {
+    await contactSync.syncStaffForClient(staffId, clientId);
+  } catch (e) {
+    console.warn('[contact] updateStaffContact syncStaffForClient', e?.message || e);
+  }
+
   return { ok: true, staffId };
+}
+
+/**
+ * Delete staffdetail row (Contact Setting). Blocked when the same email exists in client_user
+ * (User management on Company settings) — remove there first.
+ */
+async function deleteStaffContact(email, staffId, overrideClientId) {
+  const clientId = await resolveClientId(email, overrideClientId);
+  if (!clientId) return { ok: false, reason: 'NO_CLIENT_ID' };
+  if (!staffId) return { ok: false, reason: 'NO_STAFF_ID' };
+
+  const [rows] = await pool.query(
+    'SELECT id, email FROM staffdetail WHERE id = ? AND client_id = ? LIMIT 1',
+    [staffId, clientId]
+  );
+  if (!rows.length) return { ok: false, reason: 'STAFF_NOT_FOUND' };
+
+  const staffEmail = String(rows[0].email || '').trim().toLowerCase();
+  if (staffEmail) {
+    const [cu] = await pool.query(
+      'SELECT id FROM client_user WHERE client_id = ? AND LOWER(TRIM(email)) = ? LIMIT 1',
+      [clientId, staffEmail]
+    );
+    if (cu.length) {
+      return { ok: false, reason: 'STAFF_IN_USER_MANAGEMENT' };
+    }
+  }
+
+  await pool.query('DELETE FROM staffdetail WHERE id = ? AND client_id = ?', [staffId, clientId]);
+  return { ok: true };
 }
 
 function normalizeText(v) {
   return String(v || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function findContactRowByEmailOrName(arr, emailKey, nameKey, email, name) {
+  return arr.find(
+    (x) => (email && normalizeText(x[emailKey]) === email) || (name && normalizeText(x[nameKey]) === name)
+  );
+}
+
+/**
+ * Bukku types[] → which local rows to ensure on pull:
+ * - customer → tenant only (Bukku cannot distinguish owner vs tenant; operator adds Owner in Contact UI)
+ * - supplier → supplier + owner
+ * - employee → staff
+ * (Combinations union: e.g. customer+supplier+employee → tenant + supplier + owner + staff.)
+ */
+function buildBukkuTypeSet(rc) {
+  const arr = Array.isArray(rc.bukkuTypes) ? rc.bukkuTypes : [];
+  const set = new Set(
+    arr.map((x) => String(x).toLowerCase()).filter((t) => ['customer', 'supplier', 'employee'].includes(t))
+  );
+  if (set.size === 0) {
+    if (rc.role === 'supplier') set.add('supplier');
+    else if (rc.role === 'staff') set.add('employee');
+    else set.add('customer');
+  }
+  return set;
+}
+
+/**
+ * Pull from Bukku: ensure local rows per rules above and write the same accounting contact id to each
+ * applicable account[] (requires non-empty email for creates).
+ */
+async function syncBukkuPullByTypes(clientId, provider, rc, email, name, ctx) {
+  const { owners, tenants, suppliers, staffs, pushFail } = ctx;
+  const displayName = String(rc.name || '').trim().slice(0, 255);
+  const title = displayName || rc.email || 'Synced Contact';
+  const contactId = String(rc.id || '').trim();
+  if (!contactId) return { ok: false, reason: 'NO_REMOTE_ID' };
+
+  const types = buildBukkuTypeSet(rc);
+  const needOwner = types.has('supplier');
+  const needTenant = types.has('customer');
+  const needSupplier = types.has('supplier');
+  const needStaff = types.has('employee');
+
+  try {
+    let owner;
+    if (needOwner) {
+      owner = findContactRowByEmailOrName(owners, 'email', 'ownername', email, name);
+      if (!owner) {
+        const [globalO] = await pool.query(
+          'SELECT id, ownername, email FROM ownerdetail WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+          [email]
+        );
+        if (globalO.length) {
+          const oid = globalO[0].id;
+          await pool.query(
+            'INSERT IGNORE INTO owner_client (id, client_id, owner_id, created_at) VALUES (UUID(), ?, ?, NOW())',
+            [clientId, oid]
+          );
+          owner = { id: oid, ownername: globalO[0].ownername, email: globalO[0].email };
+          owners.push(owner);
+        } else {
+          const ownerId = require('crypto').randomUUID();
+          const account = JSON.stringify([]);
+          await pool.query(
+            'INSERT INTO ownerdetail (id, email, ownername, account, approvalpending, created_at, updated_at) VALUES (?, ?, ?, ?, ?, NOW(), NOW())',
+            [ownerId, email, displayName, account, '[]']
+          );
+          await pool.query(
+            'INSERT IGNORE INTO owner_client (id, client_id, owner_id, created_at) VALUES (UUID(), ?, ?, NOW())',
+            [clientId, ownerId]
+          );
+          owner = { id: ownerId, ownername: displayName, email };
+          owners.push(owner);
+        }
+      }
+    }
+
+    let tenant;
+    if (needTenant) {
+      tenant = findContactRowByEmailOrName(tenants, 'email', 'fullname', email, name);
+      if (!tenant) {
+        const [globalT] = await pool.query(
+          'SELECT id, fullname, email FROM tenantdetail WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+          [email]
+        );
+        if (globalT.length) {
+          const tid = globalT[0].id;
+          await pool.query('INSERT IGNORE INTO tenant_client (tenant_id, client_id) VALUES (?, ?)', [tid, clientId]);
+          tenant = { id: tid, fullname: globalT[0].fullname, email: globalT[0].email };
+          tenants.push(tenant);
+        } else {
+          const tenantId = require('crypto').randomUUID();
+          const account = JSON.stringify([]);
+          await pool.query(
+            'INSERT INTO tenantdetail (id, email, fullname, account, approval_request_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, NOW(), NOW())',
+            [tenantId, email, displayName, account, '[]']
+          );
+          await pool.query('INSERT IGNORE INTO tenant_client (tenant_id, client_id) VALUES (?, ?)', [tenantId, clientId]);
+          tenant = { id: tenantId, fullname: displayName, email };
+          tenants.push(tenant);
+        }
+      }
+    }
+
+    let supplier;
+    if (needSupplier) {
+      supplier = findContactRowByEmailOrName(suppliers, 'email', 'title', email, name);
+      if (!supplier) {
+        const newSupplierId = require('crypto').randomUUID();
+        const account = JSON.stringify([]);
+        const ins = await insertSupplierForAccountingSync(newSupplierId, title, rc.email || '', clientId, account);
+        if (!ins.ok) {
+          pushFail(rc, 'insertSupplierBukkuPull', ins.reason || 'INSERT_FAILED');
+          return { ok: false, reason: ins.reason };
+        }
+        supplier = { id: newSupplierId, title, email: rc.email || '' };
+        suppliers.push(supplier);
+      }
+    }
+
+    let staff;
+    if (needStaff) {
+      staff = findContactRowByEmailOrName(staffs, 'email', 'name', email, name);
+      if (!staff) {
+        const staffId = require('crypto').randomUUID();
+        const staffName = displayName || (email ? email.split('@')[0] : '') || 'Staff';
+        await pool.query(
+          `INSERT INTO staffdetail (id, name, email, permission_json, status, client_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 1, ?, NOW(), NOW())`,
+          [staffId, staffName.slice(0, 255), email, JSON.stringify([]), clientId]
+        );
+        staff = { id: staffId, name: staffName, email };
+        staffs.push(staff);
+      }
+    }
+
+    if (needOwner && owner) {
+      const wOwner = await contactSync.writeOwnerAccount(owner.id, clientId, provider, contactId);
+      if (!wOwner.ok) {
+        pushFail(rc, 'writeOwnerBukkuPull', wOwner.reason || 'WRITE_FAILED');
+        return { ok: false, reason: wOwner.reason };
+      }
+    }
+    if (needTenant && tenant) {
+      const wTenant = await contactSync.writeTenantAccount(tenant.id, clientId, provider, contactId);
+      if (!wTenant.ok) {
+        pushFail(rc, 'writeTenantBukkuPull', wTenant.reason || 'WRITE_FAILED');
+        return { ok: false, reason: wTenant.reason };
+      }
+    }
+    if (needSupplier && supplier) {
+      const wSup = await writeSupplierAccount(supplier.id, clientId, provider, contactId);
+      if (!wSup.ok) {
+        pushFail(rc, 'writeSupplierBukkuPull', wSup.reason || 'WRITE_FAILED');
+        return { ok: false, reason: wSup.reason };
+      }
+      await maybeRefreshSupplierTitleFromRemote(supplier.id, clientId, rc.name, email);
+    }
+    if (needStaff && staff) {
+      const wStaff = await contactSync.writeStaffAccount(staff.id, clientId, provider, contactId);
+      if (!wStaff.ok) {
+        pushFail(rc, 'writeStaffBukkuPull', wStaff.reason || 'WRITE_FAILED');
+        return { ok: false, reason: wStaff.reason };
+      }
+    }
+
+    return { ok: true };
+  } catch (err) {
+    const msg = err?.sqlMessage || err?.message || String(err);
+    pushFail(rc, 'syncBukkuPullByTypes', msg);
+    return { ok: false, reason: msg };
+  }
+}
+
+/**
+ * Bukku GET /contacts returns legal_name, types[], email or email_addresses[] — not `name` / single `type`.
+ * Map to our sync shape: name = display/legal name, email = primary, role = supplier | staff | customer.
+ *
+ * types[] is collapsed to one `role` for downstream matching: supplier > employee > customer (non-Bukku pull paths only).
+ * Bukku pull uses bukkuTypes[] and syncBukkuPullByTypes (customer→tenant; supplier→supplier+owner; employee→staff).
+ */
+function normalizeBukkuContactListItem(c) {
+  const raw = c || {};
+  const legal = String(raw.legal_name || raw.legalName || raw.name || raw.other_name || '').trim();
+  let email = '';
+  if (raw.email != null && String(raw.email).trim() !== '') {
+    email = String(raw.email).trim().toLowerCase();
+  } else if (Array.isArray(raw.email_addresses) && raw.email_addresses.length) {
+    const first = raw.email_addresses[0];
+    email = String(first?.email ?? first?.address ?? first ?? '')
+      .trim()
+      .toLowerCase();
+  }
+  const typesArr = Array.isArray(raw.types)
+    ? raw.types.map((x) => String(x).toLowerCase())
+    : raw.type
+      ? [String(raw.type).toLowerCase()]
+      : ['customer'];
+  let role = 'customer';
+  if (typesArr.includes('supplier')) role = 'supplier';
+  else if (typesArr.includes('employee')) role = 'staff';
+  else if (typesArr.includes('customer')) role = 'customer';
+
+  return {
+    id: String(raw.id ?? ''),
+    name: legal,
+    email,
+    role,
+    bukkuTypes: typesArr.filter((t) => ['customer', 'supplier', 'employee'].includes(t)),
+  };
+}
+
+async function maybeRefreshSupplierTitleFromRemote(supplierId, clientId, legalName, emailNorm) {
+  const title = String(legalName || '').trim();
+  if (!title || !supplierId) return;
+  try {
+    await pool.query(
+      `UPDATE supplierdetail SET title = ?, updated_at = NOW()
+       WHERE id = ? AND client_id = ?
+         AND (title IS NULL OR TRIM(title) = '' OR LOWER(TRIM(title)) = LOWER(TRIM(COALESCE(?, ''))))`,
+      [title.slice(0, 255), supplierId, clientId, emailNorm || '']
+    );
+  } catch (_) {
+    /* ignore */
+  }
 }
 
 function upsertAccountEntry(account, clientId, provider, contactId) {
@@ -1104,26 +1752,86 @@ async function writeSupplierAccount(supplierId, clientId, provider, contactId) {
   return { ok: true };
 }
 
+/**
+ * Insert a supplier row when pulling a contact from accounting with no local match.
+ * Mirrors createSupplier fallbacks (productid / full row vs minimal) for older schemas.
+ */
+async function insertSupplierForAccountingSync(newId, title, email, clientId, accountJson) {
+  const attempts = [
+    {
+      sql: `INSERT INTO supplierdetail (id, title, email, billercode, bankaccount, bankholder, bankdetail_id, client_id, account, productid, status, created_at, updated_at)
+            VALUES (?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, NULL, 1, NOW(), NOW())`,
+      params: [newId, title, email, clientId, accountJson],
+    },
+    {
+      sql: `INSERT INTO supplierdetail (id, title, email, billercode, bankaccount, bankholder, bankdetail_id, client_id, account, status, created_at, updated_at)
+            VALUES (?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, 1, NOW(), NOW())`,
+      params: [newId, title, email, clientId, accountJson],
+    },
+    {
+      sql: `INSERT INTO supplierdetail (id, title, email, client_id, account, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 1, NOW(), NOW())`,
+      params: [newId, title, email, clientId, accountJson],
+    },
+  ];
+  let lastErr;
+  for (let i = 0; i < attempts.length; i += 1) {
+    const { sql, params } = attempts[i];
+    try {
+      await pool.query(sql, params);
+      return { ok: true };
+    } catch (e) {
+      lastErr = e;
+      const msg = String(e?.sqlMessage || e?.message || '');
+      if (/duplicate/i.test(msg)) return { ok: false, reason: msg };
+      if (msg.includes('Unknown column') && i < attempts.length - 1) continue;
+      return { ok: false, reason: msg || 'INSERT_FAILED' };
+    }
+  }
+  return { ok: false, reason: String(lastErr?.sqlMessage || lastErr?.message || 'INSERT_FAILED') };
+}
+
 async function listRemoteContacts(clientId, provider) {
   const { req } = await contactSync.buildReqForProvider(clientId, provider);
   if (provider === 'bukku') {
-    const res = await bukkuContactWrapper.list(req, {});
-    if (!res.ok) return { ok: false, reason: res.error || 'BUKKU_LIST_FAILED', items: [] };
-    const raw = res.data;
-    const list = Array.isArray(raw?.contacts) ? raw.contacts : (Array.isArray(raw) ? raw : []);
+    const list = [];
+    const seenIds = new Set();
+    const perPage = 30;
+    const maxPages = 100;
+    let page = 1;
+    while (page <= maxPages) {
+      const res = await bukkuContactWrapper.list(req, { page, per_page: perPage });
+      if (!res.ok) {
+        return { ok: false, reason: formatIntegrationApiError(res.error) || 'BUKKU_LIST_FAILED', items: [] };
+      }
+      const raw = res.data;
+      const pageList = Array.isArray(raw?.contacts) ? raw.contacts : (Array.isArray(raw) ? raw : []);
+      let addedThisPage = 0;
+      for (const c of pageList) {
+        const id = String(c?.id ?? '').trim();
+        if (!id || seenIds.has(id)) continue;
+        seenIds.add(id);
+        list.push(c);
+        addedThisPage += 1;
+      }
+
+      const p = raw?.pagination || raw?.meta?.pagination || null;
+      const totalPages = Number(p?.total_pages || p?.last_page || 0);
+      const currentPage = Number(p?.current_page || page);
+      if (Number.isFinite(totalPages) && totalPages > 0 && currentPage >= totalPages) break;
+      if (!pageList.length) break;
+      if (addedThisPage === 0) break;
+      page += 1;
+    }
     return {
       ok: true,
-      items: list.map((c) => ({
-        id: String(c.id || ''),
-        name: String(c.name || ''),
-        email: String(c.email || '').trim().toLowerCase(),
-        role: String(c.type || 'customer').toLowerCase()
-      })).filter((c) => c.id)
+      items: list.map((c) => normalizeBukkuContactListItem(c)).filter((c) => c.id),
     };
   }
   if (provider === 'xero') {
     const res = await xeroContactWrapper.list(req, {});
-    if (!res.ok) return { ok: false, reason: res.error || 'XERO_LIST_FAILED', items: [] };
+    if (!res.ok)
+      return { ok: false, reason: formatIntegrationApiError(res.error) || 'XERO_LIST_FAILED', items: [] };
     const list = Array.isArray(res.data?.Contacts) ? res.data.Contacts : [];
     return {
       ok: true,
@@ -1173,25 +1881,58 @@ async function listRemoteContacts(clientId, provider) {
     return { ok: true, items };
   }
   if (provider === 'sql') {
-    const res = await sqlaccountContactWrapper.listContacts(req, {});
-    if (!res.ok) return { ok: false, reason: res.error || 'SQL_LIST_FAILED', items: [] };
-    const raw = res.data || {};
-    const list = Array.isArray(raw) ? raw : (Array.isArray(raw.Contacts) ? raw.Contacts : (Array.isArray(raw.contacts) ? raw.contacts : []));
-    return {
-      ok: true,
-      items: list.map((c) => ({
-        id: String(c.id || c.Id || c.Code || ''),
-        name: String(c.name || c.Name || ''),
-        email: String(c.email || c.Email || '').trim().toLowerCase(),
-        role: 'customer'
-      })).filter((c) => c.id)
+    const [cRes, sRes] = await Promise.all([
+      sqlaccountContactWrapper.listCustomers(req, {}),
+      sqlaccountContactWrapper.listSuppliers(req, {})
+    ]);
+    if (!cRes.ok)
+      return { ok: false, reason: formatIntegrationApiError(cRes.error) || 'SQL_LIST_FAILED', items: [] };
+    if (!sRes.ok)
+      return { ok: false, reason: formatIntegrationApiError(sRes.error) || 'SQL_LIST_FAILED', items: [] };
+    const extract = (raw) => {
+      if (Array.isArray(raw)) return raw;
+      if (raw && Array.isArray(raw.data)) return raw.data;
+      return [];
     };
+    const items = [];
+    for (const c of extract(cRes.data)) {
+      const id = String(c.code ?? c.Code ?? c.dockey ?? '').trim();
+      if (!id) continue;
+      const nm =
+        c.description ?? c.Description ?? c.companyname ?? c.CompanyName ?? c.name ?? c.Name ?? '';
+      items.push({
+        id,
+        name: String(nm),
+        email: String(c.email ?? c.Email ?? '')
+          .trim()
+          .toLowerCase(),
+        role: 'customer'
+      });
+    }
+    for (const s of extract(sRes.data)) {
+      const id = String(s.code ?? s.Code ?? s.dockey ?? '').trim();
+      if (!id) continue;
+      const nm =
+        s.description ?? s.Description ?? s.companyname ?? s.CompanyName ?? s.name ?? s.Name ?? '';
+      items.push({
+        id,
+        name: String(nm),
+        email: String(s.email ?? s.Email ?? '')
+          .trim()
+          .toLowerCase(),
+        role: 'supplier'
+      });
+    }
+    return { ok: true, items };
   }
   return { ok: false, reason: 'UNSUPPORTED_PROVIDER', items: [] };
 }
 
 async function syncContactsToAccounting(clientId, provider) {
   const counters = { scanned: 0, synced: 0, created: 0, failed: 0 };
+  const failureSamples = [];
+  const isSqlDatasetNotEditable = (reasonText) =>
+    provider === 'sql' && /dataset not in edit or insert mode/i.test(String(reasonText || ''));
   const [owners] = await pool.query(
     `SELECT DISTINCT o.id, o.ownername, o.email, o.account
      FROM ownerdetail o
@@ -1215,13 +1956,57 @@ async function syncContactsToAccounting(clientId, provider) {
     const beforeId = existingId ? String(existingId) : '';
     const syncRes = await contactSync.ensureContactInAccounting(clientId, provider, kind, row, existingId);
     if (!syncRes.ok || !syncRes.contactId) {
+      const reason = String(syncRes.reason || 'SYNC_FAILED').slice(0, 500);
+      if (isSqlDatasetNotEditable(reason)) {
+        console.warn('[contact/sync-all] ensure skipped (sql non-editable existing)', {
+          clientId,
+          provider,
+          kind,
+          email: row?.email || '',
+          reason
+        });
+        return;
+      }
       counters.failed += 1;
+      if (failureSamples.length < 20) {
+        failureSamples.push({
+          stage: 'ensureContactInAccounting',
+          kind,
+          name: String(row?.name || row?.fullname || '').slice(0, 120),
+          email: String(row?.email || '').slice(0, 120),
+          reason
+        });
+      }
+      console.warn('[contact/sync-all] ensure failed', {
+        clientId,
+        provider,
+        kind,
+        email: row?.email || '',
+        reason
+      });
       return;
     }
     if (!beforeId) counters.created += 1;
     const writeRes = await writeFn(syncRes.contactId);
     if (!writeRes.ok) {
       counters.failed += 1;
+      const reason = String(writeRes.reason || 'WRITE_FAILED').slice(0, 500);
+      if (failureSamples.length < 20) {
+        failureSamples.push({
+          stage: 'writeMapping',
+          kind,
+          name: String(row?.name || row?.fullname || '').slice(0, 120),
+          email: String(row?.email || '').slice(0, 120),
+          reason
+        });
+      }
+      console.warn('[contact/sync-all] write failed', {
+        clientId,
+        provider,
+        kind,
+        email: row?.email || '',
+        reason
+      });
       return;
     }
     counters.synced += 1;
@@ -1248,81 +2033,148 @@ async function syncContactsToAccounting(clientId, provider) {
     await runEnsure('staff', { name: s.name || '', email: s.email || '' }, () => existing?.id || existing?.contactId, (cid) => contactSync.writeStaffAccount(s.id, clientId, provider, cid));
   }
 
-  return { ok: true, ...counters };
+  return { ok: true, ...counters, failureSamples };
 }
 
+/**
+ * Pull: each remote row is matched by email/name — order: supplier branch (if normalized role is supplier) → owner → tenant → staff → supplier by email → insert supplierdetail.
+ * Bukku only: syncBukkuPullByTypes applies type rules (customer→tenant; supplier→supplier+owner; employee→staff).
+ * Other providers: each iteration writes that remote id into at most one local row (first match wins).
+ */
 async function syncContactsFromAccounting(clientId, provider) {
   const remoteRes = await listRemoteContacts(clientId, provider);
   if (!remoteRes.ok) return { ok: false, reason: remoteRes.reason || 'REMOTE_LIST_FAILED' };
   const remote = remoteRes.items || [];
   const counters = { scanned: remote.length, linked: 0, created: 0, failed: 0 };
 
+  // Email/name matching only; `account` is written by write*Account (requires `account` column — migration 0145 / 0049 / 0057).
   const [owners] = await pool.query(
-    `SELECT DISTINCT o.id, o.ownername, o.email, o.account
+    `SELECT DISTINCT o.id, o.ownername, o.email
      FROM ownerdetail o
      LEFT JOIN owner_client oc ON oc.owner_id = o.id
      WHERE oc.client_id = ?`,
     [clientId]
   );
   const [tenants] = await pool.query(
-    `SELECT t.id, t.fullname, t.email, t.account
+    `SELECT t.id, t.fullname, t.email
      FROM tenantdetail t
      LEFT JOIN tenant_client tc ON tc.tenant_id = t.id
      WHERE tc.client_id = ? OR t.client_id = ?`,
     [clientId, clientId]
   );
-  const [suppliers] = await pool.query('SELECT id, title, email, account FROM supplierdetail WHERE client_id = ?', [clientId]);
-  const [staffs] = await pool.query('SELECT id, name, email, account FROM staffdetail WHERE client_id = ?', [clientId]);
+  const [suppliers] = await pool.query('SELECT id, title, email FROM supplierdetail WHERE client_id = ?', [clientId]);
+  const [staffs] = await pool.query('SELECT id, name, email FROM staffdetail WHERE client_id = ?', [clientId]);
 
-  const findByEmailOrName = (arr, emailKey, nameKey, email, name) =>
-    arr.find((x) => (email && normalizeText(x[emailKey]) === email) || (name && normalizeText(x[nameKey]) === name));
+  const failureSamples = [];
+  const pushFail = (rc, stage, reason) => {
+    if (failureSamples.length >= 15) return;
+    failureSamples.push({
+      remoteId: rc.id,
+      email: String(rc.email || ''),
+      name: String(rc.name || ''),
+      stage,
+      reason: String(reason || '').slice(0, 500),
+    });
+  };
 
   for (const rc of remote) {
     const email = normalizeText(rc.email);
     const name = normalizeText(rc.name);
     try {
+      if (provider === 'bukku' && email) {
+        const pullRes = await syncBukkuPullByTypes(clientId, provider, rc, email, name, {
+          owners,
+          tenants,
+          suppliers,
+          staffs,
+          pushFail,
+        });
+        if (pullRes.ok) counters.linked += 1;
+        else counters.failed += 1;
+        continue;
+      }
+
       if (rc.role === 'supplier') {
-        const s = findByEmailOrName(suppliers, 'email', 'title', email, name);
+        const s = findContactRowByEmailOrName(suppliers, 'email', 'title', email, name);
         if (s) {
           const res = await writeSupplierAccount(s.id, clientId, provider, rc.id);
-          if (res.ok) counters.linked += 1; else counters.failed += 1;
+          if (res.ok) {
+            counters.linked += 1;
+            await maybeRefreshSupplierTitleFromRemote(s.id, clientId, rc.name, email);
+          } else {
+            counters.failed += 1;
+            pushFail(rc, 'writeSupplier', res.reason || 'WRITE_FAILED');
+          }
           continue;
         }
       }
 
-      const owner = findByEmailOrName(owners, 'email', 'ownername', email, name);
+      const owner = findContactRowByEmailOrName(owners, 'email', 'ownername', email, name);
       if (owner) {
         const res = await contactSync.writeOwnerAccount(owner.id, clientId, provider, rc.id);
-        if (res.ok) counters.linked += 1; else counters.failed += 1;
+        if (res.ok) counters.linked += 1;
+        else {
+          counters.failed += 1;
+          pushFail(rc, 'writeOwner', res.reason || 'WRITE_FAILED');
+        }
         continue;
       }
-      const tenant = findByEmailOrName(tenants, 'email', 'fullname', email, name);
+      const tenant = findContactRowByEmailOrName(tenants, 'email', 'fullname', email, name);
       if (tenant) {
         const res = await contactSync.writeTenantAccount(tenant.id, clientId, provider, rc.id);
-        if (res.ok) counters.linked += 1; else counters.failed += 1;
+        if (res.ok) counters.linked += 1;
+        else {
+          counters.failed += 1;
+          pushFail(rc, 'writeTenant', res.reason || 'WRITE_FAILED');
+        }
         continue;
       }
-      const staff = findByEmailOrName(staffs, 'email', 'name', email, name);
+      const staff = findContactRowByEmailOrName(staffs, 'email', 'name', email, name);
       if (staff) {
         const res = await contactSync.writeStaffAccount(staff.id, clientId, provider, rc.id);
-        if (res.ok) counters.linked += 1; else counters.failed += 1;
+        if (res.ok) counters.linked += 1;
+        else {
+          counters.failed += 1;
+          pushFail(rc, 'writeStaff', res.reason || 'WRITE_FAILED');
+        }
+        continue;
+      }
+
+      // Bukku type is often `customer`, not `supplier`, so the block above may skip supplierdetail
+      // entirely. Without this, two remote rows with the same email each INSERT a new supplier.
+      const supplierByEmail = findContactRowByEmailOrName(suppliers, 'email', 'title', email, name);
+      if (supplierByEmail) {
+        const res = await writeSupplierAccount(supplierByEmail.id, clientId, provider, rc.id);
+        if (res.ok) {
+          counters.linked += 1;
+          await maybeRefreshSupplierTitleFromRemote(supplierByEmail.id, clientId, rc.name, email);
+        } else {
+          counters.failed += 1;
+          pushFail(rc, 'writeSupplier', res.reason || 'WRITE_FAILED');
+        }
         continue;
       }
 
       const newSupplierId = require('crypto').randomUUID();
       const account = JSON.stringify([{ clientId, provider, id: rc.id }]);
-      await pool.query(
-        `INSERT INTO supplierdetail (id, title, email, client_id, account, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 1, NOW(), NOW())`,
-        [newSupplierId, rc.name || rc.email || 'Synced Contact', rc.email || '', clientId, account]
-      );
-      counters.created += 1;
-    } catch (_) {
+      const title = rc.name || rc.email || 'Synced Contact';
+      const ins = await insertSupplierForAccountingSync(newSupplierId, title, rc.email || '', clientId, account);
+      if (ins.ok) {
+        counters.created += 1;
+        suppliers.push({ id: newSupplierId, title, email: rc.email || '' });
+      } else {
+        counters.failed += 1;
+        pushFail(rc, 'insertSupplier', ins.reason || 'INSERT_FAILED');
+      }
+    } catch (err) {
       counters.failed += 1;
+      const msg = err?.sqlMessage || err?.message || String(err);
+      console.warn('[contact] syncContactsFromAccounting row failed', msg);
+      pushFail(rc, 'exception', msg);
     }
   }
 
-  return { ok: true, ...counters };
+  return { ok: true, ...counters, failureSamples };
 }
 
 async function syncAllContacts(email, params = {}, overrideClientId) {
@@ -1349,9 +2201,12 @@ module.exports = {
   getSupplier,
   getBanks,
   getAccountProvider,
+  listRemoteContacts,
   updateOwnerAccount,
+  updateOwnerBankFields,
   updateTenantAccount,
   updateStaffAccount,
+  updatePortalPhoneForClientContact,
   deleteOwnerOrCancel,
   deleteTenantOrCancel,
   deleteSupplierAccount,
@@ -1365,5 +2220,7 @@ module.exports = {
   updateSupplier,
   createStaffContact,
   updateStaffContact,
-  syncAllContacts
+  deleteStaffContact,
+  syncAllContacts,
+  syncAccountingContactsForProfileEmail
 };

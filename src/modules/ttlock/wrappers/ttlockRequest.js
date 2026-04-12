@@ -29,7 +29,16 @@ async function ttlockGet(path, auth, params = {}) {
   });
   const url = `${BASE}${path}?${q}`;
   const res = await fetch(url);
-  return res.json();
+  const text = await res.text();
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch {
+    const plain = (text || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+    console.warn('[ttlock] API returned non-JSON path=', path, 'status=', res.status, 'preview=', plain || text?.slice(0, 120));
+    throw new Error(
+      `TTLOCK_API_ERROR: HTTP ${res.status} from TTLock (non-JSON body). ${plain ? `Preview: ${plain}` : 'Retry later or check TTLock status.'}`
+    );
+  }
 }
 
 /**
@@ -47,7 +56,18 @@ async function ttlockPost(path, auth, body = {}) {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: data
   });
-  return res.json();
+  const text = await res.text();
+  let json;
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {
+    const plain = (text || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+    console.warn('[ttlock] API returned non-JSON path=', path, 'status=', res.status, 'preview=', plain || text?.slice(0, 120));
+    throw new Error(
+      `TTLOCK_API_ERROR: HTTP ${res.status} from TTLock (non-JSON body). ${plain ? `Preview: ${plain}` : 'Retry later or check TTLock status.'}`
+    );
+  }
+  return json;
 }
 
 module.exports = { buildQuery, ttlockGet, ttlockPost };

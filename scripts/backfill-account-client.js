@@ -25,7 +25,7 @@ async function run() {
     charset: 'utf8mb4'
   });
 
-  const [clientRows] = await conn.query('SELECT id, wix_id FROM clientdetail');
+  const [clientRows] = await conn.query('SELECT id, wix_id FROM operatordetail');
   const idByWixId = new Map();
   for (const r of clientRows) {
     if (r.id) idByWixId.set(r.id, r.id);

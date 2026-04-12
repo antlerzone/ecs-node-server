@@ -1,25 +1,26 @@
 /**
- * Import UtilityBills CSV into bills. billType->account, property->propertydetail, client->clientdetail. bukkuurl->billurl.
+ * Import UtilityBills CSV into bills. billType->account, property->propertydetail, client->operatordetail. bukkuurl->billurl.
  * Usage: node scripts/import-bills.js [csv_path], default ./UtilityBills.csv
  */
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 const mysql = require('mysql2/promise');
 const fs = require('fs');
 const path = require('path');
-const { randomUUID } = require('crypto');
+const { resolveId } = require('./import-util');
+const { ONBOARD_OPERATOR_ID, skipCsvColumn } = require('./onboard-import-helpers');
 
-const csvPath = process.argv[2] || path.join(process.cwd(), 'UtilityBills.csv');
+const csvPath = process.argv[2] || path.join(process.cwd(), 'utilitybills.csv');
 const table = 'bills';
 
 const CSV_TO_DB = {
-  _id: 'wix_id', ID: 'wix_id', id: 'wix_id',
+  _id: 'id', ID: 'id', id: 'id',
   listingTitle: 'listingtitle', listingtitle: 'listingtitle',
-  billType: 'billtype_wixid', billtype: 'billtype_wixid', billtype_wixid: 'billtype_wixid',
+  billType: 'supplierdetail_id', billtype: 'supplierdetail_id',
   period: 'period', amount: 'amount', description: 'description',
-  property: 'property_wixid', Property: 'property_wixid', property_wixid: 'property_wixid',
+  property: 'property_id', Property: 'property_id',
   bukkuurl: 'billurl', Bukkuurl: 'billurl', billurl: 'billurl',
   billname: 'billname', Billname: 'billname',
-  client: 'client_wixid', Client: 'client_wixid', CLIENT: 'client_wixid', client_wixid: 'client_wixid',
+  client: 'client_id', Client: 'client_id', CLIENT: 'client_id',
   Paid: 'paid', paid: 'paid',
   _createdDate: 'created_at', _updatedDate: 'updated_at', 'Created Date': 'created_at', 'Updated Date': 'updated_at',
 };
@@ -77,12 +78,13 @@ async function run() {
   const headerToDb = (h) => {
     const trimmed = (h || '').trim();
     const key = CSV_TO_DB[trimmed] || CSV_TO_DB[trimmed.replace(/_date$/i, 'Date')] || trimmed;
-    let dbCol = (key === '_id' ? 'wix_id' : key).toLowerCase().replace(/^\s+|\s+$/g, '');
-    if (trimmed.toLowerCase() === 'client') dbCol = 'client_wixid';
-    if (trimmed.toLowerCase() === 'property') dbCol = 'property_wixid';
-    if (trimmed.toLowerCase() === 'billtype') dbCol = 'billtype_wixid';
-    return dbCol;
+    return String(key).toLowerCase().replace(/^\s+|\s+$/g, '');
   };
+
+  function stripBrackets(s) {
+    if (s == null || typeof s !== 'string') return s;
+    return String(s).trim().replace(/^\[|\]$/g, '').replace(/"/g, '').trim();
+  }
 
   const conn = await mysql.createConnection({
     host: process.env.DB_HOST,
@@ -98,18 +100,8 @@ async function run() {
   );
   const tableColumns = new Set(cols.map(c => (c.column_name || c.COLUMN_NAME || '').toLowerCase()));
 
-  async function loadWixIdMap(refTable) {
-    const [rows] = await conn.query('SELECT id, wix_id FROM ' + refTable + ' WHERE wix_id IS NOT NULL');
-    return new Map(rows.map(r => [r.wix_id, r.id]));
-  }
-  function resolveWixId(map, wixId) {
-    if (!wixId) return null;
-    const s = String(wixId).trim();
-    return map.get(s) || map.get(s.replace(/^!/, '')) || null;
-  }
-  const accountMap = await loadWixIdMap('account');
-  const propertyMap = await loadWixIdMap('propertydetail');
-  const clientMap = await loadWixIdMap('clientdetail');
+  const [supplierRows] = await conn.query('SELECT id FROM supplierdetail');
+  const supplierIdSet = new Set(supplierRows.map(r => r.id));
 
   const usedIds = new Set();
   let inserted = 0;
@@ -118,20 +110,26 @@ async function run() {
       const values = parseCsvLine(lines[i]);
       const row = {};
       rawHeaders.forEach((h, idx) => {
+        if (skipCsvColumn(h)) return;
         const dbKey = headerToDb(h);
         if (dbKey === '_owner') return;
         row[dbKey] = values[idx] !== undefined ? normalizeVal(values[idx]) : null;
       });
-      row.id = (() => { let uid; do { uid = randomUUID(); } while (usedIds.has(uid)); usedIds.add(uid); return uid; })();
+      row.id = resolveId(row, usedIds);
+      if (row.client_id != null) row.client_id = stripBrackets(String(row.client_id)) || null;
+      if (row.property_id != null) row.property_id = stripBrackets(String(row.property_id)) || null;
+      if (row.supplierdetail_id != null) {
+        const sid = stripBrackets(String(row.supplierdetail_id));
+        if (!sid || !supplierIdSet.has(sid)) row.supplierdetail_id = null;
+        else row.supplierdetail_id = sid;
+      }
+      row.client_id = ONBOARD_OPERATOR_ID;
       const now = new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
       if (!row.created_at) row.created_at = now;
       if (!row.updated_at) row.updated_at = now;
       if (row.paid === null || row.paid === undefined) row.paid = 0;
-      const hasData = [row.wix_id, row.listingtitle, row.amount].some(v => v !== null && v !== undefined && String(v).trim() !== '');
+      const hasData = [row.id, row.listingtitle, row.amount].some(v => v !== null && v !== undefined && String(v).trim() !== '');
       if (!hasData) continue;
-      if (row.billtype_wixid) row.billtype_id = resolveWixId(accountMap, row.billtype_wixid);
-      if (row.property_wixid) row.property_id = resolveWixId(propertyMap, row.property_wixid);
-      if (row.client_wixid) row.client_id = resolveWixId(clientMap, row.client_wixid);
       const keys = Object.keys(row).filter(k => tableColumns.has(k.toLowerCase()));
       if (keys.length === 0) continue;
       const colsList = keys.map(k => '`' + k + '`').join(', ');

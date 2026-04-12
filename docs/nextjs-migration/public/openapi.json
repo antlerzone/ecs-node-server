@@ -1,0 +1,910 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Coliving Operator API",
+    "description": "API for operators to manage property, room, meter, smart door, and contact. All endpoints require **Authorization: Bearer &lt;token&gt;** and **X-API-Username: &lt;username&gt;** headers. You can only access your own client's data.",
+    "version": "1.0.0"
+  },
+  "servers": [
+    { "url": "https://api.colivingjb.com/api", "description": "Production" }
+  ],
+  "security": [
+    { "BearerAuth": [] },
+    { "ApiKeyUsername": [] }
+  ],
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "API Key",
+        "description": "Your API key (token). Send as: Authorization: Bearer &lt;your-token&gt;"
+      },
+      "ApiKeyUsername": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Username",
+        "description": "Your API username. Get both from portal /docs after your client is approved."
+      }
+    },
+    "schemas": {
+      "PropertyItem": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "description": "Property ID (use for get/update/delete)" },
+          "_id": { "type": "string", "description": "Same as id" },
+          "shortname": { "type": "string", "description": "Display name" },
+          "active": { "type": "boolean" }
+        }
+      },
+      "RoomItem": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "description": "Room ID" },
+          "roomName": { "type": "string" },
+          "property": { "type": "string", "description": "Property ID" },
+          "active": { "type": "boolean" }
+        }
+      },
+      "MeterItem": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "description": "Meter ID" },
+          "meterId": { "type": "string", "description": "External meter ID" },
+          "title": { "type": "string" },
+          "rate": { "type": "number" },
+          "mode": { "type": "string" },
+          "status": { "type": "boolean" }
+        }
+      },
+      "SmartDoorLock": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "description": "Lock detail ID" },
+          "lockAlias": { "type": "string" },
+          "active": { "type": "boolean" }
+        }
+      },
+      "ContactItem": {
+        "type": "object",
+        "properties": {
+          "_id": { "type": "string", "description": "e.g. owner-xxx, tenant-xxx, supplier-xxx" },
+          "type": { "type": "string", "enum": ["owner", "tenant", "supplier"] },
+          "text": { "type": "string" },
+          "raw": { "type": "object", "description": "Contains id, name, email, etc." }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/propertysetting/list": {
+      "post": {
+        "summary": "Property – List (Read)",
+        "tags": ["1) Property"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "keyword": { "type": "string", "description": "Search keyword" },
+                  "propertyId": { "type": "string", "description": "Filter by property ID" },
+                  "filter": { "type": "string" },
+                  "sort": { "type": "string" },
+                  "page": { "type": "integer" },
+                  "pageSize": { "type": "integer" },
+                  "limit": { "type": "integer" }
+                }
+              },
+              "example": { "page": 1, "pageSize": 20 }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "List of properties",
+            "content": {
+              "application/json": {
+                "example": {
+                  "items": [{ "id": "uuid-1", "_id": "uuid-1", "shortname": "Block A", "active": true }],
+                  "total": 1
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/propertysetting/get": {
+      "post": {
+        "summary": "Property – Get one (Read)",
+        "tags": ["1) Property"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["propertyId"],
+                "properties": {
+                  "propertyId": { "type": "string", "description": "Property ID from list" }
+                }
+              },
+              "example": { "propertyId": "uuid-here" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Property object" },
+          "404": { "description": "PROPERTY_NOT_FOUND" }
+        }
+      }
+    },
+    "/propertysetting/insert": {
+      "post": {
+        "summary": "Property – Add",
+        "tags": ["1) Property"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["items"],
+                "properties": {
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "unitNumber": { "type": "string" },
+                        "apartmentName": { "type": "string" }
+                      }
+                    }
+                  }
+                }
+              },
+              "example": { "items": [{ "unitNumber": "A-01", "apartmentName": "Tower A" }] }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Returns inserted records with ids"
+          }
+        }
+      }
+    },
+    "/propertysetting/update": {
+      "post": {
+        "summary": "Property – Update",
+        "tags": ["1) Property"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["propertyId"],
+                "properties": {
+                  "propertyId": { "type": "string" },
+                  "shortname": { "type": "string" },
+                  "active": { "type": "boolean" }
+                }
+              },
+              "example": { "propertyId": "uuid", "shortname": "New Name" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "ok: true" },
+          "404": { "description": "PROPERTY_NOT_FOUND" }
+        }
+      }
+    },
+    "/propertysetting/set-active": {
+      "post": {
+        "summary": "Property – Soft delete (set inactive)",
+        "tags": ["1) Property"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["propertyId", "active"],
+                "properties": {
+                  "propertyId": { "type": "string" },
+                  "active": { "type": "boolean", "description": "false = soft delete" }
+                }
+              },
+              "example": { "propertyId": "uuid", "active": false }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "ok: true" }
+        }
+      }
+    },
+    "/roomsetting/list": {
+      "post": {
+        "summary": "Room – List (Read)",
+        "tags": ["2) Room"],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "keyword": { "type": "string" },
+                  "propertyId": { "type": "string" },
+                  "sort": { "type": "string" },
+                  "page": { "type": "integer" },
+                  "pageSize": { "type": "integer" }
+                }
+              },
+              "example": { "page": 1, "pageSize": 20 }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "items (with id, roomName, property), total"
+          }
+        }
+      }
+    },
+    "/roomsetting/get": {
+      "post": {
+        "summary": "Room – Get one (Read)",
+        "tags": ["2) Room"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["roomId"],
+                "properties": {
+                  "roomId": { "type": "string" }
+                }
+              },
+              "example": { "roomId": "uuid" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Room object" },
+          "404": { "description": "ROOM_NOT_FOUND" }
+        }
+      }
+    },
+    "/roomsetting/insert": {
+      "post": {
+        "summary": "Room – Add",
+        "tags": ["2) Room"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["records"],
+                "properties": {
+                  "records": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "roomName": { "type": "string" },
+                        "property": { "type": "string", "description": "Property ID" }
+                      }
+                    }
+                  }
+                }
+              },
+              "example": { "records": [{ "roomName": "101", "property": "property-uuid" }] }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Returns inserted records with ids" }
+        }
+      }
+    },
+    "/roomsetting/update": {
+      "post": {
+        "summary": "Room – Update",
+        "tags": ["2) Room"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["roomId"],
+                "properties": {
+                  "roomId": { "type": "string" },
+                  "roomName": { "type": "string" },
+                  "description_fld": { "type": "string" },
+                  "remark": { "type": "string" },
+                  "price": { "type": "number" },
+                  "property": { "type": "string" },
+                  "active": { "type": "boolean" }
+                }
+              },
+              "example": { "roomId": "uuid", "roomName": "102" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Updated room" },
+          "404": { "description": "ROOM_NOT_FOUND" }
+        }
+      }
+    },
+    "/roomsetting/set-active": {
+      "post": {
+        "summary": "Room – Soft delete",
+        "tags": ["2) Room"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["roomId", "active"],
+                "properties": {
+                  "roomId": { "type": "string" },
+                  "active": { "type": "boolean" }
+                }
+              },
+              "example": { "roomId": "uuid", "active": false }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "ok: true" }
+        }
+      }
+    },
+    "/metersetting/list": {
+      "post": {
+        "summary": "Meter – List (Read)",
+        "tags": ["3) Meter"],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "keyword": { "type": "string" },
+                  "propertyId": { "type": "string" },
+                  "filter": { "type": "string" },
+                  "page": { "type": "integer" },
+                  "pageSize": { "type": "integer" }
+                }
+              },
+              "example": { "page": 1, "pageSize": 20 }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "items (id, meterId, title, rate, mode, status), total"
+          }
+        }
+      }
+    },
+    "/metersetting/get": {
+      "post": {
+        "summary": "Meter – Get one (Read)",
+        "tags": ["3) Meter"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["meterId"],
+                "properties": {
+                  "meterId": { "type": "string" }
+                }
+              },
+              "example": { "meterId": "uuid" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Meter object" },
+          "404": { "description": "METER_NOT_FOUND" }
+        }
+      }
+    },
+    "/metersetting/insert": {
+      "post": {
+        "summary": "Meter – Add",
+        "tags": ["3) Meter"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["records"],
+                "properties": {
+                  "records": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "meterId": { "type": "string", "description": "CNYIoT meter id" },
+                        "title": { "type": "string" },
+                        "name": { "type": "string" },
+                        "mode": { "type": "string" }
+                      }
+                    }
+                  }
+                }
+              },
+              "example": { "records": [{ "meterId": "ext-id", "title": "Room 101" }] }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Inserted meters with ids" }
+        }
+      }
+    },
+    "/metersetting/update": {
+      "post": {
+        "summary": "Meter – Update",
+        "tags": ["3) Meter"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["meterId"],
+                "properties": {
+                  "meterId": { "type": "string" },
+                  "title": { "type": "string" },
+                  "rate": { "type": "number" },
+                  "mode": { "type": "string" },
+                  "status": { "type": "boolean" }
+                }
+              },
+              "example": { "meterId": "uuid", "title": "New title" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Updated meter" },
+          "404": { "description": "METER_NOT_FOUND" }
+        }
+      }
+    },
+    "/metersetting/delete": {
+      "post": {
+        "summary": "Meter – Delete",
+        "tags": ["3) Meter"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["meterId"],
+                "properties": {
+                  "meterId": { "type": "string" }
+                }
+              },
+              "example": { "meterId": "uuid" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "ok: true" },
+          "404": { "description": "METER_NOT_FOUND" }
+        }
+      }
+    },
+    "/smartdoorsetting/list": {
+      "post": {
+        "summary": "Smart door – List (Read)",
+        "tags": ["4) Smart door"],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "keyword": { "type": "string" },
+                  "propertyId": { "type": "string" },
+                  "page": { "type": "integer" },
+                  "pageSize": { "type": "integer" }
+                }
+              },
+              "example": { "page": 1, "pageSize": 20 }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "items (locks/gateways), total"
+          }
+        }
+      }
+    },
+    "/smartdoorsetting/get-lock": {
+      "post": {
+        "summary": "Smart door – Get lock (Read)",
+        "tags": ["4) Smart door"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["id"],
+                "properties": {
+                  "id": { "type": "string", "description": "Lock detail ID" }
+                }
+              },
+              "example": { "id": "uuid" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Lock object" },
+          "404": { "description": "NOT_FOUND" }
+        }
+      }
+    },
+    "/smartdoorsetting/get-gateway": {
+      "post": {
+        "summary": "Smart door – Get gateway (Read)",
+        "tags": ["4) Smart door"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["id"],
+                "properties": {
+                  "id": { "type": "string", "description": "Gateway detail ID" }
+                }
+              },
+              "example": { "id": "uuid" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Gateway object" },
+          "404": { "description": "NOT_FOUND" }
+        }
+      }
+    },
+    "/smartdoorsetting/update-lock": {
+      "post": {
+        "summary": "Smart door – Update lock",
+        "tags": ["4) Smart door"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["id"],
+                "properties": {
+                  "id": { "type": "string" },
+                  "lockAlias": { "type": "string" },
+                  "active": { "type": "boolean" },
+                  "childmeter": { "type": "string" }
+                }
+              },
+              "example": { "id": "uuid", "lockAlias": "Room 101" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "ok: true" }
+        }
+      }
+    },
+    "/smartdoorsetting/update-gateway": {
+      "post": {
+        "summary": "Smart door – Update gateway",
+        "tags": ["4) Smart door"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["id"],
+                "properties": {
+                  "id": { "type": "string" },
+                  "gatewayName": { "type": "string" }
+                }
+              },
+              "example": { "id": "uuid", "gatewayName": "Gateway 1" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "ok: true" }
+        }
+      }
+    },
+    "/smartdoorsetting/insert-smartdoors": {
+      "post": {
+        "summary": "Smart door – Add (gateways + locks)",
+        "tags": ["4) Smart door"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "gateways": {
+                    "type": "array",
+                    "items": { "type": "object" }
+                  },
+                  "locks": {
+                    "type": "array",
+                    "items": { "type": "object" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Inserted ids" }
+        }
+      }
+    },
+    "/contact/list": {
+      "post": {
+        "summary": "Contact – List (Read)",
+        "tags": ["5) Contact"],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "type": { "type": "string", "description": "Filter: owner | tenant | supplier" },
+                  "search": { "type": "string" },
+                  "sort": { "type": "string" },
+                  "page": { "type": "integer" },
+                  "pageSize": { "type": "integer" }
+                }
+              },
+              "example": { "page": 1, "pageSize": 20 }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "items (_id, type, text, raw with id/name/email), total"
+          }
+        }
+      }
+    },
+    "/contact/owner": {
+      "post": {
+        "summary": "Contact – Get owner (Read)",
+        "tags": ["5) Contact"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["ownerId"],
+                "properties": {
+                  "ownerId": { "type": "string" }
+                }
+              },
+              "example": { "ownerId": "uuid" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Owner object (_id, ownerName, email, account)" },
+          "404": { "description": "NOT_FOUND" }
+        }
+      }
+    },
+    "/contact/tenant": {
+      "post": {
+        "summary": "Contact – Get tenant (Read)",
+        "tags": ["5) Contact"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["tenantId"],
+                "properties": {
+                  "tenantId": { "type": "string" }
+                }
+              },
+              "example": { "tenantId": "uuid" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Tenant object" },
+          "404": { "description": "NOT_FOUND" }
+        }
+      }
+    },
+    "/contact/supplier": {
+      "post": {
+        "summary": "Contact – Get supplier (Read)",
+        "tags": ["5) Contact"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["supplierId"],
+                "properties": {
+                  "supplierId": { "type": "string" }
+                }
+              },
+              "example": { "supplierId": "uuid" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Supplier object" },
+          "404": { "description": "NOT_FOUND" }
+        }
+      }
+    },
+    "/contact/supplier/create": {
+      "post": {
+        "summary": "Contact – Add supplier",
+        "tags": ["5) Contact"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": { "type": "string" },
+                  "email": { "type": "string" },
+                  "billerCode": { "type": "string" },
+                  "bankName": { "type": "string" },
+                  "bankAccount": { "type": "string" },
+                  "bankHolder": { "type": "string" },
+                  "productid": { "type": "string" }
+                }
+              },
+              "example": { "name": "Supplier A", "email": "a@example.com" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Created supplier with id" }
+        }
+      }
+    },
+    "/contact/supplier/update": {
+      "post": {
+        "summary": "Contact – Update supplier",
+        "tags": ["5) Contact"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["supplierId"],
+                "properties": {
+                  "supplierId": { "type": "string" },
+                  "name": { "type": "string" },
+                  "email": { "type": "string" },
+                  "billerCode": { "type": "string" },
+                  "bankName": { "type": "string" },
+                  "bankAccount": { "type": "string" },
+                  "bankHolder": { "type": "string" }
+                }
+              },
+              "example": { "supplierId": "uuid", "name": "New Name" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "ok: true" }
+        }
+      }
+    },
+    "/contact/owner/delete": {
+      "post": {
+        "summary": "Contact – Delete / cancel owner",
+        "tags": ["5) Contact"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["ownerId"],
+                "properties": {
+                  "ownerId": { "type": "string" },
+                  "isPending": { "type": "boolean", "description": "true to cancel pending approval only" }
+                }
+              },
+              "example": { "ownerId": "uuid" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "ok: true" }
+        }
+      }
+    },
+    "/contact/tenant/delete": {
+      "post": {
+        "summary": "Contact – Delete / cancel tenant",
+        "tags": ["5) Contact"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["tenantId"],
+                "properties": {
+                  "tenantId": { "type": "string" },
+                  "isPending": { "type": "boolean" }
+                }
+              },
+              "example": { "tenantId": "uuid" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "ok: true" }
+        }
+      }
+    },
+    "/contact/supplier/delete": {
+      "post": {
+        "summary": "Contact – Delete supplier",
+        "tags": ["5) Contact"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["supplierId"],
+                "properties": {
+                  "supplierId": { "type": "string" }
+                }
+              },
+              "example": { "supplierId": "uuid" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "ok: true" }
+        }
+      }
+    }
+  }
+}

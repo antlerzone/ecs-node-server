@@ -37,10 +37,64 @@ function normalizeApartmentName(name) {
   return t.replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+const PREMISES_TYPES = new Set(['landed', 'apartment', 'other', 'office', 'commercial']);
+
+/** Coliving `premises_type` — must match `cln_property.premises_type` vocabulary. */
+function normalizePremisesType(v) {
+  if (v == null || v === '') return null;
+  const s = String(v).trim().toLowerCase();
+  return PREMISES_TYPES.has(s) ? s : null;
+}
+
+/** WGS84 pair for `propertydetail.latitude` / `longitude`; both null or both finite (aligned with `cln_property`). */
+function wgs84FromPayload(data) {
+  if (!data || typeof data !== 'object') return undefined;
+  const hasAny =
+    ['latitude', 'longitude', 'lat', 'lng', 'lon'].some((k) => Object.prototype.hasOwnProperty.call(data, k));
+  if (!hasAny) return undefined;
+  const laRaw = Object.prototype.hasOwnProperty.call(data, 'latitude')
+    ? data.latitude
+    : Object.prototype.hasOwnProperty.call(data, 'lat')
+      ? data.lat
+      : undefined;
+  const loRaw = Object.prototype.hasOwnProperty.call(data, 'longitude')
+    ? data.longitude
+    : Object.prototype.hasOwnProperty.call(data, 'lng')
+      ? data.lng
+      : Object.prototype.hasOwnProperty.call(data, 'lon')
+        ? data.lon
+        : undefined;
+  const empty = (v) =>
+    v === undefined || v === null || (typeof v === 'string' && String(v).trim() === '');
+  if (empty(laRaw) && empty(loRaw)) return { latitude: null, longitude: null };
+  if (empty(laRaw) || empty(loRaw)) throw new Error('INVALID_LAT_LNG');
+  const la = Number(laRaw);
+  const lo = Number(loRaw);
+  if (!Number.isFinite(la) || !Number.isFinite(lo) || Math.abs(la) > 90 || Math.abs(lo) > 180) {
+    throw new Error('INVALID_LAT_LNG');
+  }
+  return { latitude: la, longitude: lo };
+}
+
+/** @returns {'management_percent_gross'|'management_percent_net'|'management_percent_rental_income_only'|'management_fees_fixed'|'rental_unit'|'guarantee_return_fixed_plus_share'} */
+function normalizeOwnerSettlementModel(v) {
+  const s = String(v ?? 'management_percent_gross').trim().toLowerCase().replace(/-/g, '_');
+  if (s === 'management_percent_net') return 'management_percent_net';
+  if (s === 'management_percent_rental_income_only') return 'management_percent_rental_income_only';
+  if (s === 'guarantee_return_fixed_plus_share') return 'guarantee_return_fixed_plus_share';
+  if (s === 'rental_unit' || s === 'fixed_rent_to_owner') return 'rental_unit';
+  if (s === 'management_fees_fixed') return 'management_fees_fixed';
+  if (s === 'management_percent') return 'management_percent_gross';
+  return 'management_percent_gross';
+}
+
 function mapPropertyRow(r) {
   // Edit utility "Wifi id" → propertydetail.wifi_id only (not wifidetail)
   const wifi = (r.wifi_id != null && r.wifi_id !== '') ? String(r.wifi_id) : '';
   const country = (r.country != null && String(r.country).trim()) ? String(r.country).trim().toUpperCase() : null;
+  const ownerSettlementModel = normalizeOwnerSettlementModel(
+    r.owner_settlement_model != null ? String(r.owner_settlement_model).trim() : 'management_percent_gross'
+  );
   return {
     _id: r.id,
     id: r.id,
@@ -49,6 +103,8 @@ function mapPropertyRow(r) {
     apartmentName: r.apartmentname || null,
     country: (country === 'MY' || country === 'SG') ? country : null,
     address: r.address || '',
+    ownerSettlementModel,
+    fixedRentToOwner: r.fixed_rent_to_owner != null && r.fixed_rent_to_owner !== '' ? Number(r.fixed_rent_to_owner) : null,
     percentage: r.percentage != null ? Number(r.percentage) : null,
     remark: r.remark || '',
     folder: r.folder || null,
@@ -63,8 +119,55 @@ function mapPropertyRow(r) {
     smartdoor: r.smartdoor_id || null,
     owner_id: r.owner_id || null,
     signagreement: r.signagreement || null,
-    active: !!r.active
+    active: !!r.active,
+    archived: !!r.archived,
+    availableUnitCount: Number(r.available_unit_count || 0),
+    totalRoomCount: Number(r.total_room_count || 0),
+    premisesType: Object.prototype.hasOwnProperty.call(r, 'premises_type') && r.premises_type != null
+      ? String(r.premises_type).trim().toLowerCase()
+      : '',
+    securitySystem: Object.prototype.hasOwnProperty.call(r, 'security_system') && r.security_system != null
+      ? String(r.security_system).trim()
+      : '',
+    cleanlemonsCleaningTenantPriceMyr:
+      Object.prototype.hasOwnProperty.call(r, 'cleanlemons_cleaning_tenant_price_myr') &&
+      r.cleanlemons_cleaning_tenant_price_myr != null
+        ? Number(r.cleanlemons_cleaning_tenant_price_myr)
+        : null,
+    latitude:
+      Object.prototype.hasOwnProperty.call(r, 'latitude') &&
+      r.latitude != null &&
+      String(r.latitude).trim() !== ''
+        ? Number(r.latitude)
+        : null,
+    longitude:
+      Object.prototype.hasOwnProperty.call(r, 'longitude') &&
+      r.longitude != null &&
+      String(r.longitude).trim() !== ''
+        ? Number(r.longitude)
+        : null,
+    mailboxPassword:
+      Object.prototype.hasOwnProperty.call(r, 'mailbox_password') && r.mailbox_password != null
+        ? String(r.mailbox_password)
+        : '',
+    smartdoorPassword:
+      Object.prototype.hasOwnProperty.call(r, 'smartdoor_password') && r.smartdoor_password != null
+        ? String(r.smartdoor_password)
+        : '',
+    smartdoorTokenEnabled:
+      Object.prototype.hasOwnProperty.call(r, 'smartdoor_token_enabled') &&
+      (r.smartdoor_token_enabled === 1 || r.smartdoor_token_enabled === true)
   };
+}
+
+async function maybeSyncPropertydetailToCleanlemonsAfter(clientId, propertyId) {
+  if (!clientId || !propertyId) return;
+  try {
+    const { maybeSyncPropertydetailToCleanlemons } = require('../coliving-cleanlemons/coliving-cleanlemons-link.service');
+    await maybeSyncPropertydetailToCleanlemons(clientId, propertyId);
+  } catch (e) {
+    console.warn('[propertysetting] maybeSyncPropertydetailToCleanlemons', e && (e.message || e));
+  }
 }
 
 function listConditions(clientId, opts = {}) {
@@ -79,9 +182,14 @@ function listConditions(clientId, opts = {}) {
   }
   if (filter === 'ACTIVE_ONLY') {
     conditions.push('p.active = 1');
+    conditions.push('(p.archived = 0 OR p.archived IS NULL)');
   } else if (filter === 'INACTIVE_ONLY') {
     conditions.push('(p.active = 0 OR p.active IS NULL)');
+    conditions.push('(p.archived = 0 OR p.archived IS NULL)');
+  } else if (filter === 'ARCHIVED_ONLY') {
+    conditions.push('p.archived = 1');
   }
+  // filter === null (ALL): show non-archived and archived together
   if (keyword && keyword.length >= 1) {
     conditions.push('(p.shortname LIKE ? OR p.apartmentname LIKE ? OR p.unitnumber LIKE ? OR p.address LIKE ?)');
     const term = `%${keyword}%`;
@@ -112,13 +220,24 @@ async function getProperties(clientId, opts = {}) {
   const total = Number(countRows[0]?.total || 0);
   const totalPages = useLimit ? 1 : Math.max(1, Math.ceil(total / pageSize));
 
-  const cols = 'p.id, p.shortname, p.unitnumber, p.apartmentname, p.address, p.percentage, p.remark, p.folder, p.electric, p.water, p.wifidetail, p.wifi_id, p.internettype_id, p.management_id, p.meter_id, p.smartdoor_id, p.owner_id, p.signagreement, p.active';
+  const cols = 'p.id, p.shortname, p.unitnumber, p.apartmentname, p.address, p.latitude, p.longitude, p.percentage, p.owner_settlement_model, p.fixed_rent_to_owner, p.remark, p.folder, p.electric, p.water, p.wifidetail, p.wifi_id, p.internettype_id, p.management_id, p.meter_id, p.smartdoor_id, p.owner_id, p.signagreement, p.active, p.archived';
   const colsWithCountry = cols + ', p.country';
   let rows;
   try {
     [rows] = await pool.query(
-      `SELECT ${colsWithCountry}
+      `SELECT ${colsWithCountry},
+              COALESCE(rs.available_unit_count, 0) AS available_unit_count,
+              COALESCE(rs.total_room_count, 0) AS total_room_count
        FROM propertydetail p
+       LEFT JOIN (
+         SELECT
+           client_id,
+           property_id,
+           COUNT(*) AS total_room_count,
+           SUM(CASE WHEN active = 1 AND available = 1 AND (availablesoon = 0 OR availablesoon IS NULL) THEN 1 ELSE 0 END) AS available_unit_count
+         FROM roomdetail
+         GROUP BY client_id, property_id
+       ) rs ON rs.client_id = p.client_id AND rs.property_id = p.id
        WHERE ${whereSql}
        ${orderBy}
        LIMIT ? OFFSET ?`,
@@ -127,14 +246,54 @@ async function getProperties(clientId, opts = {}) {
   } catch (e) {
     const isUnknownColumn = e.code === 'ER_BAD_FIELD_ERROR' || e.errno === 1054 || (e.message && String(e.message).includes('Unknown column'));
     if (isUnknownColumn) {
-      [rows] = await pool.query(
-        `SELECT ${cols}
+      const colsLegacy = 'p.id, p.shortname, p.unitnumber, p.apartmentname, p.address, p.percentage, p.remark, p.folder, p.electric, p.water, p.wifidetail, p.wifi_id, p.internettype_id, p.management_id, p.meter_id, p.smartdoor_id, p.owner_id, p.signagreement, p.active';
+      const colsLegacyCountry = colsLegacy + ', p.country';
+      try {
+        [rows] = await pool.query(
+          `SELECT ${colsLegacyCountry},
+                  COALESCE(rs.available_unit_count, 0) AS available_unit_count,
+                  COALESCE(rs.total_room_count, 0) AS total_room_count
        FROM propertydetail p
+       LEFT JOIN (
+         SELECT
+           client_id,
+           property_id,
+           COUNT(*) AS total_room_count,
+           SUM(CASE WHEN active = 1 AND available = 1 AND (availablesoon = 0 OR availablesoon IS NULL) THEN 1 ELSE 0 END) AS available_unit_count
+         FROM roomdetail
+         GROUP BY client_id, property_id
+       ) rs ON rs.client_id = p.client_id AND rs.property_id = p.id
        WHERE ${whereSql}
        ${orderBy}
        LIMIT ? OFFSET ?`,
-        [...params, pageSize, offset]
-      );
+          [...params, pageSize, offset]
+        );
+      } catch (e2) {
+        const isUnknown2 = e2.code === 'ER_BAD_FIELD_ERROR' || e2.errno === 1054 || (e2.message && String(e2.message).includes('Unknown column'));
+        if (isUnknown2) {
+          [rows] = await pool.query(
+            `SELECT ${colsLegacy},
+                    COALESCE(rs.available_unit_count, 0) AS available_unit_count,
+                    COALESCE(rs.total_room_count, 0) AS total_room_count
+       FROM propertydetail p
+       LEFT JOIN (
+         SELECT
+           client_id,
+           property_id,
+           COUNT(*) AS total_room_count,
+           SUM(CASE WHEN active = 1 AND available = 1 AND (availablesoon = 0 OR availablesoon IS NULL) THEN 1 ELSE 0 END) AS available_unit_count
+         FROM roomdetail
+         GROUP BY client_id, property_id
+       ) rs ON rs.client_id = p.client_id AND rs.property_id = p.id
+       WHERE ${whereSql}
+       ${orderBy}
+       LIMIT ? OFFSET ?`,
+            [...params, pageSize, offset]
+          );
+        } else {
+          throw e2;
+        }
+      }
     } else {
       throw e;
     }
@@ -160,7 +319,8 @@ async function getPropertyFilters(clientId) {
   const services = [
     { label: 'All', value: 'ALL' },
     { label: 'Active only', value: 'ACTIVE_ONLY' },
-    { label: 'Inactive only', value: 'INACTIVE_ONLY' }
+    { label: 'Inactive only', value: 'INACTIVE_ONLY' },
+    { label: 'Archived unit', value: 'ARCHIVED_ONLY' }
   ];
 
   return { properties, services };
@@ -173,32 +333,15 @@ async function getPropertyFilters(clientId) {
  */
 async function getProperty(clientId, propertyId) {
   if (!propertyId) return null;
-  const baseCols = 'id, shortname, unitnumber, apartmentname, address, percentage, remark, folder, electric, water, wifidetail, wifi_id, internettype_id, management_id, meter_id, smartdoor_id, owner_id, signagreement, active';
-  const baseColsWithCountry = baseCols + ', country';
-  let rows;
-  try {
-    [rows] = await pool.query(
-      `SELECT ${baseColsWithCountry}, wifi_username, wifi_password FROM propertydetail WHERE id = ? AND client_id = ? LIMIT 1`,
-      [propertyId, clientId]
-    );
-  } catch (e) {
-    const isUnknownColumn = e.code === 'ER_BAD_FIELD_ERROR' || e.errno === 1054 || (e.message && String(e.message).includes('Unknown column'));
-    if (isUnknownColumn) {
-      try {
-        [rows] = await pool.query(
-          `SELECT ${baseCols}, wifi_username, wifi_password FROM propertydetail WHERE id = ? AND client_id = ? LIMIT 1`,
-          [propertyId, clientId]
-        );
-      } catch (e2) {
-        [rows] = await pool.query(
-          `SELECT ${baseCols} FROM propertydetail WHERE id = ? AND client_id = ? LIMIT 1`,
-          [propertyId, clientId]
-        );
-      }
-    } else {
-      throw e;
-    }
-  }
+  /**
+   * Use SELECT * so we never omit mailbox / owner_settlement / optional migrations when *any*
+   * single column in a hand-built list is missing (previous fallbacks dropped mailbox_password,
+   * smartdoor_*, owner_settlement_model, etc., so updates looked "unsaved" after reload).
+   */
+  const [rows] = await pool.query(
+    'SELECT * FROM propertydetail WHERE id = ? AND client_id = ? LIMIT 1',
+    [propertyId, clientId]
+  );
   const r = rows && rows[0];
   if (!r) return null;
   return mapPropertyRow(r);
@@ -220,6 +363,8 @@ async function updateProperty(clientId, propertyId, data) {
   const countryVal = data.country != null && String(data.country).trim() !== '' ? String(data.country).trim().toUpperCase() : null;
   const country = (countryVal === 'MY' || countryVal === 'SG') ? countryVal : null;
 
+  const wgs = wgs84FromPayload(data);
+
   const updates = [];
   const params = [];
   const fields = {
@@ -235,13 +380,89 @@ async function updateProperty(clientId, propertyId, data) {
     management_id: data.management ?? data.management_id,
     meter_id: 'meter' in data ? toFkNull(data.meter) : (data.meter_id !== undefined ? toFkNull(data.meter_id) : undefined),
     smartdoor_id: 'smartdoor' in data ? toFkNull(data.smartdoor) : (data.smartdoor_id !== undefined ? toFkNull(data.smartdoor_id) : undefined),
+    owner_settlement_model:
+      data.ownerSettlementModel !== undefined || data.owner_settlement_model !== undefined
+        ? normalizeOwnerSettlementModel(data.ownerSettlementModel ?? data.owner_settlement_model)
+        : undefined,
+    fixed_rent_to_owner:
+      data.fixedRentToOwner !== undefined || data.fixed_rent_to_owner !== undefined
+        ? (() => {
+            const v = data.fixedRentToOwner ?? data.fixed_rent_to_owner;
+            if (v === '' || v === undefined || v === null) return null;
+            const n = Number(v);
+            return Number.isFinite(n) ? n : null;
+          })()
+        : undefined,
     percentage: data.percentage,
     address: data.address,
     remark: data.remark,
     folder: data.folder,
     owner_id: data.owner_id ?? data.ownername,
-    active: data.active
+    active: data.active,
+    premises_type:
+      data.premisesType !== undefined || data.premises_type !== undefined
+        ? normalizePremisesType(data.premisesType ?? data.premises_type)
+        : undefined,
+    security_system:
+      data.securitySystem !== undefined || data.security_system !== undefined
+        ? (() => {
+            const s = data.securitySystem ?? data.security_system;
+            return s == null || s === '' ? null : String(s).trim();
+          })()
+        : undefined,
+    cleanlemons_cleaning_tenant_price_myr:
+      data.cleanlemonsCleaningTenantPriceMyr !== undefined ||
+      data.cleanlemons_cleaning_tenant_price_myr !== undefined
+        ? (() => {
+            const v = data.cleanlemonsCleaningTenantPriceMyr ?? data.cleanlemons_cleaning_tenant_price_myr;
+            if (v === '' || v === undefined || v === null) return null;
+            const n = Number(v);
+            return Number.isFinite(n) ? n : null;
+          })()
+        : undefined,
+    mailbox_password: (() => {
+      if (
+        !Object.prototype.hasOwnProperty.call(data, 'mailboxPassword') &&
+        !Object.prototype.hasOwnProperty.call(data, 'mailbox_password')
+      ) {
+        return undefined;
+      }
+      const v = Object.prototype.hasOwnProperty.call(data, 'mailboxPassword')
+        ? data.mailboxPassword
+        : data.mailbox_password;
+      if (v === null || v === undefined || v === '') return null;
+      return String(v);
+    })(),
+    smartdoor_password: (() => {
+      if (
+        !Object.prototype.hasOwnProperty.call(data, 'smartdoorPassword') &&
+        !Object.prototype.hasOwnProperty.call(data, 'smartdoor_password')
+      ) {
+        return undefined;
+      }
+      const v = Object.prototype.hasOwnProperty.call(data, 'smartdoorPassword')
+        ? data.smartdoorPassword
+        : data.smartdoor_password;
+      if (v === null || v === undefined || v === '') return null;
+      return String(v);
+    })(),
+    smartdoor_token_enabled: (() => {
+      if (
+        !Object.prototype.hasOwnProperty.call(data, 'smartdoorTokenEnabled') &&
+        !Object.prototype.hasOwnProperty.call(data, 'smartdoor_token_enabled')
+      ) {
+        return undefined;
+      }
+      const v = Object.prototype.hasOwnProperty.call(data, 'smartdoorTokenEnabled')
+        ? data.smartdoorTokenEnabled
+        : data.smartdoor_token_enabled;
+      return v === true || v === 1 || v === '1' ? 1 : 0;
+    })()
   };
+  if (wgs !== undefined) {
+    fields.latitude = wgs.latitude;
+    fields.longitude = wgs.longitude;
+  }
 
   /** Smart door: one lock = property XOR one room (same rule as roomsetting.updateRoomSmartDoor). */
   if (fields.smartdoor_id !== undefined) {
@@ -274,7 +495,13 @@ async function updateProperty(clientId, propertyId, data) {
 
   const hasUnit = fields.unitnumber !== undefined;
   const hasApt = fields.apartmentname !== undefined;
-  if (hasUnit || hasApt) {
+  const hasShortname = Object.prototype.hasOwnProperty.call(data, 'shortname');
+  if (hasShortname) {
+    const rawShortname = data.shortname;
+    const shortname = rawShortname == null ? null : String(rawShortname).trim();
+    updates.push('shortname = ?');
+    params.push(shortname || null);
+  } else if (hasUnit || hasApt) {
     const [prev] = await pool.query('SELECT unitnumber, apartmentname FROM propertydetail WHERE id = ? AND client_id = ? LIMIT 1', [propertyId, clientId]);
     const merged = {
       unitnumber: hasUnit ? fields.unitnumber : (prev && prev[0] ? prev[0].unitnumber : null),
@@ -296,8 +523,12 @@ async function updateProperty(clientId, propertyId, data) {
     }
   }
   if (updates.length === 0) return { ok: true };
-  params.push(propertyId);
-  await pool.query(`UPDATE propertydetail SET ${updates.join(', ')}, updated_at = NOW() WHERE id = ?`, params);
+  params.push(propertyId, clientId);
+  await pool.query(
+    `UPDATE propertydetail SET ${updates.join(', ')}, updated_at = NOW() WHERE id = ? AND client_id = ?`,
+    params
+  );
+  await maybeSyncPropertydetailToCleanlemonsAfter(clientId, propertyId);
   return { ok: true };
 }
 
@@ -306,8 +537,77 @@ async function updateProperty(clientId, propertyId, data) {
  */
 async function setPropertyActive(clientId, propertyId, active) {
   if (!propertyId) throw new Error('NO_PROPERTY_ID');
+  if (!active) {
+    const [ongoingRows] = await pool.query(
+      `SELECT t.id
+         FROM tenancy t
+         INNER JOIN roomdetail r ON r.id = t.room_id AND r.client_id = t.client_id
+        WHERE t.client_id = ?
+          AND r.property_id = ?
+          AND (t.status = 1 OR t.status IS NULL)
+          AND t.\`end\` >= DATE(UTC_TIMESTAMP() + INTERVAL 8 HOUR)
+        LIMIT 1`,
+      [clientId, propertyId]
+    );
+    if (ongoingRows && ongoingRows.length) {
+      throw new Error('PROPERTY_HAS_ONGOING_TENANCY');
+    }
+  }
   const [r] = await pool.query('UPDATE propertydetail SET active = ?, updated_at = NOW() WHERE id = ? AND client_id = ?', [active ? 1 : 0, propertyId, clientId]);
   if (r && r.affectedRows === 0) throw new Error('PROPERTY_NOT_FOUND');
+  await maybeSyncPropertydetailToCleanlemonsAfter(clientId, propertyId);
+  return { ok: true };
+}
+
+async function setPropertyArchived(clientId, propertyId, archived) {
+  if (!propertyId) throw new Error('NO_PROPERTY_ID');
+  if (archived) {
+    const [roomCountRows] = await pool.query(
+      'SELECT COUNT(*) AS c FROM roomdetail WHERE client_id = ? AND property_id = ?',
+      [clientId, propertyId]
+    );
+    const roomCount = Number(roomCountRows?.[0]?.c ?? 0);
+    if (roomCount > 0) {
+      throw new Error('PROPERTY_HAS_ROOMS');
+    }
+    const [propUtilRows] = await pool.query(
+      'SELECT meter_id, smartdoor_id FROM propertydetail WHERE id = ? AND client_id = ? LIMIT 1',
+      [propertyId, clientId]
+    );
+    const pu = propUtilRows && propUtilRows[0];
+    if (pu && pu.meter_id) {
+      throw new Error('PROPERTY_HAS_METER_BOUND');
+    }
+    if (pu && pu.smartdoor_id) {
+      throw new Error('PROPERTY_HAS_LOCK_BOUND');
+    }
+    const [ongoingRows] = await pool.query(
+      `SELECT t.id
+         FROM tenancy t
+         INNER JOIN roomdetail r ON r.id = t.room_id AND r.client_id = t.client_id
+        WHERE t.client_id = ?
+          AND r.property_id = ?
+          AND (t.status = 1 OR t.status IS NULL)
+          AND t.\`end\` >= DATE(UTC_TIMESTAMP() + INTERVAL 8 HOUR)
+        LIMIT 1`,
+      [clientId, propertyId]
+    );
+    if (ongoingRows && ongoingRows.length) {
+      throw new Error('PROPERTY_HAS_ONGOING_TENANCY');
+    }
+  }
+  const [r] = await pool.query(
+    'UPDATE propertydetail SET archived = ?, updated_at = NOW() WHERE id = ? AND client_id = ?',
+    [archived ? 1 : 0, propertyId, clientId]
+  );
+  if (r && r.affectedRows === 0) throw new Error('PROPERTY_NOT_FOUND');
+  if (archived) {
+    await pool.query(
+      'UPDATE roomdetail SET active = 0, updated_at = NOW() WHERE property_id = ? AND client_id = ?',
+      [propertyId, clientId]
+    );
+  }
+  await maybeSyncPropertydetailToCleanlemonsAfter(clientId, propertyId);
   return { ok: true };
 }
 
@@ -347,7 +647,7 @@ async function saveParkingLots(clientId, propertyId, items) {
 }
 
 /**
- * Insert new properties (bulk). Each item: { unitNumber, apartmentName, country? }; client_id from context.
+ * Insert new properties (bulk). Each item: { unitNumber, apartmentName, shortname?, address?, country? }; client_id from context.
  * apartmentName is normalized (title case, trim). country: MY | SG.
  */
 async function insertProperties(clientId, items) {
@@ -357,31 +657,160 @@ async function insertProperties(clientId, items) {
   for (const item of items) {
     const unitNumber = (item.unitNumber || item.unitnumber || '').trim();
     const rawApt = (item.apartmentName || item.apartmentname || '').trim();
-    if (!unitNumber || !rawApt) continue;
+    if (!rawApt) continue;
     const apartmentName = normalizeApartmentName(rawApt);
-    const shortname = `${apartmentName} ${unitNumber}`.trim() || apartmentName;
+    const customShort = (item.shortname || item.shortName || '').trim();
+    const shortname = customShort || `${apartmentName} ${unitNumber}`.trim() || apartmentName;
+    const unitNumberOrNull = unitNumber || null;
+    const addressFromItem = (item.address || '').trim();
     const countryVal = (item.country != null && String(item.country).trim()) ? String(item.country).trim().toUpperCase() : null;
     const country = (countryVal === 'MY' || countryVal === 'SG') ? countryVal : null;
+    const settlementModel = normalizeOwnerSettlementModel(item.ownerSettlementModel ?? item.owner_settlement_model);
+    let fixedRent = null;
+    if (item.fixedRentToOwner !== undefined || item.fixed_rent_to_owner !== undefined) {
+      const fr = item.fixedRentToOwner ?? item.fixed_rent_to_owner;
+      if (fr !== '' && fr != null) {
+        const n = Number(fr);
+        if (Number.isFinite(n)) fixedRent = n;
+      }
+    }
+    let pct = null;
+    if (item.percentage !== undefined && item.percentage !== null && item.percentage !== '') {
+      const n = Number(item.percentage);
+      if (Number.isFinite(n)) pct = n;
+    }
+    const premisesTypeIns = normalizePremisesType(item.premisesType ?? item.premises_type);
+    const secRaw = item.securitySystem ?? item.security_system;
+    const securitySystemIns = secRaw === undefined ? undefined : (secRaw == null || secRaw === '' ? null : String(secRaw).trim());
+    const wgsIns = wgs84FromPayload(item);
     const id = randomUUID();
     try {
       await pool.query(
-        `INSERT INTO propertydetail (id, client_id, shortname, unitnumber, apartmentname, ${countryCol}, active, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 1, NOW(), NOW())`,
-        [id, clientId, shortname, unitNumber, apartmentName, country]
+        `INSERT INTO propertydetail (id, client_id, shortname, unitnumber, apartmentname, ${countryCol}, owner_settlement_model, fixed_rent_to_owner, percentage, premises_type, security_system, active, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())`,
+        [id, clientId, shortname, unitNumberOrNull, apartmentName, country, settlementModel, (settlementModel === 'management_fees_fixed' || settlementModel === 'rental_unit' || settlementModel === 'guarantee_return_fixed_plus_share') ? fixedRent : null, (settlementModel === 'management_percent_gross' || settlementModel === 'management_percent_net' || settlementModel === 'management_percent_rental_income_only' || settlementModel === 'guarantee_return_fixed_plus_share') ? pct : null, premisesTypeIns, securitySystemIns === undefined ? null : securitySystemIns]
       );
     } catch (e) {
       const isUnknownColumn = e.code === 'ER_BAD_FIELD_ERROR' || e.errno === 1054 || (e.message && String(e.message).includes('Unknown column'));
       if (isUnknownColumn) {
-        await pool.query(
-          `INSERT INTO propertydetail (id, client_id, shortname, unitnumber, apartmentname, active, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, 1, NOW(), NOW())`,
-          [id, clientId, shortname, unitNumber, apartmentName]
-        );
+        try {
+          await pool.query(
+            `INSERT INTO propertydetail (id, client_id, shortname, unitnumber, apartmentname, ${countryCol}, owner_settlement_model, fixed_rent_to_owner, percentage, active, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())`,
+            [id, clientId, shortname, unitNumberOrNull, apartmentName, country, settlementModel, (settlementModel === 'management_fees_fixed' || settlementModel === 'rental_unit' || settlementModel === 'guarantee_return_fixed_plus_share') ? fixedRent : null, (settlementModel === 'management_percent_gross' || settlementModel === 'management_percent_net' || settlementModel === 'management_percent_rental_income_only' || settlementModel === 'guarantee_return_fixed_plus_share') ? pct : null]
+          );
+        } catch (e2) {
+          const isUnknown2 = e2.code === 'ER_BAD_FIELD_ERROR' || e2.errno === 1054 || (e2.message && String(e2.message).includes('Unknown column'));
+          if (isUnknown2) {
+            try {
+              await pool.query(
+                `INSERT INTO propertydetail (id, client_id, shortname, unitnumber, apartmentname, ${countryCol}, active, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, 1, NOW(), NOW())`,
+                [id, clientId, shortname, unitNumberOrNull, apartmentName, country]
+              );
+            } catch (e3) {
+              const isUnknown3 = e3.code === 'ER_BAD_FIELD_ERROR' || e3.errno === 1054 || (e3.message && String(e3.message).includes('Unknown column'));
+              if (isUnknown3) {
+                await pool.query(
+                  `INSERT INTO propertydetail (id, client_id, shortname, unitnumber, apartmentname, active, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 1, NOW(), NOW())`,
+                  [id, clientId, shortname, unitNumberOrNull, apartmentName]
+                );
+              } else {
+                throw e3;
+              }
+            }
+          } else {
+            throw e2;
+          }
+        }
       } else {
         throw e;
       }
     }
-    inserted.push({ id, shortname, unitNumber, apartmentName, country });
+    if (addressFromItem) {
+      try {
+        await pool.query(
+          'UPDATE propertydetail SET address = ? WHERE id = ? AND client_id = ?',
+          [addressFromItem, id, clientId]
+        );
+      } catch (eAddr) {
+        const isUnknownAddr =
+          eAddr.code === 'ER_BAD_FIELD_ERROR' ||
+          eAddr.errno === 1054 ||
+          (eAddr.message && String(eAddr.message).includes('Unknown column'));
+        if (!isUnknownAddr) throw eAddr;
+      }
+    }
+    if (wgsIns !== undefined) {
+      try {
+        await pool.query(
+          'UPDATE propertydetail SET latitude = ?, longitude = ? WHERE id = ? AND client_id = ?',
+          [wgsIns.latitude, wgsIns.longitude, id, clientId]
+        );
+      } catch (eW) {
+        const isUnknownW =
+          eW.code === 'ER_BAD_FIELD_ERROR' ||
+          eW.errno === 1054 ||
+          (eW.message && String(eW.message).includes('Unknown column'));
+        if (!isUnknownW) throw eW;
+      }
+    }
+    if (premisesTypeIns != null || securitySystemIns !== undefined) {
+      try {
+        const bits = [];
+        const p = [];
+        if (premisesTypeIns != null) {
+          bits.push('premises_type = ?');
+          p.push(premisesTypeIns);
+        }
+        if (securitySystemIns !== undefined) {
+          bits.push('security_system = ?');
+          p.push(securitySystemIns == null ? null : securitySystemIns);
+        }
+        if (bits.length) {
+          p.push(id, clientId);
+          await pool.query(`UPDATE propertydetail SET ${bits.join(', ')} WHERE id = ? AND client_id = ?`, p);
+        }
+      } catch (eUpd) {
+        const isUnknownUpd = eUpd.code === 'ER_BAD_FIELD_ERROR' || eUpd.errno === 1054 || (eUpd.message && String(eUpd.message).includes('Unknown column'));
+        if (!isUnknownUpd) throw eUpd;
+      }
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(item, 'mailboxPassword') ||
+      Object.prototype.hasOwnProperty.call(item, 'smartdoorPassword') ||
+      Object.prototype.hasOwnProperty.call(item, 'smartdoorTokenEnabled')
+    ) {
+      try {
+        const mb =
+          item.mailboxPassword == null || item.mailboxPassword === ''
+            ? null
+            : String(item.mailboxPassword);
+        const sdp =
+          item.smartdoorPassword == null || item.smartdoorPassword === ''
+            ? null
+            : String(item.smartdoorPassword);
+        const ste =
+          item.smartdoorTokenEnabled === true ||
+          item.smartdoorTokenEnabled === 1 ||
+          item.smartdoorTokenEnabled === '1'
+            ? 1
+            : 0;
+        await pool.query(
+          'UPDATE propertydetail SET mailbox_password = ?, smartdoor_password = ?, smartdoor_token_enabled = ? WHERE id = ? AND client_id = ?',
+          [mb, sdp, ste, id, clientId]
+        );
+      } catch (eKey) {
+        const isUnknownKey =
+          eKey.code === 'ER_BAD_FIELD_ERROR' ||
+          eKey.errno === 1054 ||
+          (eKey.message && String(eKey.message).includes('Unknown column'));
+        if (!isUnknownKey) throw eKey;
+      }
+    }
+    await maybeSyncPropertydetailToCleanlemonsAfter(clientId, id);
+    inserted.push({ id, shortname, unitNumber: unitNumberOrNull, apartmentName, country });
   }
   return { ok: true, inserted, ids: inserted.map((i) => i.id) };
 }
@@ -615,6 +1044,7 @@ module.exports = {
   getProperty,
   updateProperty,
   setPropertyActive,
+  setPropertyArchived,
   getParkingLotsByProperty,
   saveParkingLots,
   insertProperties,

@@ -9,9 +9,9 @@ const router = express.Router();
 const sqlaccountrequest = require('../wrappers/sqlaccountrequest');
 const agentWrapper = require('../wrappers/agent.wrapper');
 
-/** GET /api/sqlaccount/agent - list agents (example; path may vary per SQL Account API version) */
+/** GET /api/sqlaccount/agent - list agents (Postman: GET /agent) */
 router.get('/agent', async (req, res) => {
-  const result = await agentWrapper.getAgents(req);
+  const result = await agentWrapper.list(req, req.query || {});
   if (!result.ok) return res.status(result.status || 400).json(result);
   res.json(result);
 });

@@ -1,0 +1,14 @@
+功能,Wix (旧),Next (新),Next 状态
+列表,getSmartDoorList(keyword,propertyId,filter,page,pageSize,limit); cache 2000 + server 分页,getSmartDoorList(search,propertyId,filter,page,pageSize 20); server 分页,已有
+筛选,Property 下拉; 类型 All/LOCK/GATEWAY/ACTIVE/INACTIVE; 搜索 debounce 300ms,Property + 类型 All/LOCK/GATEWAY/ACTIVE/INACTIVE; 搜索(无 debounce),已有(搜索可后续加 debounce)
+Tab / 视图,sectionlistview / sectiondetail / sectionnewsmartdoor / sectiontopup; 按钮 Smart Door / Add Smart Door / Top up,Tabs All | Smart Door | Gateway 同页; Sync Lock 按钮; 无独立 Top up 区块,已有(无 Top up 刻意不做)
+列表项展示,repeater: name | lockId/gatewayId [smartdoor]/[gateway]; Parent/Child 文案; Gateway connected; 在线绿/离线红底; checkbox Active(锁),卡片: name + ID; Smart Door/Gateway badge; Battery%; Parent/Child 文案; (Gateway connected); Online/Offline,已有
+列表操作,checkbox 切 Active(锁); 按钮进详情,Switch Active 在详情内; 列表 Unlock + Edit 进详情,已有
+详情,sectiondetail: 名称输入; 关详情回列表,Dialog: 名称 / Battery / Status / Active(锁); Child locks 区块(Add child + repeater),已有
+Parent / Child 锁,Lock 详情: dropdown Parent Yes/No; Add child; repeater 选 child lock + 移除; updateLock(lockAlias,childmeter); syncTTLockName 改名后,Child locks 区块; updateLock 传 childmeter; 详情改名后 syncTTLockName,已有
+更新后同步 TTLock 名称,updateLock/updateGateway 后若 name 变更则 syncTTLockName(type,externalId,name),handleDetailUpdate 成功后若名称变更调 syncTTLockName(lock/gateway),已有
+新增门锁/网关,sectionnewsmartdoor: Sync → previewSmartDoorSelection → repeater 勾选+填 name; Save → insertSmartDoors + 逐条 syncTTLockName; 关区块回列表,Sync Lock 弹窗: Sync → preview 列表; 勾选+填 alias; Save Selected → insertSmartDoors + 逐条 syncTTLockName; 关弹窗,已有
+Top up,sectiontopup: getMyBillingInfo 余额; getCreditPlans repeater; 选套餐 Checkout...,无 Top up 区块 (Operator 在 Billing/Credit 页处理),刻意不做
+分页,listViewPageSize 20; cache 满则 useServerFilter 走 server 分页; paginationlistview,pageSize 20; Previous/Next 分页 UI,已有
+Mobile,buttonmobilemenu; boxmobilemenu 收合; 按钮 Smart Door / Add 在菜单内,响应式; 无独立 mobile 菜单,可接受
+API 使用,getSmartDoorList/Filters/getLock/getGateway/updateLock/updateGateway/previewSmartDoorSelection/syncTTLockName/getChildLockOptions/insertSmartDoors,getSmartDoorList/Filters/getLock/getGateway/getChildLockOptions/updateLock(含 childmeter)/updateGateway/unlock/preview/insert/syncTTLockName,已有
