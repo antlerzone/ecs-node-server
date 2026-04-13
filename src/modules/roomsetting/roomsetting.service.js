@@ -22,6 +22,16 @@ const DEFAULT_PAGE_SIZE = 20;
 const MAX_PAGE_SIZE = 200;
 const CACHE_LIMIT_MAX = 2000;
 
+/** @param {unknown} v */
+function normalizeListingScope(v) {
+  const s = String(v == null ? '' : v)
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, '_');
+  if (s === 'entire_unit' || s === 'entireunit' || s === 'entire' || s === 'property') return 'entire_unit';
+  return 'room';
+}
+
 function orderClause(sort) {
   switch (String(sort || 'title').toLowerCase()) {
     case 'title_desc':
@@ -61,8 +71,15 @@ function listConditions(clientId, opts = {}) {
   const activeF = String(opts.activeFilter || opts.roomActiveFilter || '').trim();
   if (activeF === 'ACTIVE') {
     conditions.push('(r.active = 1)');
-  } else if (activeF === 'INACTIVE') {
+  } else   if (activeF === 'INACTIVE') {
     conditions.push('(r.active = 0 OR r.active IS NULL)');
+  }
+  const listingScope = String(opts.listingScope || opts.listing_scope || '').trim().toUpperCase();
+  const listingScopeSql = opts.listingScopeColumn !== false;
+  if (listingScopeSql && listingScope === 'ROOM') {
+    conditions.push("(COALESCE(r.listing_scope, 'room') = 'room')");
+  } else if (listingScopeSql && (listingScope === 'ENTIRE_UNIT' || listingScope === 'ENTIREUNIT')) {
+    conditions.push("r.listing_scope = 'entire_unit'");
   }
   return { whereSql: conditions.join(' AND '), params };
 }
@@ -82,7 +99,18 @@ async function getRooms(clientId, opts = {}) {
   const pageSize = useLimit ? limit : Math.min(MAX_PAGE_SIZE, Math.max(1, parseInt(opts.pageSize, 10) || DEFAULT_PAGE_SIZE));
   const offset = (page - 1) * pageSize;
 
-  const { whereSql, params } = listConditions(clientId, opts);
+  let listingScopeColumn = true;
+  try {
+    const [[colRow]] = await pool.query(
+      `SELECT COUNT(*) AS n FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'roomdetail' AND COLUMN_NAME = 'listing_scope'`
+    );
+    listingScopeColumn = Number(colRow?.n || 0) > 0;
+  } catch {
+    listingScopeColumn = false;
+  }
+
+  const { whereSql, params } = listConditions(clientId, { ...opts, listingScopeColumn });
   const orderSql = orderClause(opts.sort || 'title');
 
   console.log('[roomsetting.service] getRooms clientId=', clientId, 'whereSql=', whereSql, 'params=', params, 'pageSize=', pageSize, 'offset=', offset);
@@ -96,34 +124,64 @@ async function getRooms(clientId, opts = {}) {
 
   console.log('[roomsetting.service] getRooms COUNT total=', total);
 
-  const [rows] = await pool.query(
-    `SELECT r.id, r.roomname, r.title_fld, r.description_fld, r.remark, r.price,
-            r.mainphoto, r.media_gallery_json, r.active, r.property_id, r.meter_id, r.smartdoor_id,
-            r.available, r.availablesoon,
-            p.shortname AS property_shortname
-       FROM roomdetail r
-       LEFT JOIN propertydetail p ON p.id = r.property_id
-       WHERE ${whereSql}
-       ${orderSql}
-       LIMIT ? OFFSET ?`,
-    [...params, pageSize, offset]
-  );
+  let rows;
+  try {
+    ;[rows] = await pool.query(
+      `SELECT r.id, r.roomname, r.title_fld, r.description_fld, r.remark, r.price,
+              r.mainphoto, r.media_gallery_json, r.active, r.property_id, r.meter_id, r.smartdoor_id,
+              r.available, r.availablesoon, r.listing_scope,
+              p.shortname AS property_shortname
+         FROM roomdetail r
+         LEFT JOIN propertydetail p ON p.id = r.property_id
+         WHERE ${whereSql}
+         ${orderSql}
+         LIMIT ? OFFSET ?`,
+      [...params, pageSize, offset]
+    );
+  } catch (e) {
+    if (e.code === 'ER_BAD_FIELD_ERROR' || e.errno === 1054) {
+      ;[rows] = await pool.query(
+        `SELECT r.id, r.roomname, r.title_fld, r.description_fld, r.remark, r.price,
+                r.mainphoto, r.media_gallery_json, r.active, r.property_id, r.meter_id, r.smartdoor_id,
+                r.available, r.availablesoon,
+                p.shortname AS property_shortname
+           FROM roomdetail r
+           LEFT JOIN propertydetail p ON p.id = r.property_id
+           WHERE ${whereSql}
+           ${orderSql}
+           LIMIT ? OFFSET ?`,
+        [...params, pageSize, offset]
+      );
+    } else throw e;
+  }
 
   const roomIds = (rows || []).map(r => r.id);
+  /** room_id -> tenant fullname for "today" active tenancy (same rules as getTenancyForRoom; one row per room). */
+  const tenantNameByRoom = new Map();
   const roomIdsWithTenancy = new Set();
   if (roomIds.length > 0) {
     const placeholders = roomIds.map(() => '?').join(',');
     const [tenancyRows] = await pool.query(
-      `SELECT room_id
-         FROM tenancy
-        WHERE client_id = ?
-          AND room_id IN (${placeholders})
-          AND COALESCE(status, active, 1) = 1
-          AND DATE(begin) <= DATE(UTC_TIMESTAMP() + INTERVAL 8 HOUR)
-          AND DATE(\`end\`) >= DATE(UTC_TIMESTAMP() + INTERVAL 8 HOUR)`,
+      `SELECT z.room_id, z.fullname
+         FROM (
+           SELECT t.room_id, td.fullname,
+                  ROW_NUMBER() OVER (PARTITION BY t.room_id ORDER BY t.end DESC, t.id DESC) AS rn
+             FROM tenancy t
+             LEFT JOIN tenantdetail td ON td.id = t.tenant_id
+            WHERE t.client_id = ?
+              AND t.room_id IN (${placeholders})
+              AND COALESCE(t.status, t.active, 1) = 1
+              AND DATE(t.begin) <= DATE(UTC_TIMESTAMP() + INTERVAL 8 HOUR)
+              AND DATE(t.\`end\`) >= DATE(UTC_TIMESTAMP() + INTERVAL 8 HOUR)
+         ) z
+        WHERE z.rn = 1`,
       [clientId, ...roomIds]
     );
-    (tenancyRows || []).forEach(row => roomIdsWithTenancy.add(row.room_id));
+    (tenancyRows || []).forEach(row => {
+      roomIdsWithTenancy.add(row.room_id);
+      const name = row.fullname != null ? String(row.fullname).trim() : '';
+      if (name) tenantNameByRoom.set(row.room_id, name);
+    });
   }
 
   const items = (rows || []).map(r => ({
@@ -143,7 +201,9 @@ async function getRooms(clientId, opts = {}) {
     meter: r.meter_id || null,
     smartdoor: r.smartdoor_id || null,
     property: r.property_shortname != null ? { shortname: r.property_shortname, _id: r.property_id } : { _id: r.property_id },
-    hasActiveTenancy: roomIdsWithTenancy.has(r.id)
+    hasActiveTenancy: roomIdsWithTenancy.has(r.id),
+    tenantName: tenantNameByRoom.get(r.id) || undefined,
+    listingScope: String(r.listing_scope || 'room') === 'entire_unit' ? 'entire_unit' : 'room'
   }));
 
   console.log('[roomsetting.service] getRooms returning items.length=', items.length);
@@ -193,7 +253,7 @@ async function getRoom(clientId, roomId) {
     [rows] = await pool.query(
       `SELECT r.id, r.roomname, r.title_fld, r.description_fld, r.remark, r.price,
               r.mainphoto, r.media_gallery_json, r.active, r.property_id, r.meter_id, r.smartdoor_id,
-              r.available, r.availablesoon, r.cleanlemons_cleaning_tenant_price_myr,
+              r.available, r.availablesoon, r.listing_scope, r.cleanlemons_cleaning_tenant_price_myr,
               p.shortname AS property_shortname
          FROM roomdetail r
          LEFT JOIN propertydetail p ON p.id = r.property_id
@@ -202,16 +262,31 @@ async function getRoom(clientId, roomId) {
     );
   } catch (e) {
     if (e.code === 'ER_BAD_FIELD_ERROR' || e.errno === 1054) {
-      [rows] = await pool.query(
-        `SELECT r.id, r.roomname, r.title_fld, r.description_fld, r.remark, r.price,
-                r.mainphoto, r.media_gallery_json, r.active, r.property_id, r.meter_id, r.smartdoor_id,
-                r.available, r.availablesoon,
-                p.shortname AS property_shortname
-           FROM roomdetail r
-           LEFT JOIN propertydetail p ON p.id = r.property_id
-           WHERE r.id = ? AND r.client_id = ? LIMIT 1`,
-        [roomId, clientId]
-      );
+      try {
+        [rows] = await pool.query(
+          `SELECT r.id, r.roomname, r.title_fld, r.description_fld, r.remark, r.price,
+                  r.mainphoto, r.media_gallery_json, r.active, r.property_id, r.meter_id, r.smartdoor_id,
+                  r.available, r.availablesoon, r.listing_scope,
+                  p.shortname AS property_shortname
+             FROM roomdetail r
+             LEFT JOIN propertydetail p ON p.id = r.property_id
+             WHERE r.id = ? AND r.client_id = ? LIMIT 1`,
+          [roomId, clientId]
+        );
+      } catch (e2) {
+        if (e2.code === 'ER_BAD_FIELD_ERROR' || e2.errno === 1054) {
+          [rows] = await pool.query(
+            `SELECT r.id, r.roomname, r.title_fld, r.description_fld, r.remark, r.price,
+                    r.mainphoto, r.media_gallery_json, r.active, r.property_id, r.meter_id, r.smartdoor_id,
+                    r.available, r.availablesoon,
+                    p.shortname AS property_shortname
+               FROM roomdetail r
+               LEFT JOIN propertydetail p ON p.id = r.property_id
+               WHERE r.id = ? AND r.client_id = ? LIMIT 1`,
+            [roomId, clientId]
+          );
+        } else throw e2;
+      }
     } else throw e;
   }
   const r = rows && rows[0];
@@ -233,6 +308,7 @@ async function getRoom(clientId, roomId) {
     property: r.property_shortname != null ? { shortname: r.property_shortname, _id: r.property_id } : { _id: r.property_id },
     meter: r.meter_id || null,
     smartdoor: r.smartdoor_id || null,
+    listingScope: String(r.listing_scope || 'room') === 'entire_unit' ? 'entire_unit' : 'room',
     cleanlemonsCleaningTenantPriceMyr:
       r.cleanlemons_cleaning_tenant_price_myr != null ? Number(r.cleanlemons_cleaning_tenant_price_myr) : null
   };
@@ -288,40 +364,67 @@ async function updateRoom(clientId, roomId, data) {
     if (cleaningTenant != null && !Number.isFinite(cleaningTenant)) cleaningTenant = null;
   }
 
-  await pool.query(
-    `UPDATE roomdetail SET roomname = ?, title_fld = ?, description_fld = ?, remark = ?, price = ?,
-      property_id = ?, mainphoto = ?, media_gallery_json = ?, active = ?, updated_at = NOW()
-      ${hasCleaning ? ', cleanlemons_cleaning_tenant_price_myr = ?' : ''}
-      WHERE id = ? AND client_id = ?`,
-    hasCleaning
-      ? [
-          roomname,
-          title_fld,
-          description_fld || null,
-          remark || null,
-          price,
-          property_id || null,
-          mainphoto || null,
-          JSON.stringify(media_gallery_json),
-          active ? 1 : 0,
-          cleaningTenant,
-          roomId,
-          clientId
-        ]
-      : [
-          roomname,
-          title_fld,
-          description_fld || null,
-          remark || null,
-          price,
-          property_id || null,
-          mainphoto || null,
-          JSON.stringify(media_gallery_json),
-          active ? 1 : 0,
-          roomId,
-          clientId
-        ]
-  );
+  let hasListingScope = false;
+  let listing_scope_val = 'room';
+  if (data.listingScope !== undefined || data.listing_scope !== undefined) {
+    hasListingScope = true;
+    listing_scope_val = normalizeListingScope(data.listingScope ?? data.listing_scope);
+  }
+
+  const baseVals = [
+    roomname,
+    title_fld,
+    description_fld || null,
+    remark || null,
+    price,
+    property_id || null,
+    mainphoto || null,
+    JSON.stringify(media_gallery_json),
+    active ? 1 : 0
+  ];
+  const tryUpdate = async (includeCleaning, includeListingScope) => {
+    const parts = [
+      'roomname = ?', 'title_fld = ?', 'description_fld = ?', 'remark = ?', 'price = ?',
+      'property_id = ?', 'mainphoto = ?', 'media_gallery_json = ?', 'active = ?'
+    ];
+    const vals = [...baseVals];
+    if (includeCleaning) {
+      parts.push('cleanlemons_cleaning_tenant_price_myr = ?');
+      vals.push(cleaningTenant);
+    }
+    if (includeListingScope) {
+      parts.push('listing_scope = ?');
+      vals.push(listing_scope_val);
+    }
+    vals.push(roomId, clientId);
+    await pool.query(
+      `UPDATE roomdetail SET ${parts.join(', ')}, updated_at = NOW() WHERE id = ? AND client_id = ?`,
+      vals
+    );
+  };
+
+  const rawAttempts = [
+    [hasCleaning, hasListingScope],
+    [hasCleaning, false],
+    [false, hasListingScope],
+    [false, false]
+  ];
+  const seen = new Set();
+  let lastErr;
+  for (const [c, l] of rawAttempts) {
+    const k = `${c}|${l}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    try {
+      await tryUpdate(c, l);
+      lastErr = null;
+      break;
+    } catch (e) {
+      lastErr = e;
+      if (e.code !== 'ER_BAD_FIELD_ERROR' && e.errno !== 1054) throw e;
+    }
+  }
+  if (lastErr) throw lastErr;
   const [r2] = await pool.query('SELECT meter_id FROM roomdetail WHERE id = ? AND client_id = ? LIMIT 1', [roomId, clientId]);
   const currentMeterId = r2 && r2[0] ? r2[0].meter_id : null;
   if (currentMeterId) {
@@ -347,12 +450,23 @@ async function insertRooms(clientId, records) {
     const propertyId = r.property || null;
     if (!name || !propertyId) continue;
     const title_fld = name;
+    const listing_scope = normalizeListingScope(r.listingScope ?? r.listing_scope);
     const id = randomUUID();
-    await pool.query(
-      `INSERT INTO roomdetail (id, client_id, property_id, roomname, title_fld, active, available, availablesoon, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 0, 1, 0, NOW(), NOW())`,
-      [id, clientId, propertyId, name, title_fld]
-    );
+    try {
+      await pool.query(
+        `INSERT INTO roomdetail (id, client_id, property_id, roomname, title_fld, listing_scope, active, available, availablesoon, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, 1, 0, NOW(), NOW())`,
+        [id, clientId, propertyId, name, title_fld, listing_scope]
+      );
+    } catch (e) {
+      if (e.code === 'ER_BAD_FIELD_ERROR' || e.errno === 1054) {
+        await pool.query(
+          `INSERT INTO roomdetail (id, client_id, property_id, roomname, title_fld, active, available, availablesoon, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 0, 1, 0, NOW(), NOW())`,
+          [id, clientId, propertyId, name, title_fld]
+        );
+      } else throw e;
+    }
     ids.push(id);
     propertyIds.add(propertyId);
   }
@@ -371,20 +485,60 @@ async function insertRooms(clientId, records) {
  */
 async function getMeterDropdownOptions(clientId, roomId = null, propertyId = null) {
   const meterRows = await pool.query(
-    'SELECT id, title FROM meterdetail WHERE client_id = ? AND status = 1 LIMIT 1000',
+    'SELECT id, title, meterid FROM meterdetail WHERE client_id = ? AND status = 1 LIMIT 1000',
     [clientId]
   ).then(([rows]) => rows || []);
 
   console.log('[roomsetting.service] getMeterDropdownOptions: clientId=', clientId, 'roomId=', roomId, 'propertyId=', propertyId, 'meterRows.length=', meterRows.length, 'meterIds=', meterRows.map(m => m.id));
 
+  const toVal = (id) => (id != null ? String(id) : null);
+  /** Room may bind status=0 meter — not in meterRows; label must not be generic if title/meterid exist in DB. */
+  const toLabel = (m) => {
+    if (!m) return 'Meter Unknown';
+    const t = m.title != null && String(m.title).trim() ? String(m.title).trim() : '';
+    if (t) return t;
+    const mid = m.meterid != null && String(m.meterid).trim() ? String(m.meterid).trim() : '';
+    if (mid) return `Meter ${mid}`;
+    return 'Meter Unknown';
+  };
+
+  async function loadMeterRowIgnoreStatus(meterId) {
+    if (!meterId) return null;
+    const [[row]] = await pool.query(
+      'SELECT id, title, meterid FROM meterdetail WHERE id = ? AND client_id = ? LIMIT 1',
+      [meterId, clientId]
+    );
+    return row || null;
+  }
+
   if (meterRows.length === 0) {
-    console.log('[roomsetting.service] getMeterDropdownOptions: no meters for client, returning []');
+    if (roomId) {
+      const [roomMeterRows] = await pool.query(
+        'SELECT meter_id FROM roomdetail WHERE id = ? AND client_id = ? AND meter_id IS NOT NULL LIMIT 1',
+        [roomId, clientId]
+      );
+      const mid = roomMeterRows?.[0]?.meter_id;
+      if (mid) {
+        const m = await loadMeterRowIgnoreStatus(mid);
+        if (m) return [{ label: toLabel(m), value: String(m.id) }];
+      }
+    }
+    if (propertyId && !roomId) {
+      const [propMeterRows] = await pool.query(
+        'SELECT meter_id FROM propertydetail WHERE id = ? AND client_id = ? AND meter_id IS NOT NULL LIMIT 1',
+        [propertyId, clientId]
+      );
+      const mid = propMeterRows?.[0]?.meter_id;
+      if (mid) {
+        const m = await loadMeterRowIgnoreStatus(mid);
+        if (m) return [{ label: toLabel(m), value: String(m.id) }];
+      }
+    }
+    console.log('[roomsetting.service] getMeterDropdownOptions: no active meters for client, returning []');
     return [];
   }
 
   const ids = meterRows.map(m => m.id);
-  const toVal = (id) => (id != null ? String(id) : null);
-  const toLabel = (m) => (m && m.title && String(m.title).trim()) ? String(m.title).trim() : 'Meter Unknown';
 
   const [usedByProperty] = await pool.query(
     'SELECT meter_id FROM propertydetail WHERE client_id = ? AND meter_id IS NOT NULL',
@@ -392,10 +546,12 @@ async function getMeterDropdownOptions(clientId, roomId = null, propertyId = nul
   );
   const usedByPropertySet = new Set((usedByProperty || []).map(p => p.meter_id).filter(Boolean));
 
-  const [roomRows] = await pool.query(
-    'SELECT id, meter_id FROM roomdetail WHERE client_id = ? AND meter_id IN (?)',
-    [clientId, ids]
-  );
+  const [roomRows] = ids.length
+    ? await pool.query(
+        'SELECT id, meter_id FROM roomdetail WHERE client_id = ? AND meter_id IN (?)',
+        [clientId, ids]
+      )
+    : [[]];
   const usedByRoom = new Set((roomRows || []).map(r => r.meter_id).filter(Boolean));
 
   console.log('[roomsetting.service] getMeterDropdownOptions: usedByProperty count=', usedByProperty?.length, 'usedByRoom count=', roomRows?.length);
@@ -417,8 +573,9 @@ async function getMeterDropdownOptions(clientId, roomId = null, propertyId = nul
     const currentMeterId = roomMeterRows?.[0]?.meter_id;
     console.log('[roomsetting.service] getMeterDropdownOptions: roomId path currentMeterId=', currentMeterId);
     if (currentMeterId) {
-      const m = meterRows.find(m => m.id === currentMeterId);
-      pushMeterOption(m || { id: currentMeterId, title: null });
+      let m = meterRows.find((x) => x.id === currentMeterId);
+      if (!m) m = await loadMeterRowIgnoreStatus(currentMeterId);
+      if (m) pushMeterOption(m);
     }
   }
   if (propertyId && !roomId) {
@@ -429,8 +586,9 @@ async function getMeterDropdownOptions(clientId, roomId = null, propertyId = nul
     const currentMeterId = propMeterRows?.[0]?.meter_id;
     console.log('[roomsetting.service] getMeterDropdownOptions: propertyId-only path propMeterRows.length=', propMeterRows?.length, 'currentMeterId=', currentMeterId);
     if (currentMeterId) {
-      const m = meterRows.find(m => m.id === currentMeterId);
-      pushMeterOption(m || { id: currentMeterId, title: null });
+      let m = meterRows.find((x) => x.id === currentMeterId);
+      if (!m) m = await loadMeterRowIgnoreStatus(currentMeterId);
+      if (m) pushMeterOption(m);
     }
   }
 
@@ -442,7 +600,7 @@ async function getMeterDropdownOptions(clientId, roomId = null, propertyId = nul
 
   if (options.length === 0 && meterRows.length > 0 && !roomId && !propertyId) {
     console.log('[roomsetting.service] getMeterDropdownOptions: fallback (no roomId/propertyId) – returning all client meters');
-    return meterRows.map(m => ({ label: (m.title && String(m.title).trim()) ? String(m.title).trim() : 'Meter Unknown', value: String(m.id) }));
+    return meterRows.map((m) => ({ label: toLabel(m), value: String(m.id) }));
   }
 
   console.log('[roomsetting.service] getMeterDropdownOptions: final options.length=', options.length);

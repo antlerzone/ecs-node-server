@@ -3,7 +3,12 @@
  * Matches payment_invoice (OCR from receipt) with bank_transactions.
  * Priority: transaction_id -> reference contains invoice number -> amount -> date ±24h -> payer name.
  * confidence > 90% => auto PAID; 60–90% => PENDING_REVIEW; < 60% => ignore.
+ *
+ * PayNow (paynow_tenant / paynow_meter): same UTC+8 calendar day + exact amount on unmatched bank rows
+ * → auto when unique; multiple same amount → manual review.
  */
+
+const { getTodayMalaysiaDate } = require('../../utils/dateMalaysia');
 
 const STATUS = Object.freeze({
   UNPAID: 'UNPAID',
@@ -91,6 +96,34 @@ function computeConfidence(invoice, tx) {
 }
 
 /**
+ * @param {object} invoice - row with amount, currency, external_type
+ * @param {Array} unmatched - bank_transactions
+ * @returns {{ tx: object, confidence: number } | null}
+ */
+function pickPaynowSameDayAmountMatch(invoice, unmatched) {
+  const ext = norm(invoice.external_type || '');
+  if (ext !== 'paynow_tenant' && ext !== 'paynow_meter') return null;
+  const today = getTodayMalaysiaDate();
+  const invAmt = Number(invoice.amount);
+  if (!Number.isFinite(invAmt) || invAmt <= 0) return null;
+  const currency = norm(invoice.currency);
+  const pool = (unmatched || []).filter((t) => {
+    if (t.matched_invoice_id) return false;
+    if (t.currency && currency && norm(t.currency) !== currency) return false;
+    const td = t.transaction_date ? String(t.transaction_date).slice(0, 10) : '';
+    if (td !== today) return false;
+    const ta = Number(t.amount);
+    if (Math.abs(ta - invAmt) < 0.02) return true;
+    if (ta < 0 && Math.abs(Math.abs(ta) - invAmt) < 0.02) return true;
+    return false;
+  });
+  if (pool.length === 0) return null;
+  if (pool.length === 1) return { tx: pool[0], confidence: 95 };
+  pool.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  return { tx: pool[0], confidence: 72 };
+}
+
+/**
  * Find best matching bank transaction for an invoice and return { tx, confidence } or null.
  * Only considers transactions not already matched (matched_invoice_id IS NULL).
  * @param {object} invoice - payment_invoice + ocr_result (receipt OCR)
@@ -107,8 +140,9 @@ function findBestMatch(invoice, transactions) {
     transaction_date: ocr.transaction_date || invoice.created_at
   };
   const unmatched = (transactions || []).filter(t => !t.matched_invoice_id);
-  let best = null;
-  let bestScore = 0;
+  const paynowPick = pickPaynowSameDayAmountMatch(invoice, unmatched);
+  let best = paynowPick;
+  let bestScore = paynowPick ? paynowPick.confidence : 0;
   for (const tx of unmatched) {
     if (tx.currency && invoice.currency && norm(tx.currency) !== norm(invoice.currency)) continue;
     const confidence = computeConfidence(payload, tx);
@@ -134,6 +168,7 @@ module.exports = {
   CONFIDENCE_AUTO_PAID,
   CONFIDENCE_MANUAL_REVIEW,
   computeConfidence,
+  pickPaynowSameDayAmountMatch,
   findBestMatch,
   getDecision
 };

@@ -23,6 +23,10 @@ const nextConfig = {
   async redirects() {
     return [
       { source: '/', destination: '/login', permanent: true },
+      { source: '/homedemo', destination: '/home', permanent: true },
+      { source: '/homedemo/:path*', destination: '/home', permanent: true },
+      { source: '/availableunit', destination: '/available-unit', permanent: false },
+      { source: '/availableunit/:path*', destination: '/available-unit', permanent: false },
     ]
   },
   /**

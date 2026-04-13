@@ -76,7 +76,7 @@ export default function ForOwnersPage() {
               Get Started <ArrowRight size={16} />
             </Link>
             <Link
-              href="/homedemo"
+              href="/home"
               className="inline-flex items-center justify-center gap-2 px-8 py-4 rounded-full text-sm font-bold tracking-widest uppercase border-2"
               style={{ borderColor: "var(--brand)", color: "var(--brand)" }}
             >

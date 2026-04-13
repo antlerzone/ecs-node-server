@@ -180,8 +180,162 @@ async function ensureBukkuContactHasCustomerTypeForSales(req, contactId) {
   return { ok: true };
 }
 
+/** Same name resolution as normalizeBukkuContactListItem — list API may omit legal_name but set display_name. */
 function bukkuContactLegalLabel(c) {
-  return String(c?.legal_name ?? c?.name ?? '').trim();
+  const raw = c || {};
+  return String(
+    raw.legal_name ?? raw.legalName ?? raw.name ?? raw.display_name ?? raw.company_name ?? raw.other_name ?? ''
+  ).trim();
+}
+
+/** Normalized distinct name strings on a Bukku row (for equality with our profile / legal_name). */
+function bukkuRowNameNorms(c) {
+  const raw = c || {};
+  const candidates = [
+    raw.legal_name,
+    raw.legalName,
+    raw.name,
+    raw.display_name,
+    raw.company_name,
+    raw.other_name
+  ];
+  const out = new Set();
+  for (const x of candidates) {
+    const s = normalize(String(x || ''));
+    if (s) out.add(s);
+  }
+  return out;
+}
+
+/** Primary email from Bukku contact row (top-level `email` or first `email_addresses[]`). */
+function bukkuRowPrimaryEmail(c) {
+  const s = bukkuRowEmailsNormalized(c);
+  return s.size ? [...s][0] : '';
+}
+
+/** All emails on a Bukku row (top-level + every `email_addresses[]`) for matching portal supplier email. */
+function bukkuRowEmailsNormalized(c) {
+  const out = new Set();
+  if (c == null) return out;
+  if (c.email != null && String(c.email).trim() !== '') out.add(normalize(String(c.email)));
+  if (Array.isArray(c.email_addresses)) {
+    for (const ea of c.email_addresses) {
+      const em = String(ea?.email ?? ea?.address ?? ea ?? '').trim();
+      if (em) out.add(normalize(em));
+    }
+  }
+  return out;
+}
+
+/**
+ * Paginate Bukku GET /contacts. A single page often misses matches → POST create hits
+ * "legal_name has already been taken" while export/sync appears stuck.
+ */
+async function findBukkuContactPaginated(req, existingContactId, email, name) {
+  const perPage = 100;
+  const maxPages = 100;
+  let page = 1;
+  const e = email ? normalize(email) : '';
+  const n = name ? normalize(name) : '';
+
+  while (page <= maxPages) {
+    const listRes = await bukkuContactWrapper.list(req, { page, page_size: perPage });
+    if (!listRes.ok) {
+      return {
+        ok: false,
+        reason: formatIntegrationApiError(listRes.error) || 'BUKKU_LIST_FAILED',
+        found: null
+      };
+    }
+    const raw = listRes.data;
+    const pageContacts = Array.isArray(raw?.contacts) ? raw.contacts : Array.isArray(raw) ? raw : [];
+    let found = null;
+    if (existingContactId) {
+      found = pageContacts.find((c) => String(c.id) === String(existingContactId));
+    }
+    if (!found && (e || n)) {
+      found = pageContacts.find(
+        (c) =>
+          (e && bukkuRowEmailsNormalized(c).has(e)) ||
+          (n && bukkuRowNameNorms(c).has(n))
+      );
+    }
+    if (found) return { ok: true, found };
+
+    // Do not trust total_pages alone — Bukku sometimes reports total_pages=1 while more pages exist.
+    if (!pageContacts.length) break;
+    if (pageContacts.length < perPage) break;
+    page += 1;
+  }
+  return { ok: true, found: null };
+}
+
+/**
+ * Paginate GET /contacts with extra query params (e.g. search). Stops when matcher returns a row or pages exhaust.
+ */
+async function findBukkuContactInFilteredPages(req, queryBase, matchesFn) {
+  const perPage = 100;
+  const maxPages = 30;
+  let page = 1;
+  while (page <= maxPages) {
+    const listRes = await bukkuContactWrapper.list(req, { ...queryBase, page, page_size: perPage });
+    if (!listRes.ok) {
+      return {
+        ok: false,
+        reason: formatIntegrationApiError(listRes.error) || 'BUKKU_LIST_FAILED',
+        found: null
+      };
+    }
+    const raw = listRes.data;
+    const pageContacts = Array.isArray(raw?.contacts) ? raw.contacts : Array.isArray(raw) ? raw : [];
+    const found = pageContacts.find(matchesFn);
+    if (found) return { ok: true, found };
+
+    if (!pageContacts.length) break;
+    if (pageContacts.length < perPage) break;
+    page += 1;
+  }
+  return { ok: true, found: null };
+}
+
+/**
+ * legal_name collision but list rows lack fields: walk every page, GET /contacts/:id until legal_name matches.
+ */
+async function findBukkuContactByLegalNameReadScan(req, wantLegalNorm) {
+  if (!wantLegalNorm) return { ok: true, found: null };
+  const perPage = 100;
+  const maxPages = 100;
+  let page = 1;
+  while (page <= maxPages) {
+    const listRes = await bukkuContactWrapper.list(req, { page, page_size: perPage });
+    if (!listRes.ok) {
+      return {
+        ok: false,
+        reason: formatIntegrationApiError(listRes.error) || 'BUKKU_LIST_FAILED',
+        found: null
+      };
+    }
+    const raw = listRes.data;
+    const pageContacts = Array.isArray(raw?.contacts) ? raw.contacts : Array.isArray(raw) ? raw : [];
+    for (const c of pageContacts) {
+      const id = c?.id;
+      if (id == null) continue;
+      if (bukkuRowNameNorms(c).has(wantLegalNorm)) {
+        return { ok: true, found: c };
+      }
+      const readRes = await bukkuContactWrapper.read(req, id);
+      if (!readRes.ok) continue;
+      const root = readRes.data;
+      const contact = root?.contact ?? (root?.data && typeof root.data === 'object' ? root.data : null) ?? root;
+      if (contact && bukkuRowNameNorms(contact).has(wantLegalNorm)) {
+        return { ok: true, found: contact };
+      }
+    }
+    if (!pageContacts.length) break;
+    if (pageContacts.length < perPage) break;
+    page += 1;
+  }
+  return { ok: true, found: null };
 }
 
 /** Bukku validates phone (e.g. rejects `+012...`); normalize MY mobile to E.164 +60… */
@@ -263,34 +417,18 @@ async function ensureContactInAccounting(clientId, provider, role, record, exist
 
   try {
     if (provider === 'bukku') {
-      const listRes = await bukkuContactWrapper.list(req, {});
-      if (!listRes.ok)
-        return { ok: false, reason: formatIntegrationApiError(listRes.error) || 'BUKKU_LIST_FAILED' };
-      const raw = listRes.data;
-      const contacts = Array.isArray(raw?.contacts) ? raw.contacts : (Array.isArray(raw) ? raw : []);
-      let found = null;
-      if (existingContactId) {
-        found = contacts.find((c) => String(c.id) === String(existingContactId));
-      }
-      if (!found && (email || name)) {
-        found = contacts.find(
-          (c) =>
-            (email && normalize((c.email || '').toString()) === email) ||
-            (name && normalize(bukkuContactLegalLabel(c)) === normalize(name))
-        );
-      }
-      if (found) {
-        const prevLegal = bukkuContactLegalLabel(found);
+      const bukkuUpdateExisting = async (foundRow) => {
+        const prevLegal = bukkuContactLegalLabel(foundRow);
         /** Operator linking owner/tenant account id must not overwrite Bukku legal_name with profile name (unique constraint). */
         const legalName = preserveLegalName
           ? (prevLegal || displayName).slice(0, 100)
           : (displayName || prevLegal).slice(0, 100);
         /** Bukku PUT /contacts/:id still requires entity_type + types (same as create). Preserve remote values. */
         const entityType =
-          found.entity_type && String(found.entity_type).trim()
-            ? found.entity_type
+          foundRow.entity_type && String(foundRow.entity_type).trim()
+            ? foundRow.entity_type
             : bukkuEntityTypeForRole(role);
-        const types = mergeBukkuTypesForRole(found.types, role);
+        const types = mergeBukkuTypesForRole(foundRow.types, role);
         const phoneNorm = normalizePhoneForBukku(phone);
         const updatePayload = {
           entity_type: entityType,
@@ -299,13 +437,13 @@ async function ensureContactInAccounting(clientId, provider, role, record, exist
           ...(email ? { email } : {}),
           ...(phoneNorm ? { phone_no: phoneNorm } : {})
         };
-        let updateRes = await bukkuContactWrapper.update(req, found.id, updatePayload);
+        let updateRes = await bukkuContactWrapper.update(req, foundRow.id, updatePayload);
         if (!updateRes.ok && phoneNorm) {
           const err = updateRes.error;
           const msg = typeof err === 'string' ? err : JSON.stringify(err);
           if (/phone_no/i.test(msg)) {
             const { phone_no: _p, ...withoutPhone } = updatePayload;
-            updateRes = await bukkuContactWrapper.update(req, found.id, withoutPhone);
+            updateRes = await bukkuContactWrapper.update(req, foundRow.id, withoutPhone);
           }
         }
         if (!updateRes.ok) {
@@ -313,7 +451,14 @@ async function ensureContactInAccounting(clientId, provider, role, record, exist
           const msg = typeof err === 'string' ? err : JSON.stringify(err);
           return { ok: false, reason: msg || 'BUKKU_UPDATE_FAILED' };
         }
-        return { ok: true, contactId: String(found.id) };
+        return { ok: true, contactId: String(foundRow.id) };
+      };
+
+      const paginated = await findBukkuContactPaginated(req, existingContactId, email, name);
+      if (!paginated.ok) return { ok: false, reason: paginated.reason || 'BUKKU_LIST_FAILED' };
+      let found = paginated.found;
+      if (found) {
+        return bukkuUpdateExisting(found);
       }
       const legalName = displayName.slice(0, 100);
       const createPayload = {
@@ -336,6 +481,42 @@ async function ensureContactInAccounting(clientId, provider, role, record, exist
       if (!createRes.ok) {
         const err = createRes.error;
         const msg = typeof err === 'string' ? err : JSON.stringify(err);
+        const looksDup =
+          /legal_name/i.test(msg) &&
+          /already been taken|already exists|taken|duplicate/i.test(String(msg).toLowerCase());
+        // POST failed because legal_name exists: find that row via search + match email, profile name, or exact legal_name we tried to create.
+        if (looksDup) {
+          const terms = [...new Set([email, name, displayName, legalName].filter(Boolean))];
+          const wantE = email ? normalize(email) : '';
+          const wantN = name ? normalize(name) : '';
+          const wantLegal = legalName ? normalize(legalName) : '';
+          const matchesRescue = (c) => {
+            if (wantE && bukkuRowEmailsNormalized(c).has(wantE)) return true;
+            const norms = bukkuRowNameNorms(c);
+            if (wantN && norms.has(wantN)) return true;
+            if (wantLegal && norms.has(wantLegal)) return true;
+            return false;
+          };
+          for (const term of terms) {
+            const filtered = await findBukkuContactInFilteredPages(
+              req,
+              { search: String(term).slice(0, 100) },
+              matchesRescue
+            );
+            if (!filtered.ok) continue;
+            if (filtered.found) {
+              return bukkuUpdateExisting(filtered.found);
+            }
+          }
+          const retryPaginated = await findBukkuContactPaginated(req, existingContactId, email, legalName);
+          if (retryPaginated.ok && retryPaginated.found) {
+            return bukkuUpdateExisting(retryPaginated.found);
+          }
+          const readScan = await findBukkuContactByLegalNameReadScan(req, wantLegal);
+          if (readScan.ok && readScan.found) {
+            return bukkuUpdateExisting(readScan.found);
+          }
+        }
         return { ok: false, reason: msg || 'BUKKU_CREATE_FAILED' };
       }
       const created = createRes.data ?? createRes;

@@ -266,14 +266,15 @@ async function deductPricingPlanAddonCredit({ clientId, amount, title, addons, s
 const ACTIVE_ROOM_MONTHLY_TITLE_PREFIX = 'Active room monthly';
 
 /**
- * Deduct credit for monthly active-room fee (10 credits per active room). Used by cron on the 1st of each month.
- * 计费房间数 = Room Setting 里该 client 下的房间总数，不管是否启用(active)。
+ * Deduct credit for monthly active-room fee (10 credits per billable room). Used by cron on the 1st of each month.
+ * 计费房间数由 caller 决定：active=1 的房间，或当天（MY 日历）有租约覆盖的房间（含 room 已关 active 仍住客）。
+ * 租约侧含 tenancy.active=0 / 欠租冻结等，只要日期仍覆盖扣费日即计入（caller 不按 tenancy.active/status 过滤）。
  * Does not update pricingplandetail. Idempotent per client per year-month (caller should skip if already deducted).
  *
- * @param {{ clientId: string, activeRoomCount: number, yearMonth: string, description?: string }} opts - yearMonth e.g. '2025-03'; description written to creditlogs.remark (e.g. "room quantity total: N\nRoom A x1\nRoom B x1")
+ * @param {{ clientId: string, activeRoomCount: number, yearMonth: string, description?: string, roomLines?: Array<{ property?: string, unitNumber?: string, roomName?: string }> }} opts - yearMonth e.g. '2025-03'; roomLines → creditlogs.payload.lines for operator PDF table
  * @returns {{ success: boolean, deducted: number, coreUsed: number, flexUsed: number, credit: object[] }}
  */
-async function deductMonthlyActiveRoomCredit({ clientId, activeRoomCount, yearMonth, description }) {
+async function deductMonthlyActiveRoomCredit({ clientId, activeRoomCount, yearMonth, description, roomLines }) {
   if (!clientId) throw new Error('MISSING_CLIENT_ID');
   const count = Number(activeRoomCount) || 0;
   if (count <= 0) return { success: true, deducted: 0, coreUsed: 0, flexUsed: 0, credit: [] };
@@ -323,7 +324,23 @@ async function deductMonthlyActiveRoomCredit({ clientId, activeRoomCount, yearMo
   const title = `${ACTIVE_ROOM_MONTHLY_TITLE_PREFIX} (${yearMonth})`;
   const logId = randomUUID();
   const refNum = `SP-${logId}`;
-  const payloadStr = JSON.stringify({ source: 'active_room_monthly', yearMonth, activeRoomCount: count, coreUsed, flexUsed });
+  const creditPerRoom = 10;
+  const payloadObj = {
+    source: 'active_room_monthly',
+    yearMonth,
+    activeRoomCount: count,
+    coreUsed,
+    flexUsed,
+    creditPerRoom
+  };
+  if (Array.isArray(roomLines) && roomLines.length) {
+    payloadObj.lines = roomLines.map((l) => ({
+      property: l.property != null ? String(l.property).trim() : '',
+      unitNumber: l.unitNumber != null ? String(l.unitNumber).trim() : '',
+      roomName: l.roomName != null ? String(l.roomName).trim() : ''
+    }));
+  }
+  const payloadStr = JSON.stringify(payloadObj);
 
   const conn = await pool.getConnection();
   try {

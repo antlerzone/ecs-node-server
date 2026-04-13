@@ -135,7 +135,7 @@
   background-color: transparent !important;
 }
 
-/* /homedemo: 整屏吸附 — 第 1 屏 Hero 与第 2 屏起点对齐，避免停在两屏之间 */
+/* /home: 整屏吸附 — 第 1 屏 Hero 与第 2 屏起点对齐，避免停在两屏之间 */
 html.homedemo-scroll-snap {
   scroll-snap-type: y mandatory;
   scroll-padding-top: 4rem;
@@ -252,4 +252,12 @@ html.homedemo-scroll-snap .homedemo-platform-steps {
     animation: none !important;
     visibility: hidden !important;
   }
+}
+
+/* Available units map — card-style popup without Leaflet tail */
+.au-map-popup-wrap .leaflet-popup-tip {
+  display: none !important;
+}
+.au-map-popup-wrap .leaflet-popup-content-wrapper {
+  border-radius: 12px;
 }

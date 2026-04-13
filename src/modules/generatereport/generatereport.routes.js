@@ -27,6 +27,7 @@ const {
   getOwnerReportDriveStatus
 } = require('./generatereport.service');
 const { voidOwnerReportPayment } = require('./generatereport-accounting.service');
+const { linkExistingBukkuUrlsForOwnerPayout } = require('./generatereport-bukku-linkback.service');
 const { buildOwnerReportPdfBuffer } = require('./generatereport-pdf');
 const downloadStore = require('../download/download.store');
 
@@ -324,6 +325,32 @@ router.post('/owner-report-delete', requireClient, async (req, res, next) => {
     res.json({ success: true });
   } catch (err) {
     if (err.message === 'NOT_FOUND') return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
+    next(err);
+  }
+});
+
+/**
+ * POST /api/generatereport/owner-report-bukku-link-back
+ * Read-only Bukku list/read; match amounts; UPDATE ownerpayout URLs. Body: { email, id, dryRun?, force? }
+ */
+router.post('/owner-report-bukku-link-back', requireClient, async (req, res, next) => {
+  try {
+    const id = req.body?.id;
+    if (!id) return res.status(400).json({ ok: false, reason: 'MISSING_ID' });
+    const dryRun = req.body?.dryRun === true;
+    const force = req.body?.force === true;
+    const result = await linkExistingBukkuUrlsForOwnerPayout(req.clientId, id, { dryRun, force });
+    if (!result.ok) {
+      const status =
+        result.reason === 'PAYOUT_NOT_FOUND'
+          ? 404
+          : result.reason === 'AMBIGUOUS_INVOICE' || result.reason === 'AMBIGUOUS_BILL'
+            ? 409
+            : 400;
+      return res.status(status).json(result);
+    }
+    return res.json(result);
+  } catch (err) {
     next(err);
   }
 });

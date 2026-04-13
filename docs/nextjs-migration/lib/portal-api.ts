@@ -986,7 +986,8 @@ export async function getApiDocsMyAccess(email: string): Promise<ApiDocsMyAccess
 
 /** POST and return response as Blob (for binary downloads e.g. .docx). */
 export async function portalPostBlob(path: string, body: object): Promise<Blob> {
-  if (shouldUseDemoMock()) {
+  const isCreditDeductionPdf = path.includes("credit-log-deduction-report");
+  if (shouldUseDemoMock() && !isCreditDeductionPdf) {
     return new Blob([], { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" });
   }
   const base = getProxyBase();

@@ -351,6 +351,10 @@ async function getTenancyList(clientId, opts = {}) {
   }
 
   const tenancyIds = rows.map((x) => x.id);
+  let paidDepositByTenancy = new Map();
+  if (tenancyIds.length) {
+    paidDepositByTenancy = await sumPaidDepositRentalCollectionForTenancies(clientId, tenancyIds);
+  }
   let agreementMap = {};
   const reviewedTenancyIds = new Set();
   if (tenancyIds.length) {
@@ -411,6 +415,10 @@ async function getTenancyList(clientId, opts = {}) {
     const beginYmd = tenancyCalendarYmdFromDb(t.begin);
     const endYmd = tenancyCalendarYmdFromDb(t.end);
     const prevYmd = t.previous_end != null ? tenancyCalendarYmdFromDb(t.previous_end) : null;
+    const depositColumn = Number(t.deposit || 0);
+    const paidDepositSum = paidDepositByTenancy.get(String(t.id)) || 0;
+    const depositForPortal = depositDisplayFromTenancyOrPaidRc(depositColumn, paidDepositSum);
+    const depositInSync = depositInSyncBetweenTenancyColumnAndPaidRc(depositColumn, paidDepositSum);
     return {
       _id: t.id,
       id: t.id,
@@ -420,7 +428,11 @@ async function getTenancyList(clientId, opts = {}) {
       previous_end: prevYmd && /^\d{4}-\d{2}-\d{2}$/.test(prevYmd) ? prevYmd : t.previous_end,
       last_room_change_at: t.last_room_change_at != null ? normalizeMysqlDatetimeIso(t.last_room_change_at) : null,
       rental: t.rental,
-      deposit: t.deposit,
+      deposit: depositForPortal,
+      /** Raw tenancy.deposit — for与 RC 比对 */
+      depositFromTenancy: Number.isFinite(depositColumn) ? Number(depositColumn.toFixed(2)) : 0,
+      paidDepositFromRentalCollection: Number.isFinite(paidDepositSum) ? Number(paidDepositSum.toFixed(2)) : 0,
+      depositInSync,
       remark: t.remark,
       title: t.title,
       status: computeStatus({ ...t, status: t.db_status }),
@@ -564,6 +576,64 @@ async function sumPaidDepositRentalCollectionForTenancy(clientId, tenancyId) {
   }
 }
 
+/**
+ * Batch: paid deposit-type rentalcollection sums per tenancy (same rules as sumPaidDepositRentalCollectionForTenancy).
+ * @returns {Map<string, number>} keyed by tenancy id
+ */
+async function sumPaidDepositRentalCollectionForTenancies(clientId, tenancyIds) {
+  const out = new Map();
+  if (!clientId || !tenancyIds?.length) return out;
+  const typeId = await getAccountIdByWixId(BUKKUID_WIX.DEPOSIT);
+  if (!typeId) return out;
+  try {
+    const placeholders = tenancyIds.map(() => '?').join(',');
+    const [rows] = await pool.query(
+      `SELECT tenancy_id, COALESCE(SUM(amount), 0) AS s FROM rentalcollection
+       WHERE client_id = ? AND tenancy_id IN (${placeholders}) AND type_id = ?
+         AND (ispaid = 1 OR ispaid = TRUE)
+       GROUP BY tenancy_id`,
+      [clientId, ...tenancyIds, typeId]
+    );
+    for (const r of rows || []) {
+      if (r?.tenancy_id == null) continue;
+      const s = Number(r.s || 0);
+      out.set(String(r.tenancy_id), Number.isFinite(s) ? Number(s.toFixed(2)) : 0);
+    }
+  } catch (e) {
+    console.warn('[tenancysetting] sumPaidDepositRentalCollectionForTenancies:', e?.message || e);
+  }
+  return out;
+}
+
+/**
+ * 展示用押金：有 tenancy.deposit（>0）则以合同列为准；若为 0/未导入则用 rentalcollection 已付「押金」科目合计（与账单一致）。
+ * 不做 max：两者不一致时由 depositInSyncBetweenTenancyColumnAndPaidRc 标出，便于核对。
+ */
+function depositDisplayFromTenancyOrPaidRc(tenancyDepositColumn, paidDepositSum) {
+  const col = Number(tenancyDepositColumn || 0);
+  const paid = Number(paidDepositSum || 0);
+  const c = Number.isFinite(col) ? col : 0;
+  const p = Number.isFinite(paid) ? paid : 0;
+  if (c > 0) return Number(c.toFixed(2));
+  return Number(p.toFixed(2));
+}
+
+const DEPOSIT_RC_TENANCY_EPS = 0.02;
+
+/**
+ * 合同列 vs RC 已付押金合计是否一致。导入未写 tenancy.deposit（列=0 且 RC 有数）返回 null（仅信 RC，无「合同可对」）。
+ * @returns {boolean|null} true 一致；false 不一致或合同有数但 RC 未体现；null 列无合同押金可比
+ */
+function depositInSyncBetweenTenancyColumnAndPaidRc(tenancyDepositColumn, paidDepositSum) {
+  const col = Number(tenancyDepositColumn || 0);
+  const paid = Number(paidDepositSum || 0);
+  const c = Number.isFinite(col) ? col : 0;
+  const p = Number.isFinite(paid) ? paid : 0;
+  if (c <= 0) return null;
+  if (p <= 0) return false;
+  return Math.abs(c - p) < DEPOSIT_RC_TENANCY_EPS;
+}
+
 async function getExtendOptions(clientId, tenancyId) {
   const client = await getClientAdmin(clientId);
   const rental = client?.admin?.rental || { type: 'first', value: 1 };
@@ -582,14 +652,15 @@ async function getExtendOptions(clientId, tenancyId) {
     /* keep 0 */
   }
   const paidDepositSum = await sumPaidDepositRentalCollectionForTenancy(clientId, tenancyId);
-  /** Prefill Extend/Change room: GREATEST(contract column, paid deposit invoices) so late top-ups without DB sync still show. */
-  const deposit = Number(Math.max(depositFromTenancy, paidDepositSum).toFixed(2));
+  const deposit = depositDisplayFromTenancyOrPaidRc(depositFromTenancy, paidDepositSum);
+  const depositInSync = depositInSyncBetweenTenancyColumnAndPaidRc(depositFromTenancy, paidDepositSum);
   return {
     paymentCycle,
     maxExtensionEnd,
     deposit,
     depositFromTenancy,
-    paidDepositFromRentalCollection: paidDepositSum
+    paidDepositFromRentalCollection: paidDepositSum,
+    depositInSync
   };
 }
 
@@ -1975,8 +2046,8 @@ async function getTerminateContext(clientId, tenancyId) {
     paidDeposit = Number(paidDepositRows?.[0]?.total || 0);
   }
   const depositColumn = Number(row.deposit || 0);
-  /** UI “held”: max(column, paid) so late paid top-ups show when column was never updated. */
-  const deposit = Number(Math.max(depositColumn, paidDeposit).toFixed(2));
+  const deposit = depositDisplayFromTenancyOrPaidRc(depositColumn, paidDeposit);
+  const depositInSync = depositInSyncBetweenTenancyColumnAndPaidRc(depositColumn, paidDeposit);
   /** Cash basis when column is 0; else min(contract, paid). */
   const refundableDeposit = Number(
     Math.max(0, depositColumn > 0 ? Math.min(depositColumn, paidDeposit) : paidDeposit).toFixed(2)
@@ -1985,7 +2056,9 @@ async function getTerminateContext(clientId, tenancyId) {
     ok: true,
     tenancyId: row.id,
     deposit,
+    depositFromTenancy: Number.isFinite(depositColumn) ? Number(depositColumn.toFixed(2)) : 0,
     paidDeposit,
+    depositInSync,
     refundableDeposit,
     skipDepositRefund: refundableDeposit <= 0,
     status: row.status

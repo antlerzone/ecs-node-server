@@ -821,7 +821,11 @@ router.post('/submit-paynow-receipt', (req, res) => {
       reference_number: Array.isArray(invoiceIds) && invoiceIds.length > 0 ? invoiceIds.join(',') : null
     });
     try {
-      await syncBankTransactionsFromFinverse(clientId, {});
+      const { getTodayMalaysiaDate, getTodayPlusDaysMalaysia } = require('../../utils/dateMalaysia');
+      await syncBankTransactionsFromFinverse(clientId, {
+        from_date: getTodayPlusDaysMalaysia(-14),
+        to_date: getTodayMalaysiaDate()
+      });
     } catch (e) {
       // Finverse not linked or sync error – invoice stays PENDING_VERIFICATION
     }

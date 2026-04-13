@@ -310,7 +310,9 @@ async function upsertSyncedClnProperty({
   address,
   unitName,
   colivingPropertydetailId,
-  colivingRoomdetailId
+  colivingRoomdetailId,
+  /** When true: roomdetail row represents entire-unit listing; Cleanlemons key is (scope=entire, source=room id), distinct from property-level entire row. */
+  roomEntireUnitListing = false
 }) {
   const [hasWazeCol, hasGoogleCol, hasColivingScope, hasColivingSource, hasClientIdCol] = await Promise.all([
     tableHasColumn('cln_property', 'waze_url'),
@@ -319,10 +321,17 @@ async function upsertSyncedClnProperty({
     tableHasColumn('cln_property', 'coliving_source_id'),
     tableHasColumn('cln_property', 'client_id'),
   ]);
-  const colivingScopeVal = colivingRoomdetailId ? 'room' : 'entire';
-  const colivingSourceVal = colivingRoomdetailId
-    ? String(colivingRoomdetailId)
-    : String(colivingPropertydetailId);
+  let colivingScopeVal;
+  let colivingSourceVal;
+  if (roomEntireUnitListing && colivingRoomdetailId) {
+    colivingScopeVal = 'entire';
+    colivingSourceVal = String(colivingRoomdetailId);
+  } else {
+    colivingScopeVal = colivingRoomdetailId ? 'room' : 'entire';
+    colivingSourceVal = colivingRoomdetailId
+      ? String(colivingRoomdetailId)
+      : String(colivingPropertydetailId);
+  }
   let sel = 'id';
   if (hasWazeCol || hasGoogleCol) sel += ', address';
   if (hasWazeCol) sel += ', waze_url';
@@ -627,20 +636,33 @@ async function maybeSyncPropertydetailToCleanlemons(operatordetailId, propertyde
       colivingPropertydetailId: p.id,
       colivingRoomdetailId: null
     });
-    const [rooms] = await pool.query(
-      `SELECT id, title_fld, roomname FROM roomdetail
-       WHERE property_id = ? AND active = 1`,
-      [p.id]
-    );
+    let rooms;
+    try {
+      ;[rooms] = await pool.query(
+        `SELECT id, title_fld, roomname, listing_scope FROM roomdetail
+         WHERE property_id = ? AND active = 1`,
+        [p.id]
+      );
+    } catch (e) {
+      if (e.code === 'ER_BAD_FIELD_ERROR' || e.errno === 1054) {
+        ;[rooms] = await pool.query(
+          `SELECT id, title_fld, roomname FROM roomdetail
+           WHERE property_id = ? AND active = 1`,
+          [p.id]
+        );
+      } else throw e;
+    }
     for (const r of rooms || []) {
       const label = roomDisplayLabel(r);
+      const entireListing = String(r.listing_scope || 'room') === 'entire_unit';
       await upsertSyncedClnProperty({
         cleanlemonsClientdetailId: ctx.cleanlemonsClientdetailId,
         propertyName: `${baseName} (${label})`,
         address: addr,
         unitName: unit || null,
         colivingPropertydetailId: p.id,
-        colivingRoomdetailId: r.id
+        colivingRoomdetailId: r.id,
+        roomEntireUnitListing: entireListing
       });
     }
   }
@@ -668,13 +690,25 @@ async function syncPropertiesToCleanlemons(operatordetailId, cleanlemonsClientde
       colivingPropertydetailId: p.id,
       colivingRoomdetailId: null
     });
-    const [rooms] = await pool.query(
-      `SELECT id, title_fld, roomname FROM roomdetail
-       WHERE property_id = ? AND active = 1`,
-      [p.id]
-    );
+    let rooms;
+    try {
+      ;[rooms] = await pool.query(
+        `SELECT id, title_fld, roomname, listing_scope FROM roomdetail
+         WHERE property_id = ? AND active = 1`,
+        [p.id]
+      );
+    } catch (e) {
+      if (e.code === 'ER_BAD_FIELD_ERROR' || e.errno === 1054) {
+        ;[rooms] = await pool.query(
+          `SELECT id, title_fld, roomname FROM roomdetail
+           WHERE property_id = ? AND active = 1`,
+          [p.id]
+        );
+      } else throw e;
+    }
     for (const r of rooms) {
       const label = roomDisplayLabel(r);
+      const entireListing = String(r.listing_scope || 'room') === 'entire_unit';
       await upsertSyncedClnProperty({
         cleanlemonsClientdetailId,
         propertyName: `${baseName} (${label})`,
@@ -682,7 +716,8 @@ async function syncPropertiesToCleanlemons(operatordetailId, cleanlemonsClientde
         /* roomdetail has no unitnumber (only propertydetail does); reuse property-level unit */
         unitName: unit || null,
         colivingPropertydetailId: p.id,
-        colivingRoomdetailId: r.id
+        colivingRoomdetailId: r.id,
+        roomEntireUnitListing: entireListing
       });
     }
   }

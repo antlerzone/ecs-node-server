@@ -32,7 +32,8 @@ const {
   getOwnerEnquiries,
   acknowledgeSaasEnquiry,
   acknowledgeOwnerEnquiry,
-  deleteOwnerEnquiry
+  deleteOwnerEnquiry,
+  getCreditLogDeductionReportPdfForOperator
 } = require('./billing.service');
 const { startNormalTopup, submitManualTopupRequest } = require('./topup.service');
 const { syncSaasTopupFromXenditAfterReturn, syncSaasPricingPlanFromXenditAfterReturn } = require('./xendit-saas-platform.service');
@@ -355,6 +356,34 @@ router.post('/statement-items', async (req, res, next) => {
     formatApiResponseDates(result);
     res.json(result);
   } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/billing/credit-log-deduction-report
+ * Body: { email, clientId?, creditLogId } — PDF for one creditlogs spending row (amount < 0), same client as portal.
+ */
+router.post('/credit-log-deduction-report', async (req, res, next) => {
+  try {
+    const email = getEmail(req);
+    const body = req.body || {};
+    const clientId = body.clientId ?? body.client ?? null;
+    const creditLogId = body.creditLogId ?? body.id ?? null;
+    const buffer = await getCreditLogDeductionReportPdfForOperator(email, creditLogId, clientId);
+    const safeId = String(creditLogId || 'report').replace(/[^a-zA-Z0-9-]/g, '').slice(0, 36) || 'report';
+    const filename = `credit-deduction-${safeId}.pdf`;
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(buffer);
+  } catch (err) {
+    const status =
+      err.status ||
+      (err.message === 'NOT_FOUND' ? 404 : null) ||
+      (err.message === 'NOT_A_DEDUCTION' || err.message === 'MISSING_CREDIT_LOG_ID' ? 400 : null);
+    if (status >= 400 && status < 500) {
+      return res.status(status).json({ ok: false, reason: err.message || 'REQUEST_FAILED' });
+    }
     next(err);
   }
 });

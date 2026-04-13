@@ -110,7 +110,8 @@ router.post('/list', requireClient, async (req, res, next) => {
       pageSize: req.body?.pageSize,
       limit: req.body?.limit,
       availability: req.body?.availability,
-      activeFilter: req.body?.activeFilter
+      activeFilter: req.body?.activeFilter,
+      listingScope: req.body?.listingScope
     };
     console.log('[roomsetting] POST /list clientId=', req.clientId, 'opts=', JSON.stringify(opts));
     const result = await getRooms(req.clientId, opts);
@@ -204,7 +205,9 @@ router.post('/update', requireClient, async (req, res, next) => {
       property: req.body?.property,
       mainPhoto: req.body?.mainPhoto,
       mediaGallery: req.body?.mediaGallery,
-      active: req.body?.active
+      active: req.body?.active,
+      listingScope: req.body?.listingScope,
+      cleanlemonsCleaningTenantPriceMyr: req.body?.cleanlemonsCleaningTenantPriceMyr
     };
     const result = await updateRoom(req.clientId, roomId, data);
     res.json(result);

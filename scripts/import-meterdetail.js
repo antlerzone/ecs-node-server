@@ -1,15 +1,23 @@
 /**
  * Import meterdetail CSV。0087 后：id = CSV ID；room/property/client/parentmeter 直接写入 _id 列，无效则 null。
- * Usage: node scripts/import-meterdetail.js [path], default ./meterdetail.csv
+ * Usage:
+ *   node scripts/import-meterdetail.js [path/to/meterdetail.csv] [--truncate]
+ *   default path: ./meterdetail.csv
+ * --truncate: SET FOREIGN_KEY_CHECKS=0; TRUNCATE meterdetail; then import (orphan FKs elsewhere — same UUIDs restore links).
+ * FORCE_ONBOARD_CLIENT=1: if CSV client_id not in operatordetail, fall back to ONBOARD_OPERATOR_ID (onboard-only flows).
+ * IMPORT_METERDETAIL_CLIENT_ID=<uuid>: force every row's client_id to this operatordetail id (overrides CSV).
  */
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 const mysql = require('mysql2/promise');
 const fs = require('fs');
 const path = require('path');
-const { resolveId } = require('./import-util');
+const { resolveId, UUID_REGEX } = require('./import-util');
 const { ONBOARD_OPERATOR_ID, skipCsvColumn } = require('./onboard-import-helpers');
 
-const csvPath = process.argv[2] || path.join(process.cwd(), 'meterdetail.csv');
+const argv = process.argv.slice(2);
+const truncateFirst = argv.includes('--truncate');
+const pathArg = argv.find((a) => a !== '--truncate');
+const csvPath = pathArg || path.join(process.cwd(), 'meterdetail.csv');
 const table = 'meterdetail';
 
 const CSV_TO_DB = {
@@ -89,6 +97,16 @@ async function run() {
     return String(s).trim().replace(/^\[|\]$/g, '').replace(/"/g, '').trim();
   }
 
+  const idColIdx = rawHeaders.findIndex((h) => headerToDb((h || '').replace(/^"|"$/g, '')) === 'id');
+  const csvMeterIds = new Set();
+  if (idColIdx >= 0) {
+    for (let i = 1; i < lines.length; i++) {
+      const values = parseCsvLine(lines[i]);
+      const vid = values[idColIdx] !== undefined ? normalizeVal(values[idColIdx]) : null;
+      if (vid && UUID_REGEX.test(String(vid))) csvMeterIds.add(String(vid).trim());
+    }
+  }
+
   const conn = await mysql.createConnection({
     host: process.env.DB_HOST,
     user: process.env.DB_USER,
@@ -97,6 +115,15 @@ async function run() {
     charset: 'utf8mb4',
   });
   const dbName = process.env.DB_NAME;
+
+  if (truncateFirst) {
+    console.log('[meterdetail] TRUNCATE (FK checks off) …');
+    await conn.query('SET FOREIGN_KEY_CHECKS=0');
+    await conn.query('TRUNCATE TABLE `' + table + '`');
+    await conn.query('SET FOREIGN_KEY_CHECKS=1');
+    console.log('[meterdetail] Truncate done.');
+  }
+
   const [cols] = await conn.query(
     'SELECT column_name FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position',
     [dbName, table]
@@ -112,7 +139,7 @@ async function run() {
   const validRoomIds = new Set(roomRows);
   const validPropertyIds = new Set(propertyRows);
   const validClientIds = new Set(clientRows);
-  const validMeterIds = new Set(meterRows);
+  const validMeterIds = new Set([...meterRows, ...csvMeterIds]);
 
   const usedIds = new Set();
   let inserted = 0;
@@ -132,8 +159,16 @@ async function run() {
       }
       if (row.room_id != null && !validRoomIds.has(row.room_id)) row.room_id = null;
       if (row.property_id != null && !validPropertyIds.has(row.property_id)) row.property_id = null;
-      if (row.client_id != null && !validClientIds.has(row.client_id)) row.client_id = null;
-      row.client_id = ONBOARD_OPERATOR_ID;
+      const csvClient = row.client_id != null ? String(row.client_id).trim() : '';
+      if (csvClient && validClientIds.has(csvClient)) {
+        row.client_id = csvClient;
+      } else if (process.env.FORCE_ONBOARD_CLIENT === '1' && validClientIds.has(ONBOARD_OPERATOR_ID)) {
+        row.client_id = ONBOARD_OPERATOR_ID;
+      } else {
+        row.client_id = null;
+      }
+      const forceCid = (process.env.IMPORT_METERDETAIL_CLIENT_ID || '').trim();
+      if (forceCid && UUID_REGEX.test(forceCid)) row.client_id = forceCid;
       if (row.parentmeter_id != null && !validMeterIds.has(row.parentmeter_id)) row.parentmeter_id = null;
       const now = new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
       if (!row.created_at) row.created_at = now;

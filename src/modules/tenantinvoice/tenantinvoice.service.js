@@ -30,6 +30,8 @@ const {
 
 /** Canonical template ids (see account seeds, rentalcollection-invoice). */
 const ACCOUNT_FORFEIT_DEPOSIT_ID = '2020b22b-028e-4216-906c-c816dcb33a85';
+/** Security deposit tenant invoice line — same id as booking `billing_json` / `booking.service` DEPOSIT. */
+const ACCOUNT_DEPOSIT_ID = '18ba3daf-7208-46fc-8e97-43f34e898401';
 const ACCOUNT_OWNER_COMMISSION_ID = '86da59c0-992c-4e40-8efd-9d6d793eaf6a';
 const ACCOUNT_MANAGEMENT_FEES_ID = 'a1b2c3d4-0002-4000-8000-000000000002';
 
@@ -47,7 +49,8 @@ function isAccountTypeAllowedForManualInsert(typeId, clientId, accountRow) {
   if (cid == null || String(cid).trim() === '') return true;
   if (String(cid).trim() === String(clientId || '').trim()) return true;
   const tid = String(typeId || '').trim();
-  if (tid === ACCOUNT_OWNER_COMMISSION_ID || tid === ACCOUNT_MANAGEMENT_FEES_ID) return true;
+  if (tid === ACCOUNT_OWNER_COMMISSION_ID || tid === ACCOUNT_MANAGEMENT_FEES_ID || tid === ACCOUNT_DEPOSIT_ID)
+    return true;
   return false;
 }
 
@@ -196,16 +199,20 @@ function isExcludedFromInvoiceTypeDropdown(row) {
   return !!(t && INVOICE_TYPE_EXCLUDED_ACCOUNT_TYPES.has(t))
 }
 
-/** Manual invoice type picker + All types filter: omit Forfeit Deposit (system/terminate flow). */
+/**
+ * Manual invoice type picker + All types filter: omit Forfeit Deposit (system/terminate flow).
+ * Whitelist canonical Deposit (liability in DB) so Operator invoice matches booking-generated deposit lines.
+ */
 function isExcludedFromManualInvoiceTypePick(row) {
   if (!row || row.id == null) return true
   if (String(row.id).trim() === ACCOUNT_FORFEIT_DEPOSIT_ID) return true
+  if (String(row.id).trim().toLowerCase() === ACCOUNT_DEPOSIT_ID) return false
   return isExcludedFromInvoiceTypeDropdown(row)
 }
 
 /**
  * Get account (bukkuid) list for type dropdown. Returns { id, title }.
- * Omits balance-sheet types (asset / liability, etc.) — not valid as tenant invoice line types.
+ * Omits balance-sheet types except canonical Deposit (security deposit; same as booking).
  * Same list powers Create Invoice and the page Type filter.
  * Scoped to template rows (`client_id` NULL) plus this operator’s chart (`client_id` = clientId) so
  * per-operator income lines (e.g. Cleaning Services) appear and filter/create use the correct `account.id`.
@@ -1081,9 +1088,11 @@ async function updateRentalRecord(clientId, id, payload, staffId = null) {
           ok: false,
           reason: 'RECEIPT_FAILED',
           updated,
-          receiptErrors: receiptResult.errors
+          receiptErrors: receiptResult.errors,
+          receipts: receiptResult.receipts
         };
       }
+      return { ok: true, updated, receipts: receiptResult.receipts };
     } catch (err) {
       console.warn('[tenantinvoice] createReceiptForPaidRentalCollection failed', err?.message || err);
       return {

@@ -73,18 +73,23 @@ Finverse 有两套：
 
 当前后端 `POST /api/finverse/webhook` 已存在，收到 body 会打 log；若用 v2，在 Svix 里 Add Endpoint 填上述 URL 并到 Event Catalog 订阅需要的 events 即可。
 
-**Svix 里要勾选哪些事件（支付核销 / 银行同步）：**
+**Svix 里要勾选哪些事件（官方 [Event Types](https://app.svix.com/app_3B2HNMOwZNzCIggbo3tf5Jw6rNj/event-types)）：**
 
-在 [Event Types](https://app.svix.com/app_3B2HNMOwZNzCIggbo3tf5Jw6rNj/event-types) 或 New Endpoint 页的「Subscribe to events」里，建议勾选：
+Finverse v2 事件名是 **固定枚举**（无 `TRANSACTIONS_*` 这类旧称）。按用途分组如下：
 
-| 建议勾选 | 说明 |
-|----------|------|
-| **ACCOUNTS_RETRIEVED** | 账户列表拉取成功，可用来知道该 login 的账户已就绪。 |
-| **ACCOUNTS_RETRIEVAL_FAILED** | 账户拉取失败，便于记录或告警。 |
-| 名字里带 **TRANSACTIONS** 的事件（如 TRANSACTIONS_RETRIEVED、TRANSACTIONS_*） | 有新区块/新交易时推送，可触发我们同步到 `bank_transactions` 或跑匹配。 |
-| 名字里带 **LOGIN_IDENTITY** 或 **CONNECTION** 的事件 | 连银行状态变化（如需重新授权、断开），便于提示 operator 重新 Connect。 |
+| 分组 | 事件（节选） | 与 Coliving「银行流水核销」的关系 |
+|------|----------------|-----------------------------------|
+| **活期/网银交易** | `ONLINE_TRANSACTIONS_RETRIEVED`、`*_RETRIEVAL_FAILED`、`*_NOT_FOUND`、`*_NOT_SUPPORTED`、`*_TEMPORARILY_UNAVAILABLE_FOR_INSTITUTION` | **核心**：有检索结果或失败时通知；可在 webhook 里触发拉取/同步 `bank_transactions`。 |
+| **历史交易** | `HISTORICAL_TRANSACTIONS_RETRIEVED` 及同前缀 `*_FAILED` / `*_NOT_FOUND` 等 | 初次连银行、补历史区间时用；同样可触发同步。 |
+| **账户** | `ACCOUNTS_RETRIEVED`、`ACCOUNTS_RETRIEVAL_FAILED` 等 | 知道账户列表是否就绪，再拉交易更稳。 |
+| **账号** | `ACCOUNT_NUMBERS_RETRIEVED` 及同前缀失败类 | 若产品要对账号展示/对账可订阅。 |
+| **认证** | `AUTHENTICATED`、`AUTHENTICATION_FAILED`、`AUTHENTICATION_TEMPORARILY`、`AUTHENTICATION_TOO_MANY_ATTEMPTS` | 连银行、重登状态；失败可告警或提示 operator 重连。 |
+| **余额 / 对账单 / 身份** | `BALANCE_HISTORY_*`、`STATEMENTS_*`、`IDENTITY_*` | 按需；纯「流水匹配发票」可不订。 |
+| **收入估算** | `INCOME_ESTIMATION_*` | 信贷/风控场景；非必需。 |
+| **自动扣款 / 授权** | `AUTOPAY_*`、`MANDATE_SETUP_*` | 自动扣款产品；非必需。 |
+| **支付执行** | `PAYMENT_SUBMITTED`、`PAYMENT_EXECUTED`、`PAYMENT_FAILED`、`PAYMENT_REJECTED`、`PAYMENT_LINK_*` | **Finverse Payments** 链路；若只做 **Data API** 不对接支付，可不订。 |
 
-若列表里没有 TRANSACTIONS_*，可先勾选上述 ACCOUNTS_* 和 LOGIN_IDENTITY/CONNECTION 相关项；或先选「Receiving all events」观察一段时间，看 payload 里有哪些 `event_type`，再回来改成只订阅需要的。
+**最小建议（只做 Data 流水核销）：** 至少订 **`ONLINE_TRANSACTIONS_*`** + **`HISTORICAL_TRANSACTIONS_*`**（含 `*_RETRIEVED` 与 `*_RETRIEVAL_FAILED`）+ **`ACCOUNTS_*`** 里你关心的成功/失败；其余按产品需要加。上线初期也可在 Svix 先 **收全量** 观察 payload 里的 `event_type`，再收紧订阅。
 
 ---
 

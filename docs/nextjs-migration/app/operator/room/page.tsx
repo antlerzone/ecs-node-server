@@ -30,7 +30,9 @@ const REMARK_OPTIONS = [
 type TypeFilter = "ALL" | "AVAILABLE" | "AVAILABLE_SOON" | "NON_AVAILABLE"
 /** roomdetail.active — listing on/off for Available Unit / booking */
 type ListingActiveFilter = "ALL" | "ACTIVE" | "INACTIVE"
-type RoomItem = { id: string; roomName?: string; property?: { shortname?: string; _id?: string }; propertyId?: string; active?: boolean; available?: boolean; availablesoon?: boolean; hasActiveTenancy?: boolean; meter?: string; smartdoor?: string; description_fld?: string; mainPhoto?: string | null; mediaGallery?: Array<{ type?: string; src?: string }>; price?: number; remark?: string }
+/** roomdetail.listing_scope */
+type ListingScopeFilter = "ALL" | "ROOM" | "ENTIRE_UNIT"
+type RoomItem = { id: string; roomName?: string; listingScope?: "room" | "entire_unit"; property?: { shortname?: string; _id?: string }; propertyId?: string; active?: boolean; available?: boolean; availablesoon?: boolean; hasActiveTenancy?: boolean; tenantName?: string; meter?: string; smartdoor?: string; description_fld?: string; mainPhoto?: string | null; mediaGallery?: Array<{ type?: string; src?: string }>; price?: number; remark?: string }
 
 export default function RoomSettingsPage() {
   const [loading, setLoading] = useState(true)
@@ -40,13 +42,29 @@ export default function RoomSettingsPage() {
   const [keyword, setKeyword] = useState("")
   const [typeFilter, setTypeFilter] = useState<TypeFilter>("ALL")
   const [listingActiveFilter, setListingActiveFilter] = useState<ListingActiveFilter>("ACTIVE")
+  const [listingScopeFilter, setListingScopeFilter] = useState<ListingScopeFilter>("ALL")
   const [pageSize, setPageSize] = useState(10)
   const [currentPage, setCurrentPage] = useState(1)
   const [total, setTotal] = useState(0)
   const [totalPages, setTotalPages] = useState(1)
   const [showAddDialog, setShowAddDialog] = useState(false)
   const [editingRoom, setEditingRoom] = useState<RoomItem | null>(null)
-  const [editForm, setEditForm] = useState({ roomName: "", propertyId: "", meterId: "", smartDoorId: "", description_fld: "", mainPhoto: "" as string | null, mediaGallery: [] as Array<{ type?: string; src?: string }>, active: true, available: true, availableSoon: false, price: "" as string, remark: "" as string, tenantCleaningPrice: "" as string })
+  const [editForm, setEditForm] = useState({
+    listingScope: "room" as "room" | "entire_unit",
+    roomName: "",
+    propertyId: "",
+    meterId: "",
+    smartDoorId: "",
+    description_fld: "",
+    mainPhoto: "" as string | null,
+    mediaGallery: [] as Array<{ type?: string; src?: string }>,
+    active: true,
+    available: true,
+    availableSoon: false,
+    price: "" as string,
+    remark: "" as string,
+    tenantCleaningPrice: "" as string,
+  })
   const [cleanlemonsLinked, setCleanlemonsLinked] = useState(false)
   const [cleaningPricing, setCleaningPricing] = useState<{
     showRefGeneralCleaning?: boolean
@@ -91,6 +109,7 @@ export default function RoomSettingsPage() {
             pageSize,
             availability: typeFilter !== "ALL" ? typeFilter : undefined,
             activeFilter: effectiveListing !== "ALL" ? effectiveListing : undefined,
+            listingScope: listingScopeFilter !== "ALL" ? listingScopeFilter : undefined,
           }),
           getRoomFilters(),
         ])
@@ -107,7 +126,7 @@ export default function RoomSettingsPage() {
         if (!silent) setLoading(false)
       }
     },
-    [propertyId, keyword, typeFilter, listingActiveFilter, currentPage, pageSize]
+    [propertyId, keyword, typeFilter, listingActiveFilter, listingScopeFilter, currentPage, pageSize]
   )
 
   useEffect(() => {
@@ -211,6 +230,7 @@ export default function RoomSettingsPage() {
         smartdoor: !!String(rm.smartdoor || "").trim(),
       })
       setEditForm({
+        listingScope: (rm as RoomItem).listingScope === "entire_unit" ? "entire_unit" : "room",
         roomName: rm.roomName || "",
         propertyId: rm.propertyId || rm.property?._id || "",
         meterId: rm.meter || "",
@@ -389,6 +409,7 @@ export default function RoomSettingsPage() {
       const priceNum = editForm.price.trim() !== "" ? Number(editForm.price) : undefined
       const r = await updateRoom(editingRoom.id, {
         roomName: editForm.roomName.trim(),
+        listingScope: editForm.listingScope,
         description_fld: editForm.description_fld || undefined,
         mainPhoto: editForm.mainPhoto || undefined,
         mediaGallery: editForm.mediaGallery,
@@ -595,11 +616,14 @@ export default function RoomSettingsPage() {
     if (!addDialogPropertyValid || !editForm.roomName.trim()) return
     setSaving(true)
     try {
-      const r = await insertRoom([{ roomName: editForm.roomName.trim(), property: editForm.propertyId }])
+      const r = await insertRoom([
+        { roomName: editForm.roomName.trim(), property: editForm.propertyId, listingScope: editForm.listingScope },
+      ])
       if (r?.ok !== false) {
         setShowAddDialog(false)
         const nextProp = (properties ?? []).find((p) => p.value)?.value || ""
         setEditForm({
+          listingScope: "room",
           roomName: "",
           propertyId: nextProp,
           meterId: "",
@@ -673,13 +697,42 @@ export default function RoomSettingsPage() {
             <option value="ACTIVE">Listing: active</option>
             <option value="INACTIVE">Listing: inactive</option>
           </select>
+          <select
+            value={listingScopeFilter}
+            onChange={(e) => {
+              setListingScopeFilter(e.target.value as ListingScopeFilter)
+              setCurrentPage(1)
+            }}
+            className="border border-border rounded-lg px-3 py-2 text-sm"
+            title="Filter by listing type (room vs entire unit)"
+            aria-label="Filter by room or entire unit listing"
+          >
+            <option value="ALL">Type: all</option>
+            <option value="ROOM">Type: room</option>
+            <option value="ENTIRE_UNIT">Type: entire unit</option>
+          </select>
           <Button
             className="gap-2"
             style={{ background: "var(--brand)" }}
             onClick={() => {
               /* Page property filter only affects the table; modal uses its own dropdown (default = first property). */
               const defaultProp = (properties ?? []).find((p) => p.value)?.value || ""
-              setEditForm({ roomName: "", propertyId: defaultProp, meterId: "", smartDoorId: "", description_fld: "", mainPhoto: null, mediaGallery: [], active: true, available: true, availableSoon: false, price: "", remark: "", tenantCleaningPrice: "" })
+              setEditForm({
+                listingScope: "room",
+                roomName: "",
+                propertyId: defaultProp,
+                meterId: "",
+                smartDoorId: "",
+                description_fld: "",
+                mainPhoto: null,
+                mediaGallery: [],
+                active: true,
+                available: true,
+                availableSoon: false,
+                price: "",
+                remark: "",
+                tenantCleaningPrice: "",
+              })
               setShowAddDialog(true)
             }}
           >
@@ -697,6 +750,7 @@ export default function RoomSettingsPage() {
               <tr className="border-b border-border">
                 <th className="text-left py-3 px-4 font-semibold text-muted-foreground">Property</th>
                 <th className="text-left py-3 px-4 font-semibold text-muted-foreground">Room</th>
+                <th className="text-left py-3 px-4 font-semibold text-muted-foreground">Type</th>
                 <th className="text-left py-3 px-4 font-semibold text-muted-foreground">Status</th>
                 <th className="text-left py-3 px-4 font-semibold text-muted-foreground">
                   <Tooltip>
@@ -725,6 +779,17 @@ export default function RoomSettingsPage() {
                   <td className="py-3 px-4">{room.property?.shortname || room.propertyId || "—"}</td>
                   <td className="py-3 px-4 font-semibold">{room.roomName || room.id}</td>
                   <td className="py-3 px-4">
+                    <span
+                      className={`inline-flex px-2 py-0.5 rounded text-xs font-medium ${
+                        room.listingScope === "entire_unit"
+                          ? "bg-violet-100 text-violet-800"
+                          : "bg-slate-100 text-slate-700"
+                      }`}
+                    >
+                      {room.listingScope === "entire_unit" ? "Entire unit" : "Room"}
+                    </span>
+                  </td>
+                  <td className="py-3 px-4">
                     <span className={`inline-flex items-center gap-1 px-2 py-1 rounded-full text-xs font-semibold ${room.hasActiveTenancy ? "bg-green-100 text-green-700" : "bg-blue-100 text-blue-700"}`}>
                       {room.hasActiveTenancy ? <Check size={12} /> : <X size={12} />}
                       {room.hasActiveTenancy ? "Occupied" : "Vacant"}
@@ -743,7 +808,16 @@ export default function RoomSettingsPage() {
                       {room.availablesoon ? "Available Soon" : room.available ? "Available" : "Not available"}
                     </span>
                   </td>
-                  <td className="py-3 px-4 text-muted-foreground text-xs">—</td>
+                  <td
+                    className="py-3 px-4 text-xs max-w-[14rem] truncate"
+                    title={room.tenantName || undefined}
+                  >
+                    {room.tenantName?.trim() ? (
+                      <span className="text-foreground">{room.tenantName.trim()}</span>
+                    ) : (
+                      <span className="text-muted-foreground">—</span>
+                    )}
+                  </td>
                   <td className="py-3 px-4 text-center">
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
@@ -880,8 +954,32 @@ export default function RoomSettingsPage() {
               </div>
             )}
             <div>
-              <Label className="text-xs">Room name</Label>
-              <Input value={editForm.roomName} onChange={(e) => setEditForm(f => ({ ...f, roomName: e.target.value }))} className="mt-1" />
+              <Label className="text-xs">Listing type</Label>
+              <Select
+                value={editForm.listingScope}
+                onValueChange={(v) =>
+                  setEditForm((f) => ({ ...f, listingScope: v === "entire_unit" ? "entire_unit" : "room" }))
+                }
+              >
+                <SelectTrigger className="mt-1">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="room">Room</SelectItem>
+                  <SelectItem value="entire_unit">Entire unit</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
+              <Label className="text-xs">
+                {editForm.listingScope === "entire_unit" ? "Property / unit name" : "Room name"}
+              </Label>
+              <Input
+                value={editForm.roomName}
+                onChange={(e) => setEditForm((f) => ({ ...f, roomName: e.target.value }))}
+                className="mt-1"
+                placeholder={editForm.listingScope === "entire_unit" ? "e.g. Whole unit at Marina View" : "e.g. Room A"}
+              />
             </div>
             <div>
               <Label className="text-xs">Description</Label>
@@ -1158,8 +1256,32 @@ export default function RoomSettingsPage() {
           <DialogHeader><DialogTitle>Add Room</DialogTitle></DialogHeader>
           <div className="space-y-4 py-2">
             <div>
-              <Label className="text-xs">Room name</Label>
-              <Input value={editForm.roomName} onChange={(e) => setEditForm(f => ({ ...f, roomName: e.target.value }))} placeholder="e.g. 101" className="mt-1" />
+              <Label className="text-xs">Listing type</Label>
+              <Select
+                value={editForm.listingScope}
+                onValueChange={(v) =>
+                  setEditForm((f) => ({ ...f, listingScope: v === "entire_unit" ? "entire_unit" : "room" }))
+                }
+              >
+                <SelectTrigger className="mt-1">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="room">Room</SelectItem>
+                  <SelectItem value="entire_unit">Entire unit</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
+              <Label className="text-xs">
+                {editForm.listingScope === "entire_unit" ? "Property / unit name" : "Room name"}
+              </Label>
+              <Input
+                value={editForm.roomName}
+                onChange={(e) => setEditForm((f) => ({ ...f, roomName: e.target.value }))}
+                placeholder={editForm.listingScope === "entire_unit" ? "e.g. Full apartment" : "e.g. 101"}
+                className="mt-1"
+              />
             </div>
             <div>
               <Label className="text-xs">Property</Label>
@@ -1188,7 +1310,14 @@ export default function RoomSettingsPage() {
             <DialogTitle>Room detail</DialogTitle>
           </DialogHeader>
           <div className="space-y-3 py-2">
-            {viewDetailRoom && <p className="font-semibold text-foreground">{viewDetailRoom.roomName || viewDetailRoom.id}</p>}
+            {viewDetailRoom && (
+              <>
+                <p className="font-semibold text-foreground">{viewDetailRoom.roomName || viewDetailRoom.id}</p>
+                <p className="text-xs text-muted-foreground">
+                  Type: {viewDetailRoom.listingScope === "entire_unit" ? "Entire unit" : "Room"}
+                </p>
+              </>
+            )}
             {loadingDetail && <p className="text-sm text-muted-foreground">Loading…</p>}
             {!loadingDetail && tenancyDetail && (
               <div className="text-sm space-y-2">

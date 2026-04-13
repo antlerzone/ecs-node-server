@@ -12,9 +12,13 @@ const { getAccessContextByEmail } = require('../access/access.service');
 const { createInvoicesForRentalRecords } = require('../rentalcollection-invoice/rentalcollection-invoice.service');
 const {
   getTodayMalaysiaDate,
+  getTodayPlusDaysMalaysia,
   utcDatetimeFromDbToMalaysiaDateOnly,
   tenancyBeginEndToMysql
 } = require('../../utils/dateMalaysia');
+
+/** Same window as tenancy-active.service.js AVAILABLE_SOON_DAYS (occupied → soon label). */
+const BOOKING_ROOM_AVAILABLE_SOON_DAYS = 60;
 
 /** roomdetail.availablefrom: DATE/DATETIME → Malaysia YYYY-MM-DD for comparisons */
 function roomAvailableFromToMalaysiaYmd(raw) {
@@ -155,10 +159,42 @@ async function getAvailableRooms(email, keyword = '') {
 
   const [roomRows] = await pool.query(sql, params);
   const todayMy = getTodayMalaysiaDate();
+  const todayPlusSoon = getTodayPlusDaysMalaysia(BOOKING_ROOM_AVAILABLE_SOON_DAYS);
+
+  /** room_id → lease end (MY YMD) for tenancies covering today; same rules as updateRoomAvailableFromTenancy */
+  const occupancyEndByRoom = new Map();
+  const roomIds = roomRows.map((row) => row.id).filter(Boolean);
+  if (roomIds.length) {
+    const ph = roomIds.map(() => '?').join(',');
+    const [tenRows] = await pool.query(
+      `SELECT t.room_id, t.\`end\` FROM tenancy t
+       WHERE t.client_id = ? AND t.room_id IN (${ph})
+         AND (t.active = 1 OR t.active IS NULL)
+         AND DATE(t.begin) <= ? AND DATE(t.\`end\`) >= ?
+       ORDER BY t.room_id, t.\`end\` DESC`,
+      [clientId, ...roomIds, todayMy, todayMy]
+    );
+    const seenRoom = new Set();
+    for (const row of tenRows || []) {
+      if (!row.room_id || seenRoom.has(row.room_id)) continue;
+      seenRoom.add(row.room_id);
+      const endYmd = roomAvailableFromToMalaysiaYmd(row.end);
+      if (endYmd) occupancyEndByRoom.set(row.room_id, endYmd);
+    }
+  }
+
   const items = roomRows.map((r) => {
     let available = Number(r.available) === 1;
     let availablesoon = Number(r.availablesoon) === 1;
     let availableFrom = roomAvailableFromToMalaysiaYmd(r.availablefrom);
+
+    const occEnd = occupancyEndByRoom.get(r.id);
+    if (occEnd) {
+      const withinSoon = occEnd <= todayPlusSoon;
+      available = false;
+      availablesoon = withinSoon;
+      availableFrom = withinSoon ? occEnd : null;
+    }
 
     // Stale flags: "available soon" date on or before today (MY) → vacancy already started; list as available now.
     if (!available && availablesoon && availableFrom && availableFrom <= todayMy) {

@@ -208,6 +208,26 @@ router.post('/staff/update-account', async (req, res, next) => {
   }
 });
 
+/** NRIC + ID type: same storage as Portal profile (tenantdetail/ownerdetail profile JSON + portal_account). */
+router.post('/sync-identity', async (req, res, next) => {
+  try {
+    const email = getEmail(req);
+    const body = req.body || {};
+    const result = await contactService.syncOperatorContactIdentity(
+      email,
+      {
+        contactEmail: body.contactEmail,
+        idType: body.idType,
+        idNumber: body.idNumber
+      },
+      req.clientId
+    );
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
 /** portal_account.phone for contact email (must belong to this client); use before staff sync for phone. */
 router.post('/portal-phone', async (req, res, next) => {
   try {

@@ -32,6 +32,7 @@ const DEMO_BYPASS_PATHS = new Set([
   "upload/chop",
   "tenantdashboard/upload",
   "ownerportal/upload",
+  "billing/credit-log-deduction-report",
 ]);
 
 /** Fallback variable list by role: Owner / Tenant / Operator / General – matches ECS getAgreementVariablesReference() */
@@ -111,7 +112,8 @@ export async function POST(
   const url = `${ECS_BASE.replace(/\/$/, "")}/api/${pathStr}`;
   const isPreviewPdfDownload = pathStr === "agreementsetting/preview-pdf-download";
   const isOfficialTemplateDownload = pathStr === "agreementsetting/official-template-download";
-  const isLongBinaryDownload = isPreviewPdfDownload || isOfficialTemplateDownload;
+  const isCreditDeductionPdf = pathStr === "billing/credit-log-deduction-report";
+  const isLongBinaryDownload = isPreviewPdfDownload || isOfficialTemplateDownload || isCreditDeductionPdf;
   if (isPreviewPdfDownload) {
     console.log(`[preview] ${new Date().toISOString()} PROXY_PREVIEW_REQUEST_RECEIVED path=${pathStr} url=${url}`);
   } else {
@@ -226,6 +228,32 @@ export async function POST(
       return NextResponse.json(payload, { status });
     }
 
+    if (isCreditDeductionPdf) {
+      if (res.ok && contentType.includes("application/pdf")) {
+        const buffer = await res.arrayBuffer();
+        const disposition =
+          res.headers.get("content-disposition") || 'attachment; filename="credit-deduction.pdf"';
+        return new NextResponse(buffer, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/pdf",
+            "Content-Disposition": disposition,
+          },
+        });
+      }
+      const resTextPreview = await res.text();
+      let payload: { ok: boolean; reason?: string; message?: string } = { ok: false, reason: "DOWNLOAD_FAILED" };
+      try {
+        const parsed = resTextPreview ? JSON.parse(resTextPreview) : {};
+        if (parsed.reason) payload.reason = parsed.reason;
+        if (parsed.message) payload.message = parsed.message;
+      } catch {
+        payload.message = "PDF download failed.";
+      }
+      const status = res.status >= 400 ? res.status : 502;
+      return NextResponse.json(payload, { status });
+    }
+
     const resText = await res.text();
     let data: unknown = {};
     try {
@@ -269,7 +297,11 @@ export async function POST(
     if (pathStr === "agreementsetting/variables-reference") {
       return NextResponse.json(fallbackVariablesReference(), { status: 200 });
     }
-    if (pathStr === "agreementsetting/preview-pdf-download" || pathStr === "agreementsetting/official-template-download") {
+    if (
+      pathStr === "agreementsetting/preview-pdf-download" ||
+      pathStr === "agreementsetting/official-template-download" ||
+      pathStr === "billing/credit-log-deduction-report"
+    ) {
       const status = isAbort ? 504 : 502;
       const reason = isAbort ? "PREVIEW_TIMEOUT" : "PROXY_ERROR";
       const message = isAbort

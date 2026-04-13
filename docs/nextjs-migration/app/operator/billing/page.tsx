@@ -216,7 +216,7 @@ export default function BillingPage() {
     if (id) selectedAddonsFromBilling[id] = Math.max(1, a.qty ?? 1)
   })
   const currency = (billing?.currency || "").toUpperCase()
-  /** MYR/SGD: Coliving SaaS platform Stripe (Malaysia test). */
+  /** MYR: platform Xendit; SGD: Coliving SaaS Stripe (same MY Stripe account, charge SGD). */
   const canPayPlanOnline = currency === "MYR" || currency === "SGD"
   const operatorStripeCurrency = (currency === "SGD" ? "SGD" : "MYR") as "MYR" | "SGD"
   const expiredDate = planItem?.expired || billing?.expired
@@ -519,13 +519,18 @@ export default function BillingPage() {
                   {canPayPlanOnline ? (
                     <>
                       <p className="text-sm text-muted-foreground mb-3">
-                        You will see a short summary of platform admin and card processing fees before Stripe Checkout.
+                        {currency === "SGD"
+                          ? "You will see a short summary of platform fees before Stripe Checkout."
+                          : "You will be redirected to Xendit (FPX / online banking) to complete payment in MYR."}
                       </p>
                       <Button
                         className="gap-2"
                         style={{ background: "var(--brand)" }}
                         disabled={confirmLoading}
-                        onClick={() => setPlanFeeDialogOpen(true)}
+                        onClick={() => {
+                          if (currency === "MYR") void runConfirmPlanCheckout()
+                          else setPlanFeeDialogOpen(true)
+                        }}
                       >
                         {confirmLoading ? "Processing..." : "Pay Now"}
                         <ArrowRight size={14} />

@@ -28,6 +28,12 @@ import {
   requestPortalPasswordResetEmail,
   confirmPortalPasswordReset,
 } from '@/lib/unified-profile-portal-api'
+import { cn } from '@/lib/utils'
+import {
+  getTenantProfileIncompleteFields,
+  type TenantGateIncompleteField,
+  type TenantProfileLite,
+} from '@/lib/tenant-gates'
 
 type Props = {
   roleLabel: string
@@ -202,6 +208,67 @@ export default function UnifiedProfilePage({
 
   const inputCls =
     'w-full border border-border rounded-xl px-3 py-2.5 text-sm bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent transition-all'
+
+  /** Tenant / Owner / Operator portals — same mandatory shape as respective profile gates (operator merges ID + Tax ID for nric). */
+  const colivingProfileGateModel = useMemo((): TenantProfileLite | null => {
+    if (uploadRole !== 'tenant' && uploadRole !== 'owner' && uploadRole !== 'operator') return null
+    if (shouldUseDemoMock()) return null
+    const front = String(nricFrontUrl || nricFront || '').trim()
+    const back = String(nricBackUrl || nricBack || '').trim()
+    const nricMerged =
+      uploadRole === 'operator'
+        ? String(idNumber || taxNo || '').trim()
+        : String(idNumber || '').trim()
+    return {
+      fullname: String(legalName || fullName || '').trim(),
+      nric: nricMerged,
+      phone: String(phone || '').trim(),
+      address: String(address || '').trim(),
+      nricFront: front,
+      nricback: back,
+      bankName: String(bankId || '').trim(),
+      bankAccount: String(bankAccNo || '').trim(),
+      accountholder: String(bankHolder || '').trim(),
+      profile: {
+        entity_type: entityType,
+        id_type: idType,
+        reg_no_type: idType,
+      },
+    }
+  }, [
+    uploadRole,
+    legalName,
+    fullName,
+    idNumber,
+    taxNo,
+    phone,
+    address,
+    nricFrontUrl,
+    nricFront,
+    nricBackUrl,
+    nricBack,
+    bankId,
+    bankAccNo,
+    bankHolder,
+    entityType,
+    idType,
+  ])
+
+  const profileGateIncomplete = useMemo(() => {
+    if (!colivingProfileGateModel) return new Set<TenantGateIncompleteField>()
+    return new Set(getTenantProfileIncompleteFields(colivingProfileGateModel))
+  }, [colivingProfileGateModel])
+
+  const gateErr = (k: TenantGateIncompleteField) => profileGateIncomplete.has(k)
+
+  const profileGateHint =
+    uploadRole === 'tenant'
+      ? 'Red outline: required fields still missing — complete them to use other tenant pages.'
+      : uploadRole === 'owner'
+        ? 'Red outline: required fields still missing — complete them to use other owner pages.'
+        : uploadRole === 'operator'
+          ? 'Red outline: required fields still missing — complete them to use other operator pages.'
+          : ''
 
   useEffect(() => {
     let cancelled = false
@@ -584,6 +651,11 @@ export default function UnifiedProfilePage({
           <h1 className="text-3xl font-black text-foreground">Profile Settings</h1>
           <p className="text-muted-foreground mt-1">Manage your personal information and preferences.</p>
           <p className="text-xs text-muted-foreground mt-2">{saveHint}</p>
+          {(uploadRole === 'tenant' || uploadRole === 'owner' || uploadRole === 'operator') &&
+          profileGateIncomplete.size > 0 &&
+          !shouldUseDemoMock() ? (
+            <p className="text-xs font-medium text-destructive mt-2">{profileGateHint}</p>
+          ) : null}
         </div>
         {showViewMyProfileButton ? (
           <Button
@@ -666,7 +738,9 @@ export default function UnifiedProfilePage({
                   Entity Type
                 </Label>
                 <Select value={entityType} onValueChange={setEntityType}>
-                  <SelectTrigger>
+                  <SelectTrigger
+                    className={cn(gateErr('entityType') && 'ring-2 ring-destructive border-destructive')}
+                  >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -682,14 +756,20 @@ export default function UnifiedProfilePage({
                 <Label className="text-[10px] font-semibold tracking-[0.2em] uppercase text-muted-foreground mb-1.5 block">
                   Legal Name
                 </Label>
-                <input value={legalName} onChange={(e) => setLegalName(e.target.value)} className={inputCls} />
+                <input
+                  value={legalName}
+                  onChange={(e) => setLegalName(e.target.value)}
+                  className={cn(inputCls, gateErr('legalName') && 'ring-2 ring-destructive border-destructive')}
+                />
               </div>
               <div>
                 <Label className="text-[10px] font-semibold tracking-[0.2em] uppercase text-muted-foreground mb-1.5 block">
                   ID Type
                 </Label>
                 <Select value={idType} onValueChange={setIdType}>
-                  <SelectTrigger>
+                  <SelectTrigger
+                    className={cn(gateErr('idType') && 'ring-2 ring-destructive border-destructive')}
+                  >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -703,13 +783,24 @@ export default function UnifiedProfilePage({
                 <Label className="text-[10px] font-semibold tracking-[0.2em] uppercase text-muted-foreground mb-1.5 block">
                   ID Number
                 </Label>
-                <input value={idNumber} onChange={(e) => setIdNumber(e.target.value)} className={inputCls} />
+                <input
+                  value={idNumber}
+                  onChange={(e) => setIdNumber(e.target.value)}
+                  className={cn(inputCls, gateErr('idNumber') && 'ring-2 ring-destructive border-destructive')}
+                />
               </div>
               <div>
                 <Label className="text-[10px] font-semibold tracking-[0.2em] uppercase text-muted-foreground mb-1.5 block">
                   Tax ID (Optional)
                 </Label>
-                <input value={taxNo} onChange={(e) => setTaxNo(e.target.value)} className={inputCls} />
+                <input
+                  value={taxNo}
+                  onChange={(e) => setTaxNo(e.target.value)}
+                  className={cn(
+                    inputCls,
+                    uploadRole === 'operator' && gateErr('idNumber') && 'ring-2 ring-destructive border-destructive',
+                  )}
+                />
               </div>
               <div>
                 <Label className="text-[10px] font-semibold tracking-[0.2em] uppercase text-muted-foreground mb-1.5 block">
@@ -727,7 +818,11 @@ export default function UnifiedProfilePage({
                 <Label className="text-[10px] font-semibold tracking-[0.2em] uppercase text-muted-foreground mb-1.5 block">
                   Phone Number
                 </Label>
-                <input value={phone} onChange={(e) => setPhone(e.target.value)} className={inputCls} />
+                <input
+                  value={phone}
+                  onChange={(e) => setPhone(e.target.value)}
+                  className={cn(inputCls, gateErr('phone') && 'ring-2 ring-destructive border-destructive')}
+                />
               </div>
               <div className="sm:col-span-2">
                 <Label className="text-[10px] font-semibold tracking-[0.2em] uppercase text-muted-foreground mb-1.5 block">
@@ -737,7 +832,7 @@ export default function UnifiedProfilePage({
                   rows={2}
                   value={address}
                   onChange={(e) => setAddress(e.target.value)}
-                  className={`${inputCls} resize-none`}
+                  className={cn(`${inputCls} resize-none`, gateErr('address') && 'ring-2 ring-destructive border-destructive')}
                 />
               </div>
             </div>
@@ -750,7 +845,12 @@ export default function UnifiedProfilePage({
               <div className={`grid grid-cols-1 ${requiresBackImage ? 'sm:grid-cols-2' : ''} gap-4`}>
                 <div>
                   <p className="text-xs font-medium text-foreground mb-2">{idLabels.front} *</p>
-                  <label className="relative flex flex-col items-center justify-center w-full min-h-[10rem] border-2 border-dashed border-border rounded-xl cursor-pointer hover:border-primary transition-colors bg-secondary/30 overflow-hidden">
+                  <label
+                    className={cn(
+                      'relative flex flex-col items-center justify-center w-full min-h-[10rem] border-2 border-dashed rounded-xl cursor-pointer hover:border-primary transition-colors bg-secondary/30 overflow-hidden',
+                      gateErr('nricFront') ? 'border-destructive ring-2 ring-destructive/60' : 'border-border',
+                    )}
+                  >
                     {nricFront ? (
                       <>
                         <img src={nricFront} alt={idLabels.front} className="w-full max-h-48 object-contain rounded-xl" />
@@ -785,7 +885,12 @@ export default function UnifiedProfilePage({
                 {requiresBackImage ? (
                 <div>
                   <p className="text-xs font-medium text-foreground mb-2">{idLabels.back}</p>
-                  <label className="relative flex flex-col items-center justify-center w-full min-h-[10rem] border-2 border-dashed border-border rounded-xl cursor-pointer hover:border-primary transition-colors bg-secondary/30 overflow-hidden">
+                  <label
+                    className={cn(
+                      'relative flex flex-col items-center justify-center w-full min-h-[10rem] border-2 border-dashed rounded-xl cursor-pointer hover:border-primary transition-colors bg-secondary/30 overflow-hidden',
+                      gateErr('nricBack') ? 'border-destructive ring-2 ring-destructive/60' : 'border-border',
+                    )}
+                  >
                     {nricBack ? (
                       <>
                         <img src={nricBack} alt={idLabels.back} className="w-full max-h-48 object-contain rounded-xl" />
@@ -834,7 +939,9 @@ export default function UnifiedProfilePage({
                   Bank name
                 </Label>
                 <Select value={bankId} onValueChange={setBankId}>
-                  <SelectTrigger>
+                  <SelectTrigger
+                    className={cn(gateErr('bank') && 'ring-2 ring-destructive border-destructive')}
+                  >
                     <SelectValue placeholder="Select bank" />
                   </SelectTrigger>
                   <SelectContent>
@@ -850,13 +957,21 @@ export default function UnifiedProfilePage({
                 <Label className="text-[10px] font-semibold tracking-[0.2em] uppercase text-muted-foreground mb-1.5 block">
                   Account number
                 </Label>
-                <input value={bankAccNo} onChange={(e) => setBankAccNo(e.target.value)} className={inputCls} />
+                <input
+                  value={bankAccNo}
+                  onChange={(e) => setBankAccNo(e.target.value)}
+                  className={cn(inputCls, gateErr('bankAccount') && 'ring-2 ring-destructive border-destructive')}
+                />
               </div>
               <div className="sm:col-span-2">
                 <Label className="text-[10px] font-semibold tracking-[0.2em] uppercase text-muted-foreground mb-1.5 block">
                   Account holder name
                 </Label>
-                <input value={bankHolder} onChange={(e) => setBankHolder(e.target.value)} className={inputCls} />
+                <input
+                  value={bankHolder}
+                  onChange={(e) => setBankHolder(e.target.value)}
+                  className={cn(inputCls, gateErr('accountHolder') && 'ring-2 ring-destructive border-destructive')}
+                />
               </div>
             </div>
           </div>

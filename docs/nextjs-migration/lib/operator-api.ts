@@ -3,7 +3,7 @@
  * Email from session; clientId from current role when staff has multiple clients.
  */
 
-import { portalPost, portalPostBlob } from "./portal-api";
+import { portalPost, portalPostBlob, portalPostJsonAllowError } from "./portal-api";
 import type { AccessContextResponse } from "./portal-api";
 export type { AccessContextResponse };
 import { getMember, getCurrentRole } from "./portal-session";
@@ -277,6 +277,20 @@ export async function getStatementExportUrl(opts?: { sort?: string; filterType?:
   return post<{ downloadUrl?: string; reason?: string }>("billing/statement-export", opts ?? {});
 }
 
+/** PDF breakdown for one credit ledger deduction (no tax invoice). */
+export async function downloadCreditDeductionReportPdf(creditLogId: string): Promise<Blob> {
+  const email = getEmail();
+  if (!email) throw new Error("Not logged in");
+  const clientId = getClientId();
+  const id = String(creditLogId || "").trim();
+  if (!id) throw new Error("Missing credit log id");
+  return portalPostBlob("billing/credit-log-deduction-report", {
+    email,
+    ...(clientId ? { clientId } : {}),
+    creditLogId: id,
+  });
+}
+
 /** Submit help/topup ticket. mode e.g. 'topup_manual' | 'help'. photo = OSS URL of payment receipt (manual flow). */
 export async function submitTicket(payload: {
   mode?: string;
@@ -303,7 +317,7 @@ export async function previewPricingPlan(planId: string) {
 
 export async function confirmPricingPlan(planId: string, returnUrl: string) {
   return post<{
-    provider?: "stripe" | "billplz" | "payex" | "manual";
+    provider?: "stripe" | "xendit" | "billplz" | "payex" | "manual";
     url?: string;
     referenceNumber?: string;
     pricingplanlogId?: string;
@@ -1097,6 +1111,8 @@ export async function getRoomList(opts?: {
   availability?: string;
   /** ACTIVE | INACTIVE — roomdetail.active (listing); omit for all */
   activeFilter?: string;
+  /** ROOM | ENTIRE_UNIT — listing kind (roomdetail.listing_scope) */
+  listingScope?: string;
 }) {
   return post<{
     ok?: boolean;
@@ -1136,7 +1152,9 @@ export async function rollbackQuickSetupOnboarding(payload: {
   }>("propertysetting/rollback-quicksetup-onboarding", payload);
 }
 
-export async function insertRoom(records: Array<{ roomName?: string; property?: string }>) {
+export async function insertRoom(
+  records: Array<{ roomName?: string; property?: string; listingScope?: "room" | "entire_unit" }>
+) {
   return post<{ ok: boolean; ids?: string[]; reason?: string }>("roomsetting/insert", { records });
 }
 
@@ -1745,7 +1763,10 @@ export async function getTerminateTenancyContext(payload: { tenancyId: string })
     reason?: string;
     tenancyId?: string;
     deposit?: number;
+    depositFromTenancy?: number;
     paidDeposit?: number;
+    /** true=合同与 RC 已付一致；false=不一致；null=租约表无押金列可比（如仅导入 RC） */
+    depositInSync?: boolean | null;
     refundableDeposit?: number;
     skipDepositRefund?: boolean;
     status?: unknown;
@@ -1793,8 +1814,11 @@ export async function getExtendOptions(tenancyId: string) {
   return post<{
     paymentCycle?: { type: string; value: number };
     maxExtensionEnd?: string | null;
-    /** Current tenancy.deposit from DB — prefill Extend dialog deposit field. */
+    /** Display / prefill: tenancy column if &gt; 0 else paid RC sum */
     deposit?: number;
+    depositFromTenancy?: number;
+    paidDepositFromRentalCollection?: number;
+    depositInSync?: boolean | null;
   }>("tenancysetting/extend-options", { tenancyId });
 }
 
@@ -2119,6 +2143,15 @@ export async function updateContactPortalPhone(fields: { contactEmail: string; p
   });
 }
 
+/** NRIC + ID type — same persistence as Portal profile (tenantdetail/ownerdetail + portal_account). */
+export async function syncContactIdentity(fields: { contactEmail: string; idType?: string; idNumber?: string }) {
+  return post<{ ok?: boolean; reason?: string }>("contact/sync-identity", {
+    contactEmail: fields.contactEmail,
+    idType: fields.idType,
+    idNumber: fields.idNumber,
+  });
+}
+
 /** Update supplier's accounting system contact id (partial update). */
 export async function updateSupplierAccount(supplierId: string, contactId: string) {
   return post<{ ok?: boolean; reason?: string }>("contact/supplier/update", { supplierId, contactId });
@@ -2368,7 +2401,21 @@ export async function insertRental(records: unknown[]) {
 }
 
 export async function updateRental(id: string, payload: Record<string, unknown>) {
-  return post<{ ok: boolean; reason?: string; updated?: number; receiptErrors?: string[] }>("tenantinvoice/rental-update", { id, payload: payload });
+  return post<{
+    ok: boolean;
+    reason?: string;
+    updated?: number;
+    receiptErrors?: string[];
+    /** Bukku (etc.): rows written by createReceiptForPaidRentalCollection — paymentDateMalaysia = MY calendar date for receipt */
+    receipts?: Array<{
+      rentalcollectionId: string;
+      provider: string;
+      paymentDateMalaysia: string;
+      receipturl?: string | null;
+      bukku_payment_id?: string | null;
+      accounting_receipt_document_number?: string | null;
+    }>;
+  }>("tenantinvoice/rental-update", { id, payload: payload });
 }
 
 export async function deleteRental(ids: string[]) {
@@ -2436,6 +2483,32 @@ export async function voidOwnerReportPayment(id: string, opts?: { skipAccounting
     "generatereport/owner-report-void-payment",
     { id, ...(opts?.skipAccountingVoid ? { skipAccountingVoid: true } : {}) }
   );
+}
+
+/** Read-only Bukku: match existing invoice/bill by owner contact + amounts; UPDATE ownerpayout URLs. Does not create Bukku docs. */
+export async function linkOwnerReportBukkuUrls(id: string, opts?: { dryRun?: boolean; force?: boolean }) {
+  const email = getEmail();
+  if (!email) throw new Error("Not logged in");
+  const clientId = getClientId();
+  const payload: Record<string, unknown> = { email, id, ...(clientId ? { clientId } : {}), ...opts };
+  return portalPostJsonAllowError<{
+    ok?: boolean;
+    reason?: string;
+    dryRun?: boolean;
+    /** Commit path: ownerpayout.paid set to 1 when URLs are written */
+    paid?: boolean;
+    /** Dry-run: would set paid on commit */
+    wouldMarkPaid?: boolean;
+    bukkuinvoice?: string | null;
+    bukkubills?: string | null;
+    invoice?: { id?: string; amount?: number };
+    bill?: { id?: string; amount?: number };
+    candidates?: { id: string; amount: number; snippet: string }[];
+    notes?: string[];
+    range?: { date_from: string; date_to: string };
+    contactId?: number;
+    hint?: string;
+  }>("generatereport/owner-report-bukku-link-back", payload);
 }
 
 export async function generateOwnerPayout(propertyId: string, propertyName: string, startDate: string, endDate: string) {

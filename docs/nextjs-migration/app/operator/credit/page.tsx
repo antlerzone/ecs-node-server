@@ -13,6 +13,7 @@ import {
   Upload, CreditCard, Zap, AlertTriangle,
   CheckCircle, ArrowUpRight, ArrowDownRight, ExternalLink,
   CircleDollarSign,
+  Download,
 } from "lucide-react"
 import { useOperatorContext } from "@/contexts/operator-context"
 import { getCurrentRole } from "@/lib/portal-session"
@@ -24,6 +25,7 @@ import {
   submitManualTopupRequest,
   getActiveRoomCount,
   getStatementExportUrl,
+  downloadCreditDeductionReportPdf,
   startTopup,
   submitTicket,
   syncTopupFromBillplz,
@@ -109,6 +111,7 @@ export default function CreditLogPage() {
   const [loading, setLoading] = useState(true)
   const [topupPackages, setTopupPackages] = useState(DEFAULT_TOPUP_PACKAGES)
   const [exporting, setExporting] = useState(false)
+  const [downloadingPdfId, setDownloadingPdfId] = useState<string | null>(null)
   /** When wallet (client_credit) ≠ sum(creditlogs), header vs last row Balance can differ. */
   const [ledgerMismatch, setLedgerMismatch] = useState<{ wallet: number; net: number; delta: number } | null>(null)
   /** operatordetail.currency — drives RM vs S$ labels and SGD manual threshold vs MYR Billplz (no cap). */
@@ -330,6 +333,30 @@ export default function CreditLogPage() {
     refresh()
   }
 
+  const handleDownloadDeductionReport = useCallback(async (creditLogId: string) => {
+    const id = String(creditLogId || "").trim()
+    if (!id) return
+    setDownloadingPdfId(id)
+    try {
+      const blob = await downloadCreditDeductionReportPdf(id)
+      if (!blob || blob.size === 0) throw new Error("Empty PDF")
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement("a")
+      a.href = url
+      a.download = `credit-deduction-${id.slice(0, 8)}.pdf`
+      a.rel = "noopener"
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      console.error("[credit] deduction pdf", e)
+      window.alert(e instanceof Error ? e.message : "Failed to download report")
+    } finally {
+      setDownloadingPdfId(null)
+    }
+  }, [])
+
   const handleContinueToPayment = async () => {
     if (!canProceedTopup) return
     const price = totalPrice
@@ -355,6 +382,10 @@ export default function CreditLogPage() {
       } finally {
         setTopupSubmitting(false)
       }
+      return
+    }
+    if (operatorCurrency === "MYR") {
+      await executeTopupStripeCheckout()
       return
     }
     setTopupFeeDialogOpen(true)
@@ -654,11 +685,23 @@ export default function CreditLogPage() {
                         <span className="text-sm font-medium text-foreground">{tx.balance ?? "—"}</span>
                       </td>
                       <td className="py-3 px-4 text-center">
-                        {tx.type === "topup" && tx.invoiceUrl ? (
+                        {tx.invoiceUrl ? (
                           <Button variant="outline" size="sm" className="gap-1" asChild>
                             <a href={tx.invoiceUrl} target="_blank" rel="noopener noreferrer">
                               <ExternalLink size={12} /> Invoice
                             </a>
+                          </Button>
+                        ) : tx.amount < 0 ? (
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="gap-1"
+                            disabled={downloadingPdfId === tx.id}
+                            onClick={() => void handleDownloadDeductionReport(tx.id)}
+                          >
+                            <Download size={12} />
+                            {downloadingPdfId === tx.id ? "…" : "Receipt PDF"}
                           </Button>
                         ) : (
                           <span className="text-xs text-muted-foreground">—</span>

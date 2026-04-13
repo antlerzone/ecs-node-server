@@ -1,12 +1,13 @@
 /**
- * Import ownerpayout CSV: property -> property_wixid/property_id, client -> client_wixid/client_id.
+ * Import ownerpayout CSV: property -> property_wixid/property_id, client -> client_id (operatordetail).
  * Usage: node scripts/import-ownerpayout.js [csv_path], default ./OwnerPayout.csv
+ * IMPORT_OWNERPAYOUT_CLIENT_ID=<uuid>: force every row's client_id (overrides CSV).
  */
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 const mysql = require('mysql2/promise');
 const fs = require('fs');
 const path = require('path');
-const { resolveId } = require('./import-util');
+const { resolveId, UUID_REGEX } = require('./import-util');
 const { ONBOARD_OPERATOR_ID, skipCsvColumn } = require('./onboard-import-helpers');
 
 const csvPath = process.argv[2] || path.join(process.cwd(), 'ownerpayout.csv');
@@ -115,6 +116,9 @@ async function run() {
   );
   const tableColumns = new Set(cols.map(c => (c.column_name || c.COLUMN_NAME || '').toLowerCase()));
 
+  const [clientRows] = await conn.query('SELECT id FROM operatordetail');
+  const validClientIds = new Set(clientRows.map((x) => x.id));
+
   const usedIds = new Set();
   let inserted = 0;
   try {
@@ -129,7 +133,18 @@ async function run() {
       });
       row.id = resolveId(row, usedIds);
       if (row.property_id != null) row.property_id = stripBrackets(String(row.property_id)) || null;
-      row.client_id = ONBOARD_OPERATOR_ID;
+      if (row.client_id != null) row.client_id = stripBrackets(String(row.client_id)) || null;
+      const csvClient = row.client_id != null ? String(row.client_id).trim() : '';
+      const forceCid = (process.env.IMPORT_OWNERPAYOUT_CLIENT_ID || '').trim();
+      if (forceCid && UUID_REGEX.test(forceCid) && validClientIds.has(forceCid)) {
+        row.client_id = forceCid;
+      } else if (csvClient && validClientIds.has(csvClient)) {
+        row.client_id = csvClient;
+      } else if (validClientIds.has(ONBOARD_OPERATOR_ID)) {
+        row.client_id = ONBOARD_OPERATOR_ID;
+      } else {
+        row.client_id = null;
+      }
       const now = new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
       if (!row.created_at) row.created_at = now;
       if (!row.updated_at) row.updated_at = now;

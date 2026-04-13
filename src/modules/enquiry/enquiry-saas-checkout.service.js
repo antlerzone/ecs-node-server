@@ -1,5 +1,5 @@
 /**
- * Portal /enquiry：Coliving SaaS 平台 Stripe（Malaysia test `STRIPE_SANDBOX_SECRET_KEY`），MYR/SGD 同一路徑。
+ * Portal /enquiry：MYR → 平台 Xendit（`XENDIT_PLATFORM_*`）；SGD → Coliving SaaS Stripe（`STRIPE_*`）。
  * Billplz webhook 仍處理歷史在途單。
  */
 
@@ -117,12 +117,47 @@ async function createPlanBillplzCheckout(opts = {}) {
     return { ok: false, reason: 'INVALID_PLAN_AMOUNT' };
   }
 
-  const stripeCurrency = currency === 'SGD' ? 'sgd' : 'myr';
+  const { getPlatformXenditConfig } = require('../payex/payex.service');
+
+  if (currency === 'MYR') {
+    if (!getPlatformXenditConfig()?.secretKey) {
+      try {
+        await pool.query("DELETE FROM pricingplanlogs WHERE id = ? AND status = 'pending'", [prep.logId]);
+      } catch (_) {}
+      return { ok: false, reason: 'SAAS_XENDIT_NOT_CONFIGURED' };
+    }
+    const { createEnquiryPricingPlanXendit } = require('../billing/xendit-saas-platform.service');
+    const xRes = await createEnquiryPricingPlanXendit({
+      pricingplanlogId: prep.logId,
+      returnUrl: redirectUrl,
+      email: normalized,
+      amount: prep.amount,
+      currency: 'MYR',
+      planTitle: prep.planTitle,
+      clientId: od.id
+    });
+    if (!xRes.ok) {
+      try {
+        await pool.query("DELETE FROM pricingplanlogs WHERE id = ? AND status = 'pending'", [prep.logId]);
+      } catch (_) {}
+      return { ok: false, reason: xRes.reason || 'XENDIT_CHECKOUT_FAILED', message: xRes.message };
+    }
+    return {
+      ok: true,
+      billUrl: normalizeText(xRes.url),
+      billId: xRes.invoiceId != null ? String(xRes.invoiceId) : '',
+      pricingplanlogId: prep.logId,
+      amount: prep.amount,
+      currency: prep.currency,
+      provider: 'xendit'
+    };
+  }
+
   const { createColivingSaasPlatformCheckoutSession } = require('../stripe/stripe.service');
   try {
     const { url } = await createColivingSaasPlatformCheckoutSession({
       amountCents,
-      stripeCurrency,
+      stripeCurrency: 'sgd',
       email: normalized,
       description: `Pricing plan: ${prep.planTitle}`,
       successUrl,

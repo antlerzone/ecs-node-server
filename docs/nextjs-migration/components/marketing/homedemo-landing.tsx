@@ -11,7 +11,7 @@ import { MarketingFooter } from "@/components/marketing/footer"
 import { StatsSection } from "@/components/marketing/stats-section"
 import { WaterRippleSectionBg } from "@/components/marketing/water-ripple-section-bg"
 
-/** Section 3 phone screenshots: ECS streams from private OSS → /api/homedemo-screenshot (same-origin). */
+/** Section 3 phone screenshots: ECS streams from private OSS → /api/homedemo-screenshot (same-origin; page URL is /home). */
 function homedemoShots(...files: string[]) {
   return files.map((f) => `/api/homedemo-screenshot?file=${encodeURIComponent(f)}`)
 }

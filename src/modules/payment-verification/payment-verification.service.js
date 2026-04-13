@@ -41,6 +41,25 @@ async function emitEvent(paymentInvoiceId, eventType, payload = {}) {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+/** PayNow tenant/meter: no receipt OCR — amount/currency come from tenant; Finverse does matching. */
+function paynowReceiptOcrPlaceholder(externalType, amount, currency, reference_number) {
+  return {
+    skipped_ocr: true,
+    source: externalType || 'paynow',
+    amount: Number(amount),
+    currency: (currency || '').toString().trim().toUpperCase(),
+    reference_number: reference_number != null ? String(reference_number).trim() || null : null,
+    businessTimeZone: 'Asia/Kuala_Lumpur'
+  };
+}
+
+function shouldSkipReceiptOcrForPaynow(payload) {
+  const ext = (payload.external_type || '').toString();
+  if (ext !== 'paynow_tenant' && ext !== 'paynow_meter') return false;
+  if (payload.amount == null || Number.isNaN(Number(payload.amount))) return false;
+  return Number(payload.amount) > 0;
+}
+
 function parseReferenceIdSet(ref) {
   const s = (ref || '').toString().trim();
   if (!s) return new Set();
@@ -146,7 +165,15 @@ async function createInvoiceFromReceipt(clientId, payload) {
   const receiptUrl = payload.receipt_url;
   if (!receiptUrl) throw new Error('receipt_url required');
 
-  const ocrResult = await extractReceiptWithAi(clientId, receiptUrl);
+  const skipOcr = shouldSkipReceiptOcrForPaynow(payload);
+  const ocrResult = skipOcr
+    ? paynowReceiptOcrPlaceholder(
+        payload.external_type || 'paynow_tenant',
+        Number(payload.amount),
+        payload.currency,
+        payload.reference_number
+      )
+    : await extractReceiptWithAi(clientId, receiptUrl);
   const amount = payload.amount != null ? Number(payload.amount) : (ocrResult.amount != null ? Number(ocrResult.amount) : null);
   const currency = (payload.currency || ocrResult.currency || '').toString().trim().toUpperCase();
   if (!currency) throw new Error('CLIENT_CURRENCY_MISSING');
@@ -206,7 +233,15 @@ async function upsertPaynowTenantReceipt(clientId, payload) {
   );
   const opens = openRows || [];
 
-  const ocrResult = await extractReceiptWithAi(clientId, receiptUrl);
+  const skipOcr = shouldSkipReceiptOcrForPaynow(payload);
+  const ocrResult = skipOcr
+    ? paynowReceiptOcrPlaceholder(
+        'paynow_tenant',
+        Number(payload.amount),
+        payload.currency,
+        payload.reference_number
+      )
+    : await extractReceiptWithAi(clientId, receiptUrl);
   const amount = payload.amount != null ? Number(payload.amount) : (ocrResult.amount != null ? Number(ocrResult.amount) : null);
   const currency = (payload.currency || ocrResult.currency || '').toString().trim().toUpperCase();
   if (!currency) throw new Error('CLIENT_CURRENCY_MISSING');

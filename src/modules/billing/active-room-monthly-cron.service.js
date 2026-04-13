@@ -1,7 +1,10 @@
 /**
  * Monthly active-room credit deduction (cron).
  * Run on the 1st of each month (e.g. from POST /api/cron/daily when date is 1st).
- * Deducts 10 credits per room per client. 只要在 Room Setting 里有房间就按间数计费，不管是否启用(active)。
+ * Deducts 10 credits per billable room per client. Billable = roomdetail.active = 1,
+ * OR room has at least one tenancy whose calendar range covers today (MY date), regardless of room.active.
+ * Tenancy row: do NOT filter by tenancy.active or tenancy.status — inactive/frozen lease (active=0)
+ * still counts if DATE(begin)–DATE(end) covers the cron day.
  */
 
 const pool = require('../../config/db');
@@ -12,7 +15,8 @@ const CREDITS_PER_ACTIVE_ROOM = 10;
 
 /**
  * Run monthly room deduction for all clients that have rooms in room setting.
- * Counts all roomdetail rows per client (ignores active flag). Idempotent: skips client if creditlogs already has "Active room monthly (YYYY-MM)" for this month.
+ * Counts roomdetail rows per client that are billable (active=1 OR current-date tenancy on that room).
+ * Idempotent: skips client if creditlogs already has "Active room monthly (YYYY-MM)" for this month.
  * @returns {{ deducted: Array<{ clientId, activeRoomCount, amount }>, skipped: Array<{ clientId, reason }>, errors: Array<{ clientId, message }> }}
  */
 async function runMonthlyActiveRoomDeduction() {
@@ -45,25 +49,47 @@ async function runMonthlyActiveRoomDeduction() {
     }
 
     const [roomRows] = await pool.query(
-      'SELECT roomname, title_fld FROM roomdetail WHERE client_id = ? ORDER BY COALESCE(roomname, title_fld) ASC',
-      [clientId]
+      `SELECT
+         COALESCE(NULLIF(TRIM(p.shortname), ''), NULLIF(TRIM(p.apartmentname), ''), '—') AS property_label,
+         COALESCE(NULLIF(TRIM(p.unitnumber), ''), '—') AS unit_number,
+         COALESCE(NULLIF(TRIM(r.roomname), ''), NULLIF(TRIM(r.title_fld), ''), 'Room') AS room_name
+       FROM roomdetail r
+       LEFT JOIN propertydetail p ON p.id = r.property_id
+       WHERE r.client_id = ?
+         AND (
+           r.active = 1
+           OR EXISTS (
+             SELECT 1 FROM tenancy t
+             WHERE t.room_id = r.id
+               AND (t.client_id = r.client_id OR t.client_id IS NULL)
+               AND t.begin IS NOT NULL AND t.\`end\` IS NOT NULL
+               AND DATE(t.begin) <= ? AND DATE(t.\`end\`) >= ?
+               /* intentional: no t.active / t.status — bill even when tenancy.active=0 */
+           )
+         )
+       ORDER BY property_label, unit_number, room_name`,
+      [clientId, today, today]
     );
     const activeRoomCount = (roomRows || []).length;
     if (activeRoomCount <= 0) {
-      skipped.push({ clientId, reason: 'no_rooms' });
+      skipped.push({ clientId, reason: 'no_billable_rooms' });
       continue;
     }
 
     const amount = CREDITS_PER_ACTIVE_ROOM * activeRoomCount;
-    const roomDisplayNames = (roomRows || []).map((r) => (r.roomname && String(r.roomname).trim()) || (r.title_fld && String(r.title_fld).trim()) || 'Room');
+    const roomLines = (roomRows || []).map((r) => ({
+      property: r.property_label || '—',
+      unitNumber: r.unit_number || '—',
+      roomName: r.room_name || 'Room'
+    }));
     const description = [
       `room quantity total: ${activeRoomCount}`,
-      ...roomDisplayNames.map((name) => `${name} x1`),
+      ...roomLines.map((l) => `${l.roomName} @ ${l.property} (${l.unitNumber}) x1`),
       `total credit deduct: ${amount}`
     ].join('\n');
 
     try {
-      await deductMonthlyActiveRoomCredit({ clientId, activeRoomCount, yearMonth, description });
+      await deductMonthlyActiveRoomCredit({ clientId, activeRoomCount, yearMonth, description, roomLines });
       deducted.push({ clientId, activeRoomCount, amount });
     } catch (err) {
       errors.push({ clientId, message: err?.message || String(err) });

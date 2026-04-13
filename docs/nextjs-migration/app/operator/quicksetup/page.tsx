@@ -73,6 +73,8 @@ interface MeterDraft {
 
 interface QuicksetupDraft {
   stepIndex: number
+  /** Single room rows vs one entire-unit listing (no “add another room”). */
+  roomsListingType: "room" | "entire_unit"
   /** When selecting existing building: "apartmentName||country". When new: "__new__". */
   selectedPropertyId: string
   unitNumberForSelected: string
@@ -94,7 +96,7 @@ interface QuicksetupDraft {
 
 const STEPS: { id: StepId; label: string; icon: typeof Building2; canSkip: boolean }[] = [
   { id: "property", label: "Property", icon: Building2, canSkip: false },
-  { id: "room", label: "Room (min 1)", icon: DoorOpen, canSkip: false },
+  { id: "room", label: "Room / unit", icon: DoorOpen, canSkip: false },
   { id: "smartdoor", label: "Smart Door", icon: Lock, canSkip: true },
   { id: "meter", label: "Meter", icon: Zap, canSkip: true },
   { id: "owner", label: "Bind Owner", icon: UserPlus, canSkip: true },
@@ -103,6 +105,7 @@ const STEPS: { id: StepId; label: string; icon: typeof Building2; canSkip: boole
 
 const defaultDraft: QuicksetupDraft = {
   stepIndex: 0,
+  roomsListingType: "room",
   selectedPropertyId: "",
   unitNumberForSelected: "",
   newProperty: { apartmentName: "", unitNumber: "", address: "", country: "MY" },
@@ -125,6 +128,8 @@ function loadDraft(): QuicksetupDraft | null {
     return {
       ...defaultDraft,
       ...parsed,
+      roomsListingType:
+        parsed.roomsListingType === "entire_unit" ? "entire_unit" : "room",
       unitNumberForSelected: parsed.unitNumberForSelected ?? defaultDraft.unitNumberForSelected,
       newProperty: { ...defaultDraft.newProperty, ...parsed.newProperty },
       ownerSettlementModel:
@@ -402,9 +407,11 @@ export default function QuickSetupPage() {
         propertyIdForRollback = propertyId
       }
 
+      const listingScope = draft.roomsListingType === "entire_unit" ? "entire_unit" : "room"
       const roomRecords = draft.rooms.map((r) => ({
         roomName: r.roomName.trim(),
         property: propertyId,
+        listingScope,
       }))
       const roomRes = await insertRoom(roomRecords)
       const roomIds = (roomRes as { ids?: string[] })?.ids ?? []
@@ -985,26 +992,59 @@ export default function QuickSetupPage() {
             {/* Step: Room */}
             {currentStepId === "room" && (
               <div className="space-y-4">
-                <p className="text-sm text-muted-foreground">Add at least one room. Include rental and photos.</p>
+                <p className="text-sm text-muted-foreground">
+                  Choose whether you are listing a single room or the entire unit, then add details and photos.
+                </p>
+                <div>
+                  <Label>Listing type *</Label>
+                  <select
+                    className="mt-1 w-full rounded-lg border border-border bg-background px-3 py-2 text-sm"
+                    value={draft.roomsListingType}
+                    onChange={(e) => {
+                      const v = e.target.value === "entire_unit" ? "entire_unit" : "room"
+                      persistDraft((prev) => ({
+                        ...prev,
+                        roomsListingType: v,
+                        rooms: v === "entire_unit" ? prev.rooms.slice(0, 1) : prev.rooms.length ? prev.rooms : defaultDraft.rooms,
+                      }))
+                    }}
+                  >
+                    <option value="room">Room (you can add more than one)</option>
+                    <option value="entire_unit">Entire unit / property (one listing only)</option>
+                  </select>
+                  <Hint>Entire unit is a single listing for the whole space; rooms let you add multiple units.</Hint>
+                </div>
                 {draft.rooms.map((room, index) => (
                   <div key={index} className="p-4 rounded-lg border border-border space-y-3">
                     <div className="flex items-center justify-between">
-                      <span className="font-medium text-sm">Room {index + 1}</span>
-                      {draft.rooms.length > 1 && (
+                      <span className="font-medium text-sm">
+                        {draft.roomsListingType === "entire_unit" ? "Listing" : `Room ${index + 1}`}
+                      </span>
+                      {draft.roomsListingType === "room" && draft.rooms.length > 1 && (
                         <Button type="button" variant="ghost" size="sm" onClick={() => removeRoom(index)} className="text-destructive">
                           Remove
                         </Button>
                       )}
                     </div>
                     <div>
-                      <Label>Room name *</Label>
+                      <Label>
+                        {draft.roomsListingType === "entire_unit" ? "Property / unit name *" : "Room name *"}
+                      </Label>
                       <Input
                         value={room.roomName}
                         onChange={(e) => updateRoomAt(index, "roomName", e.target.value)}
-                        placeholder="e.g. Room A, Bedroom 1"
+                        placeholder={
+                          draft.roomsListingType === "entire_unit"
+                            ? "e.g. Whole unit at Marina View"
+                            : "e.g. Room A, Bedroom 1"
+                        }
                         className="mt-1"
                       />
-                      <Hint>Display name for this room (required).</Hint>
+                      <Hint>
+                        {draft.roomsListingType === "entire_unit"
+                          ? "Display name for this entire-unit listing (required)."
+                          : "Display name for this room (required)."}
+                      </Hint>
                     </div>
                     <div>
                       <Label>Rental (RM/month)</Label>
@@ -1125,9 +1165,11 @@ export default function QuickSetupPage() {
                     </div>
                   </div>
                 ))}
-                <Button type="button" variant="outline" onClick={addRoom} className="w-full">
-                  + Add another room
-                </Button>
+                {draft.roomsListingType === "room" && (
+                  <Button type="button" variant="outline" onClick={addRoom} className="w-full">
+                    + Add another room
+                  </Button>
+                )}
               </div>
             )}
 
@@ -1324,7 +1366,9 @@ export default function QuickSetupPage() {
                   <div className="p-3 flex items-start gap-2">
                     <DoorOpen size={18} className="text-muted-foreground flex-shrink-0 mt-0.5" />
                     <div className="flex-1 min-w-0">
-                      <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Rooms</p>
+                      <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                        {draft.roomsListingType === "entire_unit" ? "Listing (entire unit)" : "Rooms"}
+                      </p>
                       <ul className="text-sm mt-1 space-y-1">
                         {draft.rooms.map((r, i) => (
                           <li key={i} className="flex flex-wrap items-center gap-x-2 gap-y-0.5">

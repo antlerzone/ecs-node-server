@@ -7,8 +7,8 @@ import { motion, AnimatePresence } from "framer-motion"
 
 /** Center nav — plain text links only (no current-route highlight). */
 const mainNavLinks = [
-  { label: "Home", href: "/homedemo" },
-  { label: "Platform", href: "/homedemo#platform-steps" },
+  { label: "Home", href: "/home" },
+  { label: "Platform", href: "/home#platform-steps" },
   { label: "Pricing", href: "/pricing" },
   { label: "Operators", href: "/proposal" },
   { label: "For Owners", href: "/for-owners" },

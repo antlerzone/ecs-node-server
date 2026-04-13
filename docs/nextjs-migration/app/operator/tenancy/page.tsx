@@ -139,6 +139,12 @@ interface Tenancy {
   checkOut: string
   rent: number
   deposit: number
+  /** Raw tenancy.deposit — 导入可能为空 */
+  depositFromTenancy?: number
+  /** 押金科目 rentalcollection 已付合计 — 与合同列比对 */
+  paidDepositFromRentalCollection?: number
+  /** null: 租约表无数可比（通常仅 RC）；true/false: 与 RC 是否一致 */
+  depositInSync?: boolean | null
   status: string
   agreements?: AgreementItem[]
   propertyId?: string
@@ -1014,6 +1020,15 @@ export default function TenancySettingPage() {
           checkOut: tenancyDbDateToMalaysiaYmd(t.end),
           rent: Number(t.rental ?? 0),
           deposit: Number(t.deposit ?? 0),
+          depositFromTenancy:
+            (t as { depositFromTenancy?: unknown }).depositFromTenancy != null
+              ? Number((t as { depositFromTenancy?: unknown }).depositFromTenancy)
+              : undefined,
+          paidDepositFromRentalCollection:
+            (t as { paidDepositFromRentalCollection?: unknown }).paidDepositFromRentalCollection != null
+              ? Number((t as { paidDepositFromRentalCollection?: unknown }).paidDepositFromRentalCollection)
+              : undefined,
+          depositInSync: (t as { depositInSync?: boolean | null }).depositInSync,
           status: statusLabel,
           tenantRejected: rejected,
           reviewed: Boolean(t.reviewed),
@@ -4063,6 +4078,13 @@ export default function TenancySettingPage() {
               <div>
                 <p className="text-xs text-muted-foreground">Deposit Held</p>
                 <p className="font-semibold">{currencySymbol} {selectedTenancy?.deposit?.toLocaleString()}</p>
+                {selectedTenancy?.depositInSync === false ? (
+                  <p className="text-xs text-amber-800 dark:text-amber-200 mt-1.5 leading-snug">
+                    租约表与已付押金账单不一致：合同列 {currencySymbol}{" "}
+                    {(selectedTenancy.depositFromTenancy ?? 0).toLocaleString()} · 已付账单合计 {currencySymbol}{" "}
+                    {(selectedTenancy.paidDepositFromRentalCollection ?? 0).toLocaleString()}
+                  </p>
+                ) : null}
               </div>
             </div>
             <div className="border-t border-border pt-4 space-y-3">

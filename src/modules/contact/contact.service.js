@@ -641,6 +641,97 @@ async function updatePortalPhoneForClientContact(operatorEmail, { contactEmail, 
 }
 
 /**
+ * Operator Contact: persist NRIC + ID type on tenantdetail / ownerdetail / staffdetail.profile and portal_account
+ * so values match tenant/owner Portal profile (same keys as updatePortalProfile: nric, id_type, reg_no_type in profile JSON).
+ */
+async function syncOperatorContactIdentity(
+  operatorEmail,
+  { contactEmail, idType, idNumber },
+  overrideClientId
+) {
+  const clientId = await resolveClientId(operatorEmail, overrideClientId);
+  if (!clientId) return { ok: false, reason: 'NO_CLIENT_ID' };
+  const e = String(contactEmail || '').trim().toLowerCase();
+  if (!e) return { ok: false, reason: 'NO_EMAIL' };
+  const allowed = await isContactEmailForClient(clientId, e);
+  if (!allowed) return { ok: false, reason: 'EMAIL_NOT_A_CONTACT' };
+
+  const idt = String(idType != null && String(idType).trim() ? idType : 'NRIC').trim();
+  const nricVal = idNumber != null && String(idNumber).trim() !== '' ? String(idNumber).trim() : null;
+  const rnt = idt;
+
+  try {
+    const [trows] = await pool.query('SELECT id, profile FROM tenantdetail WHERE LOWER(TRIM(email)) = ?', [e]);
+    for (const row of trows || []) {
+      const ex = parseJson(row.profile) || {};
+      const next = { ...ex, id_type: idt, reg_no_type: rnt };
+      await pool.query('UPDATE tenantdetail SET nric = ?, profile = ?, updated_at = NOW() WHERE id = ?', [
+        nricVal,
+        JSON.stringify(next),
+        row.id
+      ]);
+    }
+  } catch (err) {
+    if (!(err?.code === 'ER_BAD_FIELD_ERROR' || err?.errno === 1054)) {
+      console.warn('[contact] syncOperatorContactIdentity tenantdetail', err?.message || err);
+    }
+  }
+
+  try {
+    const [orows] = await pool.query('SELECT id, profile FROM ownerdetail WHERE LOWER(TRIM(email)) = ?', [e]);
+    for (const row of orows || []) {
+      const ex = parseJson(row.profile) || {};
+      const next = { ...ex, id_type: idt, reg_no_type: rnt };
+      await pool.query('UPDATE ownerdetail SET nric = ?, profile = ?, updated_at = NOW() WHERE id = ?', [
+        nricVal,
+        JSON.stringify(next),
+        row.id
+      ]);
+    }
+  } catch (err) {
+    if (!(err?.code === 'ER_BAD_FIELD_ERROR' || err?.errno === 1054)) {
+      console.warn('[contact] syncOperatorContactIdentity ownerdetail', err?.message || err);
+    }
+  }
+
+  try {
+    const [srows] = await pool.query('SELECT id, profile FROM staffdetail WHERE LOWER(TRIM(email)) = ?', [e]);
+    for (const row of srows || []) {
+      const ex = parseJson(row.profile) || {};
+      const next = { ...ex, id_type: idt, reg_no_type: rnt };
+      await pool.query('UPDATE staffdetail SET profile = ?, updated_at = NOW() WHERE id = ?', [
+        JSON.stringify(next),
+        row.id
+      ]);
+    }
+  } catch (err) {
+    if (!(err?.code === 'ER_BAD_FIELD_ERROR' || err?.errno === 1054)) {
+      console.warn('[contact] syncOperatorContactIdentity staffdetail', err?.message || err);
+    }
+  }
+
+  try {
+    const [pa] = await pool.query('SELECT id FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1', [e]);
+    if (pa.length) {
+      await pool.query(
+        'UPDATE portal_account SET nric = ?, id_type = ?, reg_no_type = ?, updated_at = NOW() WHERE LOWER(TRIM(email)) = ?',
+        [nricVal, idt, rnt, e]
+      );
+    }
+  } catch (err) {
+    console.warn('[contact] syncOperatorContactIdentity portal_account', err?.message || err);
+  }
+
+  try {
+    await syncAccountingContactsForProfileEmail(e);
+  } catch (err) {
+    console.warn('[contact] syncOperatorContactIdentity accounting', err?.message || err);
+  }
+
+  return { ok: true };
+}
+
+/**
  * Portal profile saved fullname/email: update accounting for each operator link that already has a contact id.
  */
 async function syncAccountingContactsForProfileEmail(normalizedEmail) {
@@ -1796,11 +1887,13 @@ async function listRemoteContacts(clientId, provider) {
   if (provider === 'bukku') {
     const list = [];
     const seenIds = new Set();
-    const perPage = 30;
+    // Bukku list API expects `page_size` (see list_contact_schema), not `per_page`; wrong param → every
+    // request returns page 1, seenIds dedupes all rows → addedThisPage===0 → loop stops after 2 iterations.
+    const perPage = 100;
     const maxPages = 100;
     let page = 1;
     while (page <= maxPages) {
-      const res = await bukkuContactWrapper.list(req, { page, per_page: perPage });
+      const res = await bukkuContactWrapper.list(req, { page, page_size: perPage });
       if (!res.ok) {
         return { ok: false, reason: formatIntegrationApiError(res.error) || 'BUKKU_LIST_FAILED', items: [] };
       }
@@ -1815,11 +1908,9 @@ async function listRemoteContacts(clientId, provider) {
         addedThisPage += 1;
       }
 
-      const p = raw?.pagination || raw?.meta?.pagination || null;
-      const totalPages = Number(p?.total_pages || p?.last_page || 0);
-      const currentPage = Number(p?.current_page || page);
-      if (Number.isFinite(totalPages) && totalPages > 0 && currentPage >= totalPages) break;
+      // Do not trust total_pages alone — Bukku may under-report; stop on short/empty page only.
       if (!pageList.length) break;
+      if (pageList.length < perPage) break;
       if (addedThisPage === 0) break;
       page += 1;
     }
@@ -1954,7 +2045,19 @@ async function syncContactsToAccounting(clientId, provider) {
     counters.scanned += 1;
     const existingId = getExistingId();
     const beforeId = existingId ? String(existingId) : '';
-    const syncRes = await contactSync.ensureContactInAccounting(clientId, provider, kind, row, existingId);
+    /** Existing accounting contact id: keep remote legal/name on update (PUT collisions with portal display name). */
+    const ensureOpts =
+      beforeId && ['owner', 'tenant', 'supplier', 'staff'].includes(kind)
+        ? { preserveLegalName: true }
+        : {};
+    const syncRes = await contactSync.ensureContactInAccounting(
+      clientId,
+      provider,
+      kind,
+      row,
+      existingId,
+      ensureOpts
+    );
     if (!syncRes.ok || !syncRes.contactId) {
       const reason = String(syncRes.reason || 'SYNC_FAILED').slice(0, 500);
       if (isSqlDatasetNotEditable(reason)) {
@@ -2207,6 +2310,7 @@ module.exports = {
   updateTenantAccount,
   updateStaffAccount,
   updatePortalPhoneForClientContact,
+  syncOperatorContactIdentity,
   deleteOwnerOrCancel,
   deleteTenantOrCancel,
   deleteSupplierAccount,

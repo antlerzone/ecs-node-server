@@ -6,5 +6,5 @@ export default async function HomedemoSlugRedirect({
   params: Promise<{ slug: string }>
 }) {
   await params
-  redirect("/homedemo")
+  redirect("/home")
 }

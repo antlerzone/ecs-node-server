@@ -11,23 +11,19 @@ export function PortalSiteHeader({ className = "" }: { className?: string }) {
     <div className={`flex items-center gap-6 ${className}`}>
       <Link
         href={HOME_URL}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="flex flex-col leading-tight hover:opacity-90 transition-opacity"
+        className="flex flex-col leading-tight transition-opacity hover:opacity-90"
         aria-label="Coliving Management – Home"
       >
         <span className="text-lg font-bold tracking-widest text-primary uppercase">Coliving</span>
         <span className="text-[10px] tracking-[0.3em] text-muted-foreground uppercase">Management</span>
       </Link>
       <nav className="flex items-center gap-6">
-        <a
+        <Link
           href={HOME_URL}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-xs font-semibold tracking-widest uppercase text-muted-foreground hover:text-primary transition-colors"
+          className="text-xs font-semibold uppercase tracking-widest text-muted-foreground transition-colors hover:text-primary"
         >
           Home
-        </a>
+        </Link>
         <a
           href={PORTAL_LOGIN_URL}
           target="_blank"

@@ -986,7 +986,10 @@ function EnquiryPageInner() {
                                   disabled={
                                     isLoading || !selectedPlanId || !contactDigitsOk(operatorMeta?.contact)
                                   }
-                                  onClick={() => setPlanFeeDialogOpen(true)}
+                                  onClick={() => {
+                                    if (operatorCurrency === "MYR") void startBillplz()
+                                    else setPlanFeeDialogOpen(true)
+                                  }}
                                 >
                                   {isLoading ? <Spinner size="sm" /> : null}
                                   {operatorCurrency === "MYR"

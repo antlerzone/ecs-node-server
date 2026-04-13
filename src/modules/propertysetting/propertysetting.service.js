@@ -978,6 +978,14 @@ async function getPropertySupplierExtra(clientId, propertyId) {
  * items: [{ supplier_id, value, slot? }]. slot: electric|water|wifi|management|extra.
  * Updates propertydetail: electric, water from slots; wifi slot → wifi_id + internettype_id only (not wifidetail); management → management_id.
  */
+/** `propertydetail.electric` is DECIMAL — MySQL rejects '' in strict mode; empty UI → NULL. */
+function normalizeElectricDecimalForDb(raw) {
+  const s = raw != null ? String(raw).trim() : '';
+  if (s === '') return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+
 async function savePropertySupplierExtra(clientId, propertyId, items) {
   if (!propertyId) throw new Error('NO_PROPERTY_ID');
   const [prop] = await pool.query('SELECT id FROM propertydetail WHERE id = ? AND client_id = ?', [propertyId, clientId]);
@@ -988,7 +996,7 @@ async function savePropertySupplierExtra(clientId, propertyId, items) {
     const slot = (row.slot || 'extra').toLowerCase();
     const supplierId = row.supplier_id || row.supplierId;
     const value = row.value != null ? String(row.value).trim() : '';
-    if (slot === 'electric') updates.electric = value;
+    if (slot === 'electric') updates.electric = normalizeElectricDecimalForDb(value);
     else if (slot === 'water') updates.water = value;
     else if (slot === 'wifi') {
       updates.wifi_id = value;

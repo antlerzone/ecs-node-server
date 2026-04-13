@@ -37,7 +37,7 @@ const defaultTheme: HeroTheme = {
 
 interface CampaignHeroProps {
   theme?: Partial<HeroTheme>
-  /** 100dvh hero for full-viewport scroll-snap (e.g. /homedemo) */
+  /** 100dvh hero for full-viewport scroll-snap (e.g. /home) */
   fullViewport?: boolean
   /** When set with `fullViewport`, min-height is this many vh (e.g. 300 for 3×100vh blocks). */
   fullViewportMinVh?: number

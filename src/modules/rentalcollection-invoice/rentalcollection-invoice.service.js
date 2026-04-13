@@ -65,6 +65,18 @@ const PAYMENT_TYPE_TITLES = {
   platform_collection: ['Platform Collection', 'platform collection']
 };
 
+/**
+ * Bukku POST /sales/payments `link_items.target_transaction_id` must be the numeric sales invoice id.
+ * Prefer `bukku_invoice_id`; Wix `invoiceid` is often `IV-xxxxx` and must not be passed to Number().
+ */
+function resolveBukkuSalesTargetTransactionId(row) {
+  const b = row.bukku_invoice_id != null && String(row.bukku_invoice_id).trim() !== '' ? String(row.bukku_invoice_id).trim() : '';
+  if (b && /^\d+$/.test(b)) return Number(b);
+  const inv = row.invoiceid != null && String(row.invoiceid).trim() !== '' ? String(row.invoiceid).trim() : '';
+  if (inv && /^\d+$/.test(inv)) return Number(inv);
+  return null;
+}
+
 /** Accounting APIs often return error bodies as objects (e.g. Bukku axios err.response.data). */
 function formatProviderError(err) {
   if (err == null) return '';
@@ -1677,16 +1689,17 @@ async function voidOrDeleteInvoicesForRentalCollectionIds(clientId, rentalCollec
  * - Tenant Invoice page offline payment (source = 'manual', method = 'Cash' | 'Bank')
  * One receipt per row that has invoiceid.
  * @param {string[]} rentalcollectionIds - IDs that were just marked paid
- * @param {{ source?: 'stripe' | 'manual', method?: string, payFromDeposit?: boolean, paymentDateMalaysia?: string }} [opts] - payFromDeposit: true for forfeit (pay from Deposit liability); paymentDateMalaysia: YYYY-MM-DD for Xero/Bukku payment date when set
- * @returns {Promise<{ ok: boolean, created?: number, errors?: string[] }>}
+ * @param {{ source?: 'stripe' | 'manual', method?: string, payFromDeposit?: boolean, paymentDateMalaysia?: string }} [opts] - payFromDeposit: true for forfeit (pay from Deposit liability); paymentDateMalaysia: optional YYYY-MM-DD override (Malaysia calendar) for receipt date; otherwise `paidat` from DB is converted with {@link utcDatetimeFromDbToMalaysiaDateOnly} (same business day as Portal `malaysiaNoonIsoFromYmd`).
+ * @returns {Promise<{ ok: boolean, created?: number, errors?: string[], receipts?: Array<{ rentalcollectionId: string, provider: string, paymentDateMalaysia: string, receipturl?: string|null, bukku_payment_id?: string|null, accounting_receipt_document_number?: string|null }> }>}
  */
 async function createReceiptForPaidRentalCollection(rentalcollectionIds, opts) {
   if (!Array.isArray(rentalcollectionIds) || rentalcollectionIds.length === 0) {
     return { ok: true, created: 0 };
   }
   const placeholders = rentalcollectionIds.map(() => '?').join(',');
+  const receiptDetails = [];
   const [rows] = await pool.query(
-    `SELECT id, client_id,
+    `SELECT id, client_id, invoiceid, bukku_invoice_id,
             COALESCE(
               NULLIF(TRIM(COALESCE(invoiceid, '')), ''),
               NULLIF(TRIM(COALESCE(bukku_invoice_id, '')), '')
@@ -1863,13 +1876,20 @@ async function createReceiptForPaidRentalCollection(rentalcollectionIds, opts) {
             errors.push(`Rental ${row.id}: contact ${contactRes.reason}`);
             continue;
           }
+          const targetTxId = resolveBukkuSalesTargetTransactionId(row);
+          if (targetTxId == null || !Number.isFinite(targetTxId) || targetTxId <= 0) {
+            errors.push(
+              `Rental ${row.id}: Bukku receipt needs numeric sales invoice id (set bukku_invoice_id from Bukku; invoiceid IV-xxxxx cannot be used as API id)`
+            );
+            continue;
+          }
           const payload = {
             contact_id: Number(contactRes.contactId),
             date: dateStr,
             currency_code: bukkuCurrencyCode,
             exchange_rate: 1,
             amount,
-            link_items: [{ target_transaction_id: Number(row.accounting_invoice_id), apply_amount: amount }],
+            link_items: [{ target_transaction_id: targetTxId, apply_amount: amount }],
             deposit_items: [{ account_id: Number(bankAccountId), amount }],
             status: 'ready'
           };
@@ -1897,6 +1917,14 @@ async function createReceiptForPaidRentalCollection(rentalcollectionIds, opts) {
           } catch (wErr) {
             console.warn('[createReceiptForPaidRentalCollection] write bukku receipt snapshot failed', row.id, wErr?.message || wErr);
           }
+          receiptDetails.push({
+            rentalcollectionId: row.id,
+            provider: 'bukku',
+            paymentDateMalaysia: dateStr,
+            receipturl: receiptUrl,
+            bukku_payment_id: paymentId,
+            accounting_receipt_document_number: receiptNumber
+          });
           created++;
           continue;
         }
@@ -2094,7 +2122,12 @@ async function createReceiptForPaidRentalCollection(rentalcollectionIds, opts) {
     console.warn('[createReceiptForPaidRentalCollection] tenancy restore check failed', e?.message || e);
   }
 
-  return { ok: true, created, errors: errors.length ? errors : undefined };
+  return {
+    ok: true,
+    created,
+    errors: errors.length ? errors : undefined,
+    receipts: receiptDetails.length ? receiptDetails : undefined
+  };
 }
 
 /**

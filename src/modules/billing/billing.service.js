@@ -14,6 +14,7 @@ const {
 const { isRetiredPricingPlanAddon } = require('../../utils/pricingPlanAddonCatalog');
 const { getAccessContextByEmail, getAccessContextByEmailAndClient } = require('../access/access.service');
 const { ensureMasterAdminUserForClient } = require('./indoor-admin.service');
+const { buildCreditLogDeductionReportPdf, getMonthlyRoomLinesBundleForRow } = require('./credit-log-deduction-report.service');
 
 let clientBillingCache = {};
 let creditLogCache = {};
@@ -1994,6 +1995,79 @@ async function movePropertyToOperator({ propertyId, toOperatorId }) {
   };
 }
 
+/**
+ * Operator portal: one creditlogs spending row as PDF (no invoice). Verifies client access.
+ * @param {string} email
+ * @param {string} creditLogId creditlogs.id (UUID)
+ * @param {string|null|undefined} optsClientId from portal body when staff switches company
+ * @returns {Promise<Buffer>}
+ */
+async function getCreditLogDeductionReportPdfForOperator(email, creditLogId, optsClientId) {
+  const ctx = optsClientId
+    ? await getAccessContextByEmailAndClient(email, optsClientId)
+    : await getAccessContextByEmail(email);
+  if (!ctx.ok) {
+    const e = new Error(ctx.reason || 'ACCESS_DENIED');
+    e.status = 403;
+    throw e;
+  }
+  const clientId = ctx.client?.id != null ? String(ctx.client.id) : null;
+  if (!clientId) {
+    const e = new Error('NO_CLIENT_ID');
+    e.status = 403;
+    throw e;
+  }
+  const id = String(creditLogId || '').trim();
+  if (!id) {
+    const e = new Error('MISSING_CREDIT_LOG_ID');
+    e.status = 400;
+    throw e;
+  }
+
+  let rows;
+  try {
+    const [r] = await pool.query(
+      `SELECT id, client_id, type, title, amount, reference_number, remark, payload, created_at, currency
+       FROM creditlogs WHERE id = ? AND client_id = ? LIMIT 1`,
+      [id, clientId]
+    );
+    rows = r;
+  } catch (err) {
+    const msg = err && err.message ? String(err.message) : '';
+    if (msg.includes('Unknown column') && msg.includes('remark')) {
+      const [r] = await pool.query(
+        `SELECT id, client_id, type, title, amount, reference_number, payload, created_at, currency
+         FROM creditlogs WHERE id = ? AND client_id = ? LIMIT 1`,
+        [id, clientId]
+      );
+      rows = r;
+    } else {
+      throw err;
+    }
+  }
+  if (!rows || !rows.length) {
+    const e = new Error('NOT_FOUND');
+    e.status = 404;
+    throw e;
+  }
+  const row = rows[0];
+  const amt = Number(row.amount);
+  if (!(amt < 0)) {
+    const e = new Error('NOT_A_DEDUCTION');
+    e.status = 400;
+    throw e;
+  }
+
+  const companyTitle = safeTrim(ctx.client?.title) || safeTrim(ctx.client?.name) || 'Operator';
+  const bundle = await getMonthlyRoomLinesBundleForRow(row);
+  return buildCreditLogDeductionReportPdf({
+    ...row,
+    companyTitle,
+    pdfLines: bundle?.lines ?? null,
+    pdfCreditPerRoom: bundle?.creditPerRoom
+  });
+}
+
 module.exports = {
   getMyBillingInfo,
   getCreditStatements,
@@ -2025,5 +2099,6 @@ module.exports = {
   getOwnerEnquiries,
   acknowledgeSaasEnquiry,
   acknowledgeOwnerEnquiry,
-  deleteOwnerEnquiry
+  deleteOwnerEnquiry,
+  getCreditLogDeductionReportPdfForOperator
 };

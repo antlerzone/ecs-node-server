@@ -24,7 +24,11 @@ router.post('/list', async (req, res, next) => {
       page: req.body?.page,
       pageSize: req.body?.pageSize,
       keyword: req.body?.keyword,
-      country: req.body?.country
+      country: req.body?.country,
+      priceMin: req.body?.priceMin,
+      priceMax: req.body?.priceMax,
+      listingScope: req.body?.listingScope,
+      priceCompareCurrency: req.body?.priceCompareCurrency
     };
     const result = await getData(subdomain || null, opts);
     console.log('[availableunit] getData result', { ok: result.ok, itemsCount: result.items?.length, total: result.total });

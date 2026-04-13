@@ -1,6 +1,6 @@
 /**
  * Checkout – migrated from Wix backend/billing/checkout.jsw.
- * Operator pricing plan pay-in: Coliving SaaS platform Stripe (Malaysia test `STRIPE_SANDBOX_SECRET_KEY`), MYR or SGD from operatordetail.
+ * Operator pricing plan pay-in: MYR → Xendit platform; SGD → Coliving SaaS Stripe (operatordetail.currency).
  */
 
 const pool = require('../../config/db');
@@ -186,7 +186,8 @@ async function previewPricingPlan(email, { planId, clientId: optsClientId }) {
 }
 
 /**
- * Confirm pricing plan: insert pricingplanlogs (pending), then Stripe Checkout (Malaysia platform; sandbox vs live: COLIVING_SAAS_STRIPE_* env).
+ * Confirm pricing plan: insert pricingplanlogs (pending), then
+ * MYR → platform Xendit Invoice (`XENDIT_PLATFORM_*`), SGD → Coliving SaaS Stripe (`STRIPE_*`, COLIVING_SAAS_STRIPE_*).
  */
 async function confirmPricingPlan(email, { planId, returnUrl, clientId: optsClientId }) {
   const access = optsClientId
@@ -277,12 +278,42 @@ async function confirmPricingPlan(email, { planId, returnUrl, clientId: optsClie
     ]
   );
 
+  const { getPlatformXenditConfig } = require('../payex/payex.service');
+
+  if (currency === 'MYR') {
+    if (!getPlatformXenditConfig()?.secretKey) {
+      try {
+        await pool.query("DELETE FROM pricingplanlogs WHERE id = ? AND status = 'pending'", [logId]);
+      } catch (delErr) {
+        console.warn('[checkout] confirmPricingPlan MYR cleanup failed', logId, delErr?.message);
+      }
+      throw new Error('SAAS_XENDIT_NOT_CONFIGURED');
+    }
+    const { createOperatorPricingPlanXendit } = require('./xendit-saas-platform.service');
+    const xRes = await createOperatorPricingPlanXendit({
+      pricingplanlogId: logId,
+      returnUrl: returnUrlWithFinalize,
+      email: access.staff?.email || '',
+      amount,
+      currency: 'MYR',
+      planTitle: pricingplan.title
+    });
+    if (!xRes.ok) {
+      try {
+        await pool.query("DELETE FROM pricingplanlogs WHERE id = ? AND status = 'pending'", [logId]);
+      } catch (delErr) {
+        console.warn('[checkout] confirmPricingPlan Xendit cleanup failed', logId, delErr?.message);
+      }
+      throw new Error(xRes.reason || xRes.message || 'XENDIT_CHECKOUT_FAILED');
+    }
+    return { provider: 'xendit', url: xRes.url, referenceNumber, pricingplanlogId: logId };
+  }
+
   const { createColivingSaasPlatformCheckoutSession } = require('../stripe/stripe.service');
-  const stripeCurrency = currency === 'SGD' ? 'sgd' : 'myr';
   try {
     const { url } = await createColivingSaasPlatformCheckoutSession({
       amountCents: amountCents,
-      stripeCurrency,
+      stripeCurrency: 'sgd',
       email: access.staff?.email || '',
       description: `Pricing plan: ${pricingplan.title}`,
       successUrl,

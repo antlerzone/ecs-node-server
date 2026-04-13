@@ -79,7 +79,7 @@ function useOperatorClientId(): string | null {
   const { accessCtx } = useOperatorContext()
   return (accessCtx?.client as { id?: string } | undefined)?.id ?? null
 }
-import { wixImageToStatic } from "@/lib/utils"
+import { wixImageToStatic, cn } from "@/lib/utils"
 
 function getXeroRedirectUri(): string {
   if (typeof window === "undefined") return ""
@@ -364,6 +364,9 @@ export default function CompanySettingPage() {
       fixedAmount: "",
     }))
   )
+
+  /** Set `NEXT_PUBLIC_SHOW_OPERATOR_AI_AGENT=1` at build time to show the AI Agent card (default: hidden). */
+  const showOperatorAiAgent = process.env.NEXT_PUBLIC_SHOW_OPERATOR_AI_AGENT === "1"
 
   const loadData = useCallback(async () => {
     setLoading(true)
@@ -756,7 +759,7 @@ export default function CompanySettingPage() {
 
   // When opening AI Provider dialog, load current config so draft is correct
   useEffect(() => {
-    if (!showAiProviderDialog) return
+    if (!showOperatorAiAgent || !showAiProviderDialog) return
     setAiProviderEditingKey(false)
     getAiProviderConfig().then((r) => {
       if (r?.ok && r?.provider) setAiProviderDraft(d => ({ ...d, provider: r.provider ?? "", api_key: "" }))
@@ -1602,10 +1605,13 @@ export default function CompanySettingPage() {
             </div>
           </CardHeader>
           <CardContent className="space-y-6">
-            {/* AI Agent & Bank tracking */}
+            {/* Bank tracking (Finverse); AI Agent card optional via NEXT_PUBLIC_SHOW_OPERATOR_AI_AGENT=1 */}
             <div>
-              <p className="text-xs font-bold uppercase tracking-widest text-muted-foreground mb-3">AI & Bank</p>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <p className="text-xs font-bold uppercase tracking-widest text-muted-foreground mb-3">
+                {showOperatorAiAgent ? "AI & Bank" : "Bank"}
+              </p>
+              <div className={cn("grid grid-cols-1 gap-3", showOperatorAiAgent && "md:grid-cols-2")}>
+                {showOperatorAiAgent ? (
                 <div className="p-4 border border-border rounded-xl flex items-start justify-between gap-3">
                   <div className="flex items-start gap-3 min-w-0">
                     <div className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0" style={{ background: "var(--brand-light)" }}>
@@ -1623,6 +1629,7 @@ export default function CompanySettingPage() {
                     {aiProvider ? "Manage" : "Set up"}
                   </Button>
                 </div>
+                ) : null}
                 <div className="p-4 border border-border rounded-xl flex items-start justify-between gap-3">
                   <div className="flex items-start gap-3 min-w-0">
                     <div className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0" style={{ background: "var(--brand-light)" }}>
@@ -3386,7 +3393,8 @@ export default function CompanySettingPage() {
         </AlertDialogContent>
       </AlertDialog>
 
-      {/* AI Agent Dialog */}
+      {/* AI Agent Dialog — only when NEXT_PUBLIC_SHOW_OPERATOR_AI_AGENT=1 */}
+      {showOperatorAiAgent ? (
       <Dialog open={showAiProviderDialog} onOpenChange={setShowAiProviderDialog}>
         <DialogContent>
           <DialogHeader>
@@ -3476,6 +3484,7 @@ export default function CompanySettingPage() {
           </div>
         </DialogContent>
       </Dialog>
+      ) : null}
     </main>
   )
 }

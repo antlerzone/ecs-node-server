@@ -188,7 +188,7 @@ router.post('/change-room-preview', requireCtx, async (req, res, next) => {
   }
 });
 
-/** POST /api/tenancysetting/extend-options – body: { email, tenancyId } → { paymentCycle, maxExtensionEnd, deposit, depositFromTenancy, paidDepositFromRentalCollection } */
+/** POST /api/tenancysetting/extend-options → deposit 展示规则见 depositDisplayFromTenancyOrPaidRc；depositInSync 见 tenancysetting.service */
 router.post('/extend-options', requireCtx, async (req, res, next) => {
   try {
     const result = await getExtendOptions(req.ctx.client.id, req.body?.tenancyId);

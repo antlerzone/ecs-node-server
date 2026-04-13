@@ -580,7 +580,7 @@ function roomOptionDisplayLine(r: AvailableRoomRow): string {
   }
   if (r.availablesoon && dateOk && from > today) {
     const on = formatAvailableOnDate(from)
-    return on ? `${base} (available on ${on})` : `${base} (available soon)`
+    return on ? `${base} (available soon: ${on})` : `${base} (available soon)`
   }
   if (r.availablesoon) return `${base} (available soon)`
   return base

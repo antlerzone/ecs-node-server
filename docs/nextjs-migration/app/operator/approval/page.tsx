@@ -92,7 +92,14 @@ function extractReceiptUrl(detail: unknown): string | null {
   const o = detail as Record<string, unknown>
   const direct = o.receipt_url
   if (typeof direct === "string" && direct.trim()) return direct.trim()
-  const ocr = o.ocr_result_json
+  let ocr: unknown = o.ocr_result_json
+  if (typeof ocr === "string" && ocr.trim()) {
+    try {
+      ocr = JSON.parse(ocr) as unknown
+    } catch {
+      ocr = null
+    }
+  }
   if (ocr && typeof ocr === "object") {
     const j = ocr as Record<string, unknown>
     const u = j._url ?? j.url

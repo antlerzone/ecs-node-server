@@ -111,12 +111,43 @@ async function startNormalTopup(email, { creditPlanId, returnUrl, credits, amoun
     } catch (_) {}
     throw new Error('AMOUNT_TOO_SMALL');
   }
-  const stripeCurrency = currency === 'SGD' ? 'sgd' : 'myr';
+  const { getPlatformXenditConfig } = require('../payex/payex.service');
+
+  if (currency === 'MYR') {
+    if (!getPlatformXenditConfig()?.secretKey) {
+      try {
+        await pool.query('DELETE FROM creditlogs WHERE id = ? AND is_paid = 0', [creditLogId]);
+      } catch (_) {}
+      throw new Error('SAAS_XENDIT_NOT_CONFIGURED');
+    }
+    const { createOperatorCreditTopupXendit } = require('./xendit-saas-platform.service');
+    const xRes = await createOperatorCreditTopupXendit({
+      creditLogId,
+      returnUrl: returnUrlWithFinalize,
+      email: ctx.staff?.email || '',
+      amount: amountRM,
+      currency: 'MYR'
+    });
+    if (!xRes.ok) {
+      try {
+        await pool.query('DELETE FROM creditlogs WHERE id = ? AND (is_paid IS NULL OR is_paid = 0)', [creditLogId]);
+      } catch (_) {}
+      throw new Error(xRes.reason || xRes.message || 'XENDIT_CHECKOUT_FAILED');
+    }
+    return {
+      success: true,
+      provider: 'xendit',
+      url: xRes.url,
+      referenceNumber,
+      creditLogId
+    };
+  }
+
   const { createColivingSaasPlatformCheckoutSession } = require('../stripe/stripe.service');
   try {
     const { url } = await createColivingSaasPlatformCheckoutSession({
       amountCents,
-      stripeCurrency,
+      stripeCurrency: 'sgd',
       email: ctx.staff?.email || '',
       description: title || 'Credit top-up',
       successUrl,

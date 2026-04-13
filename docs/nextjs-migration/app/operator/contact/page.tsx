@@ -26,6 +26,7 @@ import {
   updateTenantAccount,
   updateStaffAccount,
   updateContactPortalPhone,
+  syncContactIdentity,
   updateSupplier,
   createSupplier,
   createStaffContact,
@@ -561,12 +562,30 @@ export default function ContactSettingPage() {
           bankAccount?: string
           bankHolder?: string
         }
-        setFormData((prev) => ({
-          ...prev,
-          ownerBankName: String(od.bankName ?? ""),
-          ownerBankAccount: String(od.bankAccount ?? ""),
-          ownerBankHolder: String(od.bankHolder ?? ""),
-        }))
+        const obn = String(od.bankName ?? "")
+        const oba = String(od.bankAccount ?? "")
+        const obh = String(od.bankHolder ?? "")
+        setFormData((prev) => {
+          /** Same person as owner + supplier: one bank account for payout (prefer supplier row if filled, else owner). */
+          if (supId) {
+            return {
+              ...prev,
+              ownerBankName: obn,
+              ownerBankAccount: oba,
+              ownerBankHolder: obh,
+              bankName: (prev.bankName || "").trim() || obn,
+              bankAccount: (prev.bankAccount || "").trim() || oba,
+              bankHolder: (prev.bankHolder || "").trim() || obh,
+            }
+          }
+          return {
+            ...prev,
+            ownerBankName: obn,
+            ownerBankAccount: oba,
+            ownerBankHolder: obh,
+          }
+        })
+        if (supId) setSupplierPaymentMode("bank")
       } catch (e) {
         console.error(e)
         setFormData((prev) => ({
@@ -727,7 +746,42 @@ export default function ContactSettingPage() {
     const group = selectedEditGroup
     if (!group) return
     const tenantOnly = group.roles.length === 1 && group.roles[0] === "tenant"
-    if (tenantOnly) return
+    if (tenantOnly) {
+      const accounting = accountingConnected && String(accountingProvider || "").toLowerCase() !== ""
+      if (!accounting) {
+        toast({
+          title: "Accounting not connected",
+          description: "Connect Bukku (or your accounting system) under Company → Integrations to edit the accounting contact ID.",
+        })
+        return
+      }
+      const ten = group.members.find((m) => String(m.type || "").toLowerCase() === "tenant")
+      const tid = ten ? entityIdForContact(ten) : ""
+      if (!tid) {
+        alert("Could not resolve tenant record id. Refresh the page and try again.")
+        return
+      }
+      setEditSaving(true)
+      try {
+        const cid = editAccountId.trim()
+        const r = (await updateTenantAccount(tid, cid)) as { ok?: boolean; reason?: string }
+        if (r?.ok === false) {
+          alert(r?.reason ?? "Account ID update failed (tenant)")
+          return
+        }
+        toast({ title: "Saved", description: "Accounting contact ID updated for this tenant." })
+        setShowEditDialog(false)
+        setSelectedEditGroup(null)
+        setEditAccountId("")
+        await loadData()
+      } catch (e) {
+        console.error(e)
+        alert("Update failed")
+      } finally {
+        setEditSaving(false)
+      }
+      return
+    }
 
     const anyRoleKept =
       editRoleSelection.owner ||
@@ -749,6 +803,31 @@ export default function ContactSettingPage() {
         await updateContactPortalPhone({ contactEmail, phone: phoneVal })
       } catch {
         /* optional when no portal row */
+      }
+
+      const identityLocked =
+        groupHasRole(group, "tenant") &&
+        groupHasRole(group, "owner") &&
+        groupHasRole(group, "staff")
+      const canEditIdentity =
+        !identityLocked &&
+        (editRoleSelection.owner || editRoleSelection.tenant || editRoleSelection.staff)
+      if (canEditIdentity) {
+        try {
+          const ir = (await syncContactIdentity({
+            contactEmail,
+            idType: (formData.idType || "NRIC").trim(),
+            idNumber: (formData.idNumber || "").trim(),
+          })) as { ok?: boolean; reason?: string }
+          if (ir?.ok === false) {
+            alert(ir?.reason ?? "Could not save ID")
+            return
+          }
+        } catch (e) {
+          console.error(e)
+          alert("Could not save ID")
+          return
+        }
       }
 
       const sup = group.members.find((m) => String(m.type || "").toLowerCase() === "supplier")
@@ -809,6 +888,13 @@ export default function ContactSettingPage() {
         }
       }
 
+      const ownerSupplierBothSave =
+        editRoleSelection.owner &&
+        editRoleSelection.supplier &&
+        groupHasRole(group, "owner") &&
+        groupHasRole(group, "supplier")
+      const supplierUsesBank = ownerSupplierBothSave || supplierPaymentMode === "bank"
+
       if (editRoleSelection.supplier) {
         const email = formData.email.trim()
         if (!legalName) {
@@ -824,7 +910,7 @@ export default function ContactSettingPage() {
             bankAccount?: string
             bankHolder?: string
           } = { name: legalName, email }
-          if (supplierPaymentMode === "jompay") {
+          if (!supplierUsesBank) {
             createPayload.billerCode = (formData.billerCode || "").trim() || undefined
           } else {
             createPayload.bankName = (formData.bankName || "").trim() || undefined
@@ -856,10 +942,10 @@ export default function ContactSettingPage() {
           } = {
             name: legalName,
             email,
-            billerCode: supplierPaymentMode === "jompay" ? (formData.billerCode || "").trim() || undefined : undefined,
-            bankName: supplierPaymentMode === "bank" ? (formData.bankName || "").trim() || undefined : undefined,
-            bankAccount: supplierPaymentMode === "bank" ? (formData.bankAccount || "").trim() || undefined : undefined,
-            bankHolder: supplierPaymentMode === "bank" ? (formData.bankHolder || "").trim() || undefined : undefined,
+            billerCode: !supplierUsesBank ? (formData.billerCode || "").trim() || undefined : undefined,
+            bankName: supplierUsesBank ? (formData.bankName || "").trim() || undefined : undefined,
+            bankAccount: supplierUsesBank ? (formData.bankAccount || "").trim() || undefined : undefined,
+            bankHolder: supplierUsesBank ? (formData.bankHolder || "").trim() || undefined : undefined,
             contactId: cid || undefined,
           }
           const res = (await updateSupplier(supplierEntityId, payload)) as { ok?: boolean; reason?: string }
@@ -872,11 +958,18 @@ export default function ContactSettingPage() {
 
       const ownForBank = group.members.find((m) => String(m.type || "").toLowerCase() === "owner")
       if (editRoleSelection.owner && ownForBank?.entityId) {
-        const r = (await updateOwnerBank(ownForBank.entityId, {
-          bankName: formData.ownerBankName,
-          bankAccount: formData.ownerBankAccount,
-          bankHolder: formData.ownerBankHolder,
-        })) as { ok?: boolean; reason?: string }
+        const bankPayload = ownerSupplierBothSave && supplierUsesBank
+          ? {
+              bankName: formData.bankName,
+              bankAccount: formData.bankAccount,
+              bankHolder: formData.bankHolder,
+            }
+          : {
+              bankName: formData.ownerBankName,
+              bankAccount: formData.ownerBankAccount,
+              bankHolder: formData.ownerBankHolder,
+            }
+        const r = (await updateOwnerBank(ownForBank.entityId, bankPayload)) as { ok?: boolean; reason?: string }
         if (r?.ok === false) {
           alert(r?.reason ?? "Owner bank update failed")
           return
@@ -1391,7 +1484,7 @@ export default function ContactSettingPage() {
                           <DropdownMenuContent align="end" className="w-56">
                             {staffOnly || (tenantOnly && tenantM) ? (
                               <DropdownMenuItem onClick={() => handleEditGroup(group)}>
-                                {tenantOnly ? "View / edit (tenant read-only)" : "Edit staff"}
+                                {tenantOnly ? "View / edit accounting ID" : "Edit staff"}
                               </DropdownMenuItem>
                             ) : (
                               <DropdownMenuItem onClick={() => handleEditGroup(group)}>
@@ -1598,7 +1691,7 @@ export default function ContactSettingPage() {
             <DialogTitle className="flex flex-wrap items-center gap-2">
               {selectedEditGroup && selectedEditGroup.roles.length === 1 ? getTypeIcon(selectedEditGroup.roles[0]) : <Users size={18} className="text-muted-foreground" />}
               {selectedEditGroup && selectedEditGroup.roles.length === 1 && selectedEditGroup.roles[0] === "tenant"
-                ? "View Tenant"
+                ? "Tenant · accounting ID"
                 : "Edit contact"}
             </DialogTitle>
           </DialogHeader>
@@ -1658,11 +1751,19 @@ export default function ContactSettingPage() {
                 const emailReadOnly = true
                 const phoneReadOnly = isViewMode
                 const showSupplierForm = !!(g && editRoleSelection.supplier && !isViewMode)
+                /** Owner + supplier same person: one bank block under supplier (owner payout = bank transfer, same details). */
+                const ownerSupplierBoth =
+                  !!g &&
+                  editRoleSelection.owner &&
+                  editRoleSelection.supplier &&
+                  groupHasRole(g, "owner") &&
+                  groupHasRole(g, "supplier")
                 const showOwnerBankForm =
                   !!g &&
                   !isViewMode &&
                   editRoleSelection.owner &&
-                  groupHasRole(g, "owner")
+                  groupHasRole(g, "owner") &&
+                  !ownerSupplierBoth
                 const showOwnerStaffExtras =
                   !!g &&
                   !isViewMode &&
@@ -1716,14 +1817,20 @@ export default function ContactSettingPage() {
                         disabled={phoneReadOnly}
                       />
                     </div>
-                    {accountingConnected && g && !isViewMode ? (
+                    {accountingConnected && g && (!isViewMode || tenantOnlyDialog) ? (
                       <div className="col-span-2 rounded-lg border border-border p-3 space-y-2 bg-muted/20">
-                        <Label className="text-xs font-semibold">Account ID</Label>
+                        <Label className="text-xs font-semibold">Account ID (Bukku / accounting contact)</Label>
+                        {tenantOnlyDialog ? (
+                          <p className="text-xs text-muted-foreground">
+                            Profile name and NRIC are edited in the tenant portal profile. Here you can only set or fix the
+                            accounting system contact ID for this tenant.
+                          </p>
+                        ) : null}
                         <Input
                           value={editAccountId}
                           onChange={(e) => setEditAccountId(e.target.value)}
                           className="mt-1"
-                          placeholder="Account ID"
+                          placeholder="e.g. Bukku contact numeric ID"
                         />
                       </div>
                     ) : null}
@@ -1765,24 +1872,33 @@ export default function ContactSettingPage() {
                     )}
                     {showSupplierForm && (
                       <>
-                        <div className="col-span-2">
-                          <Label className="text-xs font-semibold">Supplier — payment mode</Label>
-                          <select
-                            value={supplierPaymentMode}
-                            onChange={(e) => setSupplierPaymentMode(e.target.value as "jompay" | "bank")}
-                            className="w-full mt-1 px-3 py-2 rounded-lg border border-border bg-background text-sm"
-                          >
-                            <option value="bank">Bank Transfer</option>
-                            <option value="jompay">Jompay</option>
-                          </select>
-                        </div>
-                        {supplierPaymentMode === "jompay" && (
+                        {ownerSupplierBoth ? (
+                          <div className="col-span-2 rounded-lg border border-border bg-muted/20 p-3 text-sm text-muted-foreground">
+                            <p className="font-semibold text-foreground">Bank transfer (owner & supplier)</p>
+                            <p className="text-xs mt-1">
+                              Owner payout is bank transfer. Use the <strong>same</strong> bank, account number, and account holder for both owner and supplier.
+                            </p>
+                          </div>
+                        ) : (
+                          <div className="col-span-2">
+                            <Label className="text-xs font-semibold">Supplier — payment mode</Label>
+                            <select
+                              value={supplierPaymentMode}
+                              onChange={(e) => setSupplierPaymentMode(e.target.value as "jompay" | "bank")}
+                              className="w-full mt-1 px-3 py-2 rounded-lg border border-border bg-background text-sm"
+                            >
+                              <option value="bank">Bank Transfer</option>
+                              <option value="jompay">Jompay</option>
+                            </select>
+                          </div>
+                        )}
+                        {supplierPaymentMode === "jompay" && !ownerSupplierBoth && (
                           <div className="col-span-2">
                             <Label className="text-xs font-semibold">Biller Code</Label>
                             <Input value={formData.billerCode} onChange={(e) => setFormData({ ...formData, billerCode: e.target.value })} className="mt-1" />
                           </div>
                         )}
-                        {supplierPaymentMode === "bank" && (
+                        {(supplierPaymentMode === "bank" || ownerSupplierBoth) && (
                           <>
                             <div className="col-span-2">
                               <Label className="text-xs font-semibold">Bank</Label>
@@ -1849,11 +1965,27 @@ export default function ContactSettingPage() {
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setShowEditDialog(false)}>
-              {selectedEditGroup && selectedEditGroup.roles.length === 1 && selectedEditGroup.roles[0] === "tenant" ? "Close" : "Cancel"}
+              {selectedEditGroup &&
+              selectedEditGroup.roles.length === 1 &&
+              selectedEditGroup.roles[0] === "tenant" &&
+              !accountingConnected
+                ? "Close"
+                : "Cancel"}
             </Button>
-            {!(selectedEditGroup && selectedEditGroup.roles.length === 1 && selectedEditGroup.roles[0] === "tenant") && (
+            {!(
+              selectedEditGroup &&
+              selectedEditGroup.roles.length === 1 &&
+              selectedEditGroup.roles[0] === "tenant" &&
+              !accountingConnected
+            ) && (
               <Button style={{ background: "var(--brand)" }} onClick={handleSaveEdit} disabled={editSaving}>
-                {editSaving ? "Saving…" : "Save Changes"}
+                {editSaving
+                  ? "Saving…"
+                  : selectedEditGroup &&
+                      selectedEditGroup.roles.length === 1 &&
+                      selectedEditGroup.roles[0] === "tenant"
+                    ? "Save account ID"
+                    : "Save Changes"}
               </Button>
             )}
           </DialogFooter>

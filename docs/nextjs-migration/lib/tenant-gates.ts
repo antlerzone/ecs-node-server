@@ -108,6 +108,77 @@ export function computeTenantProfileComplete(tenant: TenantProfileLite | null): 
   )
 }
 
+/** UI field keys for highlighting — must match `computeTenantProfileComplete` / gate logic. */
+export type TenantGateIncompleteField =
+  | "entityType"
+  | "legalName"
+  | "idType"
+  | "idNumber"
+  | "phone"
+  | "address"
+  | "bank"
+  | "bankAccount"
+  | "accountHolder"
+  | "nricFront"
+  | "nricBack"
+
+/**
+ * Which profile fields are still required for the tenant portal gate (layer 1).
+ * Pass the same shape as `TenantProfileLite` (e.g. built from the profile form state).
+ */
+export function getTenantProfileIncompleteFields(tenant: TenantProfileLite | null): TenantGateIncompleteField[] {
+  if (!tenant) {
+    return [
+      "entityType",
+      "legalName",
+      "idType",
+      "idNumber",
+      "phone",
+      "address",
+      "bank",
+      "bankAccount",
+      "accountHolder",
+      "nricFront",
+      "nricBack",
+    ]
+  }
+  const missing: TenantGateIncompleteField[] = []
+  const legalName = (tenant.fullname || "").trim()
+  const nric = (tenant.nric || "").trim()
+  const entityType = (tenant.profile?.entity_type || "").trim()
+  const idType = (tenant.profile?.id_type || tenant.profile?.reg_no_type || "").trim()
+  const mobileNumber = (tenant.phone || "").trim()
+  const addressLine = (tenant.address || "").trim()
+  const nricFront = (tenant.nricFront || "").trim()
+  const nricBack = (tenant.nricback || "").trim()
+  const bankName = (tenant.bankName || "").trim()
+  const bankAccount = (tenant.bankAccount || "").trim()
+  const accountHolder = (tenant.accountholder || "").trim()
+  const exempt = entityType === "EXEMPTED_PERSON"
+  const isForeignEntity = entityType === "FOREIGN_INDIVIDUAL" || entityType === "FOREIGN_COMPANY"
+  const requiresBackImage = (idType || "").toUpperCase() !== "PASSPORT"
+
+  if (!entityType) missing.push("entityType")
+  if (!legalName) missing.push("legalName")
+  if (!idType) missing.push("idType")
+  if (!mobileNumber) missing.push("phone")
+  if (!addressLine) missing.push("address")
+
+  if (!isForeignEntity) {
+    if (!bankName) missing.push("bank")
+    if (!bankAccount) missing.push("bankAccount")
+    if (!accountHolder) missing.push("accountHolder")
+  }
+
+  if (!exempt) {
+    if (!nric) missing.push("idNumber")
+    if (!nricFront) missing.push("nricFront")
+    if (requiresBackImage && !nricBack) missing.push("nricBack")
+  }
+
+  return missing
+}
+
 export function computeHasPendingOperatorInvite(tenant: TenantProfileLite | null): boolean {
   const ar = tenant?.approvalRequest
   if (!Array.isArray(ar)) return false

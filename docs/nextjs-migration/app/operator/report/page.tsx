@@ -28,6 +28,7 @@ import {
   bulkUpdateOwnerReport,
   deleteOwnerReport,
   voidOwnerReportPayment,
+  linkOwnerReportBukkuUrls,
   generateOwnerPayout,
   insertOwnerReport,
   generateAndUploadOwnerReportPdf,
@@ -480,6 +481,7 @@ export default function ReportPage() {
   const [payDate, setPayDate] = useState(() => getTodayMalaysiaYmd())
   const [payMethod, setPayMethod] = useState<"Bank" | "Cash">("Bank")
   const [paySaving, setPaySaving] = useState(false)
+  const [bukkuLinkLoading, setBukkuLinkLoading] = useState(false)
   const [reportSettingsOpen, setReportSettingsOpen] = useState(false)
   const [reportSettingsSaving, setReportSettingsSaving] = useState(false)
   const [defaultCarryNegativeForward, setDefaultCarryNegativeForward] = useState(true)
@@ -840,6 +842,64 @@ export default function ReportPage() {
       alert(e instanceof Error ? e.message : "Delete failed")
     } finally {
       setDeleteLoading(false)
+    }
+  }
+
+  /** Read-only Bukku list/read: match amounts, save invoice & bill URLs (does not create Bukku docs). */
+  const handleLinkBukkuUrls = async (report: ReportItem) => {
+    setBukkuLinkLoading(true)
+    try {
+      const dry = await linkOwnerReportBukkuUrls(report.id, { dryRun: true })
+      const d = dry.data
+      if (!dry.ok || d?.ok === false) {
+        toast({
+          variant: "destructive",
+          title: "Bukku link preview failed",
+          description: d?.reason ? String(d.reason) : `HTTP ${dry.status}`,
+        })
+        return
+      }
+      const inv = d.bukkuinvoice?.trim() || "—"
+      const bill = d.bukkubills?.trim() || "—"
+      const okSave = window.confirm(
+        `Save these URLs on this report?\n\nInvoice (mgmt fee): ${inv}\nBill (payout): ${bill}\n\n(This only updates Coliving; nothing is created in Bukku.)`
+      )
+      if (!okSave) return
+      const commit = await linkOwnerReportBukkuUrls(report.id, { dryRun: false })
+      const cd = commit.data
+      if (!commit.ok || cd?.ok === false) {
+        const amb = cd?.candidates?.length
+          ? `Candidates: ${cd.candidates.map((c) => c.id).join(", ")}`
+          : ""
+        toast({
+          variant: "destructive",
+          title: "Save failed",
+          description: [cd?.reason, amb].filter(Boolean).join(" "),
+        })
+        return
+      }
+      toast({
+        title: "Bukku URLs saved",
+        description: "Invoice/bill links updated; report marked as paid (paid = true).",
+      })
+      await loadReports()
+      setDetailReport((prev) =>
+        prev && prev.id === report.id
+          ? {
+              ...prev,
+              bukkuinvoice: cd.bukkuinvoice ?? prev.bukkuinvoice,
+              bukkubills: cd.bukkubills ?? prev.bukkubills,
+            }
+          : prev
+      )
+    } catch (e) {
+      toast({
+        variant: "destructive",
+        title: "Bukku link failed",
+        description: e instanceof Error ? e.message : "Request failed",
+      })
+    } finally {
+      setBukkuLinkLoading(false)
     }
   }
 
@@ -1265,6 +1325,20 @@ export default function ReportPage() {
                                 </DropdownMenuItem>
                                 <DropdownMenuSeparator />
                                 <DropdownMenuItem
+                                  disabled={!accountingConnected || bukkuLinkLoading}
+                                  title={
+                                    !accountingConnected
+                                      ? "Requires accounting integration (Bukku)."
+                                      : "Match existing Bukku invoice & bill by owner contact and amounts; updates URLs only."
+                                  }
+                                  onClick={async () => {
+                                    await handleLinkBukkuUrls(report)
+                                  }}
+                                >
+                                  Link from Bukku (read-only)
+                                </DropdownMenuItem>
+                                <DropdownMenuSeparator />
+                                <DropdownMenuItem
                                   disabled={!report.paid || deleteLoading}
                                   onClick={async () => {
                                     await handleVoidPaymentSingle(report)
@@ -1350,6 +1424,11 @@ export default function ReportPage() {
               {detailReport.paid && (detailReport.paymentMethod || detailReport.paymentDate) && (
                 <p className="text-muted-foreground text-xs">Paid via {detailReport.paymentMethod ?? "—"} on {detailReport.paymentDate ? formatDateDisplay(detailReport.paymentDate) : "—"}</p>
               )}
+              {accountingConnected && !(detailReport.bukkuinvoice || detailReport.bukkubills) && (
+                <p className="text-xs text-muted-foreground pt-1">
+                  No Bukku invoice/bill links on file. If they already exist in Bukku, use &quot;Link from Bukku&quot; (read-only match by owner contact and amounts).
+                </p>
+              )}
               {accountingConnected && (detailReport.bukkuinvoice || detailReport.bukkubills) && (
                 <div className="flex flex-wrap gap-2 pt-2 border-t">
                   {detailReport.bukkuinvoice && (
@@ -1364,7 +1443,18 @@ export default function ReportPage() {
               )}
             </div>
           )}
-          <DialogFooter>
+          <DialogFooter className="flex flex-wrap gap-2">
+            {detailReport && accountingConnected && (
+              <Button
+                type="button"
+                variant="secondary"
+                disabled={bukkuLinkLoading}
+                title="Match existing Bukku sales invoice & purchase bill by owner contact and amounts; saves URLs only (no new Bukku documents)."
+                onClick={() => detailReport && handleLinkBukkuUrls(detailReport)}
+              >
+                Link from Bukku
+              </Button>
+            )}
             {detailReport && detailReport.paid && (
               <Button
                 variant="outline"
