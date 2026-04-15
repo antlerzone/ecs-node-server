@@ -10,6 +10,7 @@
 
 const { randomUUID } = require('crypto');
 const pool = require('../../config/db');
+const { normalizeAgreementStatusForStorage } = require('../../utils/agreement-status');
 const { getAccessContextByEmail } = require('../access/access.service');
 const {
   createInvoicesForRentalRecords,
@@ -361,14 +362,14 @@ async function getTenancyList(clientId, opts = {}) {
     try {
       const placeholders = tenancyIds.map(() => '?').join(',');
       const [revRows] = await pool.query(
-        `SELECT tenancy_id FROM tenant_review WHERE client_id = ? AND tenancy_id IN (${placeholders})`,
+        `SELECT tenancy_id FROM portal_account_review WHERE subject_kind = 'tenant' AND client_id = ? AND tenancy_id IN (${placeholders})`,
         [clientId, ...tenancyIds]
       );
       for (const rr of revRows || []) {
         if (rr?.tenancy_id) reviewedTenancyIds.add(String(rr.tenancy_id));
       }
     } catch (revErr) {
-      console.warn('[tenancysetting/list] tenant_review query skipped:', revErr.message);
+      console.warn('[tenancysetting/list] portal_account_review query skipped:', revErr.message);
     }
     try {
       const placeholders = tenancyIds.map(() => '?').join(',');
@@ -2395,7 +2396,8 @@ async function insertAgreement(clientId, {
     }
   }
 
-  const finalStatus = status != null ? status : (isManualUpload ? 'completed' : 'pending');
+  let finalStatus = status != null ? status : (isManualUpload ? 'completed' : 'pending');
+  finalStatus = normalizeAgreementStatusForStorage(finalStatus);
   const columnsLocked = isManualUpload ? 1 : 0;
   const finalUrl = isManualUpload ? url.trim() : null;
   let extBegin = toDateOnly(extendBegin);

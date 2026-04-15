@@ -4,11 +4,12 @@
  * Priority: transaction_id -> reference contains invoice number -> amount -> date ±24h -> payer name.
  * confidence > 90% => auto PAID; 60–90% => PENDING_REVIEW; < 60% => ignore.
  *
- * PayNow (paynow_tenant / paynow_meter): same UTC+8 calendar day + exact amount on unmatched bank rows
- * → auto when unique; multiple same amount → manual review.
+ * PayNow (paynow_tenant / paynow_meter): bank `transaction_date` (MY YYYY-MM-DD) must fall in
+ * invoice anchor MY date −14 … +1 calendar days, plus exact amount on unmatched bank rows
+ * → auto when unique; multiple same amount → manual review. (Wider window than ±1 for late uploads.)
  */
 
-const { getTodayMalaysiaDate } = require('../../utils/dateMalaysia');
+const { getTodayMalaysiaDate, utcDatetimeFromDbToMalaysiaDateOnly } = require('../../utils/dateMalaysia');
 
 const STATUS = Object.freeze({
   UNPAID: 'UNPAID',
@@ -27,6 +28,17 @@ const CONFIDENCE_MANUAL_REVIEW = 60;
 function norm(s) {
   if (s == null) return '';
   return String(s).trim().toLowerCase();
+}
+
+/** PayNow invoice vs bank row: legacy sync stored missing Finverse currency as MYR while tenant PayNow is SGD. */
+function paynowCurrencyCompatible(invoiceExternalType, invCurrency, txCurrency) {
+  const ext = norm(invoiceExternalType || '');
+  const ic = norm(invCurrency || '');
+  const tc = norm(txCurrency || '');
+  if (!tc || !ic) return true;
+  if (tc === ic) return true;
+  if (ext !== 'paynow_tenant' && ext !== 'paynow_meter') return false;
+  return (ic === 'sgd' && tc === 'myr') || (ic === 'myr' && tc === 'sgd');
 }
 
 /**
@@ -100,18 +112,55 @@ function computeConfidence(invoice, tx) {
  * @param {Array} unmatched - bank_transactions
  * @returns {{ tx: object, confidence: number } | null}
  */
+/** Malaysia YYYY-MM-DD + N calendar days (same arithmetic as `getTodayPlusDaysMalaysia`). */
+function malaysiaYmdPlusDays(ymd, deltaDays) {
+  const d = new Date(`${ymd}T12:00:00+08:00`);
+  d.setDate(d.getDate() + deltaDays);
+  return d.toISOString().substring(0, 10);
+}
+
+/** Bank row calendar day in MY: prefer DATE column, else row `created_at` (sync time / fallback). */
+function bankTxMalaysiaYmdForPaynow(t) {
+  const td = t.transaction_date != null ? String(t.transaction_date).slice(0, 10) : '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(td)) return td;
+  if (t.created_at) {
+    const y = utcDatetimeFromDbToMalaysiaDateOnly(t.created_at);
+    if (y) return y;
+  }
+  return '';
+}
+
+/** Same anchor as payment-verification `matchingAnchorDate`, as Malaysia calendar date. */
+function invoiceAnchorMalaysiaYmd(invoice) {
+  const c = invoice.created_at ? new Date(invoice.created_at).getTime() : 0;
+  const u = invoice.updated_at ? new Date(invoice.updated_at).getTime() : 0;
+  const ms = Math.max(c, u);
+  const d = ms > 0 ? new Date(ms) : new Date();
+  return utcDatetimeFromDbToMalaysiaDateOnly(d) || getTodayMalaysiaDate();
+}
+
 function pickPaynowSameDayAmountMatch(invoice, unmatched) {
   const ext = norm(invoice.external_type || '');
   if (ext !== 'paynow_tenant' && ext !== 'paynow_meter') return null;
-  const today = getTodayMalaysiaDate();
+  const anchorYmd = invoiceAnchorMalaysiaYmd(invoice);
+  // Wider MY calendar window: tenant may pay days before uploading; SQL fetch also widened for paynow.
+  const allowedDates = new Set();
+  for (let d = -14; d <= 1; d += 1) {
+    allowedDates.add(malaysiaYmdPlusDays(anchorYmd, d));
+  }
+  // Also allow MY "today" ±2 (server clock): avoids anchor pushed to next MY day (UTC/naive-DB edge) vs bank 13/4 vs value 14/4.
+  const todayYmd = getTodayMalaysiaDate();
+  for (let d = -2; d <= 2; d += 1) {
+    allowedDates.add(malaysiaYmdPlusDays(todayYmd, d));
+  }
   const invAmt = Number(invoice.amount);
   if (!Number.isFinite(invAmt) || invAmt <= 0) return null;
   const currency = norm(invoice.currency);
   const pool = (unmatched || []).filter((t) => {
     if (t.matched_invoice_id) return false;
-    if (t.currency && currency && norm(t.currency) !== currency) return false;
-    const td = t.transaction_date ? String(t.transaction_date).slice(0, 10) : '';
-    if (td !== today) return false;
+    if (!paynowCurrencyCompatible(invoice.external_type, invoice.currency, t.currency)) return false;
+    const td = bankTxMalaysiaYmdForPaynow(t);
+    if (!td || !allowedDates.has(td)) return false;
     const ta = Number(t.amount);
     if (Math.abs(ta - invAmt) < 0.02) return true;
     if (ta < 0 && Math.abs(Math.abs(ta) - invAmt) < 0.02) return true;
@@ -144,7 +193,7 @@ function findBestMatch(invoice, transactions) {
   let best = paynowPick;
   let bestScore = paynowPick ? paynowPick.confidence : 0;
   for (const tx of unmatched) {
-    if (tx.currency && invoice.currency && norm(tx.currency) !== norm(invoice.currency)) continue;
+    if (!paynowCurrencyCompatible(invoice.external_type, invoice.currency, tx.currency)) continue;
     const confidence = computeConfidence(payload, tx);
     if (confidence >= CONFIDENCE_MANUAL_REVIEW && confidence > bestScore) {
       bestScore = confidence;
@@ -170,5 +219,6 @@ module.exports = {
   computeConfidence,
   pickPaynowSameDayAmountMatch,
   findBestMatch,
-  getDecision
+  getDecision,
+  invoiceAnchorMalaysiaYmd
 };

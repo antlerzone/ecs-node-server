@@ -3,7 +3,60 @@
  * Aligns with server `src/utils/dateMalaysia.js`: DB stores UTC; display/compare by MY calendar day.
  */
 
+const MY_TZ = "Asia/Kuala_Lumpur"
+
 const MY_OFFSET_MS = 8 * 60 * 60 * 1000
+
+/**
+ * Parse rental `dueDate` from API (ISO Z, or MySQL "YYYY-MM-DD HH:mm:ss" as Malaysia wall time, or date-only YYYY-MM-DD).
+ * Same rules as `docs/nextjs-migration/app/operator/invoice/page.tsx` — keeps tenant vs operator list aligned.
+ */
+export function parseRentalDateAsMalaysiaWall(d: unknown): Date | null {
+  if (d == null || d === "") return null
+  if (d instanceof Date) return Number.isNaN(d.getTime()) ? null : d
+  if (typeof d !== "string") {
+    const t = new Date(d as string)
+    return Number.isNaN(t.getTime()) ? null : t
+  }
+  const s = d.trim()
+  if (!s) return null
+  if (/[zZ]|[+-]\d{2}:\d{2}$/.test(s) || /[+-]\d{4}$/.test(s)) {
+    const t = new Date(s)
+    return Number.isNaN(t.getTime()) ? null : t
+  }
+  const donly = s.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+  if (donly) {
+    const t = new Date(`${donly[1]}-${donly[2]}-${donly[3]}T12:00:00+08:00`)
+    return Number.isNaN(t.getTime()) ? null : t
+  }
+  const naive = s.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2}):(\d{2})(\.\d{1,6})?$/)
+  if (naive) {
+    const hh = naive[4].padStart(2, "0")
+    const t = new Date(`${naive[1]}-${naive[2]}-${naive[3]}T${hh}:${naive[5]}:${naive[6]}+08:00`)
+    return Number.isNaN(t.getTime()) ? null : t
+  }
+  const t = new Date(s)
+  return Number.isNaN(t.getTime()) ? null : t
+}
+
+/** Due line on tenant /payment — fixed Malaysia calendar (not device TZ). */
+export function formatRentalDueDateMalaysia(d: unknown): string {
+  const t = parseRentalDateAsMalaysiaWall(d)
+  if (!t) return "—"
+  return t.toLocaleDateString("en-MY", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    timeZone: MY_TZ,
+  })
+}
+
+/** Malaysia `YYYY-MM-DD` for overdue checks (same calendar as `formatRentalDueDateMalaysia`). */
+export function rentalDueDateToMalaysiaYmd(d: unknown): string {
+  const t = parseRentalDateAsMalaysiaWall(d)
+  if (!t) return ""
+  return dateInstantToMalaysiaYmd(t)
+}
 
 function parseUtcInstant(v: string | Date): Date | null {
   if (v instanceof Date) {

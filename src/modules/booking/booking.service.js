@@ -346,7 +346,7 @@ async function getRoom(email, roomId) {
  * Parking lots by property.
  */
 /**
- * After operator enters tenant email: profile + tenant_review + tenancy flags for this client.
+ * After operator enters tenant email: profile + portal_account_review + tenancy flags for this client.
  * Used by booking UI to tag New / Returning (avg score) / Former.
  */
 async function lookupTenantForBooking(email, tenantEmailRaw) {
@@ -408,7 +408,7 @@ async function lookupTenantForBooking(email, tenantEmailRaw) {
 
   const [revAgg] = await pool.query(
     `SELECT COUNT(*) AS cnt, AVG(overall_score) AS avg_overall
-     FROM tenant_review WHERE tenant_id = ? AND client_id = ?`,
+     FROM portal_account_review WHERE subject_kind = 'tenant' AND tenant_id = ? AND client_id = ?`,
     [tenantId, clientId]
   );
   const reviewCount = Number(revAgg[0]?.cnt || 0);
@@ -420,8 +420,8 @@ async function lookupTenantForBooking(email, tenantEmailRaw) {
   let latestReview = null;
   if (reviewCount > 0) {
     const [lr] = await pool.query(
-      `SELECT overall_score, payment_score_final, unit_care_score, created_at
-       FROM tenant_review WHERE tenant_id = ? AND client_id = ? ORDER BY created_at DESC LIMIT 1`,
+      `SELECT overall_score, payment_score_final, unit_care_score, communication_score, created_at
+       FROM portal_account_review WHERE subject_kind = 'tenant' AND tenant_id = ? AND client_id = ? ORDER BY created_at DESC LIMIT 1`,
       [tenantId, clientId]
     );
     if (lr[0]) {
@@ -429,7 +429,7 @@ async function lookupTenantForBooking(email, tenantEmailRaw) {
         overallScore: Number(lr[0].overall_score || 0),
         paymentScoreFinal: Number(lr[0].payment_score_final || 0),
         unitCareScore: Number(lr[0].unit_care_score || 0),
-        communicationScore: 0,
+        communicationScore: Number(lr[0].communication_score || 0),
         createdAt: lr[0].created_at
       };
     }

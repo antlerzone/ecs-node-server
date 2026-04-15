@@ -46,6 +46,7 @@
     "form-data": "^4.0.5",
     "googleapis": "^144.0.0",
     "joi": "^18.0.2",
+    "jose": "^5.10.0",
     "json5": "^2.2.3",
     "jsonwebtoken": "^9.0.2",
     "mammoth": "^1.12.0",

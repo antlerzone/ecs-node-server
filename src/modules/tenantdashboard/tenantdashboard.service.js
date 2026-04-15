@@ -278,7 +278,7 @@ async function getTenanciesForTenant(tenantId) {
                 pdfurl, url, created_at, updated_at, columns_locked
            FROM agreement
            WHERE tenancy_id IN (${placeholders})
-             AND status IN ('ready_for_signature', 'locked', 'completed')
+             AND status IN ('ready_for_signature', 'locked', 'completed', 'complete')
              AND (url IS NOT NULL OR pdfurl IS NOT NULL)
            ORDER BY created_at DESC`,
         tenancyIds
@@ -291,7 +291,7 @@ async function getTenanciesForTenant(tenantId) {
                   pdfurl, url, created_at, updated_at, columns_locked
              FROM agreement
              WHERE tenancy_id IN (${placeholders})
-               AND status IN ('ready_for_signature', 'locked', 'completed')
+               AND status IN ('ready_for_signature', 'locked', 'completed', 'complete')
                AND (url IS NOT NULL OR pdfurl IS NOT NULL)
              ORDER BY created_at DESC`,
           tenancyIds

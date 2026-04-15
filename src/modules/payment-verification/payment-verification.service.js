@@ -6,7 +6,7 @@
 const pool = require('../../config/db');
 const crypto = require('crypto');
 const { getTodayMalaysiaDate, getTodayPlusDaysMalaysia, malaysiaDateToUtcDatetimeForDb } = require('../../utils/dateMalaysia');
-const { findBestMatch, getDecision, STATUS } = require('./matching.service');
+const { findBestMatch, getDecision, STATUS, invoiceAnchorMalaysiaYmd } = require('./matching.service');
 const { extractReceiptWithAi } = require('./ai-router.service');
 const finverse = require('../finverse');
 
@@ -370,13 +370,69 @@ async function runMatchingForInvoice(clientId, invoiceId) {
   }
 
   const anchor = matchingAnchorDate(invoice);
-  const [txRows] = await pool.query(
-    'SELECT * FROM bank_transactions WHERE client_id = ? AND transaction_date >= DATE_SUB(?, INTERVAL 3 DAY) AND transaction_date <= DATE_ADD(?, INTERVAL 3 DAY) ORDER BY transaction_date DESC',
-    [clientId, anchor, anchor]
-  );
+  const ext = (invoice.external_type || '').toString();
+  const paynow = ext === 'paynow_tenant' || ext === 'paynow_meter';
+  const backDays = paynow ? 21 : 3;
+  const fwdDays = paynow ? 7 : 3;
+  let txRows;
+  if (paynow) {
+    const invAmt = Number(invoice.amount);
+    const amtParam = Number.isFinite(invAmt) ? invAmt : 0;
+    const [rows] = await pool.query(
+      `SELECT * FROM bank_transactions WHERE client_id = ?
+       AND (
+         (transaction_date IS NOT NULL AND transaction_date >= DATE_SUB(?, INTERVAL ${backDays} DAY) AND transaction_date <= DATE_ADD(?, INTERVAL ${fwdDays} DAY))
+         OR (transaction_date IS NULL AND created_at >= DATE_SUB(NOW(), INTERVAL 45 DAY))
+       )
+       ORDER BY
+         LEAST(
+           ABS(CAST(amount AS DECIMAL(20,4)) - CAST(? AS DECIMAL(20,4))),
+           ABS(ABS(CAST(amount AS DECIMAL(20,4))) - CAST(? AS DECIMAL(20,4)))
+         ) ASC,
+         COALESCE(transaction_date, DATE(created_at)) DESC,
+         created_at DESC
+       LIMIT 4000`,
+      [clientId, anchor, anchor, amtParam, amtParam]
+    );
+    txRows = rows;
+  } else {
+    const [rows] = await pool.query(
+      `SELECT * FROM bank_transactions WHERE client_id = ? AND transaction_date >= DATE_SUB(?, INTERVAL ${backDays} DAY) AND transaction_date <= DATE_ADD(?, INTERVAL ${fwdDays} DAY) ORDER BY transaction_date DESC`,
+      [clientId, anchor, anchor]
+    );
+    txRows = rows;
+  }
   const invoiceWithOcr = { ...invoice, ocr_result_json: parseJson(invoice.ocr_result_json) };
   const best = findBestMatch(invoiceWithOcr, txRows);
   if (!best) {
+    if (paynow) {
+      const invN = Number(invoice.amount);
+      const nearRows = (txRows || []).filter((t) => {
+        const ta = Number(t.amount);
+        if (!Number.isFinite(invN) || !Number.isFinite(ta)) return false;
+        if (Math.abs(ta - invN) < 0.03) return true;
+        return ta < 0 && Math.abs(Math.abs(ta) - invN) < 0.03;
+      });
+      const sample = (txRows || []).slice(0, 8).map((t) => ({
+        d: t.transaction_date,
+        a: t.amount,
+        c: t.currency,
+        matched: t.matched_invoice_id ? 1 : 0
+      }));
+      console.warn(
+        '[payment-verification] runMatchingForInvoice paynow_no_match',
+        JSON.stringify({
+          invoiceId: String(invoiceId).slice(0, 8) + '…',
+          amount: invoice.amount,
+          currency: invoice.currency,
+          anchorYmd: invoiceAnchorMalaysiaYmd(invoice),
+          txInWindow: txRows.length,
+          nearAmountCount: nearRows.length,
+          nearAmountSample: nearRows.slice(0, 3).map((t) => ({ d: t.transaction_date, a: t.amount, c: t.currency })),
+          sample
+        })
+      );
+    }
     return { status: invoice.status, matched: false, candidates: [] };
   }
 
@@ -410,11 +466,77 @@ async function runMatchingForInvoice(clientId, invoiceId) {
 }
 
 /**
+ * Finverse transaction date field names vary by institution — extract YYYY-MM-DD or null.
+ */
+/** When Finverse omits id/transaction_id, still persist row (stable id for dedup). */
+function stableFinverseSyntheticId(clientId, t) {
+  const payload = JSON.stringify({
+    c: clientId,
+    a: t.amount ?? t.value,
+    d: t.date ?? t.bookingDate ?? t.valueDate,
+    r: (t.reference || t.description || t.remittance_information || '').toString().slice(0, 240)
+  });
+  return `fv-synth-${crypto.createHash('sha256').update(payload).digest('hex').slice(0, 48)}`;
+}
+
+function extractFinverseTxDateYmd(t) {
+  if (!t || typeof t !== 'object') return null;
+  const candidates = [
+    t.date,
+    t.booking_date,
+    t.bookingDate,
+    t.value_date,
+    t.valueDate,
+    t.transaction_date,
+    t.transactionDate,
+    t.posting_date,
+    t.postingDate,
+    t.posted_date,
+    t.postedDate,
+    t.booked_at,
+    t.bookedAt
+  ];
+  for (const raw of candidates) {
+    if (raw == null || raw === '') continue;
+    if (typeof raw === 'string') {
+      const m = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+      if (m) return m[1];
+    }
+    try {
+      const d = raw instanceof Date ? raw : new Date(raw);
+      if (!Number.isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+    } catch (_) {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+/**
+ * Finverse amounts may be numbers, strings with commas, or nested { value } — never bind NaN to DECIMAL (MySQL can error as Unknown column 'NaN').
+ */
+function parseFinverseAmount(raw) {
+  if (raw == null) return null;
+  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : null;
+  if (typeof raw === 'object') {
+    const inner = raw.value != null ? raw.value : raw.amount;
+    if (inner !== undefined && inner !== raw) return parseFinverseAmount(inner);
+    return null;
+  }
+  const s = String(raw).replace(/,/g, '').replace(/\s/g, '').trim();
+  if (!s) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
  * Sync bank transactions from Finverse for client. Uses login identity token from client_integration (finverse).
  */
 async function syncBankTransactionsFromFinverse(clientId, options = {}) {
   const fromDate = options.from_date || getTodayPlusDaysMalaysia(-30);
-  const toDate = options.to_date || getTodayMalaysiaDate();
+  // Default upper bound +2 MY calendar days: many banks show VALUE DATE one day after POST DATE;
+  // Finverse may filter the list by value/booking date — capping at "today" drops those rows from the API response.
+  const toDate = options.to_date || getTodayPlusDaysMalaysia(2);
 
   const [rows] = await pool.query(
     `SELECT values_json FROM client_integration WHERE client_id = ? AND \`key\` = 'bankData' AND provider = 'finverse' AND enabled = 1 LIMIT 1`,
@@ -423,17 +545,86 @@ async function syncBankTransactionsFromFinverse(clientId, options = {}) {
   const loginToken = rows[0] && parseJson(rows[0].values_json) && parseJson(rows[0].values_json).finverse_login_identity_token;
   if (!loginToken) throw new Error('FINVERSE_NOT_LINKED');
 
-  const { transactions } = await finverse.bankData.listTransactions(loginToken, { from_date: fromDate, to_date: toDate, limit: 500 });
+  const [[odRow]] = await pool.query('SELECT currency FROM operatordetail WHERE id = ? LIMIT 1', [clientId]);
+  const clientCurrency = ((odRow && odRow.currency) || 'MYR').toString().trim().toUpperCase().slice(0, 10);
+
+  const pageLimit = 500;
+  const requestedMaxPages = Math.min(25, Math.max(1, Math.floor(Number(options.maxPages)) || 5));
+  let dynamicMaxPages = requestedMaxPages;
+  let finverseTotalReported = null;
+  const transactions = [];
+  for (let page = 0; page < dynamicMaxPages; page++) {
+    const offset = page * pageLimit;
+    let batch;
+    let res;
+    try {
+      res = await finverse.bankData.listTransactions(loginToken, {
+        from_date: fromDate,
+        to_date: toDate,
+        limit: pageLimit,
+        offset
+      });
+      batch = res.transactions || [];
+    } catch (e) {
+      if (page > 0) break;
+      throw e;
+    }
+    if (page === 0) {
+      const rawTotal = res.total_transactions != null ? res.total_transactions : res.total;
+      if (rawTotal != null) {
+        const n = Number(rawTotal);
+        if (Number.isFinite(n) && n > 0) {
+          finverseTotalReported = n;
+          const pagesNeeded = Math.ceil(n / pageLimit);
+          dynamicMaxPages = Math.min(25, Math.max(requestedMaxPages, pagesNeeded));
+          if (dynamicMaxPages > requestedMaxPages) {
+            console.log(
+              '[payment-verification] syncBankTransactionsFromFinverse extend pages from Finverse total',
+              JSON.stringify({
+                clientId: String(clientId).slice(0, 8) + '…',
+                requestedMaxPages,
+                dynamicMaxPages,
+                finverseTotalReported
+              })
+            );
+          }
+        }
+      }
+    }
+    transactions.push(...batch);
+    if (batch.length < pageLimit) break;
+  }
+
   let inserted = 0;
   for (const t of transactions || []) {
-    const extId = t.id || t.transaction_id || t.reference;
-    if (!extId) continue;
-    const amount = Number(t.amount ?? t.value ?? 0);
-    const currency = t.currency != null ? String(t.currency).trim().toUpperCase() : '';
+    const extId =
+      t.id ||
+      t.transaction_id ||
+      t.reference ||
+      t.entry_reference ||
+      t.entryReference ||
+      t.end_to_end_id ||
+      t.endToEndId ||
+      t.instruction_id ||
+      t.instructionId ||
+      (t.additional_information && (t.additional_information.reference || t.additional_information.transaction_id)) ||
+      stableFinverseSyntheticId(clientId, t);
+    const amount = parseFinverseAmount(t.amount ?? t.value);
+    if (amount == null) {
+      console.warn('[payment-verification] syncBankTransactionsFromFinverse skip non-numeric amount', {
+        clientId: String(clientId).slice(0, 8),
+        extId: String(extId).slice(0, 48),
+        raw_amount: t.amount,
+        raw_value: t.value
+      });
+      continue;
+    }
+    const currencyRaw = t.currency != null ? String(t.currency).trim().toUpperCase() : '';
+    const currency = currencyRaw.length ? currencyRaw.slice(0, 10) : clientCurrency;
     const reference = (t.reference || t.description || t.remittance_information || '').toString().slice(0, 500);
     const description = (t.description || t.narrative || '').toString().slice(0, 2000) || null;
     const payer_name = (t.counterparty_name || t.payer_name || t.name || '').toString().slice(0, 255) || null;
-    const transaction_date = t.date ? (t.date.slice ? t.date.slice(0, 10) : new Date(t.date).toISOString().slice(0, 10)) : null;
+    const transaction_date = extractFinverseTxDateYmd(t);
     const bank_account_id = (t.account_id || t.bank_account_id || '').toString() || null;
 
     try {
@@ -447,7 +638,12 @@ async function syncBankTransactionsFromFinverse(clientId, options = {}) {
       if (err.code !== 'ER_DUP_ENTRY') throw err;
     }
   }
-  return { synced: (transactions || []).length, inserted };
+  return {
+    synced: (transactions || []).length,
+    inserted,
+    finverse_total_transactions: finverseTotalReported,
+    pages_fetched_cap: dynamicMaxPages
+  };
 }
 
 /**

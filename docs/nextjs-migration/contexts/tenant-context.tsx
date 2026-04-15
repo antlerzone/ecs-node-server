@@ -24,6 +24,7 @@ export interface TenantAgreement {
   tenantsign?: string
   url?: string
   pdfurl?: string
+  columns_locked?: boolean
 }
 
 export interface TenantTenancy {

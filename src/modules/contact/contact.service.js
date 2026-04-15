@@ -191,12 +191,12 @@ async function getContactListInner(clientId, opts) {
     let tenantRows;
     try {
       [tenantRows] = await pool.query(
-        'SELECT id, fullname, email, phone, account, approval_request_json, nric, profile FROM tenantdetail'
+        'SELECT id, fullname, email, phone, account, approval_request_json, nric, profile, bankname_id, bankaccount, accountholder FROM tenantdetail'
       );
     } catch (e) {
       if (isSchemaError(e) && /Unknown column.*profile/i.test(e?.sqlMessage || e?.message || '')) {
         [tenantRows] = await pool.query(
-          'SELECT id, fullname, email, phone, account, approval_request_json, nric FROM tenantdetail'
+          'SELECT id, fullname, email, phone, account, approval_request_json, nric, bankname_id, bankaccount, accountholder FROM tenantdetail'
         );
       } else {
         throw e;
@@ -235,6 +235,9 @@ async function getContactListInner(clientId, opts) {
             const ty = prof.id_type ?? prof.reg_no_type;
             return ty != null && String(ty).trim() ? String(ty).trim() : undefined;
           })(),
+          bankName: t.bankname_id != null ? String(t.bankname_id) : undefined,
+          bankAccount: t.bankaccount != null ? String(t.bankaccount) : undefined,
+          bankHolder: t.accountholder != null ? String(t.accountholder) : undefined,
           account: parseJson(t.account),
           approvalRequest: parseJson(t.approval_request_json)
         },
@@ -432,7 +435,7 @@ async function getTenant(email, tenantId, overrideClientId) {
   const clientId = await resolveClientId(email, overrideClientId);
   if (!clientId) return null;
   const [rows] = await pool.query(
-    'SELECT id, fullname, email, account, approval_request_json FROM tenantdetail WHERE id = ? LIMIT 1',
+    'SELECT id, fullname, email, account, approval_request_json, bankname_id, bankaccount, accountholder FROM tenantdetail WHERE id = ? LIMIT 1',
     [tenantId]
   );
   if (!rows.length) return null;
@@ -441,6 +444,9 @@ async function getTenant(email, tenantId, overrideClientId) {
     _id: t.id,
     fullname: t.fullname,
     email: t.email,
+    bankName: t.bankname_id != null ? String(t.bankname_id) : '',
+    bankAccount: t.bankaccount != null ? String(t.bankaccount) : '',
+    bankHolder: t.accountholder != null ? String(t.accountholder) : '',
     account: parseJson(t.account),
     approvalRequest: parseJson(t.approval_request_json)
   };

@@ -7,9 +7,10 @@ import { Input } from "@/components/ui/input"
 import Link from "next/link"
 import { ArrowLeft, CheckCircle, Eye, EyeOff } from "lucide-react"
 import { Spinner } from "@/components/ui/spinner"
-import { isDemoSite } from "@/lib/portal-api"
+import { isDemoSite, shouldUseDemoMock } from "@/lib/portal-api"
 import { PortalSlidingAuthCard } from "@/components/portal-sliding-auth-card"
 import { SlidingSignInPanel } from "@/components/sliding-sign-in-panel"
+import { GovIdConnectButtons } from "@/components/gov-id-connect-buttons"
 
 function getEcsBase(): string {
   return (process.env.NEXT_PUBLIC_ECS_BASE_URL ?? "").replace(/\/$/, "")
@@ -24,6 +25,11 @@ function RegisterPageInner() {
       : "/login"
 
   const fromEnquiry = nextAfterRegister === "/enquiry"
+
+  const govIdReturnPath =
+    nextAfterRegister && nextAfterRegister.startsWith("/") && !nextAfterRegister.startsWith("//")
+      ? `/register?next=${encodeURIComponent(nextAfterRegister)}`
+      : "/register"
 
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
@@ -211,6 +217,13 @@ function RegisterPageInner() {
           )}
         </Button>
       </form>
+
+      <GovIdConnectButtons
+        returnPath={govIdReturnPath}
+        variant="stacked"
+        appearance="enquiry"
+        disabled={isLoading || shouldUseDemoMock()}
+      />
     </div>
   )
 
@@ -233,7 +246,11 @@ function RegisterPageInner() {
         <PortalSlidingAuthCard
           defaultMode="signup"
           signIn={
-            <SlidingSignInPanel afterLogin={postRegisterHref} oauthEnquiry={fromEnquiry} />
+            <SlidingSignInPanel
+              afterLogin={postRegisterHref}
+              oauthEnquiry={fromEnquiry}
+              govIdReturnPath={govIdReturnPath}
+            />
           }
           signUp={signUpForm}
         />

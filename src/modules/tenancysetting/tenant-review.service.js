@@ -28,66 +28,31 @@ function parseProfileAvatar(profileRaw) {
   }
 }
 
-let ensureCommunicationScoreColumnPromise = null;
-let ensureOwnerReviewTablePromise = null;
-async function ensureCommunicationScoreColumn() {
-  if (!ensureCommunicationScoreColumnPromise) {
-    ensureCommunicationScoreColumnPromise = (async () => {
-      const [rows] = await pool.query(
-        `SELECT COUNT(*) AS c
-         FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tenant_review' AND COLUMN_NAME = 'communication_score'`
-      );
-      if (Number(rows?.[0]?.c || 0) > 0) return;
-      try {
-        await pool.query('ALTER TABLE tenant_review ADD COLUMN communication_score decimal(4,2) NOT NULL DEFAULT 0 AFTER unit_care_score');
-      } catch (e) {
-        const msg = String(e?.sqlMessage || e?.message || '');
-        if (e?.code === 'ER_DUP_FIELDNAME' || msg.includes('Duplicate column')) return;
-        throw e;
-      }
-    })().catch((err) => {
-      ensureCommunicationScoreColumnPromise = null;
-      throw err;
-    });
-  }
-  return ensureCommunicationScoreColumnPromise;
+/** Resolve portal_account.id for a tenantdetail row (FK column or email match). */
+async function resolvePortalAccountIdForTenantdetail(tenantId) {
+  const [rows] = await pool.query(
+    `SELECT COALESCE(td.portal_account_id, pa.id) AS pid
+     FROM tenantdetail td
+     LEFT JOIN portal_account pa ON LOWER(TRIM(pa.email)) = LOWER(TRIM(td.email))
+     WHERE td.id = ? LIMIT 1`,
+    [tenantId]
+  );
+  return rows[0]?.pid ? String(rows[0].pid) : null;
 }
 
-async function ensureOwnerReviewTable() {
-  if (!ensureOwnerReviewTablePromise) {
-    ensureOwnerReviewTablePromise = (async () => {
-      await pool.query(
-        `CREATE TABLE IF NOT EXISTS owner_review (
-          id varchar(36) NOT NULL,
-          owner_id varchar(36) NOT NULL,
-          owner_email varchar(255) DEFAULT NULL,
-          client_id varchar(36) NOT NULL,
-          operator_id varchar(36) DEFAULT NULL,
-          communication_score decimal(4,2) NOT NULL DEFAULT 0,
-          responsibility_score decimal(4,2) NOT NULL DEFAULT 0,
-          cooperation_score decimal(4,2) NOT NULL DEFAULT 0,
-          overall_score decimal(4,2) NOT NULL DEFAULT 0,
-          comment text DEFAULT NULL,
-          evidence_json json DEFAULT NULL,
-          created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-          PRIMARY KEY (id),
-          KEY idx_owner_review_owner (owner_id),
-          KEY idx_owner_review_client (client_id),
-          KEY idx_owner_review_operator (operator_id)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
-      );
-    })().catch((err) => {
-      ensureOwnerReviewTablePromise = null;
-      throw err;
-    });
-  }
-  return ensureOwnerReviewTablePromise;
+/** Resolve portal_account.id for an ownerdetail row. */
+async function resolvePortalAccountIdForOwnerdetail(ownerId) {
+  const [rows] = await pool.query(
+    `SELECT COALESCE(od.portal_account_id, pa.id) AS pid
+     FROM ownerdetail od
+     LEFT JOIN portal_account pa ON LOWER(TRIM(pa.email)) = LOWER(TRIM(od.email))
+     WHERE od.id = ? LIMIT 1`,
+    [ownerId]
+  );
+  return rows[0]?.pid ? String(rows[0].pid) : null;
 }
 
 async function submitTenantReview(clientId, operatorId, payload = {}) {
-  await ensureCommunicationScoreColumn();
   const tenantId = payload.tenantId ? String(payload.tenantId).trim() : '';
   if (!clientId || !tenantId) return { ok: false, reason: 'MISSING_TENANT_ID' };
   const normalizedOperatorId = await resolveValidOperatorId(operatorId);
@@ -99,6 +64,9 @@ async function submitTenantReview(clientId, operatorId, payload = {}) {
   const tenant = tenantRows[0];
   if (!tenant) return { ok: false, reason: 'TENANT_NOT_FOUND' };
 
+  const portalAccountId = await resolvePortalAccountIdForTenantdetail(tenantId);
+  if (!portalAccountId) return { ok: false, reason: 'PORTAL_ACCOUNT_REQUIRED' };
+
   let tenancyId = payload.tenancyId ? String(payload.tenancyId).trim() : null;
   if (tenancyId) {
     const [tenancyRows] = await pool.query(
@@ -109,8 +77,7 @@ async function submitTenantReview(clientId, operatorId, payload = {}) {
     const tRow = tenancyRows[0];
     const terminated = tRow.status === 0 || tRow.status === '0';
     const end = tRow.end ? new Date(tRow.end) : null;
-    const endedByCalendar =
-      end && !Number.isNaN(end.getTime()) && end < new Date();
+    const endedByCalendar = end && !Number.isNaN(end.getTime()) && end < new Date();
     if (!terminated && !endedByCalendar) {
       return { ok: false, reason: 'TENANCY_NOT_ENDED' };
     }
@@ -137,14 +104,26 @@ async function submitTenantReview(clientId, operatorId, payload = {}) {
   const reviewId = payload.reviewId ? String(payload.reviewId).trim() : '';
   if (reviewId) {
     const [updateRes] = await pool.query(
-      `UPDATE tenant_review
+      `UPDATE portal_account_review
        SET tenancy_id = ?, payment_score_suggested = ?, payment_score_final = ?, unit_care_score = ?, communication_score = ?, overall_score = ?,
            late_payments_count = ?, outstanding_count = ?, badges_json = ?, comment = ?, evidence_json = ?, updated_at = NOW()
-       WHERE id = ? AND client_id = ? AND tenant_id = ? AND operator_id <=> ?`,
+       WHERE id = ? AND subject_kind = 'tenant' AND client_id = ? AND tenant_id = ? AND operator_id <=> ?`,
       [
-        tenancyId, paymentScoreSuggested, paymentScoreFinal, unitCareScore, communicationScore, overallScore,
-        latePaymentsCount, outstandingCount, JSON.stringify(badges), comment || null, JSON.stringify(evidence),
-        reviewId, clientId, tenantId, normalizedOperatorId
+        tenancyId,
+        paymentScoreSuggested,
+        paymentScoreFinal,
+        unitCareScore,
+        communicationScore,
+        overallScore,
+        latePaymentsCount,
+        outstandingCount,
+        JSON.stringify(badges),
+        comment || null,
+        JSON.stringify(evidence),
+        reviewId,
+        clientId,
+        tenantId,
+        normalizedOperatorId,
       ]
     );
     if (Number(updateRes?.affectedRows || 0) > 0) {
@@ -155,7 +134,7 @@ async function submitTenantReview(clientId, operatorId, payload = {}) {
 
   if (tenancyId) {
     const [dupRows] = await pool.query(
-      'SELECT id FROM tenant_review WHERE client_id = ? AND tenancy_id = ? LIMIT 1',
+      `SELECT id FROM portal_account_review WHERE subject_kind = 'tenant' AND client_id = ? AND tenancy_id = ? LIMIT 1`,
       [clientId, tenancyId]
     );
     if (dupRows?.length) {
@@ -165,16 +144,29 @@ async function submitTenantReview(clientId, operatorId, payload = {}) {
 
   const id = randomUUID();
   await pool.query(
-    `INSERT INTO tenant_review (
-      id, tenant_id, tenant_email, tenancy_id, client_id, operator_id,
+    `INSERT INTO portal_account_review (
+      id, subject_kind, portal_account_id, tenant_id, owner_id, tenancy_id, client_id, operator_id,
       payment_score_suggested, payment_score_final, unit_care_score, communication_score, overall_score,
-      late_payments_count, outstanding_count, badges_json, comment, evidence_json,
+      late_payments_count, outstanding_count, badges_json, responsibility_score, cooperation_score, comment, evidence_json,
       created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+    ) VALUES (?, 'tenant', ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, NOW(), NOW())`,
     [
-      id, tenantId, tenant.email || null, tenancyId, clientId, normalizedOperatorId,
-      paymentScoreSuggested, paymentScoreFinal, unitCareScore, communicationScore, overallScore,
-      latePaymentsCount, outstandingCount, JSON.stringify(badges), comment || null, JSON.stringify(evidence)
+      id,
+      portalAccountId,
+      tenantId,
+      tenancyId,
+      clientId,
+      normalizedOperatorId,
+      paymentScoreSuggested,
+      paymentScoreFinal,
+      unitCareScore,
+      communicationScore,
+      overallScore,
+      latePaymentsCount,
+      outstandingCount,
+      JSON.stringify(badges),
+      comment || null,
+      JSON.stringify(evidence),
     ]
   );
   return { ok: true, id, overallScore, updated: false };
@@ -188,17 +180,18 @@ async function resolveValidOperatorId(operatorId) {
 }
 
 async function getLatestTenantReviewForOperator(clientId, operatorId, tenantId, tenancyId = null) {
-  await ensureCommunicationScoreColumn();
   if (!clientId || !tenantId) return { ok: false, reason: 'MISSING_TENANT_ID' };
   const normalizedOperatorId = await resolveValidOperatorId(operatorId);
-  const whereTenancy = tenancyId ? ' AND tr.tenancy_id = ?' : '';
-  const params = tenancyId ? [clientId, normalizedOperatorId, tenantId, tenancyId] : [clientId, normalizedOperatorId, tenantId];
+  const whereTenancy = tenancyId ? ' AND par.tenancy_id = ?' : '';
+  const params = tenancyId
+    ? [clientId, normalizedOperatorId, tenantId, tenancyId]
+    : [clientId, normalizedOperatorId, tenantId];
   const [rows] = await pool.query(
-    `SELECT tr.id, tr.payment_score_suggested, tr.payment_score_final, tr.unit_care_score, tr.communication_score, tr.overall_score,
-            tr.late_payments_count, tr.outstanding_count, tr.badges_json, tr.comment, tr.evidence_json, tr.created_at
-     FROM tenant_review tr
-     WHERE tr.client_id = ? AND tr.operator_id <=> ? AND tr.tenant_id = ? ${whereTenancy}
-     ORDER BY tr.created_at DESC
+    `SELECT par.id, par.payment_score_suggested, par.payment_score_final, par.unit_care_score, par.communication_score, par.overall_score,
+            par.late_payments_count, par.outstanding_count, par.badges_json, par.comment, par.evidence_json, par.created_at
+     FROM portal_account_review par
+     WHERE par.subject_kind = 'tenant' AND par.client_id = ? AND par.operator_id <=> ? AND par.tenant_id = ? ${whereTenancy}
+     ORDER BY par.created_at DESC
      LIMIT 1`,
     params
   );
@@ -218,24 +211,22 @@ async function getLatestTenantReviewForOperator(clientId, operatorId, tenantId, 
       badges: safeJsonArray(r.badges_json).map((x) => String(x)),
       comment: r.comment || '',
       evidenceUrls: safeJsonArray(r.evidence_json).map((x) => String(x)),
-      createdAt: r.created_at
-    }
+      createdAt: r.created_at,
+    },
   };
 }
 
 async function getTenantPublicProfileById(tenantId) {
-  await ensureCommunicationScoreColumn();
-  await ensureOwnerReviewTable();
   if (!tenantId) return { ok: false, reason: 'MISSING_TENANT_ID' };
   const [tenantRows] = await pool.query(
-    'SELECT id, fullname, email, profile FROM tenantdetail WHERE id = ? LIMIT 1',
+    'SELECT id, fullname, email, profile, portal_account_id FROM tenantdetail WHERE id = ? LIMIT 1',
     [tenantId]
   );
   const tenant = tenantRows[0] || null;
   let owner = null;
   if (!tenant) {
     const [ownerRows] = await pool.query(
-      'SELECT id, ownername, email, profile FROM ownerdetail WHERE id = ? LIMIT 1',
+      'SELECT id, ownername, email, profile, portal_account_id FROM ownerdetail WHERE id = ? LIMIT 1',
       [tenantId]
     );
     owner = ownerRows[0] || null;
@@ -243,24 +234,45 @@ async function getTenantPublicProfileById(tenantId) {
   const email = String(tenant?.email || owner?.email || '').trim().toLowerCase();
   if (!email) return { ok: false, reason: 'TENANT_NOT_FOUND' };
 
-  const [reviewRows] = await pool.query(
-    `SELECT tr.id, tr.created_at, tr.payment_score_suggested, tr.payment_score_final, tr.unit_care_score, tr.communication_score, tr.overall_score,
-            tr.late_payments_count, tr.outstanding_count, tr.badges_json, tr.comment, tr.evidence_json,
-            tr.tenancy_id, tr.operator_id,
-            t.begin AS tenancy_begin, t.end AS tenancy_end,
-            r.title_fld AS room_title, p.shortname AS property_shortname,
-            s.name AS operator_name, cp.subdomain AS operator_subdomain
-     FROM tenant_review tr
-     LEFT JOIN tenancy t ON t.id = tr.tenancy_id
-     LEFT JOIN roomdetail r ON r.id = t.room_id
-     LEFT JOIN propertydetail p ON p.id = r.property_id
-     LEFT JOIN staffdetail s ON s.id = tr.operator_id
-     LEFT JOIN client_profile cp ON cp.client_id = tr.client_id
-     WHERE (LOWER(TRIM(tr.tenant_email)) = ? OR tr.tenant_id = ?)
-     ORDER BY tr.created_at DESC
-     LIMIT 200`,
-    [email, tenant?.id || tenantId]
-  );
+  let tenantReviewWhere = '';
+  let tenantReviewParams = [];
+  if (tenant?.id != null) {
+    tenantReviewWhere = 'par.subject_kind = ? AND par.tenant_id = ?';
+    tenantReviewParams = ['tenant', String(tenant.id)];
+  } else if (owner?.id != null) {
+    const opid = await resolvePortalAccountIdForOwnerdetail(String(owner.id));
+    if (!opid) {
+      tenantReviewWhere = '1=0';
+      tenantReviewParams = [];
+    } else {
+      tenantReviewWhere = 'par.subject_kind = ? AND par.portal_account_id = ?';
+      tenantReviewParams = ['tenant', opid];
+    }
+  } else {
+    tenantReviewWhere = '1=0';
+    tenantReviewParams = [];
+  }
+
+  const [reviewRows] = tenantReviewParams.length
+    ? await pool.query(
+        `SELECT par.id, par.created_at, par.payment_score_suggested, par.payment_score_final, par.unit_care_score, par.communication_score, par.overall_score,
+                par.late_payments_count, par.outstanding_count, par.badges_json, par.comment, par.evidence_json,
+                par.tenancy_id, par.operator_id,
+                t.begin AS tenancy_begin, t.end AS tenancy_end,
+                r.title_fld AS room_title, p.shortname AS property_shortname,
+                s.name AS operator_name, cp.subdomain AS operator_subdomain
+         FROM portal_account_review par
+         LEFT JOIN tenancy t ON t.id = par.tenancy_id
+         LEFT JOIN roomdetail r ON r.id = t.room_id
+         LEFT JOIN propertydetail p ON p.id = r.property_id
+         LEFT JOIN staffdetail s ON s.id = par.operator_id
+         LEFT JOIN client_profile cp ON cp.client_id = par.client_id
+         WHERE ${tenantReviewWhere}
+         ORDER BY par.created_at DESC
+         LIMIT 200`,
+        tenantReviewParams
+      )
+    : [[]];
 
   const tenantReviews = (reviewRows || []).map((r) => ({
     id: r.id,
@@ -283,37 +295,58 @@ async function getTenantPublicProfileById(tenantId) {
       property: r.property_shortname || null,
       room: r.room_title || null,
       checkIn: r.tenancy_begin || null,
-      checkOut: r.tenancy_end || null
-    }
+      checkOut: r.tenancy_end || null,
+    },
   }));
 
-  const [ownerReviewRows] = await pool.query(
-    `SELECT r.id, r.created_at, r.communication_score, r.responsibility_score, r.cooperation_score, r.overall_score,
-            r.comment, r.evidence_json, s.name AS operator_name, cp.subdomain AS operator_subdomain,
-            (
-              SELECT MIN(op.created_at)
-              FROM owner_property op
-              LEFT JOIN propertydetail pp ON pp.id = op.property_id
-              WHERE op.owner_id = r.owner_id
-                AND pp.client_id = r.client_id
-            ) AS binding_date,
-            (
-              SELECT pp.shortname
-              FROM owner_property op
-              LEFT JOIN propertydetail pp ON pp.id = op.property_id
-              WHERE op.owner_id = r.owner_id
-                AND pp.client_id = r.client_id
-              ORDER BY op.created_at ASC
-              LIMIT 1
-            ) AS property_shortname
-     FROM owner_review r
-     LEFT JOIN staffdetail s ON s.id = r.operator_id
-     LEFT JOIN client_profile cp ON cp.client_id = r.client_id
-     WHERE LOWER(TRIM(r.owner_email)) = ?
-     ORDER BY r.created_at DESC
-     LIMIT 200`,
-    [email]
-  );
+  let ownerReviewWhere = '';
+  let ownerReviewParams = [];
+  const portalForMerge =
+    tenant?.id != null
+      ? await resolvePortalAccountIdForTenantdetail(String(tenant.id))
+      : owner?.id != null
+        ? await resolvePortalAccountIdForOwnerdetail(String(owner.id))
+        : null;
+
+  if (portalForMerge) {
+    ownerReviewWhere = 'par.subject_kind = ? AND par.portal_account_id = ?';
+    ownerReviewParams = ['owner', portalForMerge];
+  } else {
+    ownerReviewWhere = '1=0';
+    ownerReviewParams = [];
+  }
+
+  const [ownerReviewRows] = ownerReviewParams.length
+    ? await pool.query(
+        `SELECT par.id, par.created_at, par.communication_score, par.responsibility_score, par.cooperation_score, par.overall_score,
+                par.comment, par.evidence_json, s.name AS operator_name, cp.subdomain AS operator_subdomain,
+                par.owner_id, par.client_id,
+                (
+                  SELECT MIN(op.created_at)
+                  FROM owner_property op
+                  LEFT JOIN propertydetail pp ON pp.id = op.property_id
+                  WHERE op.owner_id = par.owner_id
+                    AND pp.client_id = par.client_id
+                ) AS binding_date,
+                (
+                  SELECT pp.shortname
+                  FROM owner_property op
+                  LEFT JOIN propertydetail pp ON pp.id = op.property_id
+                  WHERE op.owner_id = par.owner_id
+                    AND pp.client_id = par.client_id
+                  ORDER BY op.created_at ASC
+                  LIMIT 1
+                ) AS property_shortname
+         FROM portal_account_review par
+         LEFT JOIN staffdetail s ON s.id = par.operator_id
+         LEFT JOIN client_profile cp ON cp.client_id = par.client_id
+         WHERE ${ownerReviewWhere}
+         ORDER BY par.created_at DESC
+         LIMIT 200`,
+        ownerReviewParams
+      )
+    : [[]];
+
   const ownerReviews = (ownerReviewRows || []).map((r) => ({
     id: r.id,
     reviewType: 'owner',
@@ -335,11 +368,13 @@ async function getTenantPublicProfileById(tenantId) {
       property: r.property_shortname || null,
       room: r.property_shortname || null,
       checkIn: r.binding_date || null,
-      checkOut: null
-    }
+      checkOut: null,
+    },
   }));
 
-  const reviews = [...tenantReviews, ...ownerReviews].sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+  const reviews = [...tenantReviews, ...ownerReviews].sort(
+    (a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0)
+  );
 
   const avgOverall = reviews.length
     ? Number((reviews.reduce((a, x) => a + Number(x.overallScore || 0), 0) / reviews.length).toFixed(2))
@@ -351,18 +386,17 @@ async function getTenantPublicProfileById(tenantId) {
       id: tenant?.id || owner?.id || tenantId,
       fullname: tenant?.fullname || owner?.ownername || '',
       email,
-      avatarUrl: parseProfileAvatar(tenant?.profile || owner?.profile)
+      avatarUrl: parseProfileAvatar(tenant?.profile || owner?.profile),
     },
     summary: {
       reviewCount: reviews.length,
-      averageOverallScore: avgOverall
+      averageOverallScore: avgOverall,
     },
-    reviews
+    reviews,
   };
 }
 
 async function submitOwnerReview(clientId, operatorId, payload = {}) {
-  await ensureOwnerReviewTable();
   const ownerId = payload.ownerId ? String(payload.ownerId).trim() : '';
   if (!clientId || !ownerId) return { ok: false, reason: 'MISSING_OWNER_ID' };
   const normalizedOperatorId = await resolveValidOperatorId(operatorId);
@@ -372,6 +406,9 @@ async function submitOwnerReview(clientId, operatorId, payload = {}) {
   );
   const owner = ownerRows[0];
   if (!owner) return { ok: false, reason: 'OWNER_NOT_FOUND' };
+
+  const portalAccountId = await resolvePortalAccountIdForOwnerdetail(ownerId);
+  if (!portalAccountId) return { ok: false, reason: 'PORTAL_ACCOUNT_REQUIRED' };
 
   const communicationScore = clampScore(payload.communicationScore);
   const responsibilityScore = clampScore(payload.responsibilityScore);
@@ -386,13 +423,21 @@ async function submitOwnerReview(clientId, operatorId, payload = {}) {
 
   if (reviewId) {
     const [updateRes] = await pool.query(
-      `UPDATE owner_review
+      `UPDATE portal_account_review
        SET communication_score = ?, responsibility_score = ?, cooperation_score = ?, overall_score = ?,
            comment = ?, evidence_json = ?, updated_at = NOW()
-       WHERE id = ? AND client_id = ? AND owner_id = ? AND operator_id <=> ?`,
+       WHERE id = ? AND subject_kind = 'owner' AND client_id = ? AND owner_id = ? AND operator_id <=> ?`,
       [
-        communicationScore, responsibilityScore, cooperationScore, overallScore,
-        comment || null, JSON.stringify(evidence), reviewId, clientId, ownerId, normalizedOperatorId
+        communicationScore,
+        responsibilityScore,
+        cooperationScore,
+        overallScore,
+        comment || null,
+        JSON.stringify(evidence),
+        reviewId,
+        clientId,
+        ownerId,
+        normalizedOperatorId,
       ]
     );
     if (Number(updateRes?.affectedRows || 0) > 0) return { ok: true, id: reviewId, overallScore, updated: true };
@@ -400,28 +445,36 @@ async function submitOwnerReview(clientId, operatorId, payload = {}) {
 
   const id = randomUUID();
   await pool.query(
-    `INSERT INTO owner_review (
-      id, owner_id, owner_email, client_id, operator_id,
-      communication_score, responsibility_score, cooperation_score, overall_score,
-      comment, evidence_json, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+    `INSERT INTO portal_account_review (
+      id, subject_kind, portal_account_id, tenant_id, owner_id, tenancy_id, client_id, operator_id,
+      payment_score_suggested, payment_score_final, unit_care_score, communication_score, overall_score,
+      late_payments_count, outstanding_count, badges_json, responsibility_score, cooperation_score, comment, evidence_json,
+      created_at, updated_at
+    ) VALUES (?, 'owner', ?, NULL, ?, NULL, ?, ?, 0, 0, 0, ?, ?, 0, 0, NULL, ?, ?, ?, ?, NOW(), NOW())`,
     [
-      id, ownerId, owner.email || null, clientId, normalizedOperatorId,
-      communicationScore, responsibilityScore, cooperationScore, overallScore,
-      comment || null, JSON.stringify(evidence)
+      id,
+      portalAccountId,
+      ownerId,
+      clientId,
+      normalizedOperatorId,
+      communicationScore,
+      overallScore,
+      responsibilityScore,
+      cooperationScore,
+      comment || null,
+      JSON.stringify(evidence),
     ]
   );
   return { ok: true, id, overallScore, updated: false };
 }
 
 async function getLatestOwnerReviewForOperator(clientId, operatorId, ownerId) {
-  await ensureOwnerReviewTable();
   if (!clientId || !ownerId) return { ok: false, reason: 'MISSING_OWNER_ID' };
   const normalizedOperatorId = await resolveValidOperatorId(operatorId);
   const [rows] = await pool.query(
     `SELECT id, communication_score, responsibility_score, cooperation_score, overall_score, comment, evidence_json, created_at
-     FROM owner_review
-     WHERE client_id = ? AND operator_id <=> ? AND owner_id = ?
+     FROM portal_account_review
+     WHERE subject_kind = 'owner' AND client_id = ? AND operator_id <=> ? AND owner_id = ?
      ORDER BY created_at DESC
      LIMIT 1`,
     [clientId, normalizedOperatorId, ownerId]
@@ -438,13 +491,12 @@ async function getLatestOwnerReviewForOperator(clientId, operatorId, ownerId) {
       overallScore: Number(r.overall_score || 0),
       comment: r.comment || '',
       evidenceUrls: safeJsonArray(r.evidence_json).map((x) => String(x)),
-      createdAt: r.created_at
-    }
+      createdAt: r.created_at,
+    },
   };
 }
 
 async function getOwnerPublicProfileById(ownerId) {
-  await ensureOwnerReviewTable();
   if (!ownerId) return { ok: false, reason: 'MISSING_OWNER_ID' };
   const [ownerRows] = await pool.query(
     'SELECT id, ownername, email, profile FROM ownerdetail WHERE id = ? LIMIT 1',
@@ -453,12 +505,12 @@ async function getOwnerPublicProfileById(ownerId) {
   const owner = ownerRows[0];
   if (!owner) return { ok: false, reason: 'OWNER_NOT_FOUND' };
   const [rows] = await pool.query(
-    `SELECT r.id, r.created_at, r.communication_score, r.responsibility_score, r.cooperation_score, r.overall_score,
-            r.comment, r.evidence_json, s.name AS operator_name
-     FROM owner_review r
-     LEFT JOIN staffdetail s ON s.id = r.operator_id
-     WHERE r.owner_id = ?
-     ORDER BY r.created_at DESC
+    `SELECT par.id, par.created_at, par.communication_score, par.responsibility_score, par.cooperation_score, par.overall_score,
+            par.comment, par.evidence_json, s.name AS operator_name
+     FROM portal_account_review par
+     LEFT JOIN staffdetail s ON s.id = par.operator_id
+     WHERE par.subject_kind = 'owner' AND par.owner_id = ?
+     ORDER BY par.created_at DESC
      LIMIT 200`,
     [ownerId]
   );
@@ -471,7 +523,7 @@ async function getOwnerPublicProfileById(ownerId) {
     overallScore: Number(x.overall_score || 0),
     comment: x.comment || '',
     evidenceUrls: safeJsonArray(x.evidence_json).map((u) => String(u)),
-    operatorName: x.operator_name || 'Operator'
+    operatorName: x.operator_name || 'Operator',
   }));
   const avgOverall = reviews.length
     ? Number((reviews.reduce((a, x) => a + Number(x.overallScore || 0), 0) / reviews.length).toFixed(2))
@@ -482,22 +534,19 @@ async function getOwnerPublicProfileById(ownerId) {
       id: owner.id,
       fullname: owner.ownername || '',
       email: owner.email || '',
-      avatarUrl: parseProfileAvatar(owner.profile)
+      avatarUrl: parseProfileAvatar(owner.profile),
     },
     summary: {
       reviewCount: reviews.length,
-      averageOverallScore: avgOverall
+      averageOverallScore: avgOverall,
     },
-    reviews
+    reviews,
   };
 }
 
 async function getTenantInvoiceHistoryById(tenantId, tenancyId = null) {
   if (!tenantId) return { ok: false, reason: 'MISSING_TENANT_ID' };
-  const [tenantRows] = await pool.query(
-    'SELECT id FROM tenantdetail WHERE id = ? LIMIT 1',
-    [tenantId]
-  );
+  const [tenantRows] = await pool.query('SELECT id FROM tenantdetail WHERE id = ? LIMIT 1', [tenantId]);
   if (!tenantRows?.length) return { ok: false, reason: 'TENANT_NOT_FOUND' };
 
   const useTenancy = tenancyId ? String(tenancyId).trim() : '';
@@ -518,7 +567,7 @@ async function getTenantInvoiceHistoryById(tenantId, tenancyId = null) {
     id: x.id,
     apartmentName: [x.property_shortname, x.room_title].filter(Boolean).join(' / ') || '-',
     invoiceDate: x.invoice_date || null,
-    paymentDate: x.payment_date || null
+    paymentDate: x.payment_date || null,
   }));
 
   return { ok: true, items };
@@ -531,5 +580,5 @@ module.exports = {
   getTenantInvoiceHistoryById,
   submitOwnerReview,
   getLatestOwnerReviewForOperator,
-  getOwnerPublicProfileById
+  getOwnerPublicProfileById,
 };

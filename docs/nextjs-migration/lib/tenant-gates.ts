@@ -34,6 +34,9 @@ export function normalizeTenantPathname(pathname: string): string {
 
 export interface TenantAgreementLite {
   tenantsign?: string
+  status?: string
+  /** From tenantdashboard init: operator manual PDF path sets `completed` + locked without `tenantsign`. */
+  columns_locked?: boolean | number | string
 }
 
 export interface TenantTenancyLite {
@@ -65,11 +68,32 @@ export interface TenantProfileLite {
   approvalRequest?: Array<{ clientId?: string; status?: string }>
 }
 
-function isPendingAgreement(a: TenantAgreementLite): boolean {
-  return !a?.tenantsign
+function isColumnsLockedVal(v: unknown): boolean {
+  return v === true || v === 1 || v === "1"
 }
 
-/** Any formal agreement missing tenant sign, or draft row still in flow. Ignores view-only (ended) tenancies. */
+/** Canonical `completed`; DB may store legacy typo `complete` on agreement.status. */
+export function isAgreementCompletedStatus(status: string | undefined | null): boolean {
+  const s = String(status ?? "").trim().toLowerCase()
+  return s === "completed" || s === "complete"
+}
+
+/**
+ * True when the tenant should still complete the in-portal canvas signature flow.
+ * False when already signed, or when the row is operator manual upload / server-finalized (`completed`/`complete` and `columns_locked`).
+ */
+export function agreementNeedsTenantPortalSignature(a: TenantAgreementLite | null | undefined): boolean {
+  if (!a) return false
+  if (String(a.tenantsign ?? "").trim() !== "") return false
+  if (isAgreementCompletedStatus(a.status) && isColumnsLockedVal(a.columns_locked)) return false
+  return true
+}
+
+function isPendingAgreement(a: TenantAgreementLite): boolean {
+  return agreementNeedsTenantPortalSignature(a)
+}
+
+/** Any formal agreement that still needs portal signature, or draft row still in flow. Ignores view-only (ended) tenancies. Manual-upload `completed`+`columns_locked` rows are excluded. */
 export function tenantHasPendingAgreementToSign(tenancies: TenantTenancyLite[]): boolean {
   return (tenancies || [])
     .filter((t) => t && !t.isPortalReadOnly)
@@ -94,7 +118,10 @@ export function computeTenantProfileComplete(tenant: TenantProfileLite | null): 
   const bankAccount = (tenant.bankAccount || "").trim()
   const accountHolder = (tenant.accountholder || "").trim()
   const exempt = entityType === "EXEMPTED_PERSON"
-  const isSingaporeEntity = entityType === "FOREIGN_INDIVIDUAL" || entityType === "FOREIGN_COMPANY"
+  const isSingaporeEntity =
+    entityType === "FOREIGN_INDIVIDUAL" ||
+    entityType === "FOREIGN_COMPANY" ||
+    entityType === "SINGAPORE_INDIVIDUAL"
   const normalizedIdType = idType.toUpperCase()
   const requiresBackImage = normalizedIdType !== "PASSPORT"
   return (
@@ -155,7 +182,10 @@ export function getTenantProfileIncompleteFields(tenant: TenantProfileLite | nul
   const bankAccount = (tenant.bankAccount || "").trim()
   const accountHolder = (tenant.accountholder || "").trim()
   const exempt = entityType === "EXEMPTED_PERSON"
-  const isForeignEntity = entityType === "FOREIGN_INDIVIDUAL" || entityType === "FOREIGN_COMPANY"
+  const isForeignEntity =
+    entityType === "FOREIGN_INDIVIDUAL" ||
+    entityType === "FOREIGN_COMPANY" ||
+    entityType === "SINGAPORE_INDIVIDUAL"
   const requiresBackImage = (idType || "").toUpperCase() !== "PASSPORT"
 
   if (!entityType) missing.push("entityType")

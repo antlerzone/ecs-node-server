@@ -2,6 +2,7 @@ import type { Metadata } from 'next'
 import { Inter, DM_Serif_Display } from 'next/font/google'
 import './globals.css'
 import { Toaster } from '@/components/ui/toaster'
+import { Toaster as SonnerToaster } from 'sonner'
 import { SeoJsonLd } from '@/components/seo-json-ld'
 import { SITE_URL, SITE_NAME, DEFAULT_DESCRIPTION, defaultOpenGraph, defaultTwitter } from '@/lib/seo'
 
@@ -75,6 +76,7 @@ export default function RootLayout({
         <SeoJsonLd />
         {children}
         <Toaster />
+        <SonnerToaster richColors closeButton position="top-center" />
       </body>
     </html>
   )

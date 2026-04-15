@@ -9,10 +9,13 @@ import { Eye, EyeOff, LogIn } from "lucide-react"
 import { Spinner } from "@/components/ui/spinner"
 import {
   buildPortalOAuthStartUrl,
+  completeGovPendingWithPortalJwt,
   loginWithPassword,
 } from "@/components/portal-auth-form"
+import { GovIdConnectButtons } from "@/components/gov-id-connect-buttons"
 import { PORTAL_KEYS, setMember, setCurrentRole } from "@/lib/portal-session"
-import { isDemoSite } from "@/lib/portal-api"
+import { isDemoSite, shouldUseDemoMock } from "@/lib/portal-api"
+import { toast } from "sonner"
 
 function getEcsBase(): string {
   return (process.env.NEXT_PUBLIC_ECS_BASE_URL ?? "").replace(/\/$/, "")
@@ -21,10 +24,18 @@ function getEcsBase(): string {
 export function SlidingSignInPanel({
   afterLogin,
   oauthEnquiry = false,
+  /** When set (e.g. `/demologin`), show MyDigital ID & Singpass under Google/Facebook. */
+  govIdReturnPath,
+  /** Singpass need-email flow: after password login, complete pending link with JWT (no password on pending screen). */
+  govPendingId,
+  emailHint,
 }: {
   afterLogin: string
   /** Pass enquiry OAuth flag when onboarding from /enquiry */
   oauthEnquiry?: boolean
+  govIdReturnPath?: string
+  govPendingId?: string
+  emailHint?: string
 }) {
   const router = useRouter()
   const [email, setEmail] = useState("")
@@ -32,6 +43,10 @@ export function SlidingSignInPanel({
   const [showPassword, setShowPassword] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState("")
+
+  useEffect(() => {
+    if (emailHint?.trim()) setEmail(emailHint.trim())
+  }, [emailHint])
 
   useEffect(() => {
     if (typeof window === "undefined") return
@@ -52,7 +67,7 @@ export function SlidingSignInPanel({
     e.preventDefault()
     setError("")
     if (!email?.trim()) {
-      setError("Please enter your email")
+      setError("Please enter your email or NRIC / ID number")
       return
     }
     if (isDemoSite()) {
@@ -87,6 +102,37 @@ export function SlidingSignInPanel({
     try {
       const result = await loginWithPassword(email.trim(), password)
       if (result.ok && result.email && Array.isArray(result.roles)) {
+        if (govPendingId && result.token) {
+          const link = await completeGovPendingWithPortalJwt({
+            pendingId: govPendingId,
+            email: result.email,
+            token: result.token,
+          })
+          if (link.ok && link.token) {
+            const next = link.nextPath && link.nextPath.startsWith("/") ? link.nextPath : afterLogin
+            window.location.href = `/auth/callback?token=${encodeURIComponent(link.token)}&next=${encodeURIComponent(next)}`
+            return
+          }
+          setMember({ email: result.email, roles: result.roles })
+          if (typeof window !== "undefined" && result.token) {
+            try {
+              localStorage.setItem(PORTAL_KEYS.PORTAL_JWT, result.token)
+            } catch {
+              /* ignore */
+            }
+          }
+          if (link.reason === "GOV_ID_SWITCH_REQUIRED") {
+            toast.error(
+              "This account already uses another government ID. Open Profile → Verification to disconnect first.",
+            )
+          } else if (link.reason === "PENDING_EXPIRED_OR_INVALID") {
+            toast.error("This Singpass step expired. Start Singpass login again.")
+          } else {
+            toast.error("Could not link Singpass. You are signed in; try connecting Singpass again from the demo.")
+          }
+          router.replace(afterLogin.split("?")[0] + "?gov=error&reason=" + encodeURIComponent(link.reason || "LINK_FAILED"))
+          return
+        }
         setMember({ email: result.email, roles: result.roles })
         if (typeof window !== "undefined") {
           if (result.token) {
@@ -108,8 +154,14 @@ export function SlidingSignInPanel({
         router.push(afterLogin)
         return
       }
-      if (result.reason === "INVALID_CREDENTIALS" || result.reason === "NO_EMAIL") {
-        setError("Invalid email or password. Not registered? Use Sign up in the marketing column.")
+      if (result.reason === "INVALID_CREDENTIALS") {
+        setError("Invalid email, NRIC, or password.")
+      } else if (result.reason === "NO_EMAIL") {
+        setError("Please enter your email or NRIC / ID number.")
+      } else if (result.reason === "ACCOUNT_NOT_FOUND_EMAIL") {
+        setError("Can't find your account. Check the email address.")
+      } else if (result.reason === "ACCOUNT_NOT_FOUND_NRIC") {
+        setError("Can't find your login details. Check your NRIC / ID number.")
       } else {
         setError(result.reason === "DB_ERROR" ? "Server error. Please try again." : result.reason || "Login failed.")
       }
@@ -152,26 +204,33 @@ export function SlidingSignInPanel({
       return
     }
     setError("")
-    window.location.assign(buildPortalOAuthStartUrl(base, provider, { enquiry: oauthEnquiry }))
+    window.location.assign(
+      buildPortalOAuthStartUrl(base, provider, {
+        enquiry: oauthEnquiry,
+        ...(govPendingId ? { govPending: govPendingId } : {}),
+      }),
+    )
   }
 
   return (
     <div className="w-full max-w-[300px] mx-auto space-y-5">
       <h2 className="text-2xl sm:text-3xl font-bold text-foreground">Sign In</h2>
-      <p className="text-xs text-muted-foreground">Use your email and password, or Google / Facebook below.</p>
+      <p className="text-xs text-muted-foreground">Use your email or NRIC / ID number and password, or Google / Facebook below.</p>
 
       <form onSubmit={handleLogin} className="space-y-4 text-left">
         {error && (
           <div className="p-3 rounded-lg bg-destructive/10 border border-destructive/20 text-destructive text-sm">{error}</div>
         )}
         <div>
-          <label className="text-xs font-semibold text-muted-foreground block mb-1.5 uppercase tracking-wide">Email</label>
+          <label className="text-xs font-semibold text-muted-foreground block mb-1.5 uppercase tracking-wide">
+            Email or NRIC / ID number
+          </label>
           <Input
-            type="email"
-            placeholder="your@email.com"
+            type="text"
+            placeholder="your@email.com or e.g. 901010105678"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
-            autoComplete="email"
+            autoComplete="username"
             className="bg-[var(--brand-muted)] border-0"
           />
         </div>
@@ -261,6 +320,15 @@ export function SlidingSignInPanel({
           Sign in with Facebook
         </Button>
       </form>
+
+      {govIdReturnPath ? (
+        <GovIdConnectButtons
+          returnPath={govIdReturnPath}
+          variant="stacked"
+          appearance="enquiry"
+          disabled={isLoading || shouldUseDemoMock()}
+        />
+      ) : null}
     </div>
   )
 }

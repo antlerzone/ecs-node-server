@@ -2104,7 +2104,16 @@ export async function updateOwnerBank(
 
 /** Get tenant detail (tenantdetail) including account[] for Edit Account ID. */
 export async function getTenantDetail(tenantId: string) {
-  return post<{ ok?: boolean; fullname?: string; email?: string; account?: Array<{ provider?: string; clientId?: string; id?: string }>; reason?: string }>("contact/tenant", { tenantId });
+  return post<{
+    ok?: boolean;
+    fullname?: string;
+    email?: string;
+    bankName?: string;
+    bankAccount?: string;
+    bankHolder?: string;
+    account?: Array<{ provider?: string; clientId?: string; id?: string }>;
+    reason?: string;
+  }>("contact/tenant", { tenantId });
 }
 
 /** Get supplier detail (supplierdetail) including account[] for Edit Account ID. */

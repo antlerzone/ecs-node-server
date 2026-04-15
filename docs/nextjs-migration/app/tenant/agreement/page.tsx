@@ -1,10 +1,11 @@
 "use client"
 
-import { useState, useRef, useMemo } from "react"
+import { useState, useRef, useMemo, useEffect } from "react"
 import { FileText, CheckCircle2, Clock, Download, PenLine, Loader2 } from "lucide-react"
 import { useTenantOptional } from "@/contexts/tenant-context"
 import { agreementGet, agreementUpdateSign } from "@/lib/tenant-api"
 import { portalHttpsAssetUrl, toDrivePreviewUrl } from "@/lib/utils"
+import { agreementNeedsTenantPortalSignature, isAgreementCompletedStatus } from "@/lib/tenant-gates"
 
 /** Row from tenantdashboard init: `url` is draft or final PDF link; only `status === 'completed'` is the final agreement for download. */
 type Agreement = {
@@ -49,9 +50,14 @@ function formatDate(d: string | undefined): string {
   }
 }
 
-/** Final = both-party flow finished; server sets status completed + final PDF URL. */
+/** Final = both-party flow finished; server sets status completed + final PDF URL (`complete` typo tolerated). */
 function isFinalAgreement(ag: Agreement): boolean {
-  return String(ag.status ?? "").toLowerCase() === "completed"
+  return isAgreementCompletedStatus(ag.status)
+}
+
+/** Completed agreement on file without a portal-captured signature (e.g. operator manual PDF upload). */
+function isOperatorProvidedFinalPdf(ag: Agreement): boolean {
+  return isFinalAgreement(ag) && String(ag.tenantsign ?? "").trim() === ""
 }
 
 /** Tenant signature timestamp from DB (`tenant_signed_at`), set on sign when migration 0133 applied. */
@@ -85,6 +91,8 @@ export default function AgreementPage() {
   const [signModalOpen, setSignModalOpen] = useState(false)
   const [signAgreementId, setSignAgreementId] = useState<string | null>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  /** Mobile double-tap can fire twice before `disabled` re-renders — avoid duplicate POST (second returns AGREEMENT_COMPLETED). */
+  const signSubmitInFlightRef = useRef(false)
 
   const pendingDraftRows = useMemo(() => {
     const out: { agreementId: string; tenancy: Tenancy; pdfGenerating: boolean }[] = []
@@ -113,7 +121,7 @@ export default function AgreementPage() {
       for (const ag of t.agreements ?? []) {
         const aid = ag._id
         if (!aid) continue
-        if (ag.tenantsign) {
+        if (!agreementNeedsTenantPortalSignature(ag)) {
           if (!pastById.has(aid)) pastById.set(aid, { ag, tenancy: t })
         } else {
           if (!pendingById.has(aid)) pendingById.set(aid, { ag, tenancy: t })
@@ -216,6 +224,7 @@ export default function AgreementPage() {
   const handleSignSubmit = async () => {
     if (agreementTenancyReadonly) return
     if (!signAgreementId || !canvasRef.current) return
+    if (signSubmitInFlightRef.current) return
     const canvas = canvasRef.current
     const ctx = canvas.getContext("2d")
     if (!ctx) return
@@ -224,19 +233,24 @@ export default function AgreementPage() {
       alert("Please draw your signature first.")
       return
     }
+    signSubmitInFlightRef.current = true
     setSignLoading(true)
     try {
       const res = await agreementUpdateSign(signAgreementId, dataUrl)
-      if (res?.ok) {
+      const reason = String((res as { reason?: string })?.reason ?? "").trim().toUpperCase()
+      /** Backend: agreement already locked — first tap may have succeeded; still refresh UI instead of leaving stale "sign" state. */
+      const treatAsSuccess = !!res?.ok || reason === "AGREEMENT_COMPLETED"
+      if (treatAsSuccess) {
         setSignModalOpen(false)
         setSignAgreementId(null)
-        state?.refetch?.()
+        await state?.refetch?.()
       } else {
         alert((res as { reason?: string })?.reason || "Sign failed.")
       }
     } catch (e) {
       alert(e instanceof Error ? e.message : "Sign failed.")
     } finally {
+      signSubmitInFlightRef.current = false
       setSignLoading(false)
     }
   }
@@ -248,24 +262,66 @@ export default function AgreementPage() {
     ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height)
   }
 
+  /** Bitmap size (must match <canvas width height>); CSS may scale via w-full — map pointer coords into bitmap space. */
+  const SIGN_CANVAS_W = 400
+  const SIGN_CANVAS_H = 150
+
+  useEffect(() => {
+    if (!signModalOpen) return
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const ctx = canvas.getContext("2d")
+    if (!ctx) return
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+    ctx.strokeStyle = "#000"
+    ctx.lineWidth = 2
+    ctx.lineCap = "round"
+    ctx.lineJoin = "round"
+  }, [signModalOpen])
+
   const isDrawing = useRef(false)
-  const startDraw = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    isDrawing.current = true
-    const ctx = canvasRef.current?.getContext("2d")
-    if (!ctx) return
-    const rect = canvasRef.current!.getBoundingClientRect()
-    ctx.beginPath()
-    ctx.moveTo(e.clientX - rect.left, e.clientY - rect.top)
+
+  const pointerToCanvas = (canvas: HTMLCanvasElement, clientX: number, clientY: number) => {
+    const rect = canvas.getBoundingClientRect()
+    const scaleX = canvas.width / rect.width
+    const scaleY = canvas.height / rect.height
+    return {
+      x: (clientX - rect.left) * scaleX,
+      y: (clientY - rect.top) * scaleY,
+    }
   }
-  const draw = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!isDrawing.current) return
-    const ctx = canvasRef.current?.getContext("2d")
+
+  const onSignPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    e.preventDefault()
+    const canvas = e.currentTarget
+    canvas.setPointerCapture(e.pointerId)
+    isDrawing.current = true
+    const ctx = canvas.getContext("2d")
     if (!ctx) return
-    const rect = canvasRef.current!.getBoundingClientRect()
-    ctx.lineTo(e.clientX - rect.left, e.clientY - rect.top)
+    const { x, y } = pointerToCanvas(canvas, e.clientX, e.clientY)
+    ctx.beginPath()
+    ctx.moveTo(x, y)
+  }
+
+  const onSignPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!isDrawing.current) return
+    e.preventDefault()
+    const canvas = e.currentTarget
+    const ctx = canvas.getContext("2d")
+    if (!ctx) return
+    const { x, y } = pointerToCanvas(canvas, e.clientX, e.clientY)
+    ctx.lineTo(x, y)
     ctx.stroke()
   }
-  const endDraw = () => { isDrawing.current = false }
+
+  const onSignPointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    isDrawing.current = false
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId)
+    } catch {
+      /* not capturing */
+    }
+  }
 
   return (
     <div className="p-8 max-w-5xl mx-auto">
@@ -431,7 +487,7 @@ export default function AgreementPage() {
           <header className="space-y-1.5">
             <h2 className="text-xs font-semibold tracking-[0.2em] uppercase text-muted-foreground">Past Agreements</h2>
             <p className="text-[11px] text-muted-foreground leading-relaxed max-w-none">
-              Download is only enabled for the <strong className="text-foreground">final</strong> agreement (all parties signed). Your signature date is shown below.
+              Each <strong className="text-foreground">View / Open</strong> button opens the PDF link stored for that tenancy (the same URL your operator saved on the agreement). If you signed in the portal, your signature time is shown; operator-uploaded agreements appear as on file without a portal signature.
             </p>
           </header>
           {pastAgreements.length === 0 ? (
@@ -440,6 +496,7 @@ export default function AgreementPage() {
             <ul className="flex flex-col gap-3 list-none p-0 m-0">
               {pastAgreements.map(({ ag, tenancy }) => {
                 const finalReady = isFinalAgreement(ag)
+                const operatorUploadFinal = isOperatorProvidedFinalPdf(ag)
                 const roomLabel = tenancy.room?.roomname || tenancy.room?.title_fld
                 return (
                   <li key={ag._id}>
@@ -467,15 +524,23 @@ export default function AgreementPage() {
                             <div className="text-xs text-muted-foreground">
                               Tenancy · {formatDate(tenancy.begin)} – {formatDate(tenancy.end)}
                             </div>
-                            <div className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0 text-xs">
-                              <span className="shrink-0 text-muted-foreground">You signed</span>
-                              <span className="text-foreground tabular-nums whitespace-nowrap">
-                                {formatTenantSignedAt(ag.tenant_signed_at ?? ag.agreement_updated_at)}
-                                {!ag.tenant_signed_at && ag.agreement_updated_at ? (
-                                  <span className="text-muted-foreground font-normal"> (approx.)</span>
-                                ) : null}
-                              </span>
-                            </div>
+                            {operatorUploadFinal ? (
+                              <div className="text-xs text-muted-foreground leading-snug">
+                                <span className="text-foreground font-medium">Agreement on file</span>
+                                {" — "}
+                                provided by your operator (opens the same PDF link they uploaded).
+                              </div>
+                            ) : (
+                              <div className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0 text-xs">
+                                <span className="shrink-0 text-muted-foreground">You signed</span>
+                                <span className="text-foreground tabular-nums whitespace-nowrap">
+                                  {formatTenantSignedAt(ag.tenant_signed_at ?? ag.agreement_updated_at)}
+                                  {!ag.tenant_signed_at && ag.agreement_updated_at ? (
+                                    <span className="text-muted-foreground font-normal"> (approx.)</span>
+                                  ) : null}
+                                </span>
+                              </div>
+                            )}
                           </div>
                         </div>
                         <div className="flex shrink-0 flex-row items-center justify-end gap-2 md:flex-col md:items-end md:justify-center">
@@ -492,7 +557,7 @@ export default function AgreementPage() {
                               style={{ background: "var(--brand)" }}
                             >
                               <Download size={13} className="shrink-0" />
-                              Open final PDF
+                              {operatorUploadFinal ? "View agreement" : "Open final PDF"}
                             </button>
                           ) : (
                             <button
@@ -528,14 +593,14 @@ export default function AgreementPage() {
             <h3 className="font-bold text-lg mb-4">Draw your signature</h3>
             <canvas
               ref={canvasRef}
-              width={400}
-              height={150}
-              className="w-full border border-border rounded-xl bg-white cursor-crosshair"
+              width={SIGN_CANVAS_W}
+              height={SIGN_CANVAS_H}
+              className="w-full touch-none border border-border rounded-xl bg-white cursor-crosshair"
               style={{ touchAction: "none" }}
-              onMouseDown={startDraw}
-              onMouseMove={draw}
-              onMouseUp={endDraw}
-              onMouseLeave={endDraw}
+              onPointerDown={onSignPointerDown}
+              onPointerMove={onSignPointerMove}
+              onPointerUp={onSignPointerUp}
+              onPointerCancel={onSignPointerUp}
             />
             <div className="flex gap-2 mt-4">
               <button

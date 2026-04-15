@@ -5,6 +5,7 @@
 
 const { randomUUID, createHash } = require('crypto');
 const pool = require('../../config/db');
+const { isAgreementCompletedStatus } = require('../../utils/agreement-status');
 const { afterSignUpdate, isAgreementFullySigned } = require('../agreement/agreement.service');
 const {
   getAccountIdByWixId,
@@ -1155,7 +1156,7 @@ async function retryAgreementFinalPdf(clientId, agreementId, options = {}) {
   );
   const row = rows[0];
   if (!row) return { ok: false, reason: 'NOT_FOUND' };
-  if (row.columns_locked || String(row.status || '').toLowerCase() === 'completed') {
+  if (row.columns_locked || isAgreementCompletedStatus(row.status)) {
     return { ok: false, reason: 'ALREADY_COMPLETED' };
   }
   if (!isAgreementFullySigned(row)) {
@@ -1170,7 +1171,7 @@ async function retryAgreementFinalPdf(clientId, agreementId, options = {}) {
   );
   const row2 = rows2[0];
   if (!row2) return { ok: false, reason: 'NOT_FOUND' };
-  const done = !!row2.columns_locked || String(row2.status || '').toLowerCase() === 'completed';
+  const done = !!row2.columns_locked || isAgreementCompletedStatus(row2.status);
   if (!done) {
     return { ok: false, reason: 'FINALIZE_NOT_COMPLETED' };
   }

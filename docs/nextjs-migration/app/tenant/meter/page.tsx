@@ -2,13 +2,13 @@
 
 import { useState, useEffect, useMemo, useRef } from "react"
 import { useSearchParams, useRouter, usePathname } from "next/navigation"
-import { Zap, DollarSign, Plus, Calendar, Download, TrendingUp, TrendingDown, CheckCircle2 } from "lucide-react"
+import { Zap, DollarSign, Plus, Calendar, Download, TrendingUp, TrendingDown, CheckCircle2, RefreshCw } from "lucide-react"
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar } from "recharts"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog"
 import { useTenantOptional } from "@/contexts/tenant-context"
-import { room, createPayment, usageSummary, confirmPayment } from "@/lib/tenant-api"
+import { room, createPayment, usageSummary, confirmPayment, meterSync } from "@/lib/tenant-api"
 import { cn } from "@/lib/utils"
 import {
   addDaysMalaysiaYmd,
@@ -97,6 +97,8 @@ export default function MeterPage() {
   const [reportRange, setReportRange] = useState("thisMonth")
   const [reportSummary, setReportSummary] = useState<{ total: number; start: string; end: string } | null>(null)
   const [reportLoading, setReportLoading] = useState(false)
+  const [syncing, setSyncing] = useState(false)
+  const [syncDone, setSyncDone] = useState(false)
   const confirmDoneRef = useRef(false)
 
   const selectedTenancy = tenancies.find((t) => (t.id ?? t._id) === selectedTenancyId) ?? tenancies[0]
@@ -141,6 +143,52 @@ export default function MeterPage() {
       .catch(() => setUsageData(null))
       .finally(() => setUsageLoading(false))
   }, [roomId, dateRange, fetchStartStr, rangeEndStr])
+
+  const handleMeterSync = async () => {
+    if (!roomId) return
+    setSyncing(true)
+    setSyncDone(false)
+    try {
+      const res = await meterSync(roomId)
+      if (res?.ok) {
+        setSyncDone(true)
+        const after = res.after as { balance?: number | string; rate?: number | string; mode?: string } | undefined
+        if (after != null && after.balance !== undefined && after.balance !== null) {
+          setMeter((m) => ({
+            ...m,
+            balance: after.balance,
+            ...(after.rate !== undefined ? { rate: after.rate } : {}),
+            ...(after.mode !== undefined ? { mode: after.mode } : {}),
+          }))
+        } else {
+          setRoomLoading(true)
+          try {
+            const r = await room(roomId)
+            const rm = (r?.room as { meter?: RoomMeter })?.meter
+            setMeter(rm ?? null)
+          } finally {
+            setRoomLoading(false)
+          }
+        }
+        const { fetchStart, end } = getMeterUsageRangeMalaysia(dateRange)
+        setUsageLoading(true)
+        usageSummary(roomId, fetchStart, end)
+          .then((ures) => {
+            if (ures?.ok && ures.records) {
+              setUsageData({ total: ures.total ?? 0, records: ures.records })
+            }
+          })
+          .catch(() => {})
+          .finally(() => setUsageLoading(false))
+        void state?.refetch?.()
+        setTimeout(() => setSyncDone(false), 3000)
+      }
+    } catch {
+      // keep prior meter / usage
+    } finally {
+      setSyncing(false)
+    }
+  }
 
   const balance = meter?.balance != null ? Number(meter.balance) : null
   const rate = meter?.rate != null ? Number(meter.rate) : 0.65
@@ -338,9 +386,23 @@ export default function MeterPage() {
           <h1 className="text-3xl font-black text-foreground">Utility Control</h1>
           <p className="text-muted-foreground mt-1">Monitor and manage your electricity usage.</p>
         </div>
-        <Button variant="outline" size="sm" className="gap-2" onClick={() => setShowReportDialog(true)}>
-          <Download size={14} /> Usage Report
-        </Button>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="gap-2"
+            onClick={() => void handleMeterSync()}
+            disabled={!roomId || syncing}
+            title="Sync meter balance from utility provider"
+          >
+            <RefreshCw size={14} className={syncing ? "animate-spin" : ""} />
+            {syncing ? "Syncing…" : syncDone ? "Synced" : "Sync"}
+          </Button>
+          <Button variant="outline" size="sm" className="gap-2" onClick={() => setShowReportDialog(true)}>
+            <Download size={14} /> Usage Report
+          </Button>
+        </div>
       </div>
 
       {meterSuccess && (

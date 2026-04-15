@@ -16,11 +16,11 @@ function getEcsBase(): string {
   return (process.env.NEXT_PUBLIC_ECS_BASE_URL ?? "").replace(/\/$/, "")
 }
 
-/** OAuth：enquiry=1 時後端允許首登（Google/Facebook state）。 */
+/** OAuth：enquiry=1 時後端允許首登（Google/Facebook state）。govPending = Singpass 補郵 pendingId。 */
 export function buildPortalOAuthStartUrl(
   base: string,
   provider: "google" | "facebook",
-  opts?: { enquiry?: boolean }
+  opts?: { enquiry?: boolean; govPending?: string }
 ): string {
   const frontend =
     typeof window !== "undefined"
@@ -29,8 +29,55 @@ export function buildPortalOAuthStartUrl(
   const params = new URLSearchParams()
   if (frontend) params.set("frontend", frontend)
   if (opts?.enquiry) params.set("enquiry", "1")
+  if (opts?.govPending) params.set("gov_pending", opts.govPending)
   const q = params.toString() ? `?${params.toString()}` : ""
   return `${base}/api/portal-auth/${provider}${q}`
+}
+
+/** Singpass 補郵：登入已取得 JWT 後免密完成綁定。 */
+export async function completeGovPendingWithPortalJwt(opts: {
+  pendingId: string
+  email: string
+  token: string
+  frontend?: string
+}): Promise<{ ok?: boolean; reason?: string; token?: string; nextPath?: string }> {
+  const base = getEcsBase()
+  if (!base) return { ok: false, reason: "NO_API" }
+  const res = await fetch(`${base}/api/portal-auth/gov-id/complete-pending-email`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${opts.token}`,
+    },
+    body: JSON.stringify({
+      pendingId: opts.pendingId,
+      email: opts.email.trim(),
+      frontend: opts.frontend ?? (typeof window !== "undefined" ? `${window.location.protocol}//${window.location.host}` : undefined),
+    }),
+  })
+  return (await res.json().catch(() => ({}))) as { ok?: boolean; reason?: string; token?: string; nextPath?: string }
+}
+
+/** Singpass 補郵：註冊表單提交密碼後完成綁定（密碼不在首屏補郵卡上收集）。 */
+export async function completeGovPendingWithPassword(opts: {
+  pendingId: string
+  email: string
+  password: string
+  frontend?: string
+}): Promise<{ ok?: boolean; reason?: string; token?: string; nextPath?: string }> {
+  const base = getEcsBase()
+  if (!base) return { ok: false, reason: "NO_API" }
+  const res = await fetch(`${base}/api/portal-auth/gov-id/complete-pending-email`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      pendingId: opts.pendingId,
+      email: opts.email.trim(),
+      password: opts.password,
+      frontend: opts.frontend ?? (typeof window !== "undefined" ? `${window.location.protocol}//${window.location.host}` : undefined),
+    }),
+  })
+  return (await res.json().catch(() => ({}))) as { ok?: boolean; reason?: string; token?: string; nextPath?: string }
 }
 
 export async function loginWithPassword(
@@ -130,7 +177,7 @@ export function PortalAuthForm({
     setError("")
 
     if (!email?.trim()) {
-      setError("Please enter your email")
+      setError("Please enter your email or NRIC / ID number")
       return
     }
 
@@ -189,8 +236,14 @@ export function PortalAuthForm({
         router.push(afterPasswordLogin)
         return
       }
-      if (result.reason === "INVALID_CREDENTIALS" || result.reason === "NO_EMAIL") {
-        setError("Invalid email or password. Not registered? Create an account first.")
+      if (result.reason === "INVALID_CREDENTIALS") {
+        setError("Invalid email, NRIC, or password.")
+      } else if (result.reason === "NO_EMAIL") {
+        setError("Please enter your email or NRIC / ID number.")
+      } else if (result.reason === "ACCOUNT_NOT_FOUND_EMAIL") {
+        setError("Can't find your account. Check the email address.")
+      } else if (result.reason === "ACCOUNT_NOT_FOUND_NRIC") {
+        setError("Can't find your login details. Check your NRIC / ID number.")
       } else {
         setError(result.reason === "DB_ERROR" ? "Server error. Please try again." : result.reason || "Login failed.")
       }
@@ -267,15 +320,15 @@ export function PortalAuthForm({
         <div className="space-y-4">
           <div>
             <label className="text-xs font-semibold text-muted-foreground block mb-1.5 uppercase tracking-wide">
-              Email Address
+              Email or NRIC / ID number
             </label>
             <Input
-              type="email"
-              placeholder="your@email.com"
+              type="text"
+              placeholder="your@email.com or e.g. 901010105678"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               className="w-full"
-              autoComplete="email"
+              autoComplete="username"
             />
           </div>
 

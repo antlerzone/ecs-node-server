@@ -44,4 +44,42 @@ async function sendPasswordResetCode(email, code) {
   console.log('[portal-password-reset] Code for', email, ':', code, '(no SMTP configured; set SMTP_* and PORTAL_RESET_FROM_EMAIL to send real email)');
 }
 
-module.exports = { sendPasswordResetCode };
+/**
+ * Generic OTP / notice email (email change, phone verification code sent to inbox when SMS not wired).
+ */
+async function sendPortalOtpEmail(to, subject, textBody, htmlBody) {
+  const fromEmail = process.env.PORTAL_RESET_FROM_EMAIL;
+  const fromName = process.env.PORTAL_RESET_FROM_NAME || 'Coliving Management';
+  const smtpHost = process.env.SMTP_HOST;
+  const smtpPort = process.env.SMTP_PORT;
+  const smtpUser = process.env.SMTP_USER;
+  const smtpPass = process.env.SMTP_PASS;
+  const hasSmtp = smtpHost && smtpPort && smtpUser && smtpPass && fromEmail;
+
+  if (hasSmtp) {
+    try {
+      const nodemailer = require('nodemailer');
+      const secure = process.env.SMTP_SECURE === 'true' || process.env.SMTP_SECURE === '1';
+      const transporter = nodemailer.createTransport({
+        host: smtpHost,
+        port: Number(smtpPort) || 587,
+        secure,
+        auth: { user: smtpUser, pass: smtpPass },
+      });
+      await transporter.sendMail({
+        from: fromName ? `"${fromName}" <${fromEmail}>` : fromEmail,
+        to,
+        subject,
+        text: textBody,
+        html: htmlBody,
+      });
+      console.log('[portal-otp-email] sent to', to);
+      return;
+    } catch (err) {
+      console.error('[portal-otp-email] Send failed:', err?.message || err);
+    }
+  }
+  console.log('[portal-otp-email] Code notice (no SMTP or send failed). To:', to, 'Subject:', subject, 'Body:', textBody);
+}
+
+module.exports = { sendPasswordResetCode, sendPortalOtpEmail };

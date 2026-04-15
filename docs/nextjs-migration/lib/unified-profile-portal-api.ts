@@ -64,31 +64,38 @@ export function mapPortalGetResponseToUnified(
     nricFrontUrl: String(p.nricfront || "").trim(),
     nricBackUrl: String(p.nricback || "").trim(),
     avatarUrl: String(p.avatar_url || "").trim(),
+    govIdentityLocked: !!(p as { gov_identity_locked?: unknown }).gov_identity_locked,
+    singpassLinked: !!(p as { singpass_linked?: unknown }).singpass_linked,
+    mydigitalLinked: !!(p as { mydigital_linked?: unknown }).mydigital_linked,
+    phoneVerified: !!(p as { phone_verified?: unknown }).phone_verified,
   };
 }
 
-export function buildPortalPayloadFromUnified(payload: {
-  fullName: string;
-  legalName: string;
-  nickname: string;
-  phone: string;
-  address: string;
-  entityType: string;
-  idType: string;
-  idNumber: string;
-  taxIdNo: string;
-  bankId: string;
-  bankAccountNo: string;
-  bankAccountHolder: string;
-  avatarUrl: string;
-  nricFrontUrl: string | null;
-  nricBackUrl: string | null;
-}): Record<string, unknown> {
+export function buildPortalPayloadFromUnified(
+  payload: {
+    fullName: string;
+    legalName: string;
+    nickname: string;
+    phone: string;
+    address: string;
+    entityType: string;
+    idType: string;
+    idNumber: string;
+    taxIdNo: string;
+    bankId: string;
+    bankAccountNo: string;
+    bankAccountHolder: string;
+    avatarUrl: string;
+    nricFrontUrl: string | null;
+    nricBackUrl: string | null;
+  },
+  options?: { identityLocked?: boolean }
+): Record<string, unknown> {
   const fullname = payload.fullName != null ? String(payload.fullName).trim() : "";
   const legal = payload.legalName != null ? String(payload.legalName).trim() : "";
   const bid =
     payload.bankId != null && String(payload.bankId).trim() !== "" ? String(payload.bankId).trim() : null;
-  return {
+  const body: Record<string, unknown> = {
     fullname: fullname || legal || null,
     first_name: payload.nickname != null ? String(payload.nickname).trim() || null : null,
     phone: payload.phone != null ? String(payload.phone).trim() || null : null,
@@ -105,6 +112,14 @@ export function buildPortalPayloadFromUnified(payload: {
     nricfront: payload.nricFrontUrl != null ? String(payload.nricFrontUrl).trim() || null : null,
     nricback: payload.nricBackUrl != null ? String(payload.nricBackUrl).trim() || null : null,
   };
+  if (options?.identityLocked) {
+    delete body.fullname;
+    delete body.nric;
+    delete body.entity_type;
+    delete body.reg_no_type;
+    delete body.id_type;
+  }
+  return body;
 }
 
 export async function fetchPortalProfileByEmail(email: string): Promise<{
@@ -136,35 +151,38 @@ export async function fetchPortalProfileByEmail(email: string): Promise<{
   }
 }
 
-export async function savePortalProfile(payload: {
-  fullName: string;
-  legalName: string;
-  nickname: string;
-  phone: string;
-  address: string;
-  entityType: string;
-  idType: string;
-  idNumber: string;
-  taxIdNo: string;
-  bankId: string;
-  bankAccountNo: string;
-  bankAccountHolder: string;
-  avatarUrl: string;
-  nricFrontUrl: string | null;
-  nricBackUrl: string | null;
-  /** Ignored by portal PUT — kept for parity with Cleanlemons payload shape */
-  clientId?: string;
-  email?: string;
-}): Promise<{ ok: boolean; reason?: string }> {
+export async function savePortalProfile(
+  payload: {
+    fullName: string;
+    legalName: string;
+    nickname: string;
+    phone: string;
+    address: string;
+    entityType: string;
+    idType: string;
+    idNumber: string;
+    taxIdNo: string;
+    bankId: string;
+    bankAccountNo: string;
+    bankAccountHolder: string;
+    avatarUrl: string;
+    nricFrontUrl: string | null;
+    nricBackUrl: string | null;
+    /** Ignored by portal PUT — kept for parity with Cleanlemons payload shape */
+    clientId?: string;
+    email?: string;
+  },
+  options?: { govIdentityLocked?: boolean }
+): Promise<{ ok: boolean; reason?: string }> {
   const base = getPortalApiBase();
   if (!base) return { ok: true };
-  const body = buildPortalPayloadFromUnified(payload);
+  const body = buildPortalPayloadFromUnified(payload, { identityLocked: options?.govIdentityLocked });
   try {
     const data = (await portalPost("access/portal-profile-save", {
       email: String(payload.email || "").trim(),
       ...body,
     })) as { ok?: boolean; reason?: string };
-    return { ok: data.ok !== false };
+    return { ok: data.ok !== false, reason: data.reason };
   } catch (err) {
     return {
       ok: false,
@@ -245,6 +263,219 @@ export async function confirmPortalPasswordReset(params: {
 }
 
 /** Coliving: ensure `tenantdetail` or `ownerdetail` exists before portal data loads (JWT). Demo: no-op. */
+async function portalAuthFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const base = getPortalApiBase();
+  const url = `${base.replace(/\/$/, "")}/${path.replace(/^\//, "")}`;
+  const headers = new Headers(init.headers || undefined);
+  const jwt = getPortalJwt();
+  if (jwt) headers.set("Authorization", `Bearer ${jwt}`);
+  return fetch(url, { ...init, headers });
+}
+
+/** Gov ID link status (Singpass / MyDigital). Requires portal JWT. */
+export async function fetchGovIdStatus(): Promise<{
+  ok: boolean;
+  singpass?: boolean;
+  mydigital?: boolean;
+  identityLocked?: boolean;
+  reason?: string;
+}> {
+  const base = getPortalApiBase();
+  if (!base) return { ok: false, reason: "NO_API" };
+  const jwt = getPortalJwt();
+  if (!jwt) return { ok: false, reason: "NO_JWT" };
+  try {
+    const r = await portalAuthFetch("portal-auth/gov-id/status", { method: "GET" });
+    const data = (await r.json().catch(() => ({}))) as {
+      ok?: boolean;
+      singpass?: boolean;
+      mydigital?: boolean;
+      identityLocked?: boolean;
+      reason?: string;
+    };
+    if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+    return data as { ok: boolean; singpass?: boolean; mydigital?: boolean; identityLocked?: boolean; reason?: string };
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : "NETWORK_ERROR" };
+  }
+}
+
+export async function disconnectGovIdApi(provider: "singpass" | "mydigital"): Promise<{ ok: boolean; reason?: string }> {
+  const base = getPortalApiBase();
+  if (!base) return { ok: false, reason: "NO_API" };
+  try {
+    const r = await portalAuthFetch("portal-auth/gov-id/disconnect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider }),
+    });
+    const data = (await r.json().catch(() => ({}))) as { ok?: boolean; reason?: string };
+    if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+    return { ok: data.ok !== false };
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : "NETWORK_ERROR" };
+  }
+}
+
+type OkReason = { ok: boolean; reason?: string; newEmail?: string };
+
+export async function requestPortalEmailChangeOtp(newEmail: string): Promise<OkReason> {
+  const base = getPortalApiBase();
+  if (!base) return { ok: false, reason: "NO_API" };
+  if (!getPortalJwt()) return { ok: false, reason: "NO_JWT" };
+  try {
+    const r = await portalAuthFetch("portal-auth/email-change/request", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ newEmail: String(newEmail || "").trim() }),
+    });
+    const data = (await r.json().catch(() => ({}))) as OkReason;
+    if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+    return data;
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : "NETWORK_ERROR" };
+  }
+}
+
+export async function confirmPortalEmailChange(params: {
+  newEmail: string;
+  code: string;
+}): Promise<OkReason> {
+  const base = getPortalApiBase();
+  if (!base) return { ok: false, reason: "NO_API" };
+  if (!getPortalJwt()) return { ok: false, reason: "NO_JWT" };
+  try {
+    const r = await portalAuthFetch("portal-auth/email-change/confirm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        newEmail: String(params.newEmail || "").trim(),
+        code: String(params.code || "").trim(),
+      }),
+    });
+    const data = (await r.json().catch(() => ({}))) as OkReason;
+    if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+    return data;
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : "NETWORK_ERROR" };
+  }
+}
+
+export async function requestPortalPhoneVerifyOtp(phone: string): Promise<OkReason> {
+  const base = getPortalApiBase();
+  if (!base) return { ok: false, reason: "NO_API" };
+  if (!getPortalJwt()) return { ok: false, reason: "NO_JWT" };
+  try {
+    const r = await portalAuthFetch("portal-auth/phone-verify/request", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ phone: String(phone || "").trim() }),
+    });
+    const data = (await r.json().catch(() => ({}))) as OkReason;
+    if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+    return data;
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : "NETWORK_ERROR" };
+  }
+}
+
+export async function confirmPortalPhoneVerify(params: {
+  phone: string;
+  code: string;
+}): Promise<OkReason> {
+  const base = getPortalApiBase();
+  if (!base) return { ok: false, reason: "NO_API" };
+  if (!getPortalJwt()) return { ok: false, reason: "NO_JWT" };
+  try {
+    const r = await portalAuthFetch("portal-auth/phone-verify/confirm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        phone: String(params.phone || "").trim(),
+        code: String(params.code || "").trim(),
+      }),
+    });
+    const data = (await r.json().catch(() => ({}))) as OkReason;
+    if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+    return data;
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : "NETWORK_ERROR" };
+  }
+}
+
+export async function requestPortalPhoneChangeOtp(newPhone: string): Promise<OkReason> {
+  const base = getPortalApiBase();
+  if (!base) return { ok: false, reason: "NO_API" };
+  if (!getPortalJwt()) return { ok: false, reason: "NO_JWT" };
+  try {
+    const r = await portalAuthFetch("portal-auth/phone-change/request", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ newPhone: String(newPhone || "").trim() }),
+    });
+    const data = (await r.json().catch(() => ({}))) as OkReason;
+    if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+    return data;
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : "NETWORK_ERROR" };
+  }
+}
+
+export async function confirmPortalPhoneChange(params: {
+  newPhone: string;
+  code: string;
+}): Promise<OkReason> {
+  const base = getPortalApiBase();
+  if (!base) return { ok: false, reason: "NO_API" };
+  if (!getPortalJwt()) return { ok: false, reason: "NO_JWT" };
+  try {
+    const r = await portalAuthFetch("portal-auth/phone-change/confirm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        newPhone: String(params.newPhone || "").trim(),
+        code: String(params.code || "").trim(),
+      }),
+    });
+    const data = (await r.json().catch(() => ({}))) as OkReason;
+    if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+    return data;
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : "NETWORK_ERROR" };
+  }
+}
+
+/**
+ * Full browser redirect must hit the **Node API** host (not the Next `/api/portal/proxy` path).
+ * MyDigital：须带 portal JWT。Singpass：`opts.direct` 时可无 JWT（主登录，回调用 MyInfo 邮箱匹配已有账号）。
+ */
+export function buildGovIdStartUrl(
+  provider: "singpass" | "mydigital",
+  returnPath = "/demologin",
+  opts?: { direct?: boolean }
+): string {
+  const jwt = getPortalJwt();
+  const ecs =
+    typeof window !== "undefined"
+      ? (process.env.NEXT_PUBLIC_ECS_BASE_URL || "https://api.colivingjb.com").replace(/\/$/, "")
+      : "";
+  if (!ecs) return "";
+  const frontend =
+    typeof window !== "undefined" ? `${window.location.protocol}//${window.location.host}` : "";
+  const params = new URLSearchParams({
+    provider,
+    frontend,
+    returnPath: returnPath.startsWith("/") ? returnPath : `/${returnPath}`,
+  });
+  if (provider === "singpass" && opts?.direct) {
+    params.set("direct", "1");
+  } else {
+    if (!jwt) return "";
+    params.set("portal_token", jwt);
+  }
+  return `${ecs}/api/portal-auth/gov-id/start?${params.toString()}`;
+}
+
 export async function ensureColivingPortalDetail(
   role: "tenant" | "owner"
 ): Promise<{ ok: boolean; reason?: string }> {

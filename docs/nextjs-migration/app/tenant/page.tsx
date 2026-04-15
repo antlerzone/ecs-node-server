@@ -6,6 +6,7 @@ import { Clock, AlertCircle, ArrowRight, CalendarDays, RefreshCw, Wifi, UserPlus
 import { Progress } from "@/components/ui/progress"
 import { useTenantOptional } from "@/contexts/tenant-context"
 import { room, meterSync, propertyWithSmartdoor, updateHandoverSchedule } from "@/lib/tenant-api"
+import { agreementNeedsTenantPortalSignature } from "@/lib/tenant-gates"
 
 function getActionItems(
   hasPendingOperatorInvite: boolean,
@@ -99,7 +100,7 @@ export default function TenantDashboard() {
     handoverCheckinAt?: string | null
     handoverCheckoutAt?: string | null
     handoverScheduleWindow?: { start: string; end: string; source?: string } | null
-    agreements?: Array<{ tenantsign?: string }>
+    agreements?: Array<{ tenantsign?: string; status?: string; columns_locked?: boolean }>
     parkingLotDisplay?: string
     parkingLots?: Array<{ parkinglot?: string }>
   }[]
@@ -149,7 +150,9 @@ export default function TenantDashboard() {
     tenancies.find((t) => (t.id ?? t._id) === selectedTenancyId) ?? tenancies[0]
   const firstTenancyId = activeTenancy?.id ?? activeTenancy?._id
   const handoverWindow = activeTenancy?.handoverScheduleWindow
-  const hasTenantSigned = Array.isArray(activeTenancy?.agreements) && activeTenancy.agreements.some((a) => !!a?.tenantsign)
+  const hasTenantSigned =
+    Array.isArray(activeTenancy?.agreements) &&
+    activeTenancy.agreements.some((a) => !agreementNeedsTenantPortalSignature(a))
   const roomId = activeTenancy?.room?.id ?? activeTenancy?.room?._id
   const propertyId = activeTenancy?.property?.id ?? activeTenancy?.property?._id
   const parkingLotDisplay = (() => {

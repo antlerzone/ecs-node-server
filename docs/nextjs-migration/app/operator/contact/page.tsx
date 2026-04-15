@@ -43,6 +43,7 @@ import {
   uploadFile,
   getOperatorClientId,
   getOwnerDetail,
+  getTenantDetail,
   updateOwnerBank,
 } from "@/lib/operator-api"
 
@@ -610,6 +611,35 @@ export default function ContactSettingPage() {
         ...(idPick.idType ? { idType: idPick.idType } : {}),
         ...(idPick.idNumber ? { idNumber: idPick.idNumber } : {}),
       }))
+    }
+    const tenantOnlyForBank = group.roles.length === 1 && group.roles[0] === "tenant"
+    const tenRow = group.members.find((m) => String(m.type || "").toLowerCase() === "tenant")
+    const tenEntity = tenRow ? entityIdForContact(tenRow) : ""
+    if (tenantOnlyForBank && tenEntity) {
+      try {
+        const td = (await getTenantDetail(tenEntity)) as {
+          bankName?: string
+          bankAccount?: string
+          bankHolder?: string
+        }
+        setFormData((prev) => ({
+          ...prev,
+          bankName:
+            td.bankName != null && String(td.bankName).trim() !== ""
+              ? String(td.bankName)
+              : prev.bankName,
+          bankAccount:
+            td.bankAccount != null && String(td.bankAccount).trim() !== ""
+              ? String(td.bankAccount)
+              : prev.bankAccount,
+          bankHolder:
+            td.bankHolder != null && String(td.bankHolder).trim() !== ""
+              ? String(td.bankHolder)
+              : prev.bankHolder,
+        }))
+      } catch (e) {
+        console.error(e)
+      }
     }
     setShowEditDialog(true)
   }
@@ -1453,6 +1483,18 @@ export default function ContactSettingPage() {
                 const ownerM = group.members.find((m) => m.type === "owner")
                 const tenantM = group.members.find((m) => m.type === "tenant")
                 const bankRow = ownerM ?? group.members.find((m) => m.bankAccount || m.bankName)
+                const bankListLabel =
+                  (bankRow?.bankName || "").trim() !== ""
+                    ? bankOptions.find((b) => b.value === bankRow?.bankName)?.label ?? bankRow?.bankName
+                    : ""
+                const bankNameCell = bankListLabel || (bankRow?.bankName || "").trim() || "—"
+                const bankAccountCell = (bankRow?.bankAccount || "").trim() || "—"
+                const supplierM = group.members.find((m) => m.type === "supplier")
+                const jompayCode = (supplierM?.billerCode || "").trim()
+                const paymentSummary =
+                  jompayCode !== ""
+                    ? `Jompay: ${jompayCode}`
+                    : `Bank: ${bankNameCell} — ${bankAccountCell}`
                 return (
                   <Card key={group.key} className="p-4">
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -1469,7 +1511,7 @@ export default function ContactSettingPage() {
                             {group.email || "—"} | {group.phone || "—"}
                           </p>
                           <p className="text-xs text-muted-foreground mt-1">
-                            {group.members.map((m) => m.idType).filter(Boolean)[0] ?? "—"}: {group.members.map((m) => m.idNumber).filter(Boolean)[0] ?? "—"} | Bank: {bankRow?.bankName ?? "—"} — {bankRow?.bankAccount ?? "—"}
+                            {group.members.map((m) => m.idType).filter(Boolean)[0] ?? "—"}: {group.members.map((m) => m.idNumber).filter(Boolean)[0] ?? "—"} | {paymentSummary}
                           </p>
                         </div>
                       </div>
@@ -1691,7 +1733,7 @@ export default function ContactSettingPage() {
             <DialogTitle className="flex flex-wrap items-center gap-2">
               {selectedEditGroup && selectedEditGroup.roles.length === 1 ? getTypeIcon(selectedEditGroup.roles[0]) : <Users size={18} className="text-muted-foreground" />}
               {selectedEditGroup && selectedEditGroup.roles.length === 1 && selectedEditGroup.roles[0] === "tenant"
-                ? "Tenant · accounting ID"
+                ? "Tenant · accounting ID & bank"
                 : "Edit contact"}
             </DialogTitle>
           </DialogHeader>
@@ -1832,6 +1874,55 @@ export default function ContactSettingPage() {
                           className="mt-1"
                           placeholder="e.g. Bukku contact numeric ID"
                         />
+                      </div>
+                    ) : null}
+                    {tenantOnlyDialog ? (
+                      <div className="col-span-2 rounded-lg border border-border p-3 space-y-3 bg-muted/10">
+                        <p className="text-xs font-semibold text-muted-foreground">Bank details</p>
+                        <p className="text-xs text-muted-foreground">
+                          The tenant enters and updates this in their portal profile. Shown here for reference only.
+                        </p>
+                        {!formData.bankName?.trim() &&
+                        !formData.bankAccount?.trim() &&
+                        !formData.bankHolder?.trim() ? (
+                          <p className="text-sm text-muted-foreground">No bank details on file.</p>
+                        ) : (
+                          <>
+                            <div>
+                              <Label className="text-xs font-semibold">Bank</Label>
+                              <Input
+                                value={
+                                  formData.bankName?.trim()
+                                    ? bankOptions.find((b) => b.value === formData.bankName)?.label ?? formData.bankName
+                                    : "—"
+                                }
+                                readOnly
+                                disabled
+                                className="mt-1 opacity-80 cursor-not-allowed bg-muted/50"
+                              />
+                            </div>
+                            <div className="grid grid-cols-2 gap-4">
+                              <div>
+                                <Label className="text-xs font-semibold">Account number</Label>
+                                <Input
+                                  value={formData.bankAccount?.trim() || "—"}
+                                  readOnly
+                                  disabled
+                                  className="mt-1 opacity-80 cursor-not-allowed bg-muted/50"
+                                />
+                              </div>
+                              <div>
+                                <Label className="text-xs font-semibold">Account holder</Label>
+                                <Input
+                                  value={formData.bankHolder?.trim() || "—"}
+                                  readOnly
+                                  disabled
+                                  className="mt-1 opacity-80 cursor-not-allowed bg-muted/50"
+                                />
+                              </div>
+                            </div>
+                          </>
+                        )}
                       </div>
                     ) : null}
                     {showOwnerBankForm && (

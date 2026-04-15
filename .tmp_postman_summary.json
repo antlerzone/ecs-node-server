@@ -1,0 +1,41 @@
+{
+  "count": 4,
+  "rows": [
+    {
+      "name": "Account > Get Account",
+      "method": "GET",
+      "raw": "{{host}}/account",
+      "addAuthDataToQuery": null,
+      "region": null,
+      "service": null,
+      "bodyKeys": []
+    },
+    {
+      "name": "Account > Create Account",
+      "method": "POST",
+      "raw": "{{host}}/account",
+      "addAuthDataToQuery": null,
+      "region": null,
+      "service": null,
+      "bodyKeys": []
+    },
+    {
+      "name": "Agent > Get Agent",
+      "method": "GET",
+      "raw": "{{host}}/agent",
+      "addAuthDataToQuery": null,
+      "region": null,
+      "service": null,
+      "bodyKeys": []
+    },
+    {
+      "name": "Agent > Create Agent",
+      "method": "POST",
+      "raw": "{{host}}/agent",
+      "addAuthDataToQuery": null,
+      "region": null,
+      "service": null,
+      "bodyKeys": []
+    }
+  ]
+}

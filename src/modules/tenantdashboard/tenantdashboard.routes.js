@@ -821,20 +821,47 @@ router.post('/submit-paynow-receipt', (req, res) => {
       reference_number: Array.isArray(invoiceIds) && invoiceIds.length > 0 ? invoiceIds.join(',') : null
     });
     try {
-      const { getTodayMalaysiaDate, getTodayPlusDaysMalaysia } = require('../../utils/dateMalaysia');
-      await syncBankTransactionsFromFinverse(clientId, {
-        from_date: getTodayPlusDaysMalaysia(-14),
-        to_date: getTodayMalaysiaDate()
+      // PayNow submit: include value/posting lag (e.g. txn date 13 Apr, value 14 Apr) and modest history; more pages so newest rows are not dropped if API orders oldest-first.
+      const { getTodayPlusDaysMalaysia } = require('../../utils/dateMalaysia');
+      const syncRes = await syncBankTransactionsFromFinverse(clientId, {
+        from_date: getTodayPlusDaysMalaysia(-7),
+        to_date: getTodayPlusDaysMalaysia(2),
+        maxPages: 12
       });
+      console.log(
+        '[tenantdashboard] submit-paynow-receipt finverse_sync ok',
+        JSON.stringify({
+          clientId: String(clientId).slice(0, 8) + '…',
+          invoiceId: String(data.id).slice(0, 8) + '…',
+          synced: syncRes?.synced,
+          inserted: syncRes?.inserted
+        })
+      );
     } catch (e) {
-      // Finverse not linked or sync error – invoice stays PENDING_VERIFICATION
+      console.warn(
+        '[tenantdashboard] submit-paynow-receipt finverse_sync_skip',
+        JSON.stringify({
+          clientId: String(clientId).slice(0, 8) + '…',
+          message: e?.message || String(e)
+        })
+      );
     }
     let status = data.status;
     try {
       const matchResult = await runMatchingForInvoice(clientId, data.id);
       if (matchResult && matchResult.status) status = matchResult.status;
-    } catch (_) {
-      // match may leave PENDING_REVIEW
+      console.log(
+        '[tenantdashboard] submit-paynow-receipt match',
+        JSON.stringify({
+          clientId: String(clientId).slice(0, 8) + '…',
+          invoiceId: String(data.id).slice(0, 8) + '…',
+          status: matchResult?.status,
+          matched: matchResult?.matched,
+          confidence: matchResult?.confidence
+        })
+      );
+    } catch (e) {
+      console.warn('[tenantdashboard] submit-paynow-receipt match_error', e?.message || String(e));
     }
     return {
       ok: true,

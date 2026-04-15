@@ -5,17 +5,19 @@ import Link from "next/link"
 import {
   Building2, Users, DoorOpen, Wrench,
   TrendingUp, ArrowRight,
-  FileText, PenLine, RefreshCw,
+  FileText, PenLine, RefreshCw, AlertTriangle,
 } from "lucide-react"
 import { useOperatorContext } from "@/contexts/operator-context"
 import {
   getAdminList,
   getMyBillingInfo,
+  getRentalList,
   getTenancyList,
   getTenancySettingList,
   getPropertyList,
   getRoomList,
 } from "@/lib/operator-api"
+import { formatRentalDueDateMalaysia, getTodayMalaysiaYmd, rentalDueDateToMalaysiaYmd } from "@/lib/dateMalaysia"
 
 const statusStyle = (status: string) => {
   if (status === "open" || status === "Open") return { bg: "#fff1f2", text: "#f43f5e", label: "Pending" }
@@ -52,6 +54,23 @@ function extractPlanExpiredAt(expired: unknown): string | null {
   return null
 }
 
+type OverdueRentalRow = {
+  id: string
+  tenant: string
+  room: string
+  property: string
+  amount: number
+  dueLabel: string
+  dateYmd: string
+}
+
+function invoiceCurrencySymbol(code: string): string {
+  const cc = String(code || "").trim().toUpperCase()
+  if (cc === "SGD") return "S$"
+  if (cc === "MYR") return "RM"
+  return cc ? `${cc} ` : "RM"
+}
+
 export default function OperatorDashboard() {
   const { refresh } = useOperatorContext()
   const [syncing, setSyncing] = useState(false)
@@ -62,16 +81,19 @@ export default function OperatorDashboard() {
   const [propertyCount, setPropertyCount] = useState(0)
   const [roomCount, setRoomCount] = useState(0)
   const [planExpiredAt, setPlanExpiredAt] = useState<string | null>(null)
+  const [overdueRentals, setOverdueRentals] = useState<OverdueRentalRow[]>([])
+  const [rentalCurrencyCode, setRentalCurrencyCode] = useState("MYR")
 
   const loadData = async () => {
     try {
-      const [adminRes, tenancyRes, tenancySettingRes, propRes, roomRes, billingRes] = await Promise.all([
+      const [adminRes, tenancyRes, tenancySettingRes, propRes, roomRes, billingRes, rentalRes] = await Promise.all([
         getAdminList({ filterType: "ALL", limit: 500, sort: "new" }),
         getTenancyList({ limit: 100, sort: "new" }),
         getTenancySettingList({ limit: 300, sort: "new" }),
         getPropertyList({ pageSize: 1000 }),
         getRoomList({ pageSize: 10000 }),
         getMyBillingInfo(),
+        getRentalList({}),
       ])
       setAdminItems(Array.isArray(adminRes.items) ? adminRes.items : [])
       setTenancyItems(Array.isArray((tenancyRes as { items?: unknown[] }).items) ? (tenancyRes as { items: unknown[] }).items : [])
@@ -89,11 +111,43 @@ export default function OperatorDashboard() {
       setPropertyCount(Array.isArray((propRes as { items?: unknown[] }).items) ? (propRes as { items: unknown[] }).items.length : 0)
       setRoomCount(Array.isArray((roomRes as { items?: unknown[] }).items) ? (roomRes as { items: unknown[] }).items.length : 0)
       setPlanExpiredAt(extractPlanExpiredAt((billingRes as { expired?: unknown })?.expired))
+      const cc =
+        typeof (rentalRes as { currency?: string })?.currency === "string" && (rentalRes as { currency: string }).currency.trim()
+          ? (rentalRes as { currency: string }).currency.trim().toUpperCase()
+          : "MYR"
+      setRentalCurrencyCode(cc)
+      const today = getTodayMalaysiaYmd()
+      const rentalItems = Array.isArray((rentalRes as { items?: unknown[] }).items) ? (rentalRes as { items: unknown[] }).items : []
+      const overdue = rentalItems
+        .map((row) => {
+          const r = row as Record<string, unknown>
+          const isPaid = Boolean(r.isPaid)
+          if (isPaid) return null
+          const dateYmd = rentalDueDateToMalaysiaYmd(r.date)
+          if (!dateYmd || dateYmd >= today) return null
+          const tenant = r.tenant as { fullname?: string } | null
+          const room = r.room as { title_fld?: string } | null
+          const prop = r.property as { shortname?: string } | null
+          return {
+            id: String(r.id ?? r._id ?? ""),
+            tenant: tenant?.fullname ?? "—",
+            room: room?.title_fld ?? "—",
+            property: prop?.shortname ?? "—",
+            amount: Number(r.amount ?? 0),
+            dueLabel: formatRentalDueDateMalaysia(r.date),
+            dateYmd,
+          } as OverdueRentalRow
+        })
+        .filter((x): x is OverdueRentalRow => Boolean(x))
+        .sort((a, b) => a.dateYmd.localeCompare(b.dateYmd))
+        .slice(0, 8)
+      setOverdueRentals(overdue)
     } catch {
       setAdminItems([])
       setTenancyItems([])
       setHandoverPendingItems([])
       setPlanExpiredAt(null)
+      setOverdueRentals([])
     }
   }
 
@@ -156,6 +210,8 @@ export default function OperatorDashboard() {
   const planMarqueeText = showPlanMarquee
     ? `Pricing plan expires in ${planDaysLeft} day${planDaysLeft === 1 ? "" : "s"} (${formatEndDate(planExpiredAt)}). Please renew soon in Billing.`
     : ""
+
+  const currencySym = invoiceCurrencySymbol(rentalCurrencyCode)
 
   const kpis = [
     { label: "Properties", value: String(propertyCount), icon: Building2, delta: null },
@@ -384,12 +440,45 @@ export default function OperatorDashboard() {
 
         <div className="bg-card border border-border rounded-2xl p-6">
           <div className="flex items-center justify-between mb-5">
-            <h2 className="font-black text-lg text-foreground">Pending Payments</h2>
+            <h2 className="font-black text-lg text-foreground">Overdue payments</h2>
             <Link href="/operator/invoice" className="text-sm text-primary font-semibold flex items-center gap-1 hover:underline">
               View Invoices <ArrowRight size={14} />
             </Link>
           </div>
-          <p className="text-sm text-muted-foreground py-4">View unpaid rentals in Tenant Invoice.</p>
+          <div className="flex flex-col gap-3">
+            {overdueRentals.length === 0 ? (
+              <p className="text-sm text-muted-foreground py-4">No overdue invoices (same rule as Tenant Invoice → Overdue).</p>
+            ) : (
+              overdueRentals.map((inv) => (
+                <Link
+                  key={inv.id}
+                  href="/operator/invoice"
+                  className="flex items-center justify-between p-3 rounded-xl bg-secondary/30 hover:bg-secondary/50 transition-colors"
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 bg-red-100 dark:bg-red-950/50">
+                      <AlertTriangle size={13} className="text-red-600 dark:text-red-400" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="font-semibold text-sm text-foreground truncate">{inv.tenant}</div>
+                      <div className="text-xs text-muted-foreground truncate">
+                        {inv.room}
+                        {inv.property ? ` · ${inv.property}` : ""}
+                      </div>
+                      <div className="text-[11px] text-red-700 dark:text-red-300 mt-0.5">Due {inv.dueLabel}</div>
+                    </div>
+                  </div>
+                  <div className="text-right flex-shrink-0 pl-2">
+                    <div className="font-black text-foreground text-sm">
+                      {currencySym}{" "}
+                      {inv.amount.toLocaleString("en-MY", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </div>
+                    <div className="text-[10px] font-bold uppercase tracking-wider text-red-600 dark:text-red-400">Overdue</div>
+                  </div>
+                </Link>
+              ))
+            )}
+          </div>
         </div>
       </div>
       <style jsx>{`

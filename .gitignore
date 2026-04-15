@@ -6,4 +6,5 @@ cleanlemon/next-app/.enable-pm2-restart-after-build
 logs/
 *.log
 secrets/*.json
+.tmp-singpass-keys/
 uploads/

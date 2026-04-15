@@ -44,6 +44,14 @@ async function verifyPassword(plain, hash) {
   return bcrypt.compare(plain.trim(), hash);
 }
 
+/** Match `portal_account.nric` whether stored with dashes/spaces (MY) or compact / SG FIN. */
+function normalizeNricForMatch(raw) {
+  return String(raw || '')
+    .trim()
+    .replace(/[\s\-_/]/g, '')
+    .toLowerCase();
+}
+
 /** OAuth / legacy rows may have NULL, '', or non-bcrypt junk; only bcrypt-shaped values count as an existing login password. */
 function hasUsablePasswordHash(hash) {
   if (hash == null) return false;
@@ -103,25 +111,55 @@ async function register(email, password) {
 }
 
 /**
- * 登入：驗證 email + 密碼後回傳 getMemberRoles(email)，供前端 setMember 並跳 /portal。
- * @returns { ok, reason?, email?, roles? } reason: INVALID_CREDENTIALS | NO_EMAIL | DB_ERROR
+ * 登入：email **或** NRIC/證件號（與 `portal_account.nric` 比對，去空白與常見分隔符）+ 密碼。
+ * Body 仍用欄位名 `email` 傳入，可填信箱或證件號。
+ * @returns { ok, reason?, email?, roles? } reason: INVALID_CREDENTIALS | NO_EMAIL | ACCOUNT_NOT_FOUND_EMAIL | ACCOUNT_NOT_FOUND_NRIC | DB_ERROR
  */
 async function login(email, password) {
-  const normalized = normalizeEmail(email);
-  if (!normalized) {
+  const raw = String(email || '').trim();
+  if (!raw) {
     return { ok: false, reason: 'NO_EMAIL' };
   }
 
-  const [rows] = await pool.query(
-    'SELECT id, email, password_hash FROM portal_account WHERE email = ? LIMIT 1',
-    [normalized]
-  );
-  const account = rows[0];
-  if (!account || !(await verifyPassword(password, account.password_hash))) {
+  let account = null;
+
+  if (raw.includes('@')) {
+    const normalized = normalizeEmail(raw);
+    if (!normalized) {
+      return { ok: false, reason: 'NO_EMAIL' };
+    }
+    const [rows] = await pool.query(
+      'SELECT id, email, password_hash FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+      [normalized]
+    );
+    if (!rows.length) {
+      return { ok: false, reason: 'ACCOUNT_NOT_FOUND_EMAIL' };
+    }
+    account = rows[0];
+  } else {
+    const key = normalizeNricForMatch(raw);
+    if (!key) {
+      return { ok: false, reason: 'NO_EMAIL' };
+    }
+    const [rows] = await pool.query(
+      `SELECT id, email, password_hash FROM portal_account
+       WHERE nric IS NOT NULL AND TRIM(nric) != ''
+         AND LOWER(REPLACE(REPLACE(REPLACE(REPLACE(TRIM(nric), '-', ''), ' ', ''), '/', ''), '_', '')) = ?
+       LIMIT 1`,
+      [key]
+    );
+    if (!rows.length) {
+      return { ok: false, reason: 'ACCOUNT_NOT_FOUND_NRIC' };
+    }
+    account = rows[0];
+  }
+
+  if (!(await verifyPassword(password, account.password_hash))) {
     return { ok: false, reason: 'INVALID_CREDENTIALS' };
   }
 
-  const memberRoles = await getMemberRoles(normalized);
+  const memberEmail = String(account.email || '').trim();
+  const memberRoles = await getMemberRoles(memberEmail);
   if (!memberRoles.ok) {
     return { ok: false, reason: 'DB_ERROR' };
   }
@@ -331,7 +369,10 @@ async function getPortalProfile(email) {
   }
   try {
     const [rows] = await pool.query(
-      'SELECT fullname, first_name, last_name, phone, address, nric, bankname_id, bankaccount, accountholder, avatar_url, nricfront, nricback, entity_type, reg_no_type, id_type, tax_id_no, bank_refund_remark FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+      `SELECT fullname, first_name, last_name, phone, address, nric, bankname_id, bankaccount, accountholder, avatar_url, nricfront, nricback, entity_type, reg_no_type, id_type, tax_id_no, bank_refund_remark,
+       singpass_sub, mydigital_sub, gov_identity_locked,
+       COALESCE(phone_verified, 0) AS phone_verified
+       FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1`,
       [normalized]
     );
     const r = rows[0];
@@ -358,11 +399,53 @@ async function getPortalProfile(email) {
         reg_no_type: r.reg_no_type ?? null,
         id_type: r.id_type ?? null,
         tax_id_no: r.tax_id_no ?? null,
-        bank_refund_remark: r.bank_refund_remark ?? null
+        bank_refund_remark: r.bank_refund_remark ?? null,
+        singpass_linked: !!(r.singpass_sub && String(r.singpass_sub).trim()),
+        mydigital_linked: !!(r.mydigital_sub && String(r.mydigital_sub).trim()),
+        gov_identity_locked: !!r.gov_identity_locked,
+        phone_verified: !!Number(r.phone_verified)
       }
     };
   } catch (err) {
-    if (err && (err.code === 'ER_BAD_FIELD_ERROR' || err.code === 'ECONNRESET')) {
+    if (err && err.code === 'ER_BAD_FIELD_ERROR') {
+      try {
+        const [rows] = await pool.query(
+          'SELECT fullname, first_name, last_name, phone, address, nric, bankname_id, bankaccount, accountholder, avatar_url, nricfront, nricback, entity_type, reg_no_type, id_type, tax_id_no, bank_refund_remark FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+          [normalized]
+        );
+        const r = rows[0];
+        if (!r) return { ok: true, profile: null };
+        return {
+          ok: true,
+          profile: {
+            fullname: r.fullname ?? null,
+            first_name: r.first_name ?? null,
+            last_name: r.last_name ?? null,
+            phone: r.phone ?? null,
+            address: r.address ?? null,
+            nric: r.nric ?? null,
+            bankname_id: r.bankname_id ?? null,
+            bankaccount: r.bankaccount ?? null,
+            accountholder: r.accountholder ?? null,
+            avatar_url: r.avatar_url ?? null,
+            nricfront: r.nricfront ?? null,
+            nricback: r.nricback ?? null,
+            entity_type: r.entity_type ?? null,
+            reg_no_type: r.reg_no_type ?? null,
+            id_type: r.id_type ?? null,
+            tax_id_no: r.tax_id_no ?? null,
+            bank_refund_remark: r.bank_refund_remark ?? null,
+            singpass_linked: false,
+            mydigital_linked: false,
+            gov_identity_locked: false,
+            phone_verified: false
+          }
+        };
+      } catch (_) {
+        return { ok: true, profile: null };
+      }
+    }
+    if (err && err.code === 'ECONNRESET') {
       return { ok: true, profile: null };
     }
     return { ok: false, reason: 'DB_ERROR' };
@@ -399,6 +482,43 @@ async function updatePortalProfile(email, payload) {
   const first_name_provided = hasKey('first_name') && payload.first_name !== undefined;
   const last_name_provided = hasKey('last_name') && payload.last_name !== undefined;
   const fullname_provided = hasKey('fullname') && payload.fullname !== undefined;
+
+  try {
+    const [lc] = await pool.query(
+      'SELECT gov_identity_locked FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+      [normalized]
+    );
+    if (lc[0] && Number(lc[0].gov_identity_locked) === 1) {
+      const nric_provided = hasKey('nric') && payload.nric !== undefined;
+      if (fullname_provided || entity_type_provided || id_type_provided || nric_provided) {
+        return { ok: false, reason: 'IDENTITY_LOCKED' };
+      }
+    }
+  } catch (e) {
+    if (e && e.code !== 'ER_BAD_FIELD_ERROR') {
+      console.warn('[portal-auth] gov_identity_locked check:', e?.message || e);
+    }
+  }
+
+  try {
+    const [phoneRows] = await pool.query(
+      'SELECT phone, COALESCE(phone_verified, 0) AS phone_verified FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+      [normalized]
+    );
+    const pr = phoneRows[0];
+    if (pr && Number(pr.phone_verified) === 1 && hasKey('phone') && payload.phone !== undefined) {
+      const incoming =
+        payload.phone != null ? String(payload.phone).replace(/\s+/g, '').trim() : '';
+      const stored = pr.phone != null ? String(pr.phone).replace(/\s+/g, '').trim() : '';
+      if (incoming !== stored) {
+        return { ok: false, reason: 'PHONE_VERIFIED_LOCKED' };
+      }
+    }
+  } catch (e) {
+    if (e && e.code !== 'ER_BAD_FIELD_ERROR') {
+      console.warn('[portal-auth] phone_verified check:', e?.message || e);
+    }
+  }
 
   const fullname = payload.fullname != null ? String(payload.fullname).trim() || null : null;
   const first_name = first_name_provided ? (payload.first_name == null ? null : String(payload.first_name).trim() || null) : null;
@@ -919,5 +1039,6 @@ module.exports = {
   updatePortalBankFields,
   requestPasswordReset,
   confirmPasswordReset,
-  changePassword
+  changePassword,
+  verifyPortalToken
 };

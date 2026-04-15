@@ -693,7 +693,7 @@ function EnquiryPageInner() {
               <a href="https://www.colivingjb.com">
                 <Button variant="outline" className="w-full sm:w-auto">Back to Home</Button>
               </a>
-              <Link href="/register">
+              <Link href="/enquiry?mode=signup">
                 <Button variant="outline" className="w-full sm:w-auto">Register</Button>
               </Link>
             </div>
@@ -722,6 +722,9 @@ function EnquiryPageInner() {
 
   const showLiveFlow = !isDemoSite() && !!getEnquiryApiBase()
 
+  const enquiryAuthInitialPage =
+    searchParams.get("mode") === "signup" ? ("signup" as const) : ("signin" as const)
+
   return (
     <div className="flex min-h-[100dvh] flex-col bg-background">
       <header className="shrink-0 border-b border-border bg-card px-4 sm:px-8 py-4 flex items-center justify-between">
@@ -736,10 +739,10 @@ function EnquiryPageInner() {
           <Link href="/privacy-policy" className="text-xs font-semibold tracking-widest uppercase text-muted-foreground hover:text-primary transition-colors">
             Privacy Policy
           </Link>
-          <Link href="/signup?next=/enquiry" className="text-xs font-semibold tracking-widest uppercase text-muted-foreground hover:text-primary transition-colors">
+          <Link href="/enquiry?mode=signup" className="text-xs font-semibold tracking-widest uppercase text-muted-foreground hover:text-primary transition-colors">
             Sign up
           </Link>
-          <Link href="/login" className="text-xs font-semibold tracking-widest uppercase text-muted-foreground hover:text-primary transition-colors">
+          <Link href="/enquiry" className="text-xs font-semibold tracking-widest uppercase text-muted-foreground hover:text-primary transition-colors">
             Sign in
           </Link>
           <a
@@ -762,6 +765,7 @@ function EnquiryPageInner() {
           )}
           <div className="flex flex-1 flex-col min-h-0 w-full">
             <EnquirySwapAuthLayout
+              initialPage={enquiryAuthInitialPage}
               signIn={
                 <SlidingSignInPanel afterLogin="/enquiry" oauthEnquiry />
               }

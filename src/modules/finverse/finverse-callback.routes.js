@@ -31,16 +31,32 @@ function wantsJson(req) {
 async function handleCallback(req, res) {
   const code = req.query?.code || req.body?.code;
   const state = req.query?.state || req.body?.state;
+  const oauthError = req.query?.error || req.body?.error;
+  const oauthErrorDesc = req.query?.error_description || req.body?.error_description;
   const json = wantsJson(req);
   console.log('[finverse] callback received', {
     method: req.method,
     code_length: (code || '').length,
     state: state ? String(state).slice(0, 8) + '...' : undefined,
+    oauth_error: oauthError || undefined,
     wantsJson: json,
     'Sec-Fetch-Mode': req.get('Sec-Fetch-Mode'),
     has_query_code: !!req.query?.code,
     has_body_code: !!req.body?.code
   });
+
+  /** Bank login failed at institution — Finverse redirects with error=, no code (not a bug in our client_secret). */
+  if (oauthError) {
+    const errCode = String(oauthError).trim().slice(0, 200) || 'oauth_error';
+    if (json) {
+      return res.status(200).json({
+        success: false,
+        error: errCode,
+        error_description: oauthErrorDesc ? String(oauthErrorDesc).slice(0, 500) : undefined
+      });
+    }
+    return res.redirect(302, getRedirectUrl(false, errCode));
+  }
 
   const bad = (error) => {
     if (json) return res.status(400).json({ success: false, error });

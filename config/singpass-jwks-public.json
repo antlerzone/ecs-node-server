@@ -1,0 +1,22 @@
+{
+  "keys": [
+    {
+      "kid": "coliving-rp-staging-sig-1",
+      "kty": "EC",
+      "use": "sig",
+      "alg": "ES256",
+      "crv": "P-256",
+      "x": "MpudptkxzjCoxF7Jd69YWCiXwStT3VeCwaEyPFHlQCQ",
+      "y": "QZZnitT5shlBW3xStEspegVsuPGhddKZurWamuoSoBk"
+    },
+    {
+      "kid": "coliving-rp-staging-enc-1",
+      "kty": "EC",
+      "use": "enc",
+      "alg": "ECDH-ES+A256KW",
+      "crv": "P-256",
+      "x": "IlBjUSZ-SbFMqkMQmeG4cDezREzw_T01ny0Ity08YWY",
+      "y": "YCy_KU9tmiywSqz1moQSXB9WFmTrSmuT5WBg7iULpG4"
+    }
+  ]
+}

@@ -1,12 +1,14 @@
 "use client"
 
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import Link from "next/link"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { CheckCircle, Eye, EyeOff } from "lucide-react"
 import { Spinner } from "@/components/ui/spinner"
-import { isDemoSite } from "@/lib/portal-api"
+import { GovIdConnectButtons } from "@/components/gov-id-connect-buttons"
+import { completeGovPendingWithPassword } from "@/components/portal-auth-form"
+import { isDemoSite, shouldUseDemoMock } from "@/lib/portal-api"
 
 function getEcsBase(): string {
   return (process.env.NEXT_PUBLIC_ECS_BASE_URL ?? "").replace(/\/$/, "")
@@ -14,9 +16,17 @@ function getEcsBase(): string {
 
 export function SlidingRegisterPanel({
   nextPath = "/enquiry",
+  /** When set, show MyDigital / Singpass under the form (same as sign-in). Callback returnPath for future email-binding flow. */
+  govIdReturnPath,
+  /** Singpass need-email: after registration, link pending (password from this form only). */
+  govPendingId,
+  emailHint,
 }: {
   /** Post-success “Continue” target (must be same-origin path) */
   nextPath?: string
+  govIdReturnPath?: string
+  govPendingId?: string
+  emailHint?: string
 }) {
   const postRegisterHref =
     nextPath && nextPath.startsWith("/") && !nextPath.startsWith("//") ? nextPath : "/login"
@@ -30,6 +40,10 @@ export function SlidingRegisterPanel({
   const [submitted, setSubmitted] = useState(false)
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [submitError, setSubmitError] = useState("")
+
+  useEffect(() => {
+    if (emailHint?.trim()) setEmail(emailHint.trim())
+  }, [emailHint])
 
   const set = (key: string, val: string) => {
     if (key === "email") setEmail(val)
@@ -79,6 +93,26 @@ export function SlidingRegisterPanel({
       const data = (await res.json().catch(() => ({}))) as { ok?: boolean; reason?: string; email?: string }
 
       if (data.ok) {
+        if (govPendingId) {
+          const link = await completeGovPendingWithPassword({
+            pendingId: govPendingId,
+            email: email.trim(),
+            password,
+          })
+          if (link.ok && link.token) {
+            const np = link.nextPath && link.nextPath.startsWith("/") ? link.nextPath : postRegisterHref
+            window.location.href = `/auth/callback?token=${encodeURIComponent(link.token)}&next=${encodeURIComponent(np)}`
+            return
+          }
+          setSubmitError(
+            link.reason === "GOV_ID_SWITCH_REQUIRED"
+              ? "This email already has a different government ID linked. Sign in and disconnect it in Profile first."
+              : link.reason === "PENDING_EXPIRED_OR_INVALID"
+                ? "This Singpass step expired. Start Singpass login again."
+                : link.reason || "Account created but Singpass could not be linked. Sign in and try Singpass again.",
+          )
+          return
+        }
         setSubmitted(true)
       } else if (data.reason === "EMAIL_NOT_REGISTERED") {
         setSubmitError("This email is not in our system. Please ask your operator to add you first, then register.")
@@ -202,6 +236,15 @@ export function SlidingRegisterPanel({
           )}
         </Button>
       </form>
+
+      {govIdReturnPath ? (
+        <GovIdConnectButtons
+          returnPath={govIdReturnPath}
+          variant="stacked"
+          appearance="enquiry"
+          disabled={isLoading || shouldUseDemoMock()}
+        />
+      ) : null}
     </div>
   )
 }

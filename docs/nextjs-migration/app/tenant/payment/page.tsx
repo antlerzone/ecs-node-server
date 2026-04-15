@@ -20,6 +20,11 @@ import { Button } from "@/components/ui/button"
 import { Switch } from "@/components/ui/switch"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { useToast } from "@/components/ui/use-toast"
+import {
+  formatRentalDueDateMalaysia,
+  getTodayMalaysiaYmd,
+  rentalDueDateToMalaysiaYmd,
+} from "@/lib/dateMalaysia"
 
 interface RentalItem {
   _id?: string
@@ -53,7 +58,7 @@ function formatAmount(amount: number | undefined, currency = ""): string {
 function formatDate(d: string | undefined): string {
   if (!d) return "—"
   try {
-    return new Date(d).toLocaleDateString("en-MY", { day: "2-digit", month: "short", year: "numeric" })
+    return formatRentalDueDateMalaysia(d)
   } catch {
     return "—"
   }
@@ -145,15 +150,14 @@ function InvoiceRow({
   )
 }
 
-/** Overdue = unpaid and due date is today or before. Future due dates are not overdue. */
+/** Overdue = unpaid and due date (Malaysia calendar) is today or before. */
 function isOverdue(dueDate: string | undefined, paid: boolean): boolean {
   if (paid) return false
   if (!dueDate) return false
-  const due = new Date(dueDate)
-  const today = new Date()
-  due.setHours(0, 0, 0, 0)
-  today.setHours(0, 0, 0, 0)
-  return due <= today
+  const dueYmd = rentalDueDateToMalaysiaYmd(dueDate)
+  if (!dueYmd) return false
+  const todayYmd = getTodayMalaysiaYmd()
+  return dueYmd <= todayYmd
 }
 
 const RENTAL_HISTORY_PAGE_SIZE = 10

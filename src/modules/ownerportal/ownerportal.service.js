@@ -556,7 +556,7 @@ async function getAgreementList(email, ownerId) {
   const placeholders = hasPropIds ? propertyIds.map(() => '?').join(',') : '';
   const modeCondition = `(a.mode IN ('owner_operator', 'owner_tenant') OR a.mode IS NULL)`;
   /* Only show in repeater when PDF is generated and ready for signing (e-sign: 先生成 PDF 才出现、才可签) */
-  const signableCondition = `(a.status IN ('ready_for_signature', 'locked', 'completed') AND (a.url IS NOT NULL OR a.pdfurl IS NOT NULL))`;
+  const signableCondition = `(a.status IN ('ready_for_signature', 'locked', 'completed', 'complete') AND (a.url IS NOT NULL OR a.pdfurl IS NOT NULL))`;
 
   const [rows] = hasPropIds
     ? await pool.query(

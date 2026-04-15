@@ -120,7 +120,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            email: String(email || '').trim().toLowerCase(),
+            email: String(email || '').trim(),
             password: String(password || ''),
             frontend: typeof window !== 'undefined' ? window.location.origin : '',
           }),

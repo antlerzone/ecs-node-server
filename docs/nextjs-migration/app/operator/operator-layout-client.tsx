@@ -9,7 +9,6 @@ import { Menu, Coins, AlertTriangle, MessageCircle, BookOpen, Rocket } from "luc
 import { useAuth } from "@/hooks/use-auth"
 import { OperatorProvider, useOperatorContext } from "@/contexts/operator-context"
 import { isDemoSite } from "@/lib/portal-api"
-import { Toaster } from "sonner"
 
 const CREDIT_LOW_THRESHOLD = 100
 
@@ -208,7 +207,6 @@ function OperatorLayoutInner({ children }: { children: React.ReactNode }) {
         </header>
 
         <main className="flex-1 overflow-y-auto w-full">{children}</main>
-        <Toaster richColors position="bottom-right" closeButton />
       </div>
     </div>
   )

@@ -12,6 +12,8 @@
  */
 
 const { formatIntegrationApiError } = require('../../utils/formatIntegrationApiError');
+const { mapPortalEntityTypeToBukku } = require('../../utils/portal-entity-bukku');
+const { normalizeEmail } = require('../access/access.service');
 const pool = require('../../config/db');
 const bukkuContactWrapper = require('../bukku/wrappers/contact.wrapper');
 const xeroContactWrapper = require('../xero/wrappers/contact.wrapper');
@@ -31,6 +33,31 @@ function parseJson(val) {
 
 function normalize(str) {
   return String(str || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+async function getOperatorCurrencyForClient(clientId) {
+  const id = String(clientId || '').trim();
+  if (!id) return '';
+  try {
+    const [rows] = await pool.query('SELECT currency FROM operatordetail WHERE id = ? LIMIT 1', [id]);
+    return rows[0]?.currency != null ? String(rows[0].currency).trim() : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+async function getPortalEntityTypeForEmail(rawEmail) {
+  const e = normalizeEmail(rawEmail);
+  if (!e) return null;
+  try {
+    const [rows] = await pool.query(
+      'SELECT entity_type FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+      [e]
+    );
+    return rows[0]?.entity_type != null ? String(rows[0].entity_type).trim() : null;
+  } catch (_) {
+    return null;
+  }
 }
 
 function looksLikeUuid(str) {
@@ -417,17 +444,23 @@ async function ensureContactInAccounting(clientId, provider, role, record, exist
 
   try {
     if (provider === 'bukku') {
+      const currency = await getOperatorCurrencyForClient(clientId);
+      const portalEt = email ? await getPortalEntityTypeForEmail(email) : null;
+      const mappedPortalEt = mapPortalEntityTypeToBukku(portalEt, currency);
+
       const bukkuUpdateExisting = async (foundRow) => {
         const prevLegal = bukkuContactLegalLabel(foundRow);
         /** Operator linking owner/tenant account id must not overwrite Bukku legal_name with profile name (unique constraint). */
         const legalName = preserveLegalName
           ? (prevLegal || displayName).slice(0, 100)
           : (displayName || prevLegal).slice(0, 100);
-        /** Bukku PUT /contacts/:id still requires entity_type + types (same as create). Preserve remote values. */
+        /** Bukku PUT /contacts/:id still requires entity_type + types (same as create). Prefer portal mapping for MyInvois enum. */
         const entityType =
-          foundRow.entity_type && String(foundRow.entity_type).trim()
+          mappedPortalEt ||
+          (foundRow.entity_type && String(foundRow.entity_type).trim()
             ? foundRow.entity_type
-            : bukkuEntityTypeForRole(role);
+            : null) ||
+          bukkuEntityTypeForRole(role);
         const types = mergeBukkuTypesForRole(foundRow.types, role);
         const phoneNorm = normalizePhoneForBukku(phone);
         const updatePayload = {
@@ -462,7 +495,7 @@ async function ensureContactInAccounting(clientId, provider, role, record, exist
       }
       const legalName = displayName.slice(0, 100);
       const createPayload = {
-        entity_type: bukkuEntityTypeForRole(role),
+        entity_type: mappedPortalEt || bukkuEntityTypeForRole(role),
         legal_name: legalName,
         types: mergeBukkuTypesForRole([], role)
       };
