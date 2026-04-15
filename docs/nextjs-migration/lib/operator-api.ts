@@ -1015,6 +1015,7 @@ export async function insertProperty(
     fixedRentToOwner?: number;
     premisesType?: "landed" | "apartment" | "other" | "office" | "commercial";
     securitySystem?: string;
+    securityUsername?: string | null;
     /** Key collection (propertydetail 0252); null clears stored password */
     mailboxPassword?: string | null;
     smartdoorPassword?: string | null;

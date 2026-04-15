@@ -126,6 +126,7 @@ type DetailFormState = {
   propertyName: string
   address: string
   unitNumber: string
+  securityUsername: string
   mailboxPassword: string
   smartdoorPassword: string
   smartdoorPasswordEnabled: boolean
@@ -151,6 +152,7 @@ function detailToForm(p: ClientPortalPropertyDetail): DetailFormState {
     propertyName: String(p.name || '').trim(),
     address: String(p.address || '').trim(),
     unitNumber: String(p.unitNumber || '').trim(),
+    securityUsername: String(p.securityUsername || '').trim(),
     mailboxPassword: p.mailboxPassword || '',
     smartdoorPassword: sdp,
     smartdoorPasswordEnabled: sdp.length > 0,
@@ -181,6 +183,7 @@ const ClientPropertiesPage = () => {
     propertyName: '',
     address: '',
     unitNumber: '',
+    securityUsername: '',
     mailboxPassword: '',
     smartdoorPassword: '',
     smartdoorPasswordEnabled: false,
@@ -223,6 +226,7 @@ const ClientPropertiesPage = () => {
     name: '',
     address: '',
     unitNumber: '',
+    securityUsername: '',
     keyCollection: 'no',
     securitySystem: '',
     afterCleanPhoto: '',
@@ -615,6 +619,7 @@ const ClientPropertiesPage = () => {
         clientPortalOwned: true,
         keyCollection: form.mailboxPassword || form.smartdoorPasswordEnabled || form.smartdoorTokenEnabled ? 'yes' : 'no',
         securitySystem: String(form.securitySystem || '').trim(),
+        securityUsername: String(form.securityUsername || '').trim(),
         afterCleanPhoto: form.afterCleanPhoto,
         keyPhoto: form.keyPhoto,
         importSource: '',
@@ -651,6 +656,7 @@ const ClientPropertiesPage = () => {
         name: '',
         address: '',
         unitNumber: '',
+        securityUsername: '',
         keyCollection: 'no',
         securitySystem: '',
         afterCleanPhoto: '',
@@ -740,6 +746,7 @@ const ClientPropertiesPage = () => {
           address: detailForm.address,
           unitNumber: detailForm.unitNumber,
           securitySystem: detailForm.securitySystem,
+          securityUsername: detailForm.securityUsername,
           mailboxPassword: detailForm.mailboxPassword,
           smartdoorPassword: detailForm.smartdoorPasswordEnabled ? detailForm.smartdoorPassword : '',
           smartdoorTokenEnabled: detailForm.smartdoorTokenEnabled,
@@ -1130,6 +1137,15 @@ const ClientPropertiesPage = () => {
                           <SelectItem value="ecommunity">ecommunity</SelectItem>
                         </SelectContent>
                       </Select>
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="dlg-security-username">Security username</Label>
+                      <Input
+                        id="dlg-security-username"
+                        value={detailForm.securityUsername}
+                        onChange={(e) => setDetailForm((f) => ({ ...f, securityUsername: e.target.value }))}
+                        placeholder="e.g. icare / gprop username"
+                      />
                     </div>
                     <div className="space-y-2">
                       <Label htmlFor="dlg-mailbox2">Mailbox password</Label>
@@ -1851,6 +1867,15 @@ const ClientPropertiesPage = () => {
                     <option value="icare">icare</option>
                     <option value="ecommunity">ecommunity</option>
                   </select>
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="securityUsername">Security Username</Label>
+                  <Input
+                    id="securityUsername"
+                    value={form.securityUsername}
+                    onChange={(e) => setForm((prev) => ({ ...prev, securityUsername: e.target.value }))}
+                    placeholder="e.g. icare / gprop username"
+                  />
                 </div>
                 <div className="space-y-2 md:col-span-2 border rounded-md p-3">
                   <label className="flex items-center gap-2 text-sm">
