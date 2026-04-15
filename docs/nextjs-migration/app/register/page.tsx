@@ -1,7 +1,9 @@
 "use client"
 
-import { useState, Suspense } from "react"
-import { useSearchParams } from "next/navigation"
+import { useState, Suspense, useEffect } from "react"
+import { useSearchParams, useRouter } from "next/navigation"
+import { toast } from "sonner"
+import { formatGovIdErrorReason } from "@/lib/gov-id-callback-messages"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import Link from "next/link"
@@ -17,6 +19,7 @@ function getEcsBase(): string {
 }
 
 function RegisterPageInner() {
+  const router = useRouter()
   const searchParams = useSearchParams()
   const nextAfterRegister = searchParams.get("next")
   const postRegisterHref =
@@ -30,6 +33,23 @@ function RegisterPageInner() {
     nextAfterRegister && nextAfterRegister.startsWith("/") && !nextAfterRegister.startsWith("//")
       ? `/register?next=${encodeURIComponent(nextAfterRegister)}`
       : "/register"
+
+  useEffect(() => {
+    const gov = searchParams.get("gov")
+    const reason = searchParams.get("reason")
+    const provider = searchParams.get("provider")
+    const cleanRegisterHref =
+      nextAfterRegister && nextAfterRegister.startsWith("/") && !nextAfterRegister.startsWith("//")
+        ? `/register?next=${encodeURIComponent(nextAfterRegister)}`
+        : "/register"
+    if (gov === "success") {
+      toast.success(`Connected${provider ? ` (${provider})` : ""}`)
+      router.replace(cleanRegisterHref, { scroll: false })
+    } else if (gov === "error" && reason) {
+      toast.error(formatGovIdErrorReason(reason))
+      router.replace(cleanRegisterHref, { scroll: false })
+    }
+  }, [searchParams, router, nextAfterRegister])
 
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")

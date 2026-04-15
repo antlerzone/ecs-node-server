@@ -25,27 +25,7 @@ import { fetchGovIdStatus, disconnectGovIdApi } from "@/lib/unified-profile-port
 import { shouldUseDemoMock, isDemoSite } from "@/lib/portal-api"
 import { getEnquiryApiBase } from "@/lib/enquiry-portal-api"
 import { buildPortalOAuthStartUrl } from "@/components/portal-auth-form"
-
-const GOV_ID_ERROR_HINTS: Record<string, string> = {
-  GOV_ID_SWITCH_REQUIRED:
-    "This account already uses a different government ID. Sign in, open Profile → Verification, disconnect the current ID, then connect the one you want.",
-  NO_EMAIL_FROM_IDP:
-    "Singpass did not return an email (unusual). Use the email step on this page if you were redirected here to complete registration.",
-  SINGPASS_OIDC_DECRYPTION_PRIVATE_KEY_REQUIRED:
-    "Singpass: API host is missing the JWKS encryption private key. Set SINGPASS_OIDC_DECRYPTION_PRIVATE_KEY_PATH (or inline PEM) to the EC key that pairs with use=enc in your Singpass app JWKS — not the signing key. See root .env.example.",
-  ID_TOKEN_DECRYPT_FAILED:
-    "Singpass: id_token could not be decrypted. Confirm the enc private key matches the kid Singpass uses (check api logs: [gov-id] id_token JWE decrypt failed).",
-  ID_TOKEN_VERIFY_FAILED:
-    "Singpass: id_token signature or claims check failed (issuer, audience, or nonce).",
-  ID_TOKEN_NONCE_MISMATCH: "Singpass: id_token nonce did not match this login session.",
-}
-
-function formatGovIdErrorReason(raw: string): string {
-  const key = decodeURIComponent(raw).trim()
-  if (GOV_ID_ERROR_HINTS[key]) return GOV_ID_ERROR_HINTS[key]
-  if (key.length > 220) return `${key.slice(0, 217)}…`
-  return key
-}
+import { formatGovIdErrorReason } from "@/lib/gov-id-callback-messages"
 
 function getPortalEcsBase(): string {
   return (process.env.NEXT_PUBLIC_ECS_BASE_URL ?? "").replace(/\/$/, "")
@@ -210,7 +190,18 @@ export default function DemoLoginClient() {
   const needEmailFlow = showLiveFlow && searchParams.get("gov") === "need_email" && !!pendingGovId
   const govPendingFromQuery = (searchParams.get("gov_pending") || "").trim()
   const emailHintFromQuery = (searchParams.get("email_hint") || "").trim()
-  const authInitialPage = searchParams.get("mode") === "signup" ? ("signup" as const) : ("signin" as const)
+  /** Gov callbacks return here so errors keep full login (email / Google / Facebook / Gov) after URL is cleaned. */
+  const DEMO_GOV_RETURN_PATH = "/demologin?mode=signin&keep_login_ui=1"
+  const govErrInUrl = searchParams.get("gov") === "error" && !!searchParams.get("reason")
+  const keepLoginUi = searchParams.get("keep_login_ui") === "1"
+  /** First paint with `?gov=error` must show full login (not only Gov demo). */
+  const showFullLogin = !jwtReady || govErrInUrl || keepLoginUi
+  const authInitialPage =
+    keepLoginUi || searchParams.get("gov") === "error"
+      ? ("signin" as const)
+      : searchParams.get("mode") === "signup"
+        ? ("signup" as const)
+        : ("signin" as const)
 
   useEffect(() => {
     if (typeof window === "undefined") return
@@ -229,6 +220,11 @@ export default function DemoLoginClient() {
   }, [])
 
   useEffect(() => {
+    if (!jwtReady) return
+    router.replace("/portal")
+  }, [jwtReady, router])
+
+  useEffect(() => {
     const gov = searchParams.get("gov")
     const provider = searchParams.get("provider")
     const reason = searchParams.get("reason")
@@ -242,7 +238,7 @@ export default function DemoLoginClient() {
       } else {
         toast.error(formatGovIdErrorReason(reason))
       }
-      router.replace("/demologin", { scroll: false })
+      router.replace(`${DEMO_GOV_RETURN_PATH}`, { scroll: false })
     }
   }, [searchParams, router])
 
@@ -310,7 +306,7 @@ export default function DemoLoginClient() {
           )}
 
           <GovIdConnectButtons
-            returnPath="/demologin"
+            returnPath={DEMO_GOV_RETURN_PATH}
             variant="solo"
             appearance="fill"
             singpassLinked={govSingpass}
@@ -387,7 +383,7 @@ export default function DemoLoginClient() {
 
       {needEmailFlow ? (
         <SingpassNeedEmailPanel pendingId={pendingGovId} />
-      ) : showLiveFlow && !jwtReady ? (
+      ) : showLiveFlow && showFullLogin ? (
         <div className="flex flex-1 flex-col w-full min-h-0">
           <div className="flex flex-1 flex-col min-h-0 w-full">
             <EnquirySwapAuthLayout
@@ -396,7 +392,7 @@ export default function DemoLoginClient() {
                 <SlidingSignInPanel
                   afterLogin="/demologin"
                   oauthEnquiry={false}
-                  govIdReturnPath="/demologin"
+                  govIdReturnPath={DEMO_GOV_RETURN_PATH}
                   govPendingId={govPendingFromQuery || undefined}
                   emailHint={emailHintFromQuery || undefined}
                 />
@@ -404,7 +400,7 @@ export default function DemoLoginClient() {
               signUp={
                 <SlidingRegisterPanel
                   nextPath="/demologin"
-                  govIdReturnPath="/demologin"
+                  govIdReturnPath={DEMO_GOV_RETURN_PATH}
                   govPendingId={govPendingFromQuery || undefined}
                   emailHint={emailHintFromQuery || undefined}
                 />
@@ -440,7 +436,7 @@ export default function DemoLoginClient() {
               Close
             </Button>
             <Button type="button" asChild>
-              <Link href="/demologin">Back to sign in</Link>
+              <Link href="/demologin?mode=signin&keep_login_ui=1">Back to sign in</Link>
             </Button>
           </DialogFooter>
         </DialogContent>

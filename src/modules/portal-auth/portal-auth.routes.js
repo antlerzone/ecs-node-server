@@ -32,6 +32,7 @@ const {
   disconnectGovId,
   getGovIdStatus,
   isGovIdConfigured,
+  buildGovIdCallbackErrorRedirect,
 } = require('./gov-id.service');
 const {
   getMemberRoles,
@@ -777,7 +778,12 @@ router.get('/gov-id/callback', async (req, res) => {
   const errParam = req.query?.error;
   const frontendFallback = getFrontendUrl(req) || FRONTEND_URL;
   if (errParam) {
-    return res.redirect(302, `${frontendFallback}/demologin?gov=error&reason=${encodeURIComponent(String(errParam))}`);
+    const loc = buildGovIdCallbackErrorRedirect({
+      query: req.query,
+      frontendFallback,
+      reason: String(errParam),
+    });
+    return res.redirect(302, loc);
   }
   try {
     const out = await handleOAuthCallback({
@@ -802,14 +808,20 @@ router.get('/gov-id/callback', async (req, res) => {
       );
     }
     const path = String(out.returnPath || '/demologin').startsWith('/') ? out.returnPath : '/demologin';
+    const successSep = String(path).includes('?') ? '&' : '?';
     return res.redirect(
       302,
-      `${out.frontend}${path}?gov=success&provider=${encodeURIComponent(out.provider)}`
+      `${out.frontend}${path}${successSep}gov=success&provider=${encodeURIComponent(out.provider)}`
     );
   } catch (err) {
     console.error('[portal-auth] gov-id/callback', err?.message || err);
     const reason = err.code || err.message || 'CALLBACK_FAILED';
-    return res.redirect(302, `${frontendFallback}/demologin?gov=error&reason=${encodeURIComponent(reason)}`);
+    const loc = buildGovIdCallbackErrorRedirect({
+      query: req.query,
+      frontendFallback,
+      reason: String(reason),
+    });
+    return res.redirect(302, loc);
   }
 });
 

@@ -66,6 +66,83 @@ function verifyState(token) {
   }
 }
 
+function parseAllowedFrontendHosts() {
+  return String(
+    process.env.PORTAL_AUTH_ALLOWED_FRONTEND_HOSTS ||
+      'portal.colivingjb.com,portal.cleanlemons.com,localhost,127.0.0.1'
+  )
+    .split(',')
+    .map((x) => String(x || '').trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function isTrustedPortalFrontend(candidate) {
+  const c = String(candidate || '').trim();
+  if (!c) return false;
+  try {
+    const p = new URL(c);
+    if (!['http:', 'https:'].includes(String(p.protocol).toLowerCase())) return false;
+    return parseAllowedFrontendHosts().includes(String(p.hostname || '').toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+function normalizeGovReturnPath(p) {
+  const s = String(p == null ? '/demologin' : p).trim() || '/demologin';
+  if (!s.startsWith('/') || s.startsWith('//')) return '/demologin';
+  if (s.toLowerCase().includes('://')) return '/demologin';
+  if (s.length > 2048) return '/demologin';
+  return s;
+}
+
+/**
+ * OAuth error on `/gov-id/callback` (e.g. access_denied): redirect back to the portal path that started Gov ID,
+ * using Singpass PAR session or MyDigital signed state when `state` is present.
+ */
+function buildGovIdCallbackErrorRedirect({ query, frontendFallback, reason }) {
+  const stateStr = String(query?.state || '').trim();
+  const reasonStr = String(
+    reason != null && String(reason).trim() !== '' ? reason : query?.error || 'CALLBACK_FAILED'
+  ).trim();
+  let frontend = '';
+  let returnPath = '/demologin';
+
+  if (stateStr) {
+    const par = singpassParSessions.get(stateStr);
+    if (par && typeof par === 'object') {
+      frontend = String(par.frontend || '').replace(/\/$/, '');
+      returnPath = normalizeGovReturnPath(par.returnPath);
+      singpassParSessions.delete(stateStr);
+    } else {
+      const st = verifyState(stateStr);
+      if (st && typeof st === 'object' && st.frontend) {
+        frontend = String(st.frontend || '').replace(/\/$/, '');
+        returnPath = normalizeGovReturnPath(st.returnPath);
+      }
+    }
+  }
+
+  const fb = String(frontendFallback || '').trim().replace(/\/$/, '');
+  if (!frontend || !isTrustedPortalFrontend(frontend)) {
+    frontend = fb && isTrustedPortalFrontend(fb) ? fb : '';
+  }
+  if (!frontend) {
+    const envFe = String(process.env.FRONTEND_URL || '').trim().replace(/\/$/, '');
+    frontend = envFe && isTrustedPortalFrontend(envFe) ? envFe : '';
+  }
+  if (!frontend) {
+    const hosts = parseAllowedFrontendHosts();
+    const h = hosts.find((x) => x && x !== 'localhost' && x !== '127.0.0.1');
+    frontend = h ? `https://${h}` : 'https://portal.colivingjb.com';
+  }
+
+  const path = normalizeGovReturnPath(returnPath);
+  const q = new URLSearchParams({ gov: 'error', reason: reasonStr });
+  const sep = path.includes('?') ? '&' : '?';
+  return `${frontend}${path}${sep}${q.toString()}`;
+}
+
 function base64url(buf) {
   return Buffer.from(buf)
     .toString('base64')
@@ -225,6 +302,15 @@ function pickSingpassVerifiedEmail(userinfo) {
   const raw = userinfo.email;
   if (typeof raw === 'string') return normalizeEmail(raw);
   if (raw && typeof raw === 'object' && typeof raw.value === 'string') return normalizeEmail(raw.value);
+  // Some Singpass/MyInfo payloads nest email under sub_attributes.email
+  const sa = userinfo.sub_attributes;
+  if (sa && typeof sa === 'object') {
+    const saEmail = sa.email;
+    if (typeof saEmail === 'string') return normalizeEmail(saEmail);
+    if (saEmail && typeof saEmail === 'object' && typeof saEmail.value === 'string') {
+      return normalizeEmail(saEmail.value);
+    }
+  }
   return '';
 }
 
@@ -597,6 +683,33 @@ async function assertSubAvailable(column, sub, email) {
   }
 }
 
+async function findPortalEmailByGovSub(provider, sub) {
+  const subVal = String(sub || '').trim();
+  if (!subVal) return '';
+  const column = provider === 'singpass' ? 'singpass_sub' : 'mydigital_sub';
+  const [rows] = await pool.query(
+    `SELECT email FROM portal_account WHERE ${column} = ? LIMIT 1`,
+    [subVal]
+  );
+  const em = rows[0]?.email != null ? String(rows[0].email).trim() : '';
+  return normalizeEmail(em);
+}
+
+async function ensurePortalAccountForEmail(email) {
+  const normalized = normalizeEmail(email);
+  if (!normalized) return { ok: false, reason: 'NO_EMAIL' };
+  const [rows] = await pool.query(
+    'SELECT id FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+    [normalized]
+  );
+  if (rows.length) return { ok: true, created: false };
+  await pool.query(
+    'INSERT INTO portal_account (id, email, password_hash) VALUES (?, ?, NULL)',
+    [crypto.randomUUID(), normalized]
+  );
+  return { ok: true, created: true };
+}
+
 /**
  * Gov ID 三选一：同一 portal_account 不能同时绑 Singpass 与 MyDigital（及后期 RPV）。
  * RPV 若上线：再在回调里区分 Passport / NRIC；当前 Singpass / MyDigital 由 linkUserinfoToAccount 写死为 NRIC。
@@ -755,25 +868,39 @@ async function handleOAuthCallback({ code, state }) {
     if (st.provider === 'singpass' && st.direct) {
       linkEmail = pickSingpassVerifiedEmail(userinfo);
       if (!linkEmail) {
-        cleanupGovEmailPendingSessions();
-        const pendingId = base64url(crypto.randomBytes(24));
-        govEmailPendingSessions.set(pendingId, {
-          provider: 'singpass',
-          userinfo,
-          frontend: st.frontend,
-          /** 补邮绑定成功后默认进 portal（与产品主入口一致） */
-          returnPath: '/portal',
-          createdAt: Date.now(),
-        });
-        return {
-          needEmail: true,
-          pendingId,
-          frontend: st.frontend,
-          returnPath: st.returnPath || '/demologin',
-          provider: st.provider,
-          directLogin: null,
-        };
+        const linkedEmail = await findPortalEmailByGovSub('singpass', userinfo?.sub);
+        if (linkedEmail) {
+          linkEmail = linkedEmail;
+        } else {
+          cleanupGovEmailPendingSessions();
+          const pendingId = base64url(crypto.randomBytes(24));
+          govEmailPendingSessions.set(pendingId, {
+            provider: 'singpass',
+            userinfo,
+            frontend: st.frontend,
+            /** 补邮绑定成功后默认进 portal（与产品主入口一致） */
+            returnPath: '/portal',
+            createdAt: Date.now(),
+          });
+          return {
+            needEmail: true,
+            pendingId,
+            frontend: st.frontend,
+            returnPath: st.returnPath || '/demologin',
+            provider: st.provider,
+            directLogin: null,
+          };
+        }
       }
+      const ensured = await ensurePortalAccountForEmail(linkEmail);
+      if (!ensured.ok) {
+        const err = new Error(ensured.reason || 'ENSURE_PORTAL_ACCOUNT_FAILED');
+        err.code = ensured.reason || 'ENSURE_PORTAL_ACCOUNT_FAILED';
+        throw err;
+      }
+    }
+
+    if (st.provider === 'singpass' && st.direct) {
       const [acctRows] = await pool.query(
         'SELECT id FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
         [linkEmail]
@@ -1001,4 +1128,5 @@ module.exports = {
   getGovIdStatus,
   isGovIdConfigured,
   getRedirectUri,
+  buildGovIdCallbackErrorRedirect,
 };

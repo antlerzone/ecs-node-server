@@ -1,10 +1,14 @@
 "use client"
 
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { useRouter } from 'next/navigation'
+import { formatGovIdErrorReason } from '@/lib/gov-id-callback-messages'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import { Command, CommandEmpty, CommandInput, CommandItem, CommandList } from '@/components/ui/command'
 import {
   Dialog,
   DialogContent,
@@ -28,6 +32,8 @@ import {
   ShieldCheck,
   BadgeCheck,
   HelpCircle,
+  Check,
+  ChevronsUpDown,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { shouldUseDemoMock } from '@/lib/portal-api'
@@ -75,6 +81,116 @@ type Props = {
   showGovVerification?: boolean
 }
 
+type PhoneCountryOption = {
+  code: string
+  label: string
+}
+
+const PHONE_COUNTRY_OPTIONS: PhoneCountryOption[] = [
+  { code: '60', label: 'Malaysia (+60)' },
+  { code: '65', label: 'Singapore (+65)' },
+  { code: '62', label: 'Indonesia (+62)' },
+  { code: '63', label: 'Philippines (+63)' },
+  { code: '66', label: 'Thailand (+66)' },
+  { code: '84', label: 'Vietnam (+84)' },
+  { code: '86', label: 'China (+86)' },
+  { code: '852', label: 'Hong Kong (+852)' },
+  { code: '853', label: 'Macau (+853)' },
+  { code: '886', label: 'Taiwan (+886)' },
+  { code: '91', label: 'India (+91)' },
+  { code: '81', label: 'Japan (+81)' },
+  { code: '82', label: 'South Korea (+82)' },
+  { code: '61', label: 'Australia (+61)' },
+  { code: '64', label: 'New Zealand (+64)' },
+  { code: '971', label: 'UAE (+971)' },
+  { code: '966', label: 'Saudi Arabia (+966)' },
+  { code: '44', label: 'United Kingdom (+44)' },
+  { code: '1', label: 'United States / Canada (+1)' },
+]
+
+const PHONE_COUNTRY_CODES_DESC = [...PHONE_COUNTRY_OPTIONS]
+  .map((item) => item.code)
+  .sort((a, b) => b.length - a.length)
+
+function normalizePhoneDigits(raw: string): string {
+  return String(raw || '').replace(/\D/g, '')
+}
+
+function splitPhoneNumberWithCountry(raw: string): { countryCode: string; localNumber: string } {
+  const digits = normalizePhoneDigits(raw)
+  if (!digits) return { countryCode: '60', localNumber: '' }
+  const matched = PHONE_COUNTRY_CODES_DESC.find((code) => digits.startsWith(code))
+  if (!matched) return { countryCode: '60', localNumber: digits }
+  return { countryCode: matched, localNumber: digits.slice(matched.length) }
+}
+
+function joinPhoneNumber(countryCode: string, localNumber: string): string {
+  const cc = normalizePhoneDigits(countryCode)
+  const local = normalizePhoneDigits(localNumber)
+  if (!local) return ''
+  return `${cc}${local}`
+}
+
+function PhoneCountryCodeSelect({
+  value,
+  onChange,
+  disabled = false,
+}: {
+  value: string
+  onChange: (next: string) => void
+  disabled?: boolean
+}) {
+  const [open, setOpen] = useState(false)
+  const selected =
+    PHONE_COUNTRY_OPTIONS.find((x) => x.code === value) ??
+    PHONE_COUNTRY_OPTIONS.find((x) => x.code === '60') ??
+    PHONE_COUNTRY_OPTIONS[0]
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <Button
+          type="button"
+          variant="outline"
+          role="combobox"
+          aria-expanded={open}
+          disabled={disabled}
+          className="w-[11rem] justify-between rounded-xl"
+        >
+          <span className="truncate">{selected?.label ?? `+${value}`}</span>
+          <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent className="w-[18rem] p-0" align="start">
+        <Command>
+          <CommandInput placeholder="Search country code..." />
+          <CommandList>
+            <CommandEmpty>No country code found.</CommandEmpty>
+            {PHONE_COUNTRY_OPTIONS.map((opt) => (
+              <CommandItem
+                key={opt.code}
+                value={`${opt.label} ${opt.code}`}
+                onSelect={() => {
+                  onChange(opt.code)
+                  setOpen(false)
+                }}
+              >
+                <Check
+                  className={cn(
+                    'mr-2 h-4 w-4',
+                    value === opt.code ? 'opacity-100' : 'opacity-0',
+                  )}
+                />
+                {opt.label}
+              </CommandItem>
+            ))}
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  )
+}
+
 function syncColivingLocalUser(partial: { name?: string; avatar?: string; hasPassword?: boolean }) {
   if (typeof window === 'undefined') return
   try {
@@ -109,6 +225,7 @@ export default function UnifiedProfilePage({
   publicProfileTenantId = null,
   showGovVerification = false,
 }: Props) {
+  const router = useRouter()
   const member = getMember()
   const email = String(member?.email || '').trim()
   const currentRole = getCurrentRole()
@@ -171,6 +288,22 @@ export default function UnifiedProfilePage({
   }, [email])
   const avatarInputRef = useRef<HTMLInputElement | null>(null)
 
+  useEffect(() => {
+    if (!showGovVerification || typeof window === 'undefined') return
+    const sp = new URLSearchParams(window.location.search)
+    const gov = sp.get('gov')
+    const reason = sp.get('reason')
+    const provider = sp.get('provider')
+    const cleanPath = window.location.pathname
+    if (gov === 'error' && reason) {
+      toast.error(formatGovIdErrorReason(reason))
+      router.replace(cleanPath, { scroll: false })
+    } else if (gov === 'success') {
+      toast.success(`Connected${provider ? ` (${provider})` : ''}`)
+      router.replace(cleanPath, { scroll: false })
+    }
+  }, [showGovVerification, router])
+
   const [fullName, setFullName] = useState(userNameHint)
   const [legalName, setLegalName] = useState(userNameHint)
   const [phone, setPhone] = useState('')
@@ -219,11 +352,15 @@ export default function UnifiedProfilePage({
 
   const [phoneVerifyOpen, setPhoneVerifyOpen] = useState(false)
   const [phoneVerifyDraft, setPhoneVerifyDraft] = useState('')
+  const [phoneVerifyCountryCode, setPhoneVerifyCountryCode] = useState('60')
+  const [phoneVerifyLocalNumber, setPhoneVerifyLocalNumber] = useState('')
   const [phoneVerifyCode, setPhoneVerifyCode] = useState('')
   const [phoneVerifyBusy, setPhoneVerifyBusy] = useState(false)
 
   const [phoneChangeOpen, setPhoneChangeOpen] = useState(false)
   const [phoneChangeNew, setPhoneChangeNew] = useState('')
+  const [phoneChangeCountryCode, setPhoneChangeCountryCode] = useState('60')
+  const [phoneChangeLocalNumber, setPhoneChangeLocalNumber] = useState('')
   const [phoneChangeCode, setPhoneChangeCode] = useState('')
   const [phoneChangeBusy, setPhoneChangeBusy] = useState(false)
 
@@ -518,7 +655,12 @@ export default function UnifiedProfilePage({
         const result = await savePortalProfile(payload, { govIdentityLocked })
         if (!result.ok) {
           if (result.reason === 'IDENTITY_LOCKED') {
-            lastSavedPayloadRef.current = payloadString
+            /** DB has gov_identity_locked but client may still send fullname/nric until we strip — do not mark saved. */
+            if (!govIdentityLocked) {
+              setGovIdentityLocked(true)
+              setSaveState('idle')
+              return
+            }
             setSaveState('idle')
             return
           }
@@ -572,6 +714,7 @@ export default function UnifiedProfilePage({
     nricBackUrl,
     backendProfile,
     localStorageKey,
+    govIdentityLocked,
   ])
 
   useEffect(() => {
@@ -587,6 +730,7 @@ export default function UnifiedProfilePage({
       const result = await savePortalProfile(payload, { govIdentityLocked })
       if (!result.ok) {
         if (result.reason === 'IDENTITY_LOCKED') {
+          setGovIdentityLocked(true)
           return
         }
         if (result.reason === 'PHONE_VERIFIED_LOCKED') {
@@ -816,13 +960,16 @@ export default function UnifiedProfilePage({
   }
 
   const openPhoneVerifyDialog = () => {
-    setPhoneVerifyDraft(phone.trim())
+    const parsed = splitPhoneNumberWithCountry(phone.trim())
+    setPhoneVerifyCountryCode(parsed.countryCode)
+    setPhoneVerifyLocalNumber(parsed.localNumber)
+    setPhoneVerifyDraft(joinPhoneNumber(parsed.countryCode, parsed.localNumber))
     setPhoneVerifyCode('')
     setPhoneVerifyOpen(true)
   }
 
   const sendPhoneVerifyOtp = async () => {
-    const p = phoneVerifyDraft.replace(/\s+/g, '').trim()
+    const p = joinPhoneNumber(phoneVerifyCountryCode, phoneVerifyLocalNumber)
     if (p.length < 8) {
       toast.error('Enter a valid phone number')
       return
@@ -847,7 +994,7 @@ export default function UnifiedProfilePage({
   }
 
   const submitPhoneVerify = async () => {
-    const p = phoneVerifyDraft.replace(/\s+/g, '').trim()
+    const p = joinPhoneNumber(phoneVerifyCountryCode, phoneVerifyLocalNumber)
     const c = phoneVerifyCode.trim()
     if (!c) {
       toast.error('Enter the verification code')
@@ -872,13 +1019,16 @@ export default function UnifiedProfilePage({
   }
 
   const openPhoneChangeDialog = () => {
+    const parsed = splitPhoneNumberWithCountry(phone.trim())
+    setPhoneChangeCountryCode(parsed.countryCode)
+    setPhoneChangeLocalNumber('')
     setPhoneChangeNew('')
     setPhoneChangeCode('')
     setPhoneChangeOpen(true)
   }
 
   const sendPhoneChangeOtp = async () => {
-    const np = phoneChangeNew.replace(/\s+/g, '').trim()
+    const np = joinPhoneNumber(phoneChangeCountryCode, phoneChangeLocalNumber)
     if (np.length < 8) {
       toast.error('Enter a valid new phone number')
       return
@@ -905,7 +1055,7 @@ export default function UnifiedProfilePage({
   }
 
   const submitPhoneChange = async () => {
-    const np = phoneChangeNew.replace(/\s+/g, '').trim()
+    const np = joinPhoneNumber(phoneChangeCountryCode, phoneChangeLocalNumber)
     const c = phoneChangeCode.trim()
     if (!c) {
       toast.error('Enter the verification code')
@@ -931,7 +1081,8 @@ export default function UnifiedProfilePage({
   /** Gov-verified: badge + read-only entity/ID fields (API flags or DB lock, avoids flicker before gov status loads). */
   const govIdVerified =
     showGovVerification && backendProfile && !shouldUseDemoMock() && ((govSingpass || govMydigital) || govIdentityLocked)
-  const govProfileFieldsReadonly = (govSingpass || govMydigital) || govIdentityLocked
+  /** Lock only enforced by DB lock flag; provider-linked alone should not freeze fields. */
+  const govProfileFieldsReadonly = govIdentityLocked
 
   return (
     <div className="p-4 sm:p-8 max-w-4xl mx-auto">
@@ -1092,10 +1243,10 @@ export default function UnifiedProfilePage({
                 <input
                   value={legalName}
                   onChange={(e) => setLegalName(e.target.value)}
-                  disabled={govIdentityLocked}
+                  disabled={govProfileFieldsReadonly}
                   className={cn(
                     inputCls,
-                    govIdentityLocked && 'opacity-80 cursor-not-allowed',
+                    govProfileFieldsReadonly && 'opacity-80 cursor-not-allowed',
                     gateErr('legalName') && 'ring-2 ring-destructive border-destructive',
                   )}
                 />
@@ -1221,13 +1372,16 @@ export default function UnifiedProfilePage({
                 </div>
                 <input
                   value={phone}
-                  onChange={(e) => setPhone(e.target.value)}
+                  onChange={(e) => setPhone(normalizePhoneDigits(e.target.value))}
                   disabled={!!(backendProfile && !shouldUseDemoMock() && phoneVerified)}
                   className={cn(
                     inputCls,
                     gateErr('phone') && 'ring-2 ring-destructive border-destructive',
                     backendProfile && !shouldUseDemoMock() && phoneVerified && 'opacity-80 cursor-not-allowed',
                   )}
+                  inputMode="numeric"
+                  autoComplete="tel"
+                  placeholder="e.g. 60123456789"
                 />
                 {backendProfile && !shouldUseDemoMock() ? (
                   phoneVerified ? (
@@ -1558,6 +1712,8 @@ export default function UnifiedProfilePage({
         onOpenChange={(o) => {
           setPhoneVerifyOpen(o)
           if (!o) {
+            setPhoneVerifyDraft('')
+            setPhoneVerifyLocalNumber('')
             setPhoneVerifyCode('')
           }
         }}
@@ -1573,14 +1729,22 @@ export default function UnifiedProfilePage({
           <div className="space-y-3 py-2">
             <div>
               <Label className="text-xs uppercase text-muted-foreground">Phone number</Label>
-              <Input
-                className="mt-1"
-                type="tel"
-                autoComplete="tel"
-                value={phoneVerifyDraft}
-                onChange={(e) => setPhoneVerifyDraft(e.target.value)}
-                placeholder="e.g. 60123456789"
-              />
+              <div className="mt-1 flex gap-2">
+                <PhoneCountryCodeSelect value={phoneVerifyCountryCode} onChange={setPhoneVerifyCountryCode} />
+                <Input
+                  type="tel"
+                  inputMode="numeric"
+                  autoComplete="tel-national"
+                  className="flex-1"
+                  value={phoneVerifyLocalNumber}
+                  onChange={(e) => {
+                    const local = normalizePhoneDigits(e.target.value)
+                    setPhoneVerifyLocalNumber(local)
+                    setPhoneVerifyDraft(joinPhoneNumber(phoneVerifyCountryCode, local))
+                  }}
+                  placeholder="Phone number"
+                />
+              </div>
             </div>
             <Button type="button" variant="secondary" className="w-full" disabled={phoneVerifyBusy} onClick={() => void sendPhoneVerifyOtp()}>
               {phoneVerifyBusy ? 'Sending...' : 'Send verification code'}
@@ -1614,6 +1778,7 @@ export default function UnifiedProfilePage({
           setPhoneChangeOpen(o)
           if (!o) {
             setPhoneChangeNew('')
+            setPhoneChangeLocalNumber('')
             setPhoneChangeCode('')
           }
         }}
@@ -1622,20 +1787,28 @@ export default function UnifiedProfilePage({
           <DialogHeader>
             <DialogTitle>Change phone number</DialogTitle>
             <DialogDescription>
-              Enter your new number, request a code to your login email ({email || '—'}), then confirm.
+              Enter your new number, request a code to your login email ({email || '—'}), then verify with OTP.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3 py-2">
             <div>
               <Label className="text-xs uppercase text-muted-foreground">New phone number</Label>
-              <Input
-                className="mt-1"
-                type="tel"
-                autoComplete="tel"
-                value={phoneChangeNew}
-                onChange={(e) => setPhoneChangeNew(e.target.value)}
-                placeholder="e.g. 60123456789"
-              />
+              <div className="mt-1 flex gap-2">
+                <PhoneCountryCodeSelect value={phoneChangeCountryCode} onChange={setPhoneChangeCountryCode} />
+                <Input
+                  type="tel"
+                  inputMode="numeric"
+                  autoComplete="tel-national"
+                  className="flex-1"
+                  value={phoneChangeLocalNumber}
+                  onChange={(e) => {
+                    const local = normalizePhoneDigits(e.target.value)
+                    setPhoneChangeLocalNumber(local)
+                    setPhoneChangeNew(joinPhoneNumber(phoneChangeCountryCode, local))
+                  }}
+                  placeholder="Phone number"
+                />
+              </div>
             </div>
             <Button type="button" variant="secondary" className="w-full" disabled={phoneChangeBusy} onClick={() => void sendPhoneChangeOtp()}>
               {phoneChangeBusy ? 'Sending...' : 'Request verification code'}
@@ -1657,7 +1830,7 @@ export default function UnifiedProfilePage({
               Cancel
             </Button>
             <Button type="button" disabled={phoneChangeBusy} onClick={() => void submitPhoneChange()}>
-              {phoneChangeBusy ? 'Confirming...' : 'Confirm'}
+              {phoneChangeBusy ? 'Verifying...' : 'Verify'}
             </Button>
           </DialogFooter>
         </DialogContent>
