@@ -480,13 +480,14 @@ async function getCleanlemonsExportContext(operatordetailId) {
 }
 
 /**
- * Push propertydetail address / unit / premises_type / security_system to all linked `cln_property` rows.
+ * Push propertydetail address / unit / premises_type / security fields to all linked `cln_property` rows.
  */
 async function mirrorPropertydetailToClnRows(propertydetailId) {
   const pid = String(propertydetailId || '').trim();
   if (!pid) return;
   const hasPdPt = await tableHasColumn('propertydetail', 'premises_type');
   const hasPdSec = await tableHasColumn('propertydetail', 'security_system');
+  const hasPdSecUser = await tableHasColumn('propertydetail', 'security_username');
   const hasPdGeo =
     (await tableHasColumn('propertydetail', 'latitude')) &&
     (await tableHasColumn('propertydetail', 'longitude'));
@@ -496,6 +497,7 @@ async function mirrorPropertydetailToClnRows(propertydetailId) {
   const sel = ['address', 'unitnumber'];
   if (hasPdPt) sel.push('premises_type');
   if (hasPdSec) sel.push('security_system');
+  if (hasPdSecUser) sel.push('security_username');
   if (hasPdGeo) {
     sel.push('latitude', 'longitude');
   }
@@ -538,6 +540,18 @@ async function mirrorPropertydetailToClnRows(propertydetailId) {
         : null;
     sets.push('`security_system` = ?');
     vals.push(sec);
+  }
+  if (
+    hasPdSecUser &&
+    pd.security_username !== undefined &&
+    (await tableHasColumn('cln_property', 'security_username'))
+  ) {
+    const secUser =
+      pd.security_username != null && String(pd.security_username).trim() !== ''
+        ? String(pd.security_username).trim()
+        : null;
+    sets.push('`security_username` = ?');
+    vals.push(secUser);
   }
   const [hasWazeMir, hasGoogleMir] = await Promise.all([
     tableHasColumn('cln_property', 'waze_url'),

@@ -3488,6 +3488,7 @@ async function listOperatorProperties({ limit = 200, offset = 0, operatorId } = 
     hasPortalOwned,
     hasPremisesType,
     hasSecuritySystem,
+    hasSecurityUsername,
     hasAfterPhoto,
     hasKeyPhoto,
     hasSmartdoorPwd,
@@ -3501,6 +3502,7 @@ async function listOperatorProperties({ limit = 200, offset = 0, operatorId } = 
     databaseHasColumn('cln_property', 'client_portal_owned'),
     databaseHasColumn('cln_property', 'premises_type'),
     databaseHasColumn('cln_property', 'security_system'),
+    databaseHasColumn('cln_property', 'security_username'),
     databaseHasColumn('cln_property', 'after_clean_photo_url'),
     databaseHasColumn('cln_property', 'key_photo_url'),
     databaseHasColumn('cln_property', 'smartdoor_password'),
@@ -3525,6 +3527,7 @@ async function listOperatorProperties({ limit = 200, offset = 0, operatorId } = 
   if (hasClientdetailCol) extraSelect.push('NULLIF(TRIM(p.clientdetail_id), \'\') AS clientdetailId');
   if (hasPremisesType) extraSelect.push('p.premises_type AS premisesType');
   if (hasSecuritySystem) extraSelect.push('p.security_system AS securitySystem');
+  if (hasSecurityUsername) extraSelect.push('p.security_username AS securityUsername');
   if (hasAfterPhoto) extraSelect.push('p.after_clean_photo_url AS afterCleanPhotoUrl');
   if (hasKeyPhoto) extraSelect.push('p.key_photo_url AS keyPhotoUrl');
   if (hasMailboxPwd) extraSelect.push('p.mailbox_password AS mailboxPassword');
@@ -4013,6 +4016,7 @@ async function listClientPortalProperties({ clientdetailId, limit = 500 } = {}) 
 /** Coliving `propertydetail` mirror: only columns that exist in DB are written. */
 const CLIENT_PORTAL_PD_MIRROR_SPECS = [
   { patchKey: 'mailboxPassword', dbCol: 'mailbox_password', kind: 'str' },
+  { patchKey: 'securityUsername', dbCol: 'security_username', kind: 'str' },
   { patchKey: 'bedCount', dbCol: 'bed_count', kind: 'int' },
   { patchKey: 'roomCount', dbCol: 'room_count', kind: 'int' },
   { patchKey: 'bathroomCount', dbCol: 'bathroom_count', kind: 'int' },
@@ -4079,6 +4083,7 @@ async function getClientPortalPropertyDetail({ clientdetailId, propertyId } = {}
     'special_area_count',
     'premises_type',
     'security_system',
+    'security_username',
     'after_clean_photo_url',
     'key_photo_url',
     'smartdoor_password',
@@ -4298,6 +4303,7 @@ async function getClientPortalPropertyDetail({ clientdetailId, propertyId } = {}
     pricing,
     premisesType: row.premises_type != null ? String(row.premises_type) : '',
     securitySystem: row.security_system != null ? String(row.security_system) : '',
+    securityUsername: row.security_username != null ? String(row.security_username) : '',
     afterCleanPhotoUrl: row.after_clean_photo_url != null ? String(row.after_clean_photo_url) : '',
     keyPhotoUrl: row.key_photo_url != null ? String(row.key_photo_url) : '',
     smartdoorPassword: row.smartdoor_password != null ? String(row.smartdoor_password) : '',
@@ -4457,6 +4463,9 @@ async function patchClientPortalProperty({ clientdetailId, propertyId, body } = 
   if (b.securitySystem !== undefined) {
     normalized.securitySystem = String(b.securitySystem ?? '').trim() || null;
   }
+  if (b.securityUsername !== undefined) {
+    normalized.securityUsername = String(b.securityUsername ?? '').trim() || null;
+  }
   const afterPh = b.afterCleanPhotoUrl !== undefined ? b.afterCleanPhotoUrl : b.afterCleanPhoto;
   if (afterPh !== undefined) normalized.afterCleanPhotoUrl = afterPh;
   const keyPh = b.keyPhotoUrl !== undefined ? b.keyPhotoUrl : b.keyPhoto;
@@ -4472,6 +4481,7 @@ async function patchClientPortalProperty({ clientdetailId, propertyId, body } = 
     ['unitName', 'unit_name', 'str'],
     ['premisesType', 'premises_type', 'str'],
     ['securitySystem', 'security_system', 'str'],
+    ['securityUsername', 'security_username', 'str'],
     ['afterCleanPhotoUrl', 'after_clean_photo_url', 'url'],
     ['keyPhotoUrl', 'key_photo_url', 'url'],
     ['smartdoorPassword', 'smartdoor_password', 'str'],
@@ -4850,6 +4860,7 @@ async function createOperatorProperty(input) {
     hasClientPortalOwned,
     hasPremisesTypeCol,
     hasSecuritySystemCol,
+    hasSecurityUsernameCol,
     hasAfterPhotoCol,
     hasKeyPhotoCol,
     hasSmartdoorPwdCol,
@@ -4858,6 +4869,7 @@ async function createOperatorProperty(input) {
     databaseHasColumn('cln_property', 'client_portal_owned'),
     databaseHasColumn('cln_property', 'premises_type'),
     databaseHasColumn('cln_property', 'security_system'),
+    databaseHasColumn('cln_property', 'security_username'),
     databaseHasColumn('cln_property', 'after_clean_photo_url'),
     databaseHasColumn('cln_property', 'key_photo_url'),
     databaseHasColumn('cln_property', 'smartdoor_password'),
@@ -4868,6 +4880,7 @@ async function createOperatorProperty(input) {
     input.clientPortalOwned === true || input.clientPortalOwned === 1 || input.client_portal_owned === 1 ? 1 : 0;
   const premisesTypeVal = String(input.premisesType || input.siteKind || '').trim().toLowerCase() || null;
   const securitySystemVal = String(input.securitySystem || '').trim() || null;
+  const securityUsernameVal = String(input.securityUsername ?? input.security_username ?? '').trim() || null;
   const smartdoorPwdVal = String(input.smartdoorPassword ?? input.smartdoor_password ?? '').trim() || null;
   const smartdoorTokVal =
     input.smartdoorToken === '1' ||
@@ -4894,6 +4907,10 @@ async function createOperatorProperty(input) {
   if (hasSecuritySystemCol) {
     columns.push('security_system');
     values.push(securitySystemVal);
+  }
+  if (hasSecurityUsernameCol) {
+    columns.push('security_username');
+    values.push(securityUsernameVal);
   }
   if (hasSmartdoorPwdCol) {
     columns.push('smartdoor_password');
@@ -5080,6 +5097,7 @@ async function updateOperatorProperty(id, input) {
   const [
     hasPremisesTypeCol,
     hasSecuritySystemCol,
+    hasSecurityUsernameCol,
     hasAfterPhotoCol,
     hasKeyPhotoCol,
     hasSmartdoorPwdCol,
@@ -5092,6 +5110,7 @@ async function updateOperatorProperty(id, input) {
   ] = await Promise.all([
     databaseHasColumn('cln_property', 'premises_type'),
     databaseHasColumn('cln_property', 'security_system'),
+    databaseHasColumn('cln_property', 'security_username'),
     databaseHasColumn('cln_property', 'after_clean_photo_url'),
     databaseHasColumn('cln_property', 'key_photo_url'),
     databaseHasColumn('cln_property', 'smartdoor_password'),
@@ -5199,6 +5218,11 @@ async function updateOperatorProperty(id, input) {
   if (hasSecuritySystemCol && input.securitySystem !== undefined) {
     sets.push('security_system = ?');
     vals.push(String(input.securitySystem ?? '').trim() || null);
+  }
+
+  if (hasSecurityUsernameCol && input.securityUsername !== undefined) {
+    sets.push('security_username = ?');
+    vals.push(String(input.securityUsername ?? '').trim() || null);
   }
 
   if (hasMailboxPwdCol && input.mailboxPassword !== undefined) {

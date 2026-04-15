@@ -129,6 +129,9 @@ function mapPropertyRow(r) {
     securitySystem: Object.prototype.hasOwnProperty.call(r, 'security_system') && r.security_system != null
       ? String(r.security_system).trim()
       : '',
+    securityUsername: Object.prototype.hasOwnProperty.call(r, 'security_username') && r.security_username != null
+      ? String(r.security_username).trim()
+      : '',
     cleanlemonsCleaningTenantPriceMyr:
       Object.prototype.hasOwnProperty.call(r, 'cleanlemons_cleaning_tenant_price_myr') &&
       r.cleanlemons_cleaning_tenant_price_myr != null
@@ -410,6 +413,13 @@ async function updateProperty(clientId, propertyId, data) {
             return s == null || s === '' ? null : String(s).trim();
           })()
         : undefined,
+    security_username:
+      data.securityUsername !== undefined || data.security_username !== undefined
+        ? (() => {
+            const s = data.securityUsername ?? data.security_username;
+            return s == null || s === '' ? null : String(s).trim();
+          })()
+        : undefined,
     cleanlemons_cleaning_tenant_price_myr:
       data.cleanlemonsCleaningTenantPriceMyr !== undefined ||
       data.cleanlemons_cleaning_tenant_price_myr !== undefined
@@ -682,13 +692,15 @@ async function insertProperties(clientId, items) {
     const premisesTypeIns = normalizePremisesType(item.premisesType ?? item.premises_type);
     const secRaw = item.securitySystem ?? item.security_system;
     const securitySystemIns = secRaw === undefined ? undefined : (secRaw == null || secRaw === '' ? null : String(secRaw).trim());
+    const secUserRaw = item.securityUsername ?? item.security_username;
+    const securityUsernameIns = secUserRaw === undefined ? undefined : (secUserRaw == null || secUserRaw === '' ? null : String(secUserRaw).trim());
     const wgsIns = wgs84FromPayload(item);
     const id = randomUUID();
     try {
       await pool.query(
-        `INSERT INTO propertydetail (id, client_id, shortname, unitnumber, apartmentname, ${countryCol}, owner_settlement_model, fixed_rent_to_owner, percentage, premises_type, security_system, active, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())`,
-        [id, clientId, shortname, unitNumberOrNull, apartmentName, country, settlementModel, (settlementModel === 'management_fees_fixed' || settlementModel === 'rental_unit' || settlementModel === 'guarantee_return_fixed_plus_share') ? fixedRent : null, (settlementModel === 'management_percent_gross' || settlementModel === 'management_percent_net' || settlementModel === 'management_percent_rental_income_only' || settlementModel === 'guarantee_return_fixed_plus_share') ? pct : null, premisesTypeIns, securitySystemIns === undefined ? null : securitySystemIns]
+        `INSERT INTO propertydetail (id, client_id, shortname, unitnumber, apartmentname, ${countryCol}, owner_settlement_model, fixed_rent_to_owner, percentage, premises_type, security_system, security_username, active, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())`,
+        [id, clientId, shortname, unitNumberOrNull, apartmentName, country, settlementModel, (settlementModel === 'management_fees_fixed' || settlementModel === 'rental_unit' || settlementModel === 'guarantee_return_fixed_plus_share') ? fixedRent : null, (settlementModel === 'management_percent_gross' || settlementModel === 'management_percent_net' || settlementModel === 'management_percent_rental_income_only' || settlementModel === 'guarantee_return_fixed_plus_share') ? pct : null, premisesTypeIns, securitySystemIns === undefined ? null : securitySystemIns, securityUsernameIns === undefined ? null : securityUsernameIns]
       );
     } catch (e) {
       const isUnknownColumn = e.code === 'ER_BAD_FIELD_ERROR' || e.errno === 1054 || (e.message && String(e.message).includes('Unknown column'));
@@ -756,7 +768,7 @@ async function insertProperties(clientId, items) {
         if (!isUnknownW) throw eW;
       }
     }
-    if (premisesTypeIns != null || securitySystemIns !== undefined) {
+    if (premisesTypeIns != null || securitySystemIns !== undefined || securityUsernameIns !== undefined) {
       try {
         const bits = [];
         const p = [];
@@ -767,6 +779,10 @@ async function insertProperties(clientId, items) {
         if (securitySystemIns !== undefined) {
           bits.push('security_system = ?');
           p.push(securitySystemIns == null ? null : securitySystemIns);
+        }
+        if (securityUsernameIns !== undefined) {
+          bits.push('security_username = ?');
+          p.push(securityUsernameIns == null ? null : securityUsernameIns);
         }
         if (bits.length) {
           p.push(id, clientId);

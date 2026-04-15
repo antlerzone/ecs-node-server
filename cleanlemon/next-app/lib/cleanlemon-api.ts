@@ -674,6 +674,7 @@ export type ClientPortalPropertyDetail = {
   pricing: ClientPortalPropertyPricingRow[];
   premisesType?: string;
   securitySystem?: string;
+  securityUsername?: string;
   afterCleanPhotoUrl?: string;
   keyPhotoUrl?: string;
   smartdoorPassword?: string;

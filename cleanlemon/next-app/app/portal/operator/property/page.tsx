@@ -111,6 +111,7 @@ interface Property {
   googleMapsUrl?: string
   wazeUrl?: string
   securitySystem: 'icare' | 'ecommunity'
+  securityUsername?: string
   cleaningTypes: string[]
   keyCollection: {
     mailboxPassword: string
@@ -192,6 +193,7 @@ interface PropertyFormState {
   mailboxPasswordValue: string
   smartdoorPasswordValue: string
   securitySystem: Property['securitySystem']
+  securityUsername: string
   afterCleanPhotoSample?: string
   cleaningPriceByType: Record<string, { defaultPrice: string; adjustAmount: string }>
   estimatedTime: string
@@ -353,6 +355,7 @@ function mapApiRowToProperty(row: Record<string, unknown>): Property {
       }
     })(),
     securitySystem,
+    securityUsername: String(row.securityUsername || '').trim(),
     cleaningTypes: [] as string[],
     keyCollection: {
       mailboxPassword: String(row.mailboxPassword || ''),
@@ -446,6 +449,7 @@ export default function PropertyPage() {
     mailboxPasswordValue: '',
     smartdoorPasswordValue: '',
     securitySystem: 'icare',
+    securityUsername: '',
     cleaningPriceByType: {},
     estimatedTime: '',
     latitude: '',
@@ -733,6 +737,7 @@ export default function PropertyPage() {
       mailboxPasswordValue: '',
       smartdoorPasswordValue: '',
       securitySystem: 'icare',
+      securityUsername: '',
       cleaningPriceByType: {},
       estimatedTime: '',
       latitude: '',
@@ -778,6 +783,7 @@ export default function PropertyPage() {
       mailboxPasswordValue: property.keyCollection.mailboxPassword,
       smartdoorPasswordValue: property.keyCollection.smartdoorPassword,
       securitySystem: property.securitySystem,
+      securityUsername: property.securityUsername || '',
       afterCleanPhotoSample: property.afterCleanPhotoSample,
       cleaningPriceByType: {
         [PRICE_SUMMARY_LABEL]: { defaultPrice: dp, adjustAmount: ap },
@@ -1105,6 +1111,7 @@ export default function PropertyPage() {
     client: propertyForm.bindingClient,
     status,
     securitySystem: propertyForm.securitySystem,
+    securityUsername: propertyForm.securityUsername.trim(),
     cleaningTypes: [],
     keyCollection: {
       mailboxPassword: propertyForm.keyCollection.mailboxPassword ? propertyForm.mailboxPasswordValue : '',
@@ -1132,6 +1139,7 @@ export default function PropertyPage() {
       operatorId,
       premisesType: propertyForm.siteKind,
       securitySystem: propertyForm.securitySystem,
+      securityUsername: propertyForm.securityUsername.trim() || null,
       mailboxPassword: propertyForm.mailboxPasswordValue,
       smartdoorPassword: propertyForm.keyCollection.smartdoorPassword ? propertyForm.smartdoorPasswordValue : '',
       smartdoorTokenEnabled: propertyForm.keyCollection.smartdoorToken,
@@ -1185,6 +1193,7 @@ export default function PropertyPage() {
       team: '',
       premisesType: propertyForm.siteKind,
       securitySystem: propertyForm.securitySystem,
+      securityUsername: propertyForm.securityUsername.trim() || null,
       mailboxPassword: propertyForm.mailboxPasswordValue,
       smartdoorPassword: propertyForm.keyCollection.smartdoorPassword ? propertyForm.smartdoorPasswordValue : '',
       smartdoorTokenEnabled: propertyForm.keyCollection.smartdoorToken,
@@ -1867,6 +1876,14 @@ export default function PropertyPage() {
                       </label>
                     </div>
                   </div>
+                </div>
+                <div className="space-y-2">
+                  <Label>Security Username</Label>
+                  <Input
+                    value={propertyForm.securityUsername}
+                    onChange={(e) => setPropertyForm({ ...propertyForm, securityUsername: e.target.value })}
+                    placeholder="e.g. icare / gprop username"
+                  />
                 </div>
                 <div className="space-y-2">
                   <Label>Security System</Label>
