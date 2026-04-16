@@ -23,12 +23,12 @@ export function EnquiryPostAuthSplitLayout({
 
   return (
     <div className="flex flex-1 flex-col min-h-0 w-full">
-      <div className="md:hidden flex flex-1 flex-col min-h-0 w-full divide-y divide-border">
-        <div className="w-full bg-background">
+      <div className="md:hidden flex flex-1 flex-col min-h-0 w-full divide-y divide-border overflow-y-auto overscroll-y-contain [webkit-overflow-scrolling:touch]">
+        <div className="w-full shrink-0 bg-background">
           <EnquiryMarketingSigninColumn footerPrimary={footerPrimary} />
         </div>
-        <div className="flex flex-1 min-h-0 w-full bg-background px-4 py-8 items-center justify-center">
-          <div className="w-full max-w-[360px] min-h-0 max-h-full overflow-y-auto my-auto">{children}</div>
+        <div className="w-full shrink-0 bg-background px-4 py-8">
+          <div className="w-full max-w-[360px] mx-auto">{children}</div>
         </div>
       </div>
 

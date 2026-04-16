@@ -19,6 +19,7 @@ const {
   verifyPortalToken,
   getPortalProfile,
   updatePortalProfile,
+  applyAliyunEkycToPortalAccount,
   getPasswordStatusForEmail,
   requestPasswordReset,
   confirmPasswordReset,
@@ -46,6 +47,11 @@ const {
   ensureColivingDetailForPortalEmail,
 } = require('./portal-detail-ensure.service');
 const contactVerify = require('./portal-contact-verify.service');
+const {
+  isIdVerifyConfigured,
+  initializeEkycPro,
+  checkEkycResult,
+} = require('../../services/aliyun-idverify.service');
 
 const FRONTEND_URL = process.env.PORTAL_FRONTEND_URL || 'http://localhost:3000';
 
@@ -168,10 +174,29 @@ function hasFacebookOauthConfig(frontendUrl) {
   return !!(process.env.FACEBOOK_APP_ID && process.env.FACEBOOK_APP_SECRET);
 }
 
+/**
+ * Bearer from Authorization, X-Portal-Authorization, JSON body `portalToken`, or query `portalToken`.
+ * Some reverse proxies strip auth headers; body/query fallback keeps eKYC working behind Nginx → Next → API.
+ */
+function getPortalBearerToken(req) {
+  const auth = req.headers.authorization;
+  if (auth && auth.startsWith('Bearer ')) return auth.slice(7);
+  const x = req.headers['x-portal-authorization'];
+  if (x && String(x).startsWith('Bearer ')) return String(x).slice(7);
+  if (req.body && typeof req.body.portalToken === 'string') {
+    const raw = req.body.portalToken.trim();
+    if (raw) return raw.startsWith('Bearer ') ? raw.slice(7) : raw;
+  }
+  if (req.query && typeof req.query.portalToken === 'string') {
+    const raw = String(req.query.portalToken).trim();
+    if (raw) return raw.startsWith('Bearer ') ? raw.slice(7) : raw;
+  }
+  return null;
+}
+
 /** 從 Authorization: Bearer <token> 取得 email，設為 req.portalEmail；無效或無 token 則 401。 */
 function requirePortalToken(req, res, next) {
-  const auth = req.headers.authorization;
-  const token = auth && auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  const token = getPortalBearerToken(req);
   const payload = verifyPortalToken(token);
   if (!payload || !payload.email) {
     return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
@@ -832,8 +857,7 @@ router.get('/gov-id/callback', async (req, res) => {
 router.post('/gov-id/complete-pending-email', async (req, res) => {
   try {
     const { pendingId, email, password, frontend: frontendBody } = req.body || {};
-    const auth = req.headers.authorization;
-    const bearer = auth && auth.startsWith('Bearer ') ? auth.slice(7) : null;
+    const bearer = getPortalBearerToken(req);
     const jwtPayload = bearer ? verifyPortalToken(bearer) : null;
     const bodyEmailNorm = normalizeEmail(email);
     const trustedIdentityEmail =
@@ -902,6 +926,100 @@ router.post('/gov-id/disconnect', requirePortalToken, async (req, res) => {
     res.status(200).json(result);
   } catch (err) {
     res.status(500).json({ ok: false, reason: 'DB_ERROR' });
+  }
+});
+
+// --- Aliyun ID Verification (eKYC_PRO, MY KL) ---
+/** POST /api/portal-auth/aliyun-idv/start { metaInfo, docType?: MYS01001|GLB03002, returnPath?: string } */
+router.post('/aliyun-idv/start', requirePortalToken, async (req, res) => {
+  if (!isIdVerifyConfigured()) {
+    return res.status(503).json({ ok: false, reason: 'ALIYUN_IDV_NOT_CONFIGURED' });
+  }
+  try {
+    const metaInfo = req.body?.metaInfo;
+    const docType = String(req.body?.docType || 'MYS01001').trim();
+    const returnPath = String(req.body?.returnPath || '/demoprofile').trim() || '/demoprofile';
+    const out = await initializeEkycPro(req.portalEmail, { metaInfo, docType, returnPath });
+    return res.status(200).json({
+      ok: true,
+      transactionId: out.transactionId,
+      transactionUrl: out.transactionUrl,
+    });
+  } catch (err) {
+    const code = err?.code || 'START_FAILED';
+    console.error('[portal-auth] aliyun-idv/start', code, err?.message || err);
+    if (code === 'NOT_CONFIGURED') {
+      return res.status(503).json({ ok: false, reason: 'ALIYUN_IDV_NOT_CONFIGURED' });
+    }
+    if (code === 'MISSING_META_INFO' || code === 'INVALID_DOC_TYPE') {
+      return res.status(400).json({ ok: false, reason: code });
+    }
+    if (code === 'ALIYUN_FORBIDDEN') {
+      return res.status(403).json({
+        ok: false,
+        reason: code,
+        message:
+          'Alibaba Cloud denied: RAM must allow antcloudauth:Initialize. Attach AliyunAntCloudAuthFullAccess (not only Yundun CloudAuth).',
+      });
+    }
+    return res.status(502).json({ ok: false, reason: code, message: String(err?.message || '') });
+  }
+});
+
+/** GET /api/portal-auth/aliyun-idv/result?transactionId= */
+router.get('/aliyun-idv/result', requirePortalToken, async (req, res) => {
+  if (!isIdVerifyConfigured()) {
+    return res.status(503).json({ ok: false, reason: 'ALIYUN_IDV_NOT_CONFIGURED' });
+  }
+  const transactionId = String(req.query?.transactionId || '').trim();
+  if (!transactionId) {
+    return res.status(400).json({ ok: false, reason: 'MISSING_TRANSACTION_ID' });
+  }
+  try {
+    const out = await checkEkycResult(req.portalEmail, transactionId);
+    let profileApplied = false;
+    let profileReason = null;
+    let profileOcrDebug;
+    if (out.passed) {
+      const ar = await applyAliyunEkycToPortalAccount(
+        req.portalEmail,
+        out.docType || 'MYS01001',
+        out.extIdInfo,
+        out.extBasicInfo,
+        out.ekycResult,
+        out.extInfo
+      );
+      profileApplied = !!ar.ok;
+      profileReason = ar.reason || null;
+      if (ar.ocrDebug) profileOcrDebug = ar.ocrDebug;
+      if (!ar.ok) {
+        console.warn('[portal-auth] aliyun-idv profile apply', ar.reason);
+      } else {
+        console.log('[portal-auth] aliyun-idv profile apply OK (portal-token)');
+      }
+    }
+    return res.status(200).json({
+      ok: true,
+      ...out,
+      profileApplied,
+      profileReason,
+      ...(profileOcrDebug ? { profileOcrDebug } : {}),
+    });
+  } catch (err) {
+    const code = err?.code || 'CHECK_FAILED';
+    console.error('[portal-auth] aliyun-idv/result', code, err?.message || err);
+    if (code === 'SESSION_INVALID') {
+      return res.status(400).json({ ok: false, reason: code });
+    }
+    if (code === 'ALIYUN_FORBIDDEN') {
+      return res.status(403).json({
+        ok: false,
+        reason: code,
+        message:
+          'Alibaba Cloud denied: RAM must allow antcloudauth:* (e.g. AliyunAntCloudAuthFullAccess).',
+      });
+    }
+    return res.status(502).json({ ok: false, reason: code, message: String(err?.message || '') });
   }
 });
 

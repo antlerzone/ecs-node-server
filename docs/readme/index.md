@@ -25,6 +25,8 @@
 | **封装** | Coliving：`docs/nextjs-migration/lib/unified-profile-portal-api.ts`。 |
 | **Demo** | `demo.colivingjb.com`：`shouldUseDemoMock()` 为真时不打真实 profile API，组件用 `localStorageKeyDemo` 存草稿。 |
 
+**Alibaba eKYC（护照 / MyKad，2026-04）：** 实名走 **`POST /api/access/aliyun-idv/start`** → 回调 **`POST /api/access/aliyun-idv/result`**（`aliyun-idverify.service.js`），成功写入 **`portal_account`**（含 **`passport_expiry_date`**、**`aliyun_ekyc_locked`**）。**Gov 链接状态：** **`POST /api/access/gov-id-status`**（body `{ email }`）返回 **`singpass` / `mydigital` / `identityLocked` / `aliyunEkycLocked`**。读资料 **`POST /api/access/portal-profile`** 内 **`getPortalProfile`**：若缺 **`phone_verified`** 等列，后端会**降级多条 SELECT** 仍带出护照到期（见 [docs/index.md](../index.md)「Portal — Alibaba eKYC」条）。**重置 eKYC 填充（测重用）：** `node scripts/reset-portal-account-ekyc.js <portal_account_uuid>`。
+
 **联动说明：** [profile-sync-and-portal.md](../profile-sync-and-portal.md)。
 
 ---

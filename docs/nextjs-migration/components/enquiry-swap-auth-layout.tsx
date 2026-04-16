@@ -54,9 +54,9 @@ export function EnquirySwapAuthLayout({
   return (
     <div className="flex flex-1 flex-col min-h-0 w-full">
       {/* Mobile: stacked, full-width sections (no floating card) */}
-      <div className="md:hidden flex flex-1 flex-col min-h-0 w-full divide-y divide-border">
-        <div className="w-full bg-background">{backgroundLayer}</div>
-        <div className="flex border-b border-border p-1 bg-muted/30">
+      <div className="md:hidden flex flex-1 flex-col min-h-0 w-full divide-y divide-border overflow-y-auto overscroll-y-contain [webkit-overflow-scrolling:touch]">
+        <div className="w-full shrink-0 bg-background">{backgroundLayer}</div>
+        <div className="flex shrink-0 border-b border-border p-1 bg-muted/30">
           <button
             type="button"
             onClick={() => setPage("signin")}
@@ -80,8 +80,8 @@ export function EnquirySwapAuthLayout({
             Create account
           </button>
         </div>
-        <div className="flex flex-1 min-h-0 w-full bg-background px-4 py-8 items-center justify-center">
-          <div className="w-full max-w-[360px] min-h-0 max-h-full overflow-y-auto my-auto">{page === "signin" ? signIn : signUp}</div>
+        <div className="w-full shrink-0 bg-background px-4 py-8">
+          <div className="w-full max-w-[360px] mx-auto">{page === "signin" ? signIn : signUp}</div>
         </div>
       </div>
 

@@ -19,6 +19,7 @@ import {
 } from '@/components/ui/dialog'
 import {
   User,
+  Calendar,
   Mail,
   Phone,
   Lock,
@@ -49,7 +50,8 @@ import {
   requestPortalPasswordResetEmail,
   confirmPortalPasswordReset,
   fetchGovIdStatus,
-  buildGovIdStartUrl,
+  startAliyunIdvEkyc,
+  fetchAliyunIdvResult,
   requestPortalEmailChangeOtp,
   confirmPortalEmailChange,
   requestPortalPhoneVerifyOtp,
@@ -64,6 +66,7 @@ import {
   type TenantGateIncompleteField,
   type TenantProfileLite,
 } from '@/lib/tenant-gates'
+import { GovIdConnectButtons } from '@/components/gov-id-connect-buttons'
 
 type Props = {
   roleLabel: string
@@ -79,11 +82,27 @@ type Props = {
   publicProfileTenantId?: string | null
   /** Singpass / MyDigital verification row + avatar badge — only `/demoprofile` (not tenant/owner/operator profile). */
   showGovVerification?: boolean
+  /** `/demoprofile` only: no mandatory-field red outlines or gate hint text */
+  disableProfileGateUi?: boolean
 }
 
 type PhoneCountryOption = {
   code: string
   label: string
+}
+
+/** Passport expiry calendar date within 30 days (inclusive) or already past — allow re-eKYC from verification dialog. */
+function isPassportRenewalWindow(expiryIso: string): boolean {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(expiryIso || '').trim())
+  if (!m) return false
+  const y = Number(m[1])
+  const mo = Number(m[2])
+  const d = Number(m[3])
+  const exp = new Date(y, mo - 1, d)
+  const now = new Date()
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const daysUntil = Math.floor((exp.getTime() - today.getTime()) / 86400000)
+  return daysUntil <= 30
 }
 
 const PHONE_COUNTRY_OPTIONS: PhoneCountryOption[] = [
@@ -224,6 +243,7 @@ export default function UnifiedProfilePage({
   showViewMyProfileButton = false,
   publicProfileTenantId = null,
   showGovVerification = false,
+  disableProfileGateUi = false,
 }: Props) {
   const router = useRouter()
   const member = getMember()
@@ -294,6 +314,7 @@ export default function UnifiedProfilePage({
     const gov = sp.get('gov')
     const reason = sp.get('reason')
     const provider = sp.get('provider')
+    const ekyc = sp.get('ekyc')
     const cleanPath = window.location.pathname
     if (gov === 'error' && reason) {
       toast.error(formatGovIdErrorReason(reason))
@@ -301,8 +322,89 @@ export default function UnifiedProfilePage({
     } else if (gov === 'success') {
       toast.success(`Connected${provider ? ` (${provider})` : ''}`)
       router.replace(cleanPath, { scroll: false })
+    } else if (ekyc === '1' && !shouldUseDemoMock()) {
+      const tid = sessionStorage.getItem('aliyun_ekyc_tid')
+      if (tid) {
+        void (async () => {
+          const r = await fetchAliyunIdvResult(tid)
+          if (r.ok && r.passed) {
+            sessionStorage.setItem('aliyun_ekyc_ok', '1')
+            sessionStorage.removeItem('aliyun_ekyc_tid')
+            const em = String(email || '').trim()
+            if (em) {
+              const pr = await fetchPortalProfileByEmail(em)
+              if (pr.ok && pr.profile) {
+                const p = pr.profile as {
+                  fullName?: string
+                  legalName?: string
+                  nickname?: string
+                  phone?: string
+                  address?: string
+                  entityType?: string
+                  idType?: string
+                  idNumber?: string
+                  taxIdNo?: string
+                  bankId?: string
+                  bankAccountNo?: string
+                  bankAccountHolder?: string
+                  avatarUrl?: string
+                  nricFrontUrl?: string
+                  nricBackUrl?: string
+                  govIdentityLocked?: boolean
+                  aliyunEkycLocked?: boolean
+                }
+                setFullName(String(p.fullName || ''))
+                setLegalName(String(p.legalName || ''))
+                setNickname(String(p.nickname || ''))
+                setPhone(String(p.phone || ''))
+                setAddress(String(p.address || ''))
+                setEntityType(String(p.entityType || 'MALAYSIAN_INDIVIDUAL'))
+                setIdType(String(p.idType || 'NRIC'))
+                setIdNumber(String(p.idNumber || ''))
+                setPassportExpiryDate(String((p as { passportExpiryDate?: string }).passportExpiryDate || ''))
+                setTaxNo(String(p.taxIdNo || ''))
+                setBankId(String(p.bankId || ''))
+                setBankAccNo(String(p.bankAccountNo || ''))
+                setBankHolder(String(p.bankAccountHolder || ''))
+                if (p.avatarUrl) {
+                  setAvatarPreview(String(p.avatarUrl))
+                  setAvatarUrl(String(p.avatarUrl))
+                  syncColivingLocalUser({ avatar: String(p.avatarUrl) })
+                }
+                if (p.nricFrontUrl) {
+                  setNricFront(String(p.nricFrontUrl))
+                  setNricFrontUrl(String(p.nricFrontUrl))
+                }
+                if (p.nricBackUrl) {
+                  setNricBack(String(p.nricBackUrl))
+                  setNricBackUrl(String(p.nricBackUrl))
+                }
+                if (typeof p.govIdentityLocked === 'boolean') setGovIdentityLocked(p.govIdentityLocked)
+                setAliyunEkycVerified(!!p.aliyunEkycLocked || r.profileApplied === true)
+              } else {
+                setAliyunEkycVerified(r.profileApplied === true)
+              }
+            } else {
+              setAliyunEkycVerified(true)
+            }
+            if (r.profileApplied === false && r.profileReason === 'GOV_ID_ALREADY_LINKED') {
+              toast.warning('Verified, but name and ID were not saved — a government login is already linked.')
+            } else if (r.profileApplied === false && r.profileReason === 'EKYC_OCR_INCOMPLETE') {
+              toast.warning('Verified, but name/ID could not be saved automatically. Contact support if needed.')
+            }
+            toast.success('Identity verification completed')
+          } else if (r.ok && r.passed === false) {
+            toast.error(
+              r.subCode ? `Verification did not pass (${r.subCode})` : 'Verification not completed — try again',
+            )
+          } else {
+            toast.error(r.reason || 'Could not load verification result')
+          }
+        })()
+      }
+      router.replace(cleanPath, { scroll: false })
     }
-  }, [showGovVerification, router])
+  }, [showGovVerification, router, email])
 
   const [fullName, setFullName] = useState(userNameHint)
   const [legalName, setLegalName] = useState(userNameHint)
@@ -310,6 +412,7 @@ export default function UnifiedProfilePage({
   const [entityType, setEntityType] = useState('MALAYSIAN_INDIVIDUAL')
   const [idType, setIdType] = useState('NRIC')
   const [idNumber, setIdNumber] = useState('')
+  const [passportExpiryDate, setPassportExpiryDate] = useState('')
   const [taxNo, setTaxNo] = useState('')
   const [nickname, setNickname] = useState('')
   const [address, setAddress] = useState('')
@@ -342,6 +445,8 @@ export default function UnifiedProfilePage({
   const [govSingpass, setGovSingpass] = useState(false)
   const [govMydigital, setGovMydigital] = useState(false)
   const [govDialogOpen, setGovDialogOpen] = useState(false)
+  const [aliyunEkycVerified, setAliyunEkycVerified] = useState(false)
+  const [aliyunEkycStarting, setAliyunEkycStarting] = useState(false)
   const [phoneVerified, setPhoneVerified] = useState(false)
 
   const [emailChangeOpen, setEmailChangeOpen] = useState(false)
@@ -368,11 +473,15 @@ export default function UnifiedProfilePage({
   const saveStateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastSavedPayloadRef = useRef<string>('')
   const didInitSnapshotRef = useRef(false)
+  /** After Aliyun eKYC, align auto-save baseline once so a pending timer does not POST stale identity fields. */
+  const prevAliyunVerifiedForSnapshotRef = useRef(false)
 
   const displayNameForCard = useMemo(
     () => String(nickname || legalName || fullName || 'User').trim() || 'User',
     [nickname, legalName, fullName]
   )
+
+  const idTypeU = useMemo(() => String(idType || '').toUpperCase(), [idType])
 
   const publicProfilePath = useMemo(() => {
     const id = String(publicProfileTenantId ?? '').trim()
@@ -381,14 +490,14 @@ export default function UnifiedProfilePage({
   }, [publicProfileTenantId])
 
   const idLabels = useMemo(() => {
-    if (idType === 'PASSPORT') {
+    if (idTypeU === 'PASSPORT') {
       return {
         section: 'Passport or travel document',
         front: 'Passport',
         back: 'Passport (additional page)',
       }
     }
-    if (idType === 'BRN') {
+    if (idTypeU === 'BRN') {
       return {
         section: 'BRN document',
         front: 'BRN (front)',
@@ -400,8 +509,8 @@ export default function UnifiedProfilePage({
       front: 'NRIC Front',
       back: 'NRIC Back',
     }
-  }, [idType])
-  const requiresBackImage = idType !== 'PASSPORT'
+  }, [idTypeU])
+  const requiresBackImage = idTypeU !== 'PASSPORT'
 
   const inputCls =
     'w-full border border-border rounded-xl px-3 py-2.5 text-sm bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent transition-all'
@@ -452,9 +561,10 @@ export default function UnifiedProfilePage({
   ])
 
   const profileGateIncomplete = useMemo(() => {
+    if (disableProfileGateUi) return new Set<TenantGateIncompleteField>()
     if (!colivingProfileGateModel) return new Set<TenantGateIncompleteField>()
     return new Set(getTenantProfileIncompleteFields(colivingProfileGateModel))
-  }, [colivingProfileGateModel])
+  }, [colivingProfileGateModel, disableProfileGateUi])
 
   const gateErr = (k: TenantGateIncompleteField) => profileGateIncomplete.has(k)
 
@@ -550,6 +660,7 @@ export default function UnifiedProfilePage({
         setEntityType(String(p.entityType || entityType))
         setIdType(String(p.idType || idType))
         setIdNumber(String(p.idNumber || idNumber))
+        setPassportExpiryDate(String((p as { passportExpiryDate?: string }).passportExpiryDate || ''))
         setTaxNo(String(p.taxIdNo || taxNo))
         setBankId(String(p.bankId || bankId))
         setBankAccNo(String(p.bankAccountNo || bankAccNo))
@@ -572,11 +683,19 @@ export default function UnifiedProfilePage({
           singpassLinked?: boolean
           mydigitalLinked?: boolean
           phoneVerified?: boolean
+          aliyunEkycLocked?: boolean
         }
         if (typeof gl.govIdentityLocked === 'boolean') setGovIdentityLocked(gl.govIdentityLocked)
         if (typeof gl.singpassLinked === 'boolean') setGovSingpass(gl.singpassLinked)
         if (typeof gl.mydigitalLinked === 'boolean') setGovMydigital(gl.mydigitalLinked)
         if (typeof gl.phoneVerified === 'boolean') setPhoneVerified(gl.phoneVerified)
+        /** eKYC verified only when DB says so — never trust stale sessionStorage alone (user may clear DB / retry). */
+        setAliyunEkycVerified(!!gl.aliyunEkycLocked)
+        try {
+          if (!gl.aliyunEkycLocked) sessionStorage.removeItem('aliyun_ekyc_ok')
+        } catch {
+          /* ignore */
+        }
       }
       /** Gov status API must run after profile apply — parallel effect previously overwrote DB-linked state with false when JWT/status won the race. Merge with OR so profile + status never downgrade incorrectly. */
       if (showGovVerification && !shouldUseDemoMock() && !cancelled) {
@@ -585,6 +704,7 @@ export default function UnifiedProfilePage({
           setGovSingpass((prev) => !!s.singpass || !!prev)
           setGovMydigital((prev) => !!s.mydigital || !!prev)
           setGovIdentityLocked((prev) => !!s.identityLocked || !!prev)
+          setAliyunEkycVerified((prev) => !!s.aliyunEkycLocked || !!prev)
         }
       }
       setIsInitializing(false)
@@ -642,6 +762,36 @@ export default function UnifiedProfilePage({
   ])
 
   useEffect(() => {
+    if (isInitializing || !backendProfile) return
+    if (aliyunEkycVerified && !prevAliyunVerifiedForSnapshotRef.current) {
+      lastSavedPayloadRef.current = JSON.stringify(buildProfilePayload())
+    }
+    prevAliyunVerifiedForSnapshotRef.current = aliyunEkycVerified
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    aliyunEkycVerified,
+    isInitializing,
+    backendProfile,
+    clientId,
+    email,
+    fullName,
+    legalName,
+    nickname,
+    phone,
+    address,
+    entityType,
+    idType,
+    idNumber,
+    taxNo,
+    bankId,
+    bankAccNo,
+    bankHolder,
+    avatarUrl,
+    nricFrontUrl,
+    nricBackUrl,
+  ])
+
+  useEffect(() => {
     if (isInitializing) return
     if (uploadingAvatar || uploadingSide) return
     const payload = buildProfilePayload()
@@ -652,7 +802,10 @@ export default function UnifiedProfilePage({
     setSaveState('saving')
     saveTimerRef.current = setTimeout(async () => {
       if (backendProfile) {
-        const result = await savePortalProfile(payload, { govIdentityLocked })
+        const result = await savePortalProfile(payload, {
+          govIdentityLocked,
+          aliyunEkycVerified,
+        })
         if (!result.ok) {
           if (result.reason === 'IDENTITY_LOCKED') {
             /** DB has gov_identity_locked but client may still send fullname/nric until we strip — do not mark saved. */
@@ -715,6 +868,7 @@ export default function UnifiedProfilePage({
     backendProfile,
     localStorageKey,
     govIdentityLocked,
+    aliyunEkycVerified,
   ])
 
   useEffect(() => {
@@ -724,10 +878,75 @@ export default function UnifiedProfilePage({
     }
   }, [])
 
+  /** Opening the verification dialog: refresh profile + Gov flags so button disabled states match DB (fixes stale client state). */
+  useEffect(() => {
+    if (!govDialogOpen || !email || !backendProfile || shouldUseDemoMock()) return
+    let cancelled = false
+    void (async () => {
+      try {
+        const [pr, gs] = await Promise.all([fetchPortalProfileByEmail(email), fetchGovIdStatus()])
+        if (cancelled) return
+        let profileAliyun = false
+        if (pr?.ok && pr.profile) {
+          const p = pr.profile as Record<string, unknown>
+          const raw = String(p.idType ?? '').toUpperCase()
+          if (raw === 'NRIC' || raw === 'PASSPORT' || raw === 'BRN') setIdType(raw)
+          profileAliyun = !!p.aliyunEkycLocked
+          const pe = p.passportExpiryDate
+          if (typeof pe === 'string' && pe.trim()) setPassportExpiryDate(pe.trim())
+        }
+        if (gs?.ok) {
+          setGovSingpass(!!gs.singpass)
+          setGovMydigital(!!gs.mydigital)
+          if (typeof gs.identityLocked === 'boolean') setGovIdentityLocked(gs.identityLocked)
+        }
+        const statusAliyun = !!(gs?.ok && gs.aliyunEkycLocked)
+        setAliyunEkycVerified((prev) => profileAliyun || statusAliyun || prev)
+      } catch {
+        /* ignore */
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [govDialogOpen, email, backendProfile])
+
+  /** Aliyun eKYC_PRO: MyKad — lock identity + address + both NRIC images. */
+  const aliyunMykadEkycLocked =
+    showGovVerification && backendProfile && !shouldUseDemoMock() && aliyunEkycVerified && idTypeU === 'NRIC'
+  /** Aliyun passport — lock identity + passport photo (front slot); address stays editable. */
+  const aliyunPassportEkycLocked =
+    showGovVerification && backendProfile && !shouldUseDemoMock() && aliyunEkycVerified && idTypeU === 'PASSPORT'
+
+  const aliyunCoreIdentityLocked = govIdentityLocked || aliyunMykadEkycLocked || aliyunPassportEkycLocked
+  const aliyunAddressLocked = govIdentityLocked || aliyunMykadEkycLocked
+  /** Passport expiry ≤30 days: allow starting passport eKYC again from Verification Status dialog (main form stays locked until success). */
+  const passportRenewalEligible =
+    showGovVerification &&
+    backendProfile &&
+    !shouldUseDemoMock() &&
+    aliyunEkycVerified &&
+    idTypeU === 'PASSPORT' &&
+    isPassportRenewalWindow(passportExpiryDate)
+  const idFrontUploadLocked = aliyunMykadEkycLocked || aliyunPassportEkycLocked
+  const idBackUploadLocked = aliyunMykadEkycLocked
+
+  /** Verification Status dialog: disable only the method currently in use; Gov ID row uses linked flags on each button. */
+  const govIdProviderLinked = govSingpass || govMydigital
+  const verifiedByAliyunMyKadOnly = aliyunEkycVerified && idTypeU === 'NRIC'
+  const verifiedByAliyunPassport = aliyunEkycVerified && idTypeU === 'PASSPORT'
+  const disableVerificationDialogMyKad =
+    shouldUseDemoMock() || (verifiedByAliyunMyKadOnly && !govIdProviderLinked)
+  const disableVerificationDialogPassport =
+    shouldUseDemoMock() || (verifiedByAliyunPassport && !passportRenewalEligible)
+
   const handleSave = async () => {
     const payload = buildProfilePayload()
     if (backendProfile) {
-      const result = await savePortalProfile(payload, { govIdentityLocked })
+      const result = await savePortalProfile(payload, {
+        govIdentityLocked,
+        aliyunEkycVerified,
+      })
       if (!result.ok) {
         if (result.reason === 'IDENTITY_LOCKED') {
           setGovIdentityLocked(true)
@@ -758,6 +977,8 @@ export default function UnifiedProfilePage({
 
   const handleNricFile = async (side: 'front' | 'back', file: File | null) => {
     if (!file) return
+    if (side === 'front' && idFrontUploadLocked) return
+    if (side === 'back' && idBackUploadLocked) return
     if (!file.type.startsWith('image/')) {
       toast.error('Please upload an image file')
       return
@@ -883,14 +1104,76 @@ export default function UnifiedProfilePage({
 
   const securityTitle = hasPassword ? 'Change password' : 'Create password'
 
-  const startGovConnect = (provider: 'singpass' | 'mydigital') => {
-    const url = buildGovIdStartUrl(provider, showGovVerification ? '/demoprofile' : '/demologin')
-    if (!url) {
-      toast.error('Sign in required or API not configured')
+  async function loadAliyunVerifyScript(): Promise<void> {
+    if (typeof window === 'undefined') return
+    const w = window as unknown as { getMetaInfo?: () => string }
+    if (typeof w.getMetaInfo === 'function') return
+    const src =
+      process.env.NEXT_PUBLIC_ALIYUN_IDV_VERIFY_JS_URL || 'https://hkwebcdn.yuncloudauth.com/cdn/verify.js'
+    await new Promise<void>((resolve, reject) => {
+      const existing = document.querySelector(`script[data-aliyun-verify="1"]`)
+      if (existing) {
+        existing.addEventListener('load', () => resolve(), { once: true })
+        existing.addEventListener('error', () => reject(new Error('verify.js load failed')), { once: true })
+        return
+      }
+      const s = document.createElement('script')
+      s.src = src
+      s.async = true
+      s.dataset.aliyunVerify = '1'
+      s.onload = () => resolve()
+      s.onerror = () => reject(new Error('verify.js load failed'))
+      document.head.appendChild(s)
+    })
+  }
+
+  const startAliyunEkycFlow = async (docType: 'MYS01001' | 'GLB03002') => {
+    if (shouldUseDemoMock() || !backendProfile) {
+      toast.error('Use the live portal with a signed-in account (demo is mock-only).')
       return
     }
-    setGovDialogOpen(false)
-    window.location.href = url
+    if (docType === 'MYS01001') {
+      const block =
+        verifiedByAliyunMyKadOnly && !govIdProviderLinked
+      if (block) {
+        toast.error('You are already verified with Malaysian MyKad. Use another method above to switch.')
+        return
+      }
+    }
+    if (docType === 'GLB03002') {
+      const block = verifiedByAliyunPassport && !isPassportRenewalWindow(passportExpiryDate)
+      if (block) {
+        toast.error('Passport verification is already completed.')
+        return
+      }
+    }
+    setAliyunEkycStarting(true)
+    try {
+      await loadAliyunVerifyScript()
+      const getMetaInfo = (window as unknown as { getMetaInfo?: () => string }).getMetaInfo
+      if (typeof getMetaInfo !== 'function') {
+        toast.error('Verification script not ready — refresh and try again')
+        return
+      }
+      const rawMeta = getMetaInfo()
+      const metaInfo = typeof rawMeta === 'string' ? rawMeta : JSON.stringify(rawMeta)
+      const out = await startAliyunIdvEkyc({
+        metaInfo,
+        docType,
+        returnPath: '/demoprofile',
+      })
+      if (!out.ok || !out.transactionUrl || !out.transactionId) {
+        toast.error(out.reason || 'Could not start verification')
+        return
+      }
+      sessionStorage.setItem('aliyun_ekyc_tid', out.transactionId)
+      setGovDialogOpen(false)
+      window.location.href = out.transactionUrl
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Verification start failed')
+    } finally {
+      setAliyunEkycStarting(false)
+    }
   }
 
   const openEmailChangeDialog = () => {
@@ -1080,10 +1363,10 @@ export default function UnifiedProfilePage({
 
   /** Gov-verified: badge + read-only entity/ID fields (API flags or DB lock, avoids flicker before gov status loads). */
   const govIdVerified =
-    showGovVerification && backendProfile && !shouldUseDemoMock() && ((govSingpass || govMydigital) || govIdentityLocked)
-  /** Lock only enforced by DB lock flag; provider-linked alone should not freeze fields. */
-  const govProfileFieldsReadonly = govIdentityLocked
-
+    showGovVerification &&
+    backendProfile &&
+    !shouldUseDemoMock() &&
+    ((govSingpass || govMydigital) || govIdentityLocked || aliyunEkycVerified)
   return (
     <div className="p-4 sm:p-8 max-w-4xl mx-auto">
       <div className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
@@ -1093,7 +1376,8 @@ export default function UnifiedProfilePage({
           <p className="text-xs text-muted-foreground mt-2">{saveHint}</p>
           {(uploadRole === 'tenant' || uploadRole === 'owner' || uploadRole === 'operator') &&
           profileGateIncomplete.size > 0 &&
-          !shouldUseDemoMock() ? (
+          !shouldUseDemoMock() &&
+          !disableProfileGateUi ? (
             <p className="text-xs font-medium text-destructive mt-2">{profileGateHint}</p>
           ) : null}
         </div>
@@ -1174,18 +1458,24 @@ export default function UnifiedProfilePage({
             <div className="flex items-center gap-2 text-muted-foreground">
               <User size={14} /> {idNumber || '-'}
             </div>
+            {idTypeU === 'PASSPORT' ? (
+              <div className="flex items-center gap-2 text-muted-foreground">
+                <Calendar size={14} />
+                {passportExpiryDate.trim() !== '' ? `Expires ${passportExpiryDate}` : 'Passport expiry —'}
+              </div>
+            ) : null}
           </div>
         </div>
 
         <div className="lg:col-span-2 flex flex-col gap-5">
           <div className="bg-card border border-border rounded-2xl p-6">
-            <div className="flex flex-wrap items-center justify-between gap-3 mb-5">
-              <div className="flex items-center gap-2">
+            <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between mb-5">
+              <div className="flex items-center gap-2 min-w-0">
                 <User size={16} style={{ color: 'var(--brand)' }} />
                 <h2 className="font-bold text-foreground">Personal Information</h2>
               </div>
               {showGovVerification && backendProfile && !shouldUseDemoMock() && (
-                <div className="flex flex-wrap items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto sm:max-w-[min(100%,28rem)] sm:justify-end">
                   {(govSingpass || govMydigital) && (
                     <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 text-primary px-2.5 py-1 text-xs font-semibold">
                       <ShieldCheck className="h-3.5 w-3.5" />
@@ -1196,13 +1486,19 @@ export default function UnifiedProfilePage({
                           : 'Verified'}
                     </span>
                   )}
+                  {aliyunEkycVerified && (
+                    <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 text-primary px-2.5 py-1 text-xs font-semibold">
+                      <ShieldCheck className="h-3.5 w-3.5" />
+                      eKYC (MyKad / passport)
+                    </span>
+                  )}
                   <Button
                     type="button"
                     variant="outline"
                     size="sm"
                     className={cn(
                       'text-xs font-semibold',
-                      (govSingpass || govMydigital) &&
+                      govIdVerified &&
                         'border-green-600 bg-green-600 text-white hover:bg-green-700 hover:text-white',
                     )}
                     onClick={() => setGovDialogOpen(true)}
@@ -1217,11 +1513,11 @@ export default function UnifiedProfilePage({
                 <Label className="text-[10px] font-semibold tracking-[0.2em] uppercase text-muted-foreground mb-1.5 block">
                   Entity Type
                 </Label>
-                <Select value={entityType} onValueChange={setEntityType} disabled={govProfileFieldsReadonly}>
+                <Select value={entityType} onValueChange={setEntityType} disabled={aliyunCoreIdentityLocked}>
                   <SelectTrigger
                     className={cn(
                       gateErr('entityType') && 'ring-2 ring-destructive border-destructive',
-                      govProfileFieldsReadonly && 'opacity-80 cursor-not-allowed',
+                      aliyunCoreIdentityLocked && 'opacity-80 cursor-not-allowed',
                     )}
                   >
                     <SelectValue />
@@ -1243,19 +1539,24 @@ export default function UnifiedProfilePage({
                 <input
                   value={legalName}
                   onChange={(e) => setLegalName(e.target.value)}
-                  disabled={govProfileFieldsReadonly}
+                  disabled={aliyunCoreIdentityLocked}
                   className={cn(
                     inputCls,
-                    govProfileFieldsReadonly && 'opacity-80 cursor-not-allowed',
+                    aliyunCoreIdentityLocked && 'opacity-80 cursor-not-allowed',
                     gateErr('legalName') && 'ring-2 ring-destructive border-destructive',
                   )}
                 />
               </div>
-              <div>
-                <div className="flex items-center gap-1.5 mb-1.5">
-                  <Label className="text-[10px] font-semibold tracking-[0.2em] uppercase text-muted-foreground">
+              <div className="sm:col-span-2">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 mb-1.5">
+                  <Label className="text-[10px] font-semibold tracking-[0.2em] uppercase text-muted-foreground shrink-0">
                     ID Type
                   </Label>
+                  {idTypeU === 'PASSPORT' ? (
+                    <span className="text-sm font-medium text-foreground tabular-nums">
+                      {passportExpiryDate.trim() !== '' ? `Expires ${passportExpiryDate}` : 'Expiry date —'}
+                    </span>
+                  ) : null}
                   {govIdentityLocked && (govSingpass || govMydigital) ? (
                     <Tooltip>
                       <TooltipTrigger asChild>
@@ -1274,11 +1575,11 @@ export default function UnifiedProfilePage({
                     </Tooltip>
                   ) : null}
                 </div>
-                <Select value={idType} onValueChange={setIdType} disabled={govProfileFieldsReadonly}>
+                <Select value={idType} onValueChange={setIdType} disabled={aliyunCoreIdentityLocked}>
                   <SelectTrigger
                     className={cn(
                       gateErr('idType') && 'ring-2 ring-destructive border-destructive',
-                      govProfileFieldsReadonly && 'opacity-80 cursor-not-allowed',
+                      aliyunCoreIdentityLocked && 'opacity-80 cursor-not-allowed',
                     )}
                   >
                     <SelectValue />
@@ -1297,10 +1598,10 @@ export default function UnifiedProfilePage({
                 <input
                   value={idNumber}
                   onChange={(e) => setIdNumber(e.target.value)}
-                  disabled={govProfileFieldsReadonly}
+                  disabled={aliyunCoreIdentityLocked}
                   className={cn(
                     inputCls,
-                    govProfileFieldsReadonly && 'opacity-80 cursor-not-allowed',
+                    aliyunCoreIdentityLocked && 'opacity-80 cursor-not-allowed',
                     gateErr('idNumber') && 'ring-2 ring-destructive border-destructive',
                   )}
                 />
@@ -1411,7 +1712,12 @@ export default function UnifiedProfilePage({
                   rows={2}
                   value={address}
                   onChange={(e) => setAddress(e.target.value)}
-                  className={cn(`${inputCls} resize-none`, gateErr('address') && 'ring-2 ring-destructive border-destructive')}
+                  disabled={aliyunAddressLocked}
+                  className={cn(
+                    `${inputCls} resize-none`,
+                    gateErr('address') && 'ring-2 ring-destructive border-destructive',
+                    aliyunAddressLocked && 'opacity-80 cursor-not-allowed',
+                  )}
                 />
               </div>
             </div>
@@ -1426,30 +1732,35 @@ export default function UnifiedProfilePage({
                   <p className="text-xs font-medium text-foreground mb-2">{idLabels.front} *</p>
                   <label
                     className={cn(
-                      'relative flex flex-col items-center justify-center w-full min-h-[10rem] border-2 border-dashed rounded-xl cursor-pointer hover:border-primary transition-colors bg-secondary/30 overflow-hidden',
-                      gateErr('nricFront') ? 'border-destructive ring-2 ring-destructive/60' : 'border-border',
+                      'relative flex flex-col items-center justify-center w-full min-h-[10rem] border-2 border-dashed rounded-xl transition-colors bg-secondary/30 overflow-hidden',
+                      idFrontUploadLocked
+                        ? 'cursor-not-allowed opacity-70 border-border'
+                        : 'cursor-pointer hover:border-primary border-border',
+                      gateErr('nricFront') ? 'border-destructive ring-2 ring-destructive/60' : !idFrontUploadLocked && 'border-border',
                     )}
                   >
                     {nricFront ? (
                       <>
                         <img src={nricFront} alt={idLabels.front} className="w-full max-h-48 object-contain rounded-xl" />
-                        <button
-                          type="button"
-                          className="absolute top-2 right-2 bg-destructive text-destructive-foreground rounded-full p-1"
-                          onClick={(e) => {
-                            e.preventDefault()
-                            setNricFront(null)
-                            setNricFrontUrl(null)
-                          }}
-                        >
-                          <X className="h-3 w-3" />
-                        </button>
+                        {!idFrontUploadLocked ? (
+                          <button
+                            type="button"
+                            className="absolute top-2 right-2 bg-destructive text-destructive-foreground rounded-full p-1"
+                            onClick={(e) => {
+                              e.preventDefault()
+                              setNricFront(null)
+                              setNricFrontUrl(null)
+                            }}
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        ) : null}
                       </>
                     ) : (
                       <>
                         <Upload size={22} className="text-muted-foreground mb-2" />
                         <span className="text-xs text-muted-foreground">
-                          {uploadingSide === 'front' ? 'Uploading...' : 'Click to upload'}
+                          {uploadingSide === 'front' ? 'Uploading...' : idFrontUploadLocked ? 'Verified — cannot replace' : 'Click to upload'}
                         </span>
                       </>
                     )}
@@ -1457,6 +1768,7 @@ export default function UnifiedProfilePage({
                       type="file"
                       accept="image/*"
                       className="hidden"
+                      disabled={idFrontUploadLocked}
                       onChange={(e) => handleNricFile('front', e.target.files?.[0] ?? null)}
                     />
                   </label>
@@ -1466,30 +1778,35 @@ export default function UnifiedProfilePage({
                   <p className="text-xs font-medium text-foreground mb-2">{idLabels.back}</p>
                   <label
                     className={cn(
-                      'relative flex flex-col items-center justify-center w-full min-h-[10rem] border-2 border-dashed rounded-xl cursor-pointer hover:border-primary transition-colors bg-secondary/30 overflow-hidden',
-                      gateErr('nricBack') ? 'border-destructive ring-2 ring-destructive/60' : 'border-border',
+                      'relative flex flex-col items-center justify-center w-full min-h-[10rem] border-2 border-dashed rounded-xl transition-colors bg-secondary/30 overflow-hidden',
+                      idBackUploadLocked
+                        ? 'cursor-not-allowed opacity-70 border-border'
+                        : 'cursor-pointer hover:border-primary border-border',
+                      gateErr('nricBack') ? 'border-destructive ring-2 ring-destructive/60' : !idBackUploadLocked && 'border-border',
                     )}
                   >
                     {nricBack ? (
                       <>
                         <img src={nricBack} alt={idLabels.back} className="w-full max-h-48 object-contain rounded-xl" />
-                        <button
-                          type="button"
-                          className="absolute top-2 right-2 bg-destructive text-destructive-foreground rounded-full p-1"
-                          onClick={(e) => {
-                            e.preventDefault()
-                            setNricBack(null)
-                            setNricBackUrl(null)
-                          }}
-                        >
-                          <X className="h-3 w-3" />
-                        </button>
+                        {!idBackUploadLocked ? (
+                          <button
+                            type="button"
+                            className="absolute top-2 right-2 bg-destructive text-destructive-foreground rounded-full p-1"
+                            onClick={(e) => {
+                              e.preventDefault()
+                              setNricBack(null)
+                              setNricBackUrl(null)
+                            }}
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        ) : null}
                       </>
                     ) : (
                       <>
                         <Upload size={22} className="text-muted-foreground mb-2" />
                         <span className="text-xs text-muted-foreground">
-                          {uploadingSide === 'back' ? 'Uploading...' : 'Click to upload'}
+                          {uploadingSide === 'back' ? 'Uploading...' : idBackUploadLocked ? 'Verified — cannot replace' : 'Click to upload'}
                         </span>
                       </>
                     )}
@@ -1497,6 +1814,7 @@ export default function UnifiedProfilePage({
                       type="file"
                       accept="image/*"
                       className="hidden"
+                      disabled={idBackUploadLocked}
                       onChange={(e) => handleNricFile('back', e.target.files?.[0] ?? null)}
                     />
                   </label>
@@ -1616,22 +1934,50 @@ export default function UnifiedProfilePage({
       </Dialog>
 
       <Dialog open={govDialogOpen} onOpenChange={setGovDialogOpen}>
-        <DialogContent className="sm:max-w-md">
+        <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>Government ID verification</DialogTitle>
-            <DialogDescription>
-              Connect <strong>MyDigital ID</strong> (Malaysia) or <strong>Singpass</strong> (Singapore). Your legal name and ID fields are
-              updated from the provider and locked. To switch provider, complete the other connection below — your account
-              stays linked to this login.
-            </DialogDescription>
+            <DialogDescription className="sr-only">Choose a verification method.</DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-3 py-2">
-            <Button type="button" className="w-full justify-center" onClick={() => startGovConnect('mydigital')}>
-              Connect MyDigital ID (MY)
+            <GovIdConnectButtons
+              returnPath={showGovVerification ? '/demoprofile' : '/demologin'}
+              variant="solo"
+              appearance="fill"
+              singpassLinked={!!govSingpass}
+              mydigitalLinked={!!govMydigital}
+            />
+            <div className="relative py-2">
+              <div className="absolute inset-0 flex items-center" aria-hidden>
+                <span className="w-full border-t border-border" />
+              </div>
+              <div className="relative flex justify-center text-xs uppercase">
+                <span className="bg-card px-2 text-muted-foreground">Or verify with document</span>
+              </div>
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              className="w-full justify-center"
+              disabled={aliyunEkycStarting || disableVerificationDialogMyKad}
+              onClick={() => void startAliyunEkycFlow('MYS01001')}
+            >
+              {aliyunEkycStarting ? 'Starting…' : 'Verification by Malaysian MyKad (NRIC)'}
             </Button>
-            <Button type="button" variant="secondary" className="w-full justify-center" onClick={() => startGovConnect('singpass')}>
-              Connect Singpass (SG)
+            <Button
+              type="button"
+              variant="outline"
+              className="w-full justify-center"
+              disabled={aliyunEkycStarting || disableVerificationDialogPassport}
+              onClick={() => void startAliyunEkycFlow('GLB03002')}
+            >
+              {aliyunEkycStarting ? 'Starting…' : 'Verification by passport'}
             </Button>
+            {passportRenewalEligible ? (
+              <p className="text-xs text-center text-muted-foreground">
+                Passport expires within one month — you can re-verify with a new document above.
+              </p>
+            ) : null}
           </div>
           <DialogFooter>
             <Button type="button" variant="secondary" onClick={() => setGovDialogOpen(false)}>

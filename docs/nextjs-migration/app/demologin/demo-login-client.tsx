@@ -26,6 +26,7 @@ import { shouldUseDemoMock, isDemoSite } from "@/lib/portal-api"
 import { getEnquiryApiBase } from "@/lib/enquiry-portal-api"
 import { buildPortalOAuthStartUrl } from "@/components/portal-auth-form"
 import { formatGovIdErrorReason } from "@/lib/gov-id-callback-messages"
+import { cn } from "@/lib/utils"
 
 function getPortalEcsBase(): string {
   return (process.env.NEXT_PUBLIC_ECS_BASE_URL ?? "").replace(/\/$/, "")
@@ -420,7 +421,12 @@ export default function DemoLoginClient() {
       )}
 
       <Dialog open={govSwitchDialogOpen} onOpenChange={setGovSwitchDialogOpen}>
-        <DialogContent className="sm:max-w-md">
+        <DialogContent
+          className={cn(
+            "sm:max-w-md max-h-[calc(100dvh-2rem)] overflow-y-auto overflow-x-hidden",
+            "top-[5%] translate-y-0 sm:top-[50%] sm:translate-y-[-50%]",
+          )}
+        >
           <DialogHeader>
             <DialogTitle>Switch government ID</DialogTitle>
             <DialogDescription>

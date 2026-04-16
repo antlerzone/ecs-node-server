@@ -25,12 +25,19 @@ export function getPortalJwt(): string {
   }
 }
 
+/** Some reverse proxies strip `Authorization` to Next; duplicate token so proxy can forward. */
+const PORTAL_AUTH_HEADER_FALLBACK = "X-Portal-Authorization";
+
 async function portalUserFetch(path: string, init: RequestInit = {}): Promise<Response> {
   const base = getPortalApiBase();
   const url = `${base.replace(/\/$/, "")}/${path.replace(/^\//, "")}`;
   const headers = new Headers(init.headers || undefined);
   const jwt = getPortalJwt();
-  if (jwt) headers.set("Authorization", `Bearer ${jwt}`);
+  if (jwt) {
+    const bearer = `Bearer ${jwt}`;
+    headers.set("Authorization", bearer);
+    headers.set(PORTAL_AUTH_HEADER_FALLBACK, bearer);
+  }
   return fetch(url, { ...init, headers });
 }
 
@@ -64,10 +71,24 @@ export function mapPortalGetResponseToUnified(
     nricFrontUrl: String(p.nricfront || "").trim(),
     nricBackUrl: String(p.nricback || "").trim(),
     avatarUrl: String(p.avatar_url || "").trim(),
-    govIdentityLocked: !!(p as { gov_identity_locked?: unknown }).gov_identity_locked,
+    govIdentityLocked:
+      !!(p as { gov_identity_locked?: unknown }).gov_identity_locked ||
+      !!(p as { aliyun_ekyc_locked?: unknown }).aliyun_ekyc_locked,
+    aliyunEkycLocked: !!(p as { aliyun_ekyc_locked?: unknown }).aliyun_ekyc_locked,
     singpassLinked: !!(p as { singpass_linked?: unknown }).singpass_linked,
     mydigitalLinked: !!(p as { mydigital_linked?: unknown }).mydigital_linked,
     phoneVerified: !!(p as { phone_verified?: unknown }).phone_verified,
+    passportExpiryDate: (() => {
+      const raw =
+        (p as { passport_expiry_date?: unknown }).passport_expiry_date ??
+        (p as { passportExpiryDate?: unknown }).passportExpiryDate;
+      if (raw == null || raw === "") return "";
+      if (raw instanceof Date && !Number.isNaN(raw.getTime())) return raw.toISOString().slice(0, 10);
+      const s = String(raw).trim();
+      const ymd = /^(\d{4}-\d{2}-\d{2})/.exec(s);
+      if (ymd) return ymd[1];
+      return s.replace(/\s*T.*$/, "").slice(0, 10);
+    })(),
   };
 }
 
@@ -89,14 +110,15 @@ export function buildPortalPayloadFromUnified(
     nricFrontUrl: string | null;
     nricBackUrl: string | null;
   },
-  options?: { identityLocked?: boolean }
+  options?: { identityLocked?: boolean; aliyunEkycVerified?: boolean }
 ): Record<string, unknown> {
   const fullname = payload.fullName != null ? String(payload.fullName).trim() : "";
   const legal = payload.legalName != null ? String(payload.legalName).trim() : "";
   const bid =
     payload.bankId != null && String(payload.bankId).trim() !== "" ? String(payload.bankId).trim() : null;
+  /** `portal_account.fullname` is legal name; prefer Legal name over Display full name so auto-save cannot overwrite eKYC/OCR with the nickname row. */
   const body: Record<string, unknown> = {
-    fullname: fullname || legal || null,
+    fullname: legal || fullname || null,
     first_name: payload.nickname != null ? String(payload.nickname).trim() || null : null,
     phone: payload.phone != null ? String(payload.phone).trim() || null : null,
     address: payload.address != null ? String(payload.address).trim() || null : null,
@@ -118,6 +140,16 @@ export function buildPortalPayloadFromUnified(
     delete body.entity_type;
     delete body.reg_no_type;
     delete body.id_type;
+  }
+  /** After Aliyun eKYC, auto-save must not overwrite server-filled legal name / NRIC / OCR address (DB aliyun_ekyc_locked may be missing). */
+  if (options?.aliyunEkycVerified) {
+    delete body.fullname;
+    delete body.nric;
+    delete body.entity_type;
+    delete body.reg_no_type;
+    delete body.id_type;
+    delete body.address;
+    delete body.passport_expiry_date;
   }
   return body;
 }
@@ -172,11 +204,14 @@ export async function savePortalProfile(
     clientId?: string;
     email?: string;
   },
-  options?: { govIdentityLocked?: boolean }
+  options?: { govIdentityLocked?: boolean; aliyunEkycVerified?: boolean }
 ): Promise<{ ok: boolean; reason?: string }> {
   const base = getPortalApiBase();
   if (!base) return { ok: true };
-  const body = buildPortalPayloadFromUnified(payload, { identityLocked: options?.govIdentityLocked });
+  const body = buildPortalPayloadFromUnified(payload, {
+    identityLocked: options?.govIdentityLocked,
+    aliyunEkycVerified: options?.aliyunEkycVerified,
+  });
   try {
     const data = (await portalPost("access/portal-profile-save", {
       email: String(payload.email || "").trim(),
@@ -265,36 +300,55 @@ export async function confirmPortalPasswordReset(params: {
 /** Coliving: ensure `tenantdetail` or `ownerdetail` exists before portal data loads (JWT). Demo: no-op. */
 async function portalAuthFetch(path: string, init: RequestInit = {}): Promise<Response> {
   const base = getPortalApiBase();
-  const url = `${base.replace(/\/$/, "")}/${path.replace(/^\//, "")}`;
-  const headers = new Headers(init.headers || undefined);
+  const method = (init.method ?? "GET").toUpperCase();
+  let rel = path.replace(/^\//, "");
   const jwt = getPortalJwt();
-  if (jwt) headers.set("Authorization", `Bearer ${jwt}`);
+  /** GET: append portalToken in query — some stacks strip Authorization on GET; Node accepts query (getPortalBearerToken). */
+  if (jwt && method === "GET" && !/[?&]portalToken=/.test(rel)) {
+    const joiner = rel.includes("?") ? "&" : "?";
+    rel = `${rel}${joiner}portalToken=${encodeURIComponent(jwt)}`;
+  }
+  const url = `${base.replace(/\/$/, "")}/${rel}`;
+  const headers = new Headers(init.headers || undefined);
+  if (jwt) {
+    const bearer = `Bearer ${jwt}`;
+    headers.set("Authorization", bearer);
+    headers.set(PORTAL_AUTH_HEADER_FALLBACK, bearer);
+  }
   return fetch(url, { ...init, headers });
 }
 
-/** Gov ID link status (Singpass / MyDigital). Requires portal JWT. */
+/** Gov ID link status (Singpass / MyDigital). Uses access/* + email like portal-profile (avoids long JWT in GET query). */
 export async function fetchGovIdStatus(): Promise<{
   ok: boolean;
   singpass?: boolean;
   mydigital?: boolean;
   identityLocked?: boolean;
+  aliyunEkycLocked?: boolean;
   reason?: string;
 }> {
   const base = getPortalApiBase();
   if (!base) return { ok: false, reason: "NO_API" };
-  const jwt = getPortalJwt();
-  if (!jwt) return { ok: false, reason: "NO_JWT" };
+  const email = String(getMember()?.email || "").trim();
+  if (!email) return { ok: false, reason: "NO_EMAIL" };
   try {
-    const r = await portalAuthFetch("portal-auth/gov-id/status", { method: "GET" });
-    const data = (await r.json().catch(() => ({}))) as {
+    const data = (await portalPost("access/gov-id-status", { email })) as {
       ok?: boolean;
       singpass?: boolean;
       mydigital?: boolean;
       identityLocked?: boolean;
+      aliyunEkycLocked?: boolean;
       reason?: string;
     };
-    if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
-    return data as { ok: boolean; singpass?: boolean; mydigital?: boolean; identityLocked?: boolean; reason?: string };
+    if (data?.ok === false) return { ok: false, reason: data.reason || "REQUEST_FAILED" };
+    return data as {
+      ok: boolean;
+      singpass?: boolean;
+      mydigital?: boolean;
+      identityLocked?: boolean;
+      aliyunEkycLocked?: boolean;
+      reason?: string;
+    };
   } catch (err) {
     return { ok: false, reason: err instanceof Error ? err.message : "NETWORK_ERROR" };
   }
@@ -474,6 +528,123 @@ export function buildGovIdStartUrl(
     params.set("portal_token", jwt);
   }
   return `${ecs}/api/portal-auth/gov-id/start?${params.toString()}`;
+}
+
+/** Aliyun eKYC_PRO — uses /api/access/* (ECS token + email), same as portal-profile; MetaInfo from Web SDK. */
+export async function startAliyunIdvEkyc(params: {
+  metaInfo: string;
+  docType?: "MYS01001" | "GLB03002";
+  returnPath?: string;
+}): Promise<{
+  ok: boolean;
+  transactionId?: string;
+  transactionUrl?: string;
+  reason?: string;
+  message?: string;
+}> {
+  const base = getPortalApiBase();
+  if (!base) return { ok: false, reason: "NO_API" };
+  const email = String(getMember()?.email || "").trim();
+  if (!email) return { ok: false, reason: "NO_EMAIL" };
+  try {
+    const data = (await portalPost("access/aliyun-idv/start", {
+      email,
+      metaInfo: String(params.metaInfo || "").trim(),
+      docType: params.docType || "MYS01001",
+      returnPath: params.returnPath || "/demoprofile",
+    })) as {
+      ok?: boolean;
+      transactionId?: string;
+      transactionUrl?: string;
+      reason?: string;
+      message?: string;
+    };
+    if (data?.ok === false) {
+      return {
+        ok: false,
+        reason: data.reason || "START_FAILED",
+        message: data.message,
+      };
+    }
+    return {
+      ok: true,
+      transactionId: data.transactionId,
+      transactionUrl: data.transactionUrl,
+    };
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : "NETWORK_ERROR" };
+  }
+}
+
+export async function fetchAliyunIdvResult(transactionId: string): Promise<{
+  ok: boolean;
+  passed?: boolean;
+  subCode?: string;
+  reason?: string;
+  message?: string;
+  profileApplied?: boolean;
+  profileReason?: string;
+  /** Present when profile apply failed with EKYC_OCR_INCOMPLETE: key names/types only (no PII). */
+  profileOcrDebug?: unknown;
+  /** Alibaba CheckResult body.result shape: whether name/ID keys & non-empty strings exist (no raw values). */
+  resultHints?: {
+    hasNameKey?: boolean;
+    hasIdKey?: boolean;
+    nameKeys?: string[];
+    idKeys?: string[];
+    keyCount?: number;
+    nameStringPresent?: boolean;
+    idStringPresent?: boolean;
+  };
+}> {
+  const base = getPortalApiBase();
+  if (!base) return { ok: false, reason: "NO_API" };
+  const email = String(getMember()?.email || "").trim();
+  if (!email) return { ok: false, reason: "NO_EMAIL" };
+  const tid = String(transactionId || "").trim();
+  if (!tid) return { ok: false, reason: "NO_TRANSACTION_ID" };
+  try {
+    const data = (await portalPost("access/aliyun-idv/result", {
+      email,
+      transactionId: tid,
+    })) as {
+      ok?: boolean;
+      passed?: boolean;
+      subCode?: string;
+      reason?: string;
+      message?: string;
+      profileApplied?: boolean;
+      profileReason?: string;
+      profileOcrDebug?: unknown;
+      resultHints?: {
+        hasNameKey?: boolean;
+        hasIdKey?: boolean;
+        nameKeys?: string[];
+        idKeys?: string[];
+        keyCount?: number;
+        nameStringPresent?: boolean;
+        idStringPresent?: boolean;
+      };
+    };
+    if (data?.ok === false) {
+      return {
+        ok: false,
+        reason: data.reason || "CHECK_FAILED",
+        message: data.message,
+      };
+    }
+    return {
+      ok: true,
+      passed: data.passed,
+      subCode: data.subCode,
+      profileApplied: data.profileApplied,
+      profileReason: data.profileReason,
+      profileOcrDebug: data.profileOcrDebug,
+      resultHints: data.resultHints,
+    };
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : "NETWORK_ERROR" };
+  }
 }
 
 export async function ensureColivingPortalDetail(

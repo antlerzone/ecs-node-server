@@ -1,5 +1,13 @@
 # AGENTS.md
 
+## How agents should reply (this user)
+
+The maintainer is **not a developer**. In every reply:
+
+- **Plain answers only** — state the result, decision, or next step in simple words.
+- **Do not explain code** — no code walkthroughs, file-by-file narration, or jargon unless they explicitly ask for technical detail.
+- **Stay short** — avoid long background, alternatives, or tutorials; expand only if they ask.
+
 ## Cursor Cloud specific instructions
 
 ### Architecture overview
@@ -13,6 +21,11 @@ This is a monorepo with **two products** served from a single Express backend:
 | **Cleanlemons Portal** (Next.js 16) | `/workspace/cleanlemon/next-app` | 3100 | `npm run dev` |
 
 All three share a single **MySQL** database. The backend serves Coliving routes at `/api/*` and Cleanlemons routes at `/api/cleanlemon/*`.
+
+### Source control (GitHub)
+
+- **Authoritative history:** Every code change must **end up on the GitHub `main` branch** (via commit, push, PR, and merge—follow your team’s usual review rules). GitHub `main` is the long-term source of truth, not any single machine.
+- **ECS edits:** If work is done **on the ECS checkout** (including edits saved from Cursor on that host), those changes **must be synced back** to the repository: commit, push to GitHub, merge to `main`, then other environments and future deploys use `git pull` (or deploy scripts with `--pull`) against `main`. Do not leave ECS-only changes unpushed.
 
 ### MySQL setup (first time only)
 

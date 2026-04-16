@@ -1090,19 +1090,42 @@ async function getGovIdStatus(email) {
   const normalized = normalizeEmail(email);
   if (!normalized) return { ok: false, reason: 'NO_EMAIL' };
   try {
-    const [rows] = await pool.query(
-      `SELECT singpass_sub, mydigital_sub, gov_identity_locked FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1`,
-      [normalized]
-    );
+    let rows;
+    try {
+      [rows] = await pool.query(
+        `SELECT singpass_sub, mydigital_sub, gov_identity_locked, COALESCE(aliyun_ekyc_locked,0) AS aliyun_ekyc_locked
+         FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1`,
+        [normalized]
+      );
+    } catch (err) {
+      if (err && err.code === 'ER_BAD_FIELD_ERROR') {
+        [rows] = await pool.query(
+          `SELECT singpass_sub, mydigital_sub, gov_identity_locked FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1`,
+          [normalized]
+        );
+      } else {
+        throw err;
+      }
+    }
     const r = rows[0];
-    if (!r) return { ok: true, singpass: false, mydigital: false, identityLocked: false };
+    if (!r) {
+      return {
+        ok: true,
+        singpass: false,
+        mydigital: false,
+        identityLocked: false,
+        aliyunEkycLocked: false,
+      };
+    }
     const hasS = !!(r.singpass_sub && String(r.singpass_sub).trim());
     const hasM = !!(r.mydigital_sub && String(r.mydigital_sub).trim());
+    const aliyunLocked = r.aliyun_ekyc_locked != null ? !!Number(r.aliyun_ekyc_locked) : false;
     return {
       ok: true,
       singpass: hasS,
       mydigital: hasM,
-      identityLocked: !!r.gov_identity_locked && (hasS || hasM),
+      identityLocked: (!!r.gov_identity_locked && (hasS || hasM)) || aliyunLocked,
+      aliyunEkycLocked: aliyunLocked,
     };
   } catch (err) {
     if (err && err.code === 'ER_BAD_FIELD_ERROR') {
@@ -1111,6 +1134,7 @@ async function getGovIdStatus(email) {
         singpass: false,
         mydigital: false,
         identityLocked: false,
+        aliyunEkycLocked: false,
         _migrationPending: true,
       };
     }

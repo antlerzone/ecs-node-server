@@ -7,6 +7,7 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const pool = require('../../config/db');
 const { getMemberRoles, normalizeEmail } = require('../access/access.service');
+const { uploadToOss } = require('../upload/oss.service');
 
 const PORTAL_JWT_SECRET = process.env.PORTAL_JWT_SECRET || 'portal-jwt-secret-change-in-production';
 /** Onboarding flows (/enquiry, etc.) need longer than a few minutes; override with PORTAL_JWT_EXPIRES_IN in .env */
@@ -32,6 +33,1092 @@ function safeStringify(val) {
   } catch {
     return null;
   }
+}
+
+function firstNonEmptyStr(...vals) {
+  for (const v of vals) {
+    if (v == null) continue;
+    const t = String(v).trim();
+    if (!t) continue;
+    /** MY eKYC_PRO: englishName may be "?" while name holds the Roman legal line (same as sn). */
+    if (t === '?' || t === '？') continue;
+    return t;
+  }
+  return '';
+}
+
+/** Alibaba sometimes returns JSON-as-string twice; parse twice if needed. */
+function parseJsonLenient(raw) {
+  if (raw == null || raw === '') return null;
+  /** cloudauth-intl SDK may return UTF-8 Buffer for Result.extIdInfo — must JSON.parse, not return as object. */
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(raw)) {
+    raw = raw.toString('utf8');
+  } else if (raw instanceof Uint8Array && typeof raw !== 'string' && !Buffer.isBuffer(raw)) {
+    raw = Buffer.from(raw).toString('utf8');
+  } else if (typeof raw === 'object' && raw !== null) {
+    return raw;
+  }
+  if (typeof raw !== 'string') return null;
+  let x = null;
+  try {
+    x = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof x === 'string') {
+    try {
+      return JSON.parse(x);
+    } catch {
+      return null;
+    }
+  }
+  return x;
+}
+
+/**
+ * Nested Result fields (ocrIdEditInfo, ocrIdInfo, …) may be UTF-8 Buffer — must parse JSON before merge/assign.
+ * Plain objects pass through; strings parse; Buffer/Uint8Array → parseJsonLenient.
+ */
+function coerceAliyunJsonField(val) {
+  if (val == null) return null;
+  if (typeof val === 'object' && val !== null && !Array.isArray(val)) {
+    if (typeof Buffer !== 'undefined' && Buffer.isBuffer(val)) return parseJsonLenient(val);
+    if (val instanceof Uint8Array && !Buffer.isBuffer(val)) return parseJsonLenient(Buffer.from(val));
+    return val;
+  }
+  if (typeof val === 'string') return parseJsonLenient(val);
+  return null;
+}
+
+function unwrapAliyunBlob(blob) {
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(blob)) {
+    return unwrapAliyunBlob(parseJsonLenient(blob) || {});
+  }
+  if (!blob || typeof blob !== 'object' || Array.isArray(blob)) return blob || {};
+  const o = { ...blob };
+  if (o.result && typeof o.result === 'object' && !Array.isArray(o.result)) {
+    Object.assign(o, o.result);
+  }
+  if (o.data && typeof o.data === 'object' && !Array.isArray(o.data)) {
+    Object.assign(o, o.data);
+  }
+  return o;
+}
+
+/** MY NRIC: 12 digits; OCR may return dashed or back-of-card longer numeric string — take first 12 digits. */
+function normalizeMalaysianNric12Digits(raw) {
+  if (raw == null || raw === '') return '';
+  const digits = String(raw).replace(/\D/g, '');
+  if (digits.length >= 12) return digits.slice(0, 12);
+  return '';
+}
+
+function deepFindMalaysianIc12(val, depth = 0) {
+  if (depth > 10 || val == null) return '';
+  if (typeof val === 'string') {
+    const t = val.replace(/[-\s]/g, '');
+    if (/^\d{12}$/.test(t)) return val.trim();
+    const norm = normalizeMalaysianNric12Digits(val);
+    if (norm) return norm;
+    return '';
+  }
+  if (typeof val !== 'object') return '';
+  if (Array.isArray(val)) {
+    for (const item of val) {
+      const s = deepFindMalaysianIc12(item, depth + 1);
+      if (s) return s;
+    }
+    return '';
+  }
+  for (const k of Object.keys(val)) {
+    const s = deepFindMalaysianIc12(val[k], depth + 1);
+    if (s) return s;
+  }
+  return '';
+}
+
+/**
+ * Alibaba MY MyKad OCR often uses snake_case: id_number, name (see certificate-ocr-field-list).
+ * eKYC_PRO may nest ocrIdInfo or duplicate keys under result/data.
+ * Docs: ocrIdInfo / ocrIdBackInfo may be JSON strings; ShowOcrResult flow puts user-confirmed values in ocrIdEditInfo (merge last per blob).
+ */
+function mergeOcrCandidates(...blobs) {
+  const out = {};
+  for (const blob of blobs) {
+    if (!blob || typeof blob !== 'object' || Array.isArray(blob)) continue;
+    const mergeLayer = (v) => {
+      if (v == null) return;
+      const x = coerceAliyunJsonField(v);
+      if (x && typeof x === 'object' && !Array.isArray(x)) Object.assign(out, x);
+    };
+    /** MY eKYC_PRO: certificate slots under ocrIdInfoData.{sideId} — merge text before user-confirmed ocrIdEditInfo. */
+    const mergeOcrIdInfoDataTextSlots = () => {
+      const data = blob.ocrIdInfoData || blob.OcrIdInfoData;
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return;
+      for (const slot of Object.values(data)) {
+        if (!slot || typeof slot !== 'object' || Array.isArray(slot)) continue;
+        for (const [k, v] of Object.entries(slot)) {
+          if (
+            /^(idImage|IdImage|id_image|idBackImage|IdBackImage|id_back_image|faceImg|FaceImg|portraitImage|PortraitImage)$/i.test(
+              k
+            )
+          )
+            continue;
+          if (v != null && typeof v !== 'object') {
+            /** Alibaba may send "" at slot top-level; do not wipe values merged from ocrIdEditInfo. */
+            if (typeof v === 'string' && !String(v).trim()) continue;
+            out[k] = v;
+          }
+        }
+      }
+    };
+    mergeLayer(blob.ocrIdInfo || blob.OcrIdInfo || blob.ocr_id_info);
+    mergeLayer(blob.ocrIdBackInfo || blob.OcrIdBackInfo);
+    mergeOcrIdInfoDataTextSlots();
+    mergeLayer(blob.ocrIdEditInfo || blob.OcrIdEditInfo);
+    for (const k of Object.keys(blob)) {
+      if (
+        /^(ocrIdInfo|OcrIdInfo|ocr_id_info|ocrIdBackInfo|OcrIdBackInfo|ocrIdEditInfo|OcrIdEditInfo|ocrIdInfoData|OcrIdInfoData)$/i.test(
+          k
+        )
+      )
+        continue;
+      const v = blob[k];
+      if (v != null && typeof v !== 'object') {
+        /** Top-level duplicate keys (e.g. name/religion as "") must not overwrite ocrIdEditInfo. */
+        if (typeof v === 'string' && !String(v).trim()) continue;
+        out[k] = v;
+      }
+    }
+  }
+  return out;
+}
+
+/** Walk tree; return first object that looks like an OCR id block (MY: id_number or idNumber + optional name). */
+function deepFindOcrLikeObject(val, depth = 0) {
+  if (depth > 14 || val == null) return null;
+  if (typeof val === 'object' && !Array.isArray(val)) {
+    const keys = Object.keys(val);
+    const hasId = keys.some((k) =>
+      /^(id_number|id_number_back|idNumber|IdNumber|ic_number|ICNumber|nric|NRIC|identityCardNumber|IdentityCardNumber|identity_no|IdentityNo|nric_no|NRIC_NO|ic_no|IC_NO)$/i.test(
+        k
+      )
+    );
+    const hasName = keys.some((k) =>
+      /^(name|Name|englishName|EnglishName|english_name|fullName|FullName|nama|Nama|legalName|full_name)$/i.test(k)
+    );
+    if (hasId && hasName) return val;
+    for (const k of keys) {
+      const sub = deepFindOcrLikeObject(val[k], depth + 1);
+      if (sub) return sub;
+    }
+  } else if (Array.isArray(val)) {
+    for (const item of val) {
+      const sub = deepFindOcrLikeObject(item, depth + 1);
+      if (sub) return sub;
+    }
+  }
+  return null;
+}
+
+function deepFindPassportNo(val, depth = 0) {
+  if (depth > 10 || val == null) return '';
+  if (typeof val === 'string') {
+    const t = val.replace(/\s/g, '');
+    if (t.length >= 6 && /^[A-Z0-9]+$/i.test(t)) return val.trim();
+    return '';
+  }
+  if (typeof val !== 'object') return '';
+  if (Array.isArray(val)) {
+    for (const item of val) {
+      const s = deepFindPassportNo(item, depth + 1);
+      if (s) return s;
+    }
+    return '';
+  }
+  for (const k of Object.keys(val)) {
+    if (/id|number|passport|document|ic|nric/i.test(k)) {
+      const s = deepFindPassportNo(val[k], depth + 1);
+      if (s) return s;
+    }
+  }
+  for (const k of Object.keys(val)) {
+    const s = deepFindPassportNo(val[k], depth + 1);
+    if (s) return s;
+  }
+  return '';
+}
+
+/** Deep-walk Alibaba blobs for a human-readable name when flat merge missed (nested ocrIdInfoData / alternate keys). */
+function deepFindPersonNameInTree(val, depth = 0) {
+  if (depth > 18 || val == null) return '';
+  if (typeof val !== 'object') return '';
+  if (Array.isArray(val)) {
+    for (const item of val) {
+      const s = deepFindPersonNameInTree(item, depth + 1);
+      if (s) return s;
+    }
+    return '';
+  }
+  const NAME_KEY_RE =
+    /^(name|englishName|EnglishName|english_name|fullName|FullName|full_name|customerName|CustomerName|primaryName|legalName|LegalName|displayName|DisplayName|nama|Nama|holderName|holder_name|certificateName|givenName|GivenName|surname|Surname|localName|NameOnDocument)$/i;
+  for (const [k, v] of Object.entries(val)) {
+    if (typeof v !== 'string') continue;
+    if (/^idImage|idBackImage|faceImg|portrait|base64|image$/i.test(k) && v.length > 120) continue;
+    if (NAME_KEY_RE.test(k)) {
+      const t = v.trim();
+      if (t.length >= 2 && t.length <= 220) {
+        const digitsOnly = t.replace(/\D/g, '');
+        if (digitsOnly.length >= 10 && digitsOnly.length === t.replace(/\s/g, '').length) continue;
+        return t;
+      }
+    }
+  }
+  for (const [k, v] of Object.entries(val)) {
+    if (/faceImg|extFaceInfo|liveness|portraitImage/i.test(k)) continue;
+    const s = deepFindPersonNameInTree(v, depth + 1);
+    if (s) return s;
+  }
+  return '';
+}
+
+/** MY MyKad OCR: residential line under `address` in ocrIdEditInfo / nested JSON. */
+/** Normalize passport / document expiry from Alibaba OCR (mixed formats) to YYYY-MM-DD for MySQL DATE. */
+function normalizePassportExpiryToIsoDate(raw) {
+  if (raw == null || raw === '') return null;
+  if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
+    return raw.toISOString().slice(0, 10);
+  }
+  const s0 = String(raw).trim();
+  if (!s0) return null;
+  const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(s0);
+  if (iso) {
+    const y = Number(iso[1]);
+    const mo = Number(iso[2]);
+    const d = Number(iso[3]);
+    if (y >= 1950 && y <= 2100 && mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+      const test = new Date(Date.UTC(y, mo - 1, d));
+      if (!Number.isNaN(test.getTime()) && test.getUTCFullYear() === y) {
+        return `${String(y).padStart(4, '0')}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+      }
+    }
+  }
+  const dmy =
+    /^(\d{1,2})[./-](\d{1,2})[./-](\d{4})$/.exec(s0) || /^(\d{1,2})[./-](\d{1,2})[./-](\d{2})$/.exec(s0);
+  if (dmy) {
+    let day = Number(dmy[1]);
+    let month = Number(dmy[2]);
+    let year = Number(dmy[3]);
+    if (year < 100) year += 2000;
+    if (month > 12) {
+      const t = day;
+      day = month;
+      month = t;
+    }
+    const test = new Date(Date.UTC(year, month - 1, day));
+    if (!Number.isNaN(test.getTime())) return test.toISOString().slice(0, 10);
+  }
+  const compact8 = s0.replace(/\D/g, '');
+  if (compact8.length === 8 && /^(19|20)\d{6}$/.test(compact8)) {
+    const y = Number(compact8.slice(0, 4));
+    const mo = Number(compact8.slice(4, 6));
+    const d = Number(compact8.slice(6, 8));
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+      const test = new Date(Date.UTC(y, mo - 1, d));
+      if (!Number.isNaN(test.getTime()) && test.getUTCFullYear() === y) {
+        return `${String(y).padStart(4, '0')}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+      }
+    }
+  }
+
+  const t = Date.parse(s0);
+  if (!Number.isNaN(t)) return new Date(t).toISOString().slice(0, 10);
+  return null;
+}
+
+/** MY / SG vs foreign — from passport OCR nationality / issuing country (Alibaba field names vary). */
+function pickPassportNationalityHintFromObject(o) {
+  if (!o || typeof o !== 'object' || Array.isArray(o)) return '';
+  return firstNonEmptyStr(
+    o.nationality,
+    o.Nationality,
+    o.nationalityCode,
+    o.NationalityCode,
+    o.issuingCountry,
+    o.IssuingCountry,
+    o.issuing_country,
+    o.countryOfIssue,
+    o.CountryOfIssue,
+    o.country,
+    o.Country,
+    o.countryCode,
+    o.CountryCode,
+    o.documentIssuingCountry,
+    o.passportNationality,
+    o.issueCountry,
+    o.IssueCountry
+  );
+}
+
+function classifyPassportCountryHint(raw) {
+  if (raw == null || raw === '') return null;
+  const s = String(raw).trim().toUpperCase();
+  if (!s || s === '?' || s === '？') return null;
+  if (s === 'MY' || s === 'MYS' || s === 'MALAYSIA' || s === 'MALAYSIAN' || s.includes('MALAYSIA')) return 'MY';
+  if (s === 'SG' || s === 'SGP' || s === 'SINGAPORE' || s.includes('SINGAPORE')) return 'SG';
+  return null;
+}
+
+/**
+ * @returns {'MALAYSIAN_INDIVIDUAL'|'SINGAPORE_INDIVIDUAL'|'FOREIGN_INDIVIDUAL'}
+ */
+function inferPassportEntityTypeFromAliyunOcr(ext, ocrPick, basic, ekyc, extInf, ocr) {
+  const hints = [];
+  const eraw = ext.ocrIdEditInfo || ext.OcrIdEditInfo;
+  const ed = eraw == null ? null : coerceAliyunJsonField(eraw);
+  if (ed && typeof ed === 'object' && !Array.isArray(ed)) {
+    hints.push(pickPassportNationalityHintFromObject(ed));
+  }
+  hints.push(
+    pickPassportNationalityHintFromObject(ocrPick),
+    pickPassportNationalityHintFromObject(basic),
+    pickPassportNationalityHintFromObject(ekyc),
+    pickPassportNationalityHintFromObject(extInf),
+    pickPassportNationalityHintFromObject(ext),
+    pickPassportNationalityHintFromObject(ocr)
+  );
+  for (const h of hints) {
+    const c = classifyPassportCountryHint(h);
+    if (c === 'MY') return 'MALAYSIAN_INDIVIDUAL';
+    if (c === 'SG') return 'SINGAPORE_INDIVIDUAL';
+  }
+  return 'FOREIGN_INDIVIDUAL';
+}
+
+function pickPassportExpiryRawFromObject(o) {
+  if (!o || typeof o !== 'object' || Array.isArray(o)) return '';
+  return firstNonEmptyStr(
+    o.expiryDate,
+    o.ExpiryDate,
+    o.expiry_date,
+    o.expiryDateText,
+    o.dateOfExpiry,
+    o.date_of_expiry,
+    o.DateOfExpiry,
+    o.passportExpiryDate,
+    o.passport_expiry_date,
+    o.PassportExpiryDate,
+    o.validUntil,
+    o.valid_until,
+    o.ValidUntil,
+    o.validTo,
+    o.validToDate,
+    o.valid_to,
+    o.documentExpiryDate,
+    o.document_expiry_date,
+    o.expireDate,
+    o.ExpireDate,
+    o.expirationDate,
+    o.ExpirationDate,
+    o.validityEndDate,
+    o.ValidityEndDate,
+    o.validity_end_date,
+    o.expireTime,
+    o.ExpireTime,
+    o.expire_time,
+    o.endDate,
+    o.EndDate,
+    o.end_date
+  );
+}
+
+/**
+ * Alibaba GLB03002 OCR may nest expiry under labels we do not list, or key/value rows — walk tree (bounded depth).
+ * Skips obvious birth/issue fields when the key name distinguishes them.
+ */
+function deepFindPassportExpiryRawInTree(val, depth = 0) {
+  if (depth > 18 || val == null) return '';
+  if (typeof val === 'string') {
+    const t = val.trim();
+    if (t.length < 4 || t.length > 80 || !/\d/.test(t)) return '';
+    const iso = normalizePassportExpiryToIsoDate(t);
+    return iso ? t : '';
+  }
+  if (typeof val !== 'object') return '';
+  if (Array.isArray(val)) {
+    for (const item of val) {
+      const s = deepFindPassportExpiryRawInTree(item, depth + 1);
+      if (s) return s;
+    }
+    return '';
+  }
+  for (const [k, v] of Object.entries(val)) {
+    const kl = String(k).toLowerCase();
+    if (
+      /birth|dateofbirth|dob|born|issue|issued|start|begin|fromdate|性别|出生|签发|发行/i.test(kl) &&
+      !/expir|valid|到期|届满|失效|expire/i.test(kl)
+    ) {
+      continue;
+    }
+    if (/expir|validuntil|validto|valid_to|dateofexpir|到期|届满|失效|expire|validity|documentexpir/i.test(kl)) {
+      if (typeof v === 'string') {
+        const t = v.trim();
+        if (normalizePassportExpiryToIsoDate(t)) return t;
+      }
+    }
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const kn = String(v.key || v.name || v.label || v.field || '').toLowerCase();
+      const vv = v.value ?? v.text ?? v.val ?? v.Value;
+      if (
+        kn &&
+        /expir|valid|到期|届满|失效|expire|validity/i.test(kn) &&
+        typeof vv === 'string' &&
+        normalizePassportExpiryToIsoDate(vv.trim())
+      ) {
+        return vv.trim();
+      }
+    }
+  }
+  for (const v of Object.values(val)) {
+    if (v != null && typeof v === 'object') {
+      const s = deepFindPassportExpiryRawInTree(v, depth + 1);
+      if (s) return s;
+    }
+  }
+  return '';
+}
+
+function deepFindAddressInTree(val, depth = 0) {
+  if (depth > 16 || val == null) return '';
+  if (typeof val !== 'object') return '';
+  if (Array.isArray(val)) {
+    for (const item of val) {
+      const s = deepFindAddressInTree(item, depth + 1);
+      if (s) return s;
+    }
+    return '';
+  }
+  for (const [k, v] of Object.entries(val)) {
+    if (/^address$/i.test(k) && typeof v === 'string') {
+      const t = v.trim();
+      if (t.length > 5 && t.length < 500) return t;
+    }
+  }
+  for (const [k, v] of Object.entries(val)) {
+    if (/faceImg|extFaceInfo|liveness/i.test(k)) continue;
+    if (v != null && typeof v === 'object') {
+      const s = deepFindAddressInTree(v, depth + 1);
+      if (s) return s;
+    }
+  }
+  return '';
+}
+
+/**
+ * Legal name for MY MyKad: prefer Roman/English line (englishName) — matches agreements / Singpass-style "legal name".
+ * @param {string} docType MYS01001 | GLB03002
+ */
+function extractAliyunEkycIdentity(docType, extIdInfoStr, extBasicInfoStr, ekycResultStr, extInfoStr) {
+  const ext = unwrapAliyunBlob(parseJsonLenient(extIdInfoStr) || {});
+  const basic = unwrapAliyunBlob(parseJsonLenient(extBasicInfoStr) || {});
+  const ekyc = unwrapAliyunBlob(parseJsonLenient(ekycResultStr) || {});
+  const extInf = unwrapAliyunBlob(parseJsonLenient(extInfoStr) || {});
+
+  /** ExtIdInfo is authoritative; merge basic/ekyc/extInfo first, then ext so Result.ExtIdInfo wins. */
+  const ocr = mergeOcrCandidates(basic, ekyc, extInf, ext);
+  const ocrDeep = deepFindOcrLikeObject(ext) || deepFindOcrLikeObject(basic) || deepFindOcrLikeObject(ekyc) || deepFindOcrLikeObject(extInf);
+  const ocrPick = mergeOcrCandidates(ocr, ocrDeep || {});
+
+  let idNumber = firstNonEmptyStr(
+    ocrPick.idNumber,
+    ocrPick.IdNumber,
+    ocrPick.id_number,
+    ocrPick.id_number_back,
+    ocrPick.IDNumber,
+    ocrPick.icNumber,
+    ocrPick.ICNumber,
+    ocrPick.identityNumber,
+    ocrPick.identityCardNumber,
+    ocrPick.IdentityCardNumber,
+    ocrPick.nric,
+    ocrPick.NRIC,
+    ocrPick.nric_no,
+    ocrPick.ic_no,
+    ocrPick.passportNumber,
+    ocrPick.PassportNumber,
+    ocrPick.documentNumber,
+    ext.idNumber,
+    basic.idNumber,
+    basic.passportNumber,
+    ekyc.idNumber,
+    extInf.idNumber
+  );
+  if (!idNumber && docType === 'MYS01001') {
+    idNumber =
+      deepFindMalaysianIc12(ocrPick) ||
+      deepFindMalaysianIc12(ocr) ||
+      deepFindMalaysianIc12(ext) ||
+      deepFindMalaysianIc12(basic) ||
+      deepFindMalaysianIc12(ekyc) ||
+      deepFindMalaysianIc12(extInf);
+  }
+  if (docType === 'MYS01001' && idNumber) {
+    const compact = normalizeMalaysianNric12Digits(idNumber);
+    if (compact) idNumber = compact;
+  }
+  if (!idNumber && docType === 'GLB03002') {
+    idNumber =
+      firstNonEmptyStr(
+        ocrPick.passportNumber,
+        ocrPick.PassportNumber,
+        ocrPick.documentNumber,
+        ext.passportNumber,
+        basic.passportNumber
+      ) ||
+      deepFindPassportNo(ocrPick) ||
+      deepFindPassportNo(ext);
+  }
+
+  let fullName = '';
+  if (docType === 'MYS01001') {
+    const editRaw = ext.ocrIdEditInfo || ext.OcrIdEditInfo;
+    const editObj = editRaw == null ? null : coerceAliyunJsonField(editRaw);
+    if (editObj && typeof editObj === 'object' && !Array.isArray(editObj)) {
+      fullName = firstNonEmptyStr(
+        editObj.name,
+        editObj.Name,
+        editObj.legalName,
+        editObj.LegalName,
+        editObj.englishName,
+        editObj.EnglishName
+      );
+    }
+  }
+  if (docType === 'MYS01001' && !fullName) {
+    fullName = firstNonEmptyStr(
+      ocrPick.englishName,
+      ocrPick.EnglishName,
+      ocrPick.english_name,
+      basic.englishName,
+      basic.EnglishName,
+      ext.englishName,
+      ekyc.englishName,
+      extInf.englishName,
+      ocrPick.fullName,
+      ocrPick.FullName,
+      basic.fullName,
+      basic.FullName,
+      ekyc.fullName,
+      ocrPick.name,
+      ocrPick.Name,
+      ocrPick.full_name,
+      ocrPick.customerName,
+      ocrPick.CustomerName,
+      ocrPick.primaryName,
+      ocrPick.nama,
+      ocrPick.Nama,
+      ocrPick.certificateName,
+      ocrPick.localName,
+      ocrPick.holderName,
+      ocrPick.HolderName,
+      /** MY doc: front field `name` (may be Malay script); prefer english* above */
+      basic.name,
+      basic.fullName,
+      basic.nama,
+      ext.name,
+      ext.nama,
+      ekyc.name,
+      extInf.nama
+    );
+  }
+  if (docType === 'GLB03002') {
+    fullName = firstNonEmptyStr(
+      ocrPick.fullName,
+      ocrPick.FullName,
+      ocrPick.name,
+      ocrPick.Name,
+      ocrPick.englishName,
+      ocrPick.EnglishName,
+      basic.fullName,
+      basic.name,
+      ext.name,
+      ekyc.name
+    );
+  }
+
+  if (!fullName) {
+    const roots = [ext, basic, ekyc, extInf, ocrPick, ocr];
+    for (const root of roots) {
+      if (!root || typeof root !== 'object') continue;
+      for (const k of Object.keys(root)) {
+        if (!/name|nama|fullName|englishName|legalName|displayName|customerName/i.test(k)) continue;
+        const v = root[k];
+        if (typeof v === 'string' && v.trim()) {
+          fullName = v.trim();
+          break;
+        }
+      }
+      if (fullName) break;
+    }
+  }
+  if (!fullName) {
+    for (const root of [ext, basic, ekyc, extInf, ocr, ocrPick]) {
+      const n = deepFindPersonNameInTree(root);
+      if (n) {
+        fullName = n;
+        break;
+      }
+    }
+  }
+
+  let address = firstNonEmptyStr(
+    ocrPick.address,
+    ocrPick.Address,
+    ocrPick.fullAddress,
+    ocrPick.FullAddress,
+    ocrPick.registeredAddress,
+    ocrPick.residentialAddress,
+    ocrPick.ResidentialAddress,
+    basic.address,
+    ext.address,
+    ekyc.address,
+    extInf.address
+  );
+  if (!address) {
+    for (const root of [ext, basic, ekyc, extInf, ocrPick, ocr]) {
+      if (!root || typeof root !== 'object') continue;
+      for (const k of Object.keys(root)) {
+        if (!/^address$/i.test(k) && !/Address$/i.test(k)) continue;
+        const v = root[k];
+        if (typeof v === 'string' && v.trim().length > 3) {
+          address = v.trim();
+          break;
+        }
+      }
+      if (address) break;
+    }
+  }
+  if (!address) {
+    address = deepFindAddressInTree(ext) || deepFindAddressInTree(basic) || deepFindAddressInTree(ocrPick);
+  }
+
+  /** MY: `ocrIdEditInfo` is user-confirmed — must win for legal name + address (slot/merge order can drop them while id_number still merges). */
+  if (docType === 'MYS01001') {
+    const eraw = ext.ocrIdEditInfo || ext.OcrIdEditInfo;
+    const ed = eraw == null ? null : coerceAliyunJsonField(eraw);
+    if (ed && typeof ed === 'object' && !Array.isArray(ed)) {
+      const fromEditName = firstNonEmptyStr(
+        ed.name,
+        ed.Name,
+        ed.legalName,
+        ed.LegalName,
+        ed.englishName,
+        ed.EnglishName
+      );
+      if (fromEditName) fullName = fromEditName;
+      const fromEditAddr = firstNonEmptyStr(ed.address, ed.Address, ed.fullAddress, ed.FullAddress);
+      if (fromEditAddr) address = fromEditAddr;
+    }
+  }
+
+  let entityType = 'MALAYSIAN_INDIVIDUAL';
+  let idType = 'NRIC';
+  let regNoType = 'NRIC';
+  if (docType === 'GLB03002') {
+    entityType = inferPassportEntityTypeFromAliyunOcr(ext, ocrPick, basic, ekyc, extInf, ocr);
+    idType = 'PASSPORT';
+    regNoType = 'PASSPORT';
+  }
+
+  let passportExpiryDate = null;
+  if (docType === 'GLB03002') {
+    const erawGl = ext.ocrIdEditInfo || ext.OcrIdEditInfo;
+    const edGl = erawGl == null ? null : coerceAliyunJsonField(erawGl);
+    let rawExp = '';
+    if (edGl && typeof edGl === 'object' && !Array.isArray(edGl)) {
+      rawExp = pickPassportExpiryRawFromObject(edGl);
+    }
+    if (!rawExp) rawExp = pickPassportExpiryRawFromObject(ocrPick);
+    if (!rawExp) rawExp = pickPassportExpiryRawFromObject(basic);
+    if (!rawExp) rawExp = pickPassportExpiryRawFromObject(ekyc);
+    if (!rawExp) rawExp = pickPassportExpiryRawFromObject(extInf);
+    if (!rawExp) rawExp = pickPassportExpiryRawFromObject(ext);
+    passportExpiryDate = normalizePassportExpiryToIsoDate(rawExp);
+    if (!passportExpiryDate) {
+      const deepRaw =
+        deepFindPassportExpiryRawInTree(ext) ||
+        deepFindPassportExpiryRawInTree(basic) ||
+        deepFindPassportExpiryRawInTree(ekyc) ||
+        deepFindPassportExpiryRawInTree(extInf) ||
+        deepFindPassportExpiryRawInTree(ocrPick);
+      passportExpiryDate = deepRaw ? normalizePassportExpiryToIsoDate(deepRaw) : null;
+    }
+  }
+
+  return { fullName, idNumber, entityType, idType, regNoType, address, passportExpiryDate };
+}
+
+const EKYC_MAX_IMAGE_BYTES = 18 * 1024 * 1024;
+
+function decodeAliyunImageBase64Field(raw) {
+  if (raw == null || raw === '') return null;
+  if (typeof raw !== 'string') return null;
+  const t = raw.trim();
+  if (!t) return null;
+  const dataUrl = /^data:([^;]+);base64,(.+)$/i.exec(t.replace(/\s/g, ''));
+  if (dataUrl) {
+    try {
+      const buf = Buffer.from(dataUrl[2], 'base64');
+      if (!buf.length || buf.length > EKYC_MAX_IMAGE_BYTES) return null;
+      return { buffer: buf, mime: dataUrl[1] };
+    } catch {
+      return null;
+    }
+  }
+  try {
+    const buf = Buffer.from(t.replace(/\s/g, ''), 'base64');
+    if (!buf.length || buf.length > EKYC_MAX_IMAGE_BYTES) return null;
+    return { buffer: buf, mime: null };
+  } catch {
+    return null;
+  }
+}
+
+function filenameForEkycImage(mime, role) {
+  if (mime && /png/i.test(String(mime))) return `ekyc-nric-${role}.png`;
+  if (mime && /webp/i.test(String(mime))) return `ekyc-nric-${role}.webp`;
+  return `ekyc-nric-${role}.jpg`;
+}
+
+const EKYC_ID_FRONT_KEYS = [
+  'idImage',
+  'IdImage',
+  'id_image',
+  'certImage',
+  'CertImage',
+  'cardImage',
+  'CardImage',
+  'frontImage',
+  'FrontImage',
+  'scanImage',
+  'certificateImage',
+];
+const EKYC_ID_BACK_KEYS = [
+  'idBackImage',
+  'IdBackImage',
+  'id_back_image',
+  'certBackImage',
+  'backImage',
+  'BackImage',
+  'rearImage',
+  'RearImage',
+];
+
+function looksLikeBase64DocumentScan(s) {
+  if (typeof s !== 'string') return false;
+  const t = s.replace(/\s/g, '');
+  if (t.length < 400) return false;
+  return /^[A-Za-z0-9+/]+=*$/.test(t.slice(0, 200));
+}
+
+/** When keys differ from idImage/idBackImage, pick long base64 blobs from ocrIdInfoData slots (skip face/liveness). */
+function heuristicIdImagesFromOcrIdInfoData(ext) {
+  const data = ext.ocrIdInfoData || ext.OcrIdInfoData;
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return { front: null, back: null };
+  const cands = [];
+  for (const [slotKey, slot] of Object.entries(data)) {
+    if (!slot || typeof slot !== 'object' || Array.isArray(slot)) continue;
+    for (const [k, v] of Object.entries(slot)) {
+      if (typeof v !== 'string' || !looksLikeBase64DocumentScan(v)) continue;
+      if (/face|portrait|selfie|liveness|FaceImg|faceImg|nationality|chip/i.test(k)) continue;
+      const backHint = /back|rear|reverse|02$/i.test(k) || /(^|[^0-9])2$/i.test(String(slotKey).trim());
+      cands.push({ v, backHint });
+    }
+  }
+  let front = null;
+  let back = null;
+  for (const { v, backHint } of cands) {
+    if (backHint) {
+      if (!back) back = v;
+    } else if (!front) front = v;
+  }
+  if (!front && cands.length === 1) front = cands[0].v;
+  if (!front && cands.length > 1) {
+    const nonBack = cands.filter((c) => !c.backHint);
+    front = nonBack.length ? nonBack[0].v : cands[0].v;
+  }
+  if (!back && cands.length > 1) {
+    const rest = cands.map((c) => c.v).filter((v) => v !== front);
+    if (rest.length) back = rest[0];
+  }
+  return { front, back };
+}
+
+/** Alibaba CheckResult Result.ExtIdInfo: idImage / idBackImage (Base64 when isReturnImage=Y). */
+function extractAliyunExtIdCardImages(extIdInfoStr) {
+  const ext = unwrapAliyunBlob(parseJsonLenient(extIdInfoStr) || {});
+  const pick = (obj, keys) => {
+    if (!obj || typeof obj !== 'object') return null;
+    for (const k of keys) {
+      const v = obj[k];
+      if (v != null && String(v).trim()) return v;
+    }
+    return null;
+  };
+  let front = pick(ext, EKYC_ID_FRONT_KEYS);
+  let back = pick(ext, EKYC_ID_BACK_KEYS);
+  const data = ext.ocrIdInfoData || ext.OcrIdInfoData;
+  if ((!front || !back) && data && typeof data === 'object' && !Array.isArray(data)) {
+    for (const slot of Object.values(data)) {
+      if (!slot || typeof slot !== 'object') continue;
+      if (!front) front = pick(slot, EKYC_ID_FRONT_KEYS);
+      if (!back) back = pick(slot, EKYC_ID_BACK_KEYS);
+    }
+  }
+  let ocrFlat = ext.ocrIdInfo || ext.OcrIdInfo || ext.ocr_id_info;
+  if (typeof ocrFlat === 'string') ocrFlat = parseJsonLenient(ocrFlat);
+  if (typeof ocrFlat === 'object' && ocrFlat && !Array.isArray(ocrFlat)) {
+    if (!front) front = pick(ocrFlat, EKYC_ID_FRONT_KEYS);
+    if (!back) back = pick(ocrFlat, EKYC_ID_BACK_KEYS);
+  }
+  if (!front || !back) {
+    const h = heuristicIdImagesFromOcrIdInfoData(ext);
+    if (!front) front = h.front;
+    if (!back) back = h.back;
+  }
+  return { front, back };
+}
+
+/**
+ * Upload eKYC card crops to OSS; URLs go to portal_account.nricfront / nricback (demoprofile unified profile).
+ * @param {string} portalAccountId portal_account.id (UUID)
+ */
+async function uploadEkycNricImagesFromExtIdInfo(extIdInfoStr, portalAccountId) {
+  const out = { nricfront: null, nricback: null };
+  const pid = portalAccountId != null ? String(portalAccountId).trim() : '';
+  if (!pid) return out;
+  const { front, back } = extractAliyunExtIdCardImages(extIdInfoStr);
+  const clientId = `portal-${pid}`;
+  const one = async (raw, role) => {
+    if (raw == null || raw === '') return null;
+    const s = String(raw).trim();
+    if (/^https?:\/\//i.test(s)) return s;
+    const dec = decodeAliyunImageBase64Field(raw);
+    if (!dec) {
+      console.warn('[portal-auth] ekyc id image decode failed', role, 'len=', s.length);
+      return null;
+    }
+    const fn = filenameForEkycImage(dec.mime, role);
+    const r = await uploadToOss(dec.buffer, fn, clientId);
+    if (r.ok) return r.url;
+    console.warn('[portal-auth] ekyc id image OSS upload failed', role, r.reason);
+    return null;
+  };
+  if (front) out.nricfront = await one(front, 'front');
+  if (back) out.nricback = await one(back, 'back');
+  return out;
+}
+
+/**
+ * Read user-confirmed MY/passport OCR block from raw Result.extIdInfo (SDK shape varies; merge in extract can drop fields).
+ * @returns {{ name: string|null, address: string|null, passportExpiryDate: string|null }}
+ */
+function pickOcrIdEditInfoLegalAndAddress(rawExtIdInfo) {
+  const empty = { name: null, address: null, passportExpiryDate: null };
+  let ext = rawExtIdInfo;
+  if (ext == null) return empty;
+  if (typeof ext === 'string') ext = parseJsonLenient(ext);
+  if (!ext || typeof ext !== 'object') return empty;
+  ext = unwrapAliyunBlob(ext);
+  let ed = ext.ocrIdEditInfo || ext.OcrIdEditInfo;
+  if (ed == null && ext.result && typeof ext.result === 'object' && !Array.isArray(ext.result)) {
+    ed = ext.result.ocrIdEditInfo || ext.result.OcrIdEditInfo;
+  }
+  ed = coerceAliyunJsonField(ed);
+  if (!ed || typeof ed !== 'object' || Array.isArray(ed)) return empty;
+  const name = firstNonEmptyStr(
+    ed.name,
+    ed.Name,
+    ed.legalName,
+    ed.LegalName,
+    ed.englishName,
+    ed.EnglishName
+  );
+  const address = firstNonEmptyStr(ed.address, ed.Address, ed.fullAddress, ed.FullAddress);
+  const expRaw = pickPassportExpiryRawFromObject(ed);
+  const passportExpiryDate = expRaw ? normalizePassportExpiryToIsoDate(expRaw) : null;
+  return {
+    name: name ? name : null,
+    address: address ? address : null,
+    passportExpiryDate,
+  };
+}
+
+/** Safe summary for API/logs: keys + value types only (no PII, no base64 bodies). */
+function summarizeAliyunEkycBlob(strOrObj) {
+  let o = strOrObj;
+  if (o == null) return { present: false, keyCount: 0, keys: [], keyHints: [] };
+  if (typeof o === 'string') {
+    const p = parseJsonLenient(o);
+    o = unwrapAliyunBlob(p || {});
+  } else if (typeof o === 'object') {
+    o = unwrapAliyunBlob(o);
+  } else {
+    return { present: false, keyCount: 0, keys: [], keyHints: [] };
+  }
+  if (!o || typeof o !== 'object') return { present: false, keyCount: 0, keys: [], keyHints: [] };
+  const keys = Object.keys(o);
+  const keyHints = keys.slice(0, 50).map((k) => {
+    const v = o[k];
+    if (v == null) return `${k}:null`;
+    if (Array.isArray(v)) return `${k}:array(len=${v.length})`;
+    if (typeof v === 'object') return `${k}:object`;
+    if (typeof v === 'string') return `${k}:string(len=${v.length})`;
+    return `${k}:${typeof v}`;
+  });
+  return { present: true, keyCount: keys.length, keys: keys.slice(0, 50), keyHints };
+}
+
+/**
+ * Last-resort: read ocrIdEditInfo straight from raw ExtIdInfo (string/object) when merge/extract miss (SDK shape quirks).
+ */
+function tryParseOcrIdEditInfoDirect(rawExtIdInfo, docType) {
+  const empty = { legalName: '', nric: '', address: '', passportExpiryDate: '' };
+  let s = rawExtIdInfo;
+  if (s == null) return empty;
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(s)) s = s.toString('utf8');
+  if (typeof s === 'object') {
+    try {
+      s = JSON.stringify(s);
+    } catch {
+      return empty;
+    }
+  }
+  if (typeof s !== 'string' || !s.includes('ocrIdEditInfo')) return empty;
+  const o = parseJsonLenient(s);
+  if (!o || typeof o !== 'object') return empty;
+  const u = unwrapAliyunBlob(o);
+  const ed = coerceAliyunJsonField(u.ocrIdEditInfo || u.OcrIdEditInfo);
+  if (!ed || typeof ed !== 'object' || Array.isArray(ed)) return empty;
+  const legalName = firstNonEmptyStr(ed.name, ed.Name, ed.legalName, ed.LegalName, ed.englishName, ed.EnglishName);
+  let nric = firstNonEmptyStr(ed.id_number, ed.idNumber, ed.id_number_back, ed.IDNumber);
+  if (docType === 'MYS01001' && nric) {
+    const c = normalizeMalaysianNric12Digits(nric);
+    if (c) nric = c;
+  }
+  const address = firstNonEmptyStr(ed.address, ed.Address, ed.fullAddress, ed.FullAddress);
+  const expRaw = pickPassportExpiryRawFromObject(ed);
+  const passportExpiryIso = expRaw ? normalizePassportExpiryToIsoDate(expRaw) : null;
+  return {
+    legalName: legalName || '',
+    nric: nric || '',
+    address: address || '',
+    passportExpiryDate: passportExpiryIso || '',
+  };
+}
+
+/**
+ * After eKYC_PRO passed: write legal name + ID to portal_account (same pattern as Gov OIDC) and set aliyun_ekyc_locked.
+ * Skips if Singpass/MyDigital already linked (does not overwrite).
+ * @returns {Promise<{ ok: boolean, reason?: string, ocrDebug?: object }>}
+ */
+async function applyAliyunEkycToPortalAccount(email, docType, extIdInfo, extBasicInfo, ekycResult, extInfo) {
+  const normalized = normalizeEmail(email);
+  if (!normalized) {
+    return { ok: false, reason: 'NO_EMAIL' };
+  }
+  const dt = docType === 'GLB03002' ? 'GLB03002' : 'MYS01001';
+  const extracted = extractAliyunEkycIdentity(dt, extIdInfo, extBasicInfo, ekycResult, extInfo);
+  const directPick = pickOcrIdEditInfoLegalAndAddress(extIdInfo);
+  let legalName = firstNonEmptyStr(directPick.name, extracted.fullName);
+  let addressLine = firstNonEmptyStr(directPick.address, extracted.address);
+  let idNumber = extracted.idNumber;
+  if (!legalName || !idNumber) {
+    const fb = tryParseOcrIdEditInfoDirect(extIdInfo, dt);
+    if (!legalName && fb.legalName) legalName = fb.legalName;
+    if (!idNumber && fb.nric) idNumber = fb.nric;
+    if (!addressLine && fb.address) addressLine = fb.address;
+  }
+  if (!legalName || !idNumber) {
+    const extObj = unwrapAliyunBlob(parseJsonLenient(extIdInfo) || {});
+    const merged = mergeOcrCandidates(
+      unwrapAliyunBlob(parseJsonLenient(extBasicInfo) || {}),
+      unwrapAliyunBlob(parseJsonLenient(ekycResult) || {}),
+      unwrapAliyunBlob(parseJsonLenient(extInfo) || {}),
+      extObj
+    );
+    const ocrDebug = {
+      docType: dt,
+      missing: { legalName: !legalName, idNumber: !extracted.idNumber },
+      extIdInfo: summarizeAliyunEkycBlob(extIdInfo),
+      extBasicInfo: summarizeAliyunEkycBlob(extBasicInfo),
+      ekycResult: summarizeAliyunEkycBlob(ekycResult),
+      extInfo: summarizeAliyunEkycBlob(extInfo),
+      mergedScalarKeys: Object.keys(merged).filter((k) => merged[k] == null || typeof merged[k] !== 'object'),
+    };
+    console.warn('[portal-auth] aliyun-idv applyAliyunEkycToPortalAccount EKYC_OCR_INCOMPLETE', ocrDebug);
+    return { ok: false, reason: 'EKYC_OCR_INCOMPLETE', ocrDebug };
+  }
+  let portalAccountId = null;
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, singpass_sub, mydigital_sub FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1`,
+      [normalized]
+    );
+    if (!rows.length) {
+      return { ok: false, reason: 'NO_ACCOUNT' };
+    }
+    const r = rows[0];
+    portalAccountId = r.id != null ? String(r.id) : null;
+    const hasS = r.singpass_sub && String(r.singpass_sub).trim();
+    const hasM = r.mydigital_sub && String(r.mydigital_sub).trim();
+    if (hasS || hasM) {
+      return { ok: false, reason: 'GOV_ID_ALREADY_LINKED' };
+    }
+  } catch (e) {
+    console.error('[portal-auth] applyAliyunEkycToPortalAccount precheck', e?.message || e);
+    return { ok: false, reason: 'DB_ERROR' };
+  }
+
+  let nricImg = { nricfront: null, nricback: null };
+  try {
+    nricImg = await uploadEkycNricImagesFromExtIdInfo(extIdInfo, portalAccountId);
+  } catch (imgErr) {
+    console.warn('[portal-auth] applyAliyunEkycToPortalAccount image upload', imgErr?.message || imgErr);
+  }
+
+  let passportExpiryDate =
+    normalizePassportExpiryToIsoDate(directPick.passportExpiryDate) || extracted.passportExpiryDate || null;
+  if (!passportExpiryDate && dt === 'GLB03002') {
+    const fbPe = tryParseOcrIdEditInfoDirect(extIdInfo, dt);
+    passportExpiryDate = normalizePassportExpiryToIsoDate(fbPe.passportExpiryDate);
+  }
+  if (!passportExpiryDate && dt === 'GLB03002') {
+    const extOnly = unwrapAliyunBlob(parseJsonLenient(extIdInfo) || {});
+    const deepOnly = deepFindPassportExpiryRawInTree(extOnly);
+    if (deepOnly) passportExpiryDate = normalizePassportExpiryToIsoDate(deepOnly);
+  }
+
+  const inner = {
+    fullname: legalName,
+    nric: idNumber,
+    entity_type: extracted.entityType,
+    id_type: extracted.idType,
+    reg_no_type: extracted.regNoType,
+    _bypassIdentityLock: true,
+    _setAliyunEkycLocked: true,
+  };
+  if (addressLine) inner.address = addressLine;
+  if (passportExpiryDate) inner.passport_expiry_date = passportExpiryDate;
+  if (nricImg.nricfront) inner.nricfront = nricImg.nricfront;
+  if (nricImg.nricback) inner.nricback = nricImg.nricback;
+  const updated = await updatePortalProfile(normalized, inner);
+  if (!updated.ok) {
+    console.warn('[portal-auth] aliyun-idv applyAliyunEkycToPortalAccount updatePortalProfile FAILED', updated.reason || '', updated);
+    return updated;
+  }
+  console.log('[portal-auth] aliyun-idv profile WRITE_OK', { emailDomain: normalized.split('@')[1] || '?' });
+  return { ok: true };
 }
 
 async function hashPassword(plain) {
@@ -362,50 +1449,84 @@ function verifyPortalToken(token) {
  * 若 portal_account 尚無該 email 或無 profile 欄位則回傳 null 或空物件。
  * @returns {{ ok: boolean, profile?: { fullname, phone, address, nric, bankname_id, bankaccount, accountholder } } | { ok: false, reason } }
  */
+function mapPortalAccountRowToProfile(r) {
+  if (!r) return null;
+  return {
+    fullname: r.fullname ?? null,
+    first_name: r.first_name ?? null,
+    last_name: r.last_name ?? null,
+    phone: r.phone ?? null,
+    address: r.address ?? null,
+    nric: r.nric ?? null,
+    passport_expiry_date:
+      r.passport_expiry_date != null && r.passport_expiry_date !== ''
+        ? r.passport_expiry_date instanceof Date && !Number.isNaN(r.passport_expiry_date.getTime())
+          ? r.passport_expiry_date.toISOString().slice(0, 10)
+          : String(r.passport_expiry_date).slice(0, 10)
+        : null,
+    bankname_id: r.bankname_id ?? null,
+    bankaccount: r.bankaccount ?? null,
+    accountholder: r.accountholder ?? null,
+    avatar_url: r.avatar_url ?? null,
+    nricfront: r.nricfront ?? null,
+    nricback: r.nricback ?? null,
+    entity_type: r.entity_type ?? null,
+    reg_no_type: r.reg_no_type ?? null,
+    id_type: r.id_type ?? null,
+    tax_id_no: r.tax_id_no ?? null,
+    bank_refund_remark: r.bank_refund_remark ?? null,
+    singpass_linked: !!(r.singpass_sub && String(r.singpass_sub).trim()),
+    mydigital_linked: !!(r.mydigital_sub && String(r.mydigital_sub).trim()),
+    gov_identity_locked: !!r.gov_identity_locked,
+    phone_verified: !!Number(r.phone_verified),
+    aliyun_ekyc_locked: !!Number(r.aliyun_ekyc_locked)
+  };
+}
+
 async function getPortalProfile(email) {
   const normalized = normalizeEmail(email);
   if (!normalized) {
     return { ok: false, reason: 'NO_EMAIL' };
   }
-  try {
-    const [rows] = await pool.query(
-      `SELECT fullname, first_name, last_name, phone, address, nric, bankname_id, bankaccount, accountholder, avatar_url, nricfront, nricback, entity_type, reg_no_type, id_type, tax_id_no, bank_refund_remark,
-       singpass_sub, mydigital_sub, gov_identity_locked,
-       COALESCE(phone_verified, 0) AS phone_verified
+  const baseCols = `fullname, first_name, last_name, phone, address, nric, passport_expiry_date, bankname_id, bankaccount, accountholder, avatar_url, nricfront, nricback, entity_type, reg_no_type, id_type, tax_id_no, bank_refund_remark,
+       singpass_sub, mydigital_sub, gov_identity_locked`;
+  const attempts = [
+    `SELECT ${baseCols},
+       COALESCE(phone_verified, 0) AS phone_verified,
+       COALESCE(aliyun_ekyc_locked, 0) AS aliyun_ekyc_locked
        FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1`,
-      [normalized]
-    );
+    `SELECT ${baseCols},
+       0 AS phone_verified,
+       COALESCE(aliyun_ekyc_locked, 0) AS aliyun_ekyc_locked
+       FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1`,
+    `SELECT ${baseCols},
+       0 AS phone_verified,
+       0 AS aliyun_ekyc_locked
+       FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1`,
+    `SELECT fullname, first_name, last_name, phone, address, nric, bankname_id, bankaccount, accountholder, avatar_url, nricfront, nricback, entity_type, reg_no_type, id_type, tax_id_no, bank_refund_remark FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1`
+  ];
+  try {
+    let rows;
+    let lastErr;
+    for (let i = 0; i < attempts.length; i++) {
+      try {
+        ;[rows] = await pool.query(attempts[i], [normalized]);
+        lastErr = null;
+        break;
+      } catch (e) {
+        lastErr = e;
+        if (!e || e.code !== 'ER_BAD_FIELD_ERROR' || i === attempts.length - 1) {
+          throw e;
+        }
+      }
+    }
+    if (lastErr) throw lastErr;
     const r = rows[0];
     if (!r) {
       return { ok: true, profile: null };
     }
-    return {
-      ok: true,
-      profile: {
-        fullname: r.fullname ?? null,
-        first_name: r.first_name ?? null,
-        last_name: r.last_name ?? null,
-        phone: r.phone ?? null,
-        address: r.address ?? null,
-        nric: r.nric ?? null,
-        bankname_id: r.bankname_id ?? null,
-        bankaccount: r.bankaccount ?? null,
-        accountholder: r.accountholder ?? null
-        ,
-        avatar_url: r.avatar_url ?? null,
-        nricfront: r.nricfront ?? null,
-        nricback: r.nricback ?? null,
-        entity_type: r.entity_type ?? null,
-        reg_no_type: r.reg_no_type ?? null,
-        id_type: r.id_type ?? null,
-        tax_id_no: r.tax_id_no ?? null,
-        bank_refund_remark: r.bank_refund_remark ?? null,
-        singpass_linked: !!(r.singpass_sub && String(r.singpass_sub).trim()),
-        mydigital_linked: !!(r.mydigital_sub && String(r.mydigital_sub).trim()),
-        gov_identity_locked: !!r.gov_identity_locked,
-        phone_verified: !!Number(r.phone_verified)
-      }
-    };
+    const profile = mapPortalAccountRowToProfile(r);
+    return { ok: true, profile };
   } catch (err) {
     if (err && err.code === 'ER_BAD_FIELD_ERROR') {
       try {
@@ -424,6 +1545,7 @@ async function getPortalProfile(email) {
             phone: r.phone ?? null,
             address: r.address ?? null,
             nric: r.nric ?? null,
+            passport_expiry_date: null,
             bankname_id: r.bankname_id ?? null,
             bankaccount: r.bankaccount ?? null,
             accountholder: r.accountholder ?? null,
@@ -438,7 +1560,8 @@ async function getPortalProfile(email) {
             singpass_linked: false,
             mydigital_linked: false,
             gov_identity_locked: false,
-            phone_verified: false
+            phone_verified: false,
+            aliyun_ekyc_locked: false
           }
         };
       } catch (_) {
@@ -467,6 +1590,16 @@ async function updatePortalProfile(email, payload) {
     return { ok: false, reason: 'NO_PAYLOAD' };
   }
 
+  const bypassIdentityLock = payload._bypassIdentityLock === true;
+  if (Object.prototype.hasOwnProperty.call(payload, '_bypassIdentityLock')) {
+    delete payload._bypassIdentityLock;
+  }
+  /** Set in same UPDATE as OCR fields so autosave cannot overwrite fullname between write and lock (race). */
+  const setAliyunEkycLockedInThisUpdate = payload._setAliyunEkycLocked === true;
+  if (Object.prototype.hasOwnProperty.call(payload, '_setAliyunEkycLocked')) {
+    delete payload._setAliyunEkycLocked;
+  }
+
   // When a key is not present in payload, keep destination values unchanged (COALESCE + provided flags).
   const hasKey = (k) => Object.prototype.hasOwnProperty.call(payload, k);
 
@@ -482,21 +1615,50 @@ async function updatePortalProfile(email, payload) {
   const first_name_provided = hasKey('first_name') && payload.first_name !== undefined;
   const last_name_provided = hasKey('last_name') && payload.last_name !== undefined;
   const fullname_provided = hasKey('fullname') && payload.fullname !== undefined;
+  const passport_expiry_date_provided = hasKey('passport_expiry_date') && payload.passport_expiry_date !== undefined;
 
-  try {
-    const [lc] = await pool.query(
-      'SELECT gov_identity_locked FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
-      [normalized]
-    );
-    if (lc[0] && Number(lc[0].gov_identity_locked) === 1) {
-      const nric_provided = hasKey('nric') && payload.nric !== undefined;
-      if (fullname_provided || entity_type_provided || id_type_provided || nric_provided) {
-        return { ok: false, reason: 'IDENTITY_LOCKED' };
+  if (!bypassIdentityLock) {
+    try {
+      let lc;
+      try {
+        [lc] = await pool.query(
+          'SELECT gov_identity_locked, COALESCE(aliyun_ekyc_locked,0) AS aliyun_ekyc_locked FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+          [normalized]
+        );
+      } catch (qErr) {
+        if (qErr && qErr.code === 'ER_BAD_FIELD_ERROR') {
+          [lc] = await pool.query(
+            'SELECT gov_identity_locked, 0 AS aliyun_ekyc_locked FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+            [normalized]
+          );
+        } else {
+          throw qErr;
+        }
       }
-    }
-  } catch (e) {
-    if (e && e.code !== 'ER_BAD_FIELD_ERROR') {
-      console.warn('[portal-auth] gov_identity_locked check:', e?.message || e);
+      if (lc[0] && Number(lc[0].gov_identity_locked) === 1) {
+        const nric_provided = hasKey('nric') && payload.nric !== undefined;
+        if (fullname_provided || entity_type_provided || id_type_provided || nric_provided) {
+          return { ok: false, reason: 'IDENTITY_LOCKED' };
+        }
+      }
+      if (lc[0] && Number(lc[0].aliyun_ekyc_locked) === 1) {
+        const nric_provided = hasKey('nric') && payload.nric !== undefined;
+        /** OCR-filled legal name + address must not be overwritten by autosave (same as fullname/nric). */
+        if (
+          fullname_provided ||
+          address_provided ||
+          entity_type_provided ||
+          id_type_provided ||
+          nric_provided ||
+          passport_expiry_date_provided
+        ) {
+          return { ok: false, reason: 'IDENTITY_LOCKED' };
+        }
+      }
+    } catch (e) {
+      if (e && e.code !== 'ER_BAD_FIELD_ERROR') {
+        console.warn('[portal-auth] identity lock check:', e?.message || e);
+      }
     }
   }
 
@@ -538,6 +1700,11 @@ async function updatePortalProfile(email, payload) {
   const id_type = id_type_provided ? (payload.id_type == null ? null : String(payload.id_type).trim() || null) : null;
   const tax_id_no = tax_id_no_provided ? (payload.tax_id_no == null ? null : String(payload.tax_id_no).trim() || null) : null;
   const bank_refund_remark = bank_refund_remark_provided ? (payload.bank_refund_remark == null ? null : String(payload.bank_refund_remark).trim() || null) : null;
+  const passport_expiry_date = passport_expiry_date_provided
+    ? payload.passport_expiry_date == null
+      ? null
+      : normalizePassportExpiryToIsoDate(payload.passport_expiry_date)
+    : null;
 
   try {
     const [existing] = await pool.query(
@@ -549,21 +1716,143 @@ async function updatePortalProfile(email, payload) {
     }
     const portalAccountPk = String(existing[0].id);
 
-    await pool.query(
-      `UPDATE portal_account SET fullname = COALESCE(?, fullname), first_name = COALESCE(?, first_name), last_name = COALESCE(?, last_name), phone = COALESCE(?, phone), address = COALESCE(?, address),
-       nric = COALESCE(?, nric), bankname_id = COALESCE(?, bankname_id), bankaccount = COALESCE(?, bankaccount),
+    const lockFrag = setAliyunEkycLockedInThisUpdate ? 'aliyun_ekyc_locked = 1,' : '';
+    try {
+      await pool.query(
+        `UPDATE portal_account SET fullname = COALESCE(?, fullname), first_name = COALESCE(?, first_name), last_name = COALESCE(?, last_name), phone = COALESCE(?, phone), address = COALESCE(?, address),
+       nric = COALESCE(?, nric), passport_expiry_date = COALESCE(?, passport_expiry_date), bankname_id = COALESCE(?, bankname_id), bankaccount = COALESCE(?, bankaccount),
        accountholder = COALESCE(?, accountholder),
        avatar_url = COALESCE(?, avatar_url), nricfront = COALESCE(?, nricfront), nricback = COALESCE(?, nricback),
        entity_type = COALESCE(?, entity_type), reg_no_type = COALESCE(?, reg_no_type), id_type = COALESCE(?, id_type), tax_id_no = COALESCE(?, tax_id_no),
        bank_refund_remark = COALESCE(?, bank_refund_remark),
+       ${lockFrag}
        updated_at = NOW() WHERE LOWER(TRIM(email)) = ?`,
-      [fullname, first_name, last_name, phone, address, nric, bankname_id, bankaccount, accountholder, avatar_url, nricfront, nricback, entity_type, reg_no_type, id_type, tax_id_no, bank_refund_remark, normalized]
-    );
+        [
+          fullname,
+          first_name,
+          last_name,
+          phone,
+          address,
+          nric,
+          passport_expiry_date,
+          bankname_id,
+          bankaccount,
+          accountholder,
+          avatar_url,
+          nricfront,
+          nricback,
+          entity_type,
+          reg_no_type,
+          id_type,
+          tax_id_no,
+          bank_refund_remark,
+          normalized,
+        ]
+      );
+    } catch (e) {
+      if (!e || e.code !== 'ER_BAD_FIELD_ERROR') throw e;
 
-    const [updated] = await pool.query(
-      'SELECT fullname, first_name, last_name, phone, address, nric, bankname_id, bankaccount, accountholder, avatar_url, nricfront, nricback, entity_type, reg_no_type, id_type, tax_id_no, bank_refund_remark FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
-      [normalized]
-    );
+      const paramsNoPe = [
+        fullname,
+        first_name,
+        last_name,
+        phone,
+        address,
+        nric,
+        bankname_id,
+        bankaccount,
+        accountholder,
+        avatar_url,
+        nricfront,
+        nricback,
+        entity_type,
+        reg_no_type,
+        id_type,
+        tax_id_no,
+        bank_refund_remark,
+        normalized,
+      ];
+      const paramsWithPe = [
+        fullname,
+        first_name,
+        last_name,
+        phone,
+        address,
+        nric,
+        passport_expiry_date,
+        bankname_id,
+        bankaccount,
+        accountholder,
+        avatar_url,
+        nricfront,
+        nricback,
+        entity_type,
+        reg_no_type,
+        id_type,
+        tax_id_no,
+        bank_refund_remark,
+        normalized,
+      ];
+      const sqlBase = `UPDATE portal_account SET fullname = COALESCE(?, fullname), first_name = COALESCE(?, first_name), last_name = COALESCE(?, last_name), phone = COALESCE(?, phone), address = COALESCE(?, address),
+       nric = COALESCE(?, nric)`;
+      const sqlTail = `, bankname_id = COALESCE(?, bankname_id), bankaccount = COALESCE(?, bankaccount),
+       accountholder = COALESCE(?, accountholder),
+       avatar_url = COALESCE(?, avatar_url), nricfront = COALESCE(?, nricfront), nricback = COALESCE(?, nricback),
+       entity_type = COALESCE(?, entity_type), reg_no_type = COALESCE(?, reg_no_type), id_type = COALESCE(?, id_type), tax_id_no = COALESCE(?, tax_id_no),
+       bank_refund_remark = COALESCE(?, bank_refund_remark),`;
+
+      let applied = false;
+      if (setAliyunEkycLockedInThisUpdate) {
+        try {
+          await pool.query(
+            `${sqlBase}, passport_expiry_date = COALESCE(?, passport_expiry_date) ${sqlTail} updated_at = NOW() WHERE LOWER(TRIM(email)) = ?`,
+            paramsWithPe
+          );
+          console.warn('[portal-auth] aliyun_ekyc_locked column missing — run migration 0266 (OCR write ok, lock skipped)');
+          applied = true;
+        } catch (e2) {
+          if (!e2 || e2.code !== 'ER_BAD_FIELD_ERROR') throw e2;
+        }
+      }
+      if (!applied) {
+        try {
+          await pool.query(
+            `${sqlBase} ${sqlTail} ${lockFrag} updated_at = NOW() WHERE LOWER(TRIM(email)) = ?`,
+            paramsNoPe
+          );
+          console.warn('[portal-auth] passport_expiry_date column missing — run migration 0267 (OCR write ok, date skipped)');
+          applied = true;
+        } catch (e3) {
+          if (!e3 || e3.code !== 'ER_BAD_FIELD_ERROR') throw e3;
+        }
+      }
+      if (!applied) {
+        await pool.query(
+          `${sqlBase} ${sqlTail} updated_at = NOW() WHERE LOWER(TRIM(email)) = ?`,
+          paramsNoPe
+        );
+        console.warn(
+          '[portal-auth] passport_expiry_date and/or aliyun_ekyc_locked missing — run migrations 0266/0267 (OCR fields ok, lock/date skipped)'
+        );
+      }
+    }
+
+    let updated;
+    try {
+      ;[updated] = await pool.query(
+        'SELECT fullname, first_name, last_name, phone, address, nric, passport_expiry_date, bankname_id, bankaccount, accountholder, avatar_url, nricfront, nricback, entity_type, reg_no_type, id_type, tax_id_no, bank_refund_remark FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+        [normalized]
+      );
+    } catch (selErr) {
+      if (selErr && selErr.code === 'ER_BAD_FIELD_ERROR') {
+        ;[updated] = await pool.query(
+          'SELECT fullname, first_name, last_name, phone, address, nric, bankname_id, bankaccount, accountholder, avatar_url, nricfront, nricback, entity_type, reg_no_type, id_type, tax_id_no, bank_refund_remark FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+          [normalized]
+        );
+      } else {
+        throw selErr;
+      }
+    }
     const p = updated[0] || {};
     const fn = p.fullname ?? null;
     const first = p.first_name ?? null;
@@ -1034,6 +2323,7 @@ module.exports = {
   verifyPortalToken,
   getPortalProfile,
   updatePortalProfile,
+  applyAliyunEkycToPortalAccount,
   getPasswordStatusForEmail,
   ensurePortalAccountByEmail,
   updatePortalBankFields,

@@ -8,7 +8,7 @@
 
 ## 後端設計（一個 email = 一份個人資料）
 
-- **`portal_account`**：存一份「會員個人資料」（fullname, phone, address, nric, bankname_id, bankaccount, accountholder）。
+- **`portal_account`**：存一份「會員個人資料」（fullname, phone, address, nric, bankname_id, bankaccount, accountholder）；另有 **Singpass/MyDigital** 与 **Alibaba eKYC** 相关列（如 **`passport_expiry_date`**、**`aliyun_ekyc_locked`**）。读单条资料见 **`getPortalProfile`**（`POST /api/access/portal-profile`）；若库缺 **`phone_verified`** 等列，后端会**多条 SELECT 降级**仍读出护照到期等字段（详见 [index.md](./index.md)「Portal — Alibaba eKYC」）。
 - **`tenantdetail`** / **`staffdetail`** / **`ownerdetail`**：各業務表也有對應欄位；同一 email 的列會與 `portal_account` 同步。
 
 核心函數：**`portal-auth.service.js` 的 `updatePortalProfile(email, payload)`**

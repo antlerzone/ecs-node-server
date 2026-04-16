@@ -20,6 +20,7 @@ export default function DemoprofilePage() {
       showViewMyProfileButton
       publicProfileTenantId={publicProfileTenantId}
       showGovVerification
+      disableProfileGateUi
     />
   )
 }

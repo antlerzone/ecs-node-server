@@ -1016,6 +1016,8 @@ export async function insertProperty(
     premisesType?: "landed" | "apartment" | "other" | "office" | "commercial";
     securitySystem?: string;
     securityUsername?: string | null;
+    /** propertydetail 0265 — saved with same request as `securitySystem` */
+    securitySystemCredentials?: Record<string, unknown> | null;
     /** Key collection (propertydetail 0252); null clears stored password */
     mailboxPassword?: string | null;
     smartdoorPassword?: string | null;

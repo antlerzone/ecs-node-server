@@ -6,6 +6,7 @@ import { useTenantOptional } from "@/contexts/tenant-context"
 import { isDemoSite } from "@/lib/portal-api"
 import {
   getTenantGateRedirectUrl,
+  isDemoprofilePath,
   isTenantPathAllowedForGateLayer,
   normalizeTenantPathname,
 } from "@/lib/tenant-gates"
@@ -24,6 +25,8 @@ export default function ProfileGate({ children }: { children: ReactNode }) {
     if (state.loading) return
     // Demo: no profile requirement, no redirects – open all permission
     if (typeof window !== "undefined" && isDemoSite()) return
+    // Demo profile page (portal live + demo): never redirect away for gate layers
+    if (isDemoprofilePath(pathname)) return
 
     const noTenant = !state.tenant
     if (noTenant && !isProfilePath(pathname)) {
@@ -46,7 +49,7 @@ export default function ProfileGate({ children }: { children: ReactNode }) {
 
   if (!state) return <>{children}</>
 
-  if (state.loading) {
+  if (state.loading && !isDemoprofilePath(pathname)) {
     return (
       <div className="min-h-[60vh] flex items-center justify-center">
         <div className="animate-spin rounded-full h-8 w-8 border-2 border-primary border-t-transparent" />

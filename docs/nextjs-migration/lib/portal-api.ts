@@ -49,7 +49,14 @@ export function isDemoSite(): boolean {
 
 function canUseBackendOnDemoPath(pathname: string): boolean {
   const p = String(pathname || "/");
-  return p === "/saas-admin" || p.startsWith("/saas-admin/") || p === "/docs" || p.startsWith("/docs/");
+  return (
+    p === "/saas-admin" ||
+    p.startsWith("/saas-admin/") ||
+    p === "/docs" ||
+    p.startsWith("/docs/") ||
+    p === "/demoprofile" ||
+    p.startsWith("/demoprofile/")
+  );
 }
 
 export function shouldUseDemoMock(): boolean {
@@ -785,6 +792,19 @@ function getDemoMock(path: string, body: object): unknown {
   }
   if (path === "tenantdashboard/confirm-payment") {
     return { ok: true, result: { demo: true } };
+  }
+  if (path === "access/aliyun-idv/start") {
+    return {
+      ok: true,
+      transactionId: "demo-aliyun-txn",
+      transactionUrl: "about:blank",
+    };
+  }
+  if (path === "access/aliyun-idv/result") {
+    return { ok: true, passed: false, subCode: "DEMO" };
+  }
+  if (path === "access/gov-id-status") {
+    return { ok: true, singpass: false, mydigital: false, identityLocked: false };
   }
   return { ok: true, items: [] };
 }

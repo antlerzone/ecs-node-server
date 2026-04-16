@@ -39,6 +39,69 @@ function normalizeApartmentName(name) {
 
 const PREMISES_TYPES = new Set(['landed', 'apartment', 'other', 'office', 'commercial']);
 
+const SECURITY_SYSTEMS = new Set(['icare', 'ecommunity', 'veemios', 'gprop', 'css']);
+
+/** Lowercase known security_system values; unknown non-empty strings pass through for legacy rows. */
+function normalizeSecuritySystemForDb(v) {
+  if (v == null || v === '') return null;
+  const s = String(v).trim().toLowerCase();
+  if (SECURITY_SYSTEMS.has(s)) return s;
+  return s;
+}
+
+/**
+ * Build storable credentials object for `security_system_credentials_json` (single system).
+ * @param {string} systemRaw
+ * @param {object} payload
+ * @returns {object|null}
+ */
+function buildSecurityCredentialsObject(systemRaw, payload) {
+  const system = normalizeSecuritySystemForDb(systemRaw);
+  if (!system || !payload || typeof payload !== 'object') return null;
+  const p = payload;
+  if (system === 'icare') {
+    const phoneNumber = String(p.phoneNumber ?? p.phone ?? '').trim();
+    const dateOfBirth = String(p.dateOfBirth ?? p.dob ?? '').trim();
+    const password = p.password != null ? String(p.password) : '';
+    if (!phoneNumber || !dateOfBirth || !password) return null;
+    return { phoneNumber, dateOfBirth, businessTimeZone: 'Asia/Kuala_Lumpur', password };
+  }
+  if (system === 'ecommunity') {
+    const username = String(p.username ?? p.user ?? '').trim();
+    const password = p.password != null ? String(p.password) : '';
+    if (!username || !password) return null;
+    return { username, password };
+  }
+  if (system === 'veemios' || system === 'gprop') {
+    const userId = String(p.userId ?? p.user_id ?? '').trim();
+    const password = p.password != null ? String(p.password) : '';
+    if (!userId || !password) return null;
+    return { userId, password };
+  }
+  if (system === 'css') {
+    const loginCode = String(p.loginCode ?? p.login_code ?? '').trim();
+    const password = p.password != null ? String(p.password) : '';
+    if (!loginCode || !password) return null;
+    return { loginCode, password };
+  }
+  return null;
+}
+
+async function tryUpdateSecuritySystemCredentialsJson(clientId, propertyId, jsonStr) {
+  try {
+    await pool.query(
+      'UPDATE propertydetail SET security_system_credentials_json = ? WHERE id = ? AND client_id = ?',
+      [jsonStr, propertyId, clientId]
+    );
+  } catch (e) {
+    const unknown =
+      e.code === 'ER_BAD_FIELD_ERROR' ||
+      e.errno === 1054 ||
+      (e.message && String(e.message).includes('Unknown column'));
+    if (!unknown) throw e;
+  }
+}
+
 /** Coliving `premises_type` — must match `cln_property.premises_type` vocabulary. */
 function normalizePremisesType(v) {
   if (v == null || v === '') return null;
@@ -132,6 +195,13 @@ function mapPropertyRow(r) {
     securityUsername: Object.prototype.hasOwnProperty.call(r, 'security_username') && r.security_username != null
       ? String(r.security_username).trim()
       : '',
+    securitySystemCredentials: (() => {
+      if (!Object.prototype.hasOwnProperty.call(r, 'security_system_credentials_json')) return null;
+      const raw = r.security_system_credentials_json;
+      if (raw == null || raw === '') return null;
+      const parsed = parseJson(raw);
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    })(),
     cleanlemonsCleaningTenantPriceMyr:
       Object.prototype.hasOwnProperty.call(r, 'cleanlemons_cleaning_tenant_price_myr') &&
       r.cleanlemons_cleaning_tenant_price_myr != null
@@ -410,7 +480,8 @@ async function updateProperty(clientId, propertyId, data) {
       data.securitySystem !== undefined || data.security_system !== undefined
         ? (() => {
             const s = data.securitySystem ?? data.security_system;
-            return s == null || s === '' ? null : String(s).trim();
+            if (s == null || s === '') return null;
+            return normalizeSecuritySystemForDb(s);
           })()
         : undefined,
     security_username:
@@ -420,6 +491,34 @@ async function updateProperty(clientId, propertyId, data) {
             return s == null || s === '' ? null : String(s).trim();
           })()
         : undefined,
+    security_system_credentials_json: (() => {
+      const hasCred =
+        Object.prototype.hasOwnProperty.call(data, 'securitySystemCredentials') ||
+        Object.prototype.hasOwnProperty.call(data, 'security_system_credentials_json');
+      if (!hasCred) return undefined;
+      const v = Object.prototype.hasOwnProperty.call(data, 'securitySystemCredentials')
+        ? data.securitySystemCredentials
+        : data.security_system_credentials_json;
+      if (v === null) return null;
+      if (v === undefined) return undefined;
+      if (typeof v === 'string') {
+        const t = v.trim();
+        if (t === '') return null;
+        const parsed = parseJson(t);
+        if (!parsed || typeof parsed !== 'object') throw new Error('INVALID_SECURITY_CREDENTIALS');
+        const sys = normalizeSecuritySystemForDb(data.securitySystem ?? data.security_system);
+        if (!sys) throw new Error('INVALID_SECURITY_CREDENTIALS');
+        const built = buildSecurityCredentialsObject(sys, parsed);
+        if (!built) throw new Error('INVALID_SECURITY_CREDENTIALS');
+        return JSON.stringify(built);
+      }
+      if (typeof v !== 'object') return undefined;
+      const sys = normalizeSecuritySystemForDb(data.securitySystem ?? data.security_system);
+      if (!sys) throw new Error('INVALID_SECURITY_CREDENTIALS');
+      const built = buildSecurityCredentialsObject(sys, v);
+      if (!built) throw new Error('INVALID_SECURITY_CREDENTIALS');
+      return JSON.stringify(built);
+    })(),
     cleanlemons_cleaning_tenant_price_myr:
       data.cleanlemonsCleaningTenantPriceMyr !== undefined ||
       data.cleanlemons_cleaning_tenant_price_myr !== undefined
@@ -823,6 +922,16 @@ async function insertProperties(clientId, items) {
           eKey.errno === 1054 ||
           (eKey.message && String(eKey.message).includes('Unknown column'));
         if (!isUnknownKey) throw eKey;
+      }
+    }
+    const credPayload = item.securitySystemCredentials ?? item.security_system_credentials_json;
+    if (credPayload != null && typeof credPayload === 'object') {
+      const sysForCred = normalizeSecuritySystemForDb(
+        securitySystemIns !== undefined ? securitySystemIns : (item.securitySystem ?? item.security_system)
+      );
+      const built = buildSecurityCredentialsObject(sysForCred, credPayload);
+      if (built) {
+        await tryUpdateSecuritySystemCredentialsJson(clientId, id, JSON.stringify(built));
       }
     }
     await maybeSyncPropertydetailToCleanlemonsAfter(clientId, id);

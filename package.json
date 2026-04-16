@@ -32,6 +32,8 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@alicloud/cloudauth-intl20220809": "^3.17.1",
+    "@alicloud/credentials": "^2.4.4",
     "ali-oss": "^6.23.0",
     "aws4": "^1.13.2",
     "axios": "^1.13.5",

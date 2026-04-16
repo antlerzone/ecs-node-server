@@ -85,6 +85,19 @@ function demoMock(pathStr: string, body: unknown): unknown {
   if (pathStr === "companysetting/operator-bank-save") {
     return { ok: true };
   }
+  if (pathStr === "access/aliyun-idv/start") {
+    return {
+      ok: true,
+      transactionId: "demo-aliyun-txn",
+      transactionUrl: "about:blank",
+    };
+  }
+  if (pathStr === "access/aliyun-idv/result") {
+    return { ok: true, passed: false, subCode: "DEMO" };
+  }
+  if (pathStr === "access/gov-id-status") {
+    return { ok: true, singpass: false, mydigital: false, identityLocked: false };
+  }
   return { ok: true, items: [] };
 }
 
@@ -321,7 +334,10 @@ export async function POST(
  * 其它路径用 ECS API token；enquiry 无 JWT 时回退 ECS_TOKEN（如公开 submit）。
  */
 function ecsHeadersForPath(pathStr: string, request: NextRequest): Record<string, string> {
-  const authFromClient = request.headers.get("authorization") || "";
+  const authFromClient =
+    request.headers.get("authorization")?.trim() ||
+    request.headers.get("x-portal-authorization")?.trim() ||
+    "";
   const headers: Record<string, string> = {};
   if (pathStr.startsWith("portal-auth/")) {
     if (authFromClient) headers.Authorization = authFromClient;
@@ -355,7 +371,8 @@ export async function GET(
     return NextResponse.json({ ok: false, reason: "DEMO_GET_NOT_SUPPORTED" }, { status: 404 });
   }
 
-  const url = `${ECS_BASE.replace(/\/$/, "")}/api/${pathStr}`;
+  const search = request.nextUrl.search || "";
+  const url = `${ECS_BASE.replace(/\/$/, "")}/api/${pathStr}${search}`;
   const headers = ecsHeadersForPath(pathStr, request);
   try {
     const res = await fetch(url, { method: "GET", headers });

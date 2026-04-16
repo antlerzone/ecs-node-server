@@ -9,14 +9,22 @@ const router = express.Router();
 const {
   getAccessContextByEmail,
   getAccessContextByEmailAndClient,
-  getMemberRoles
+  getMemberRoles,
+  normalizeEmail
 } = require('./access.service');
+const {
+  isIdVerifyConfigured,
+  initializeEkycPro,
+  checkEkycResult
+} = require('../../services/aliyun-idverify.service');
 const {
   getPortalProfile,
   updatePortalProfile,
-  getPasswordStatusForEmail
+  getPasswordStatusForEmail,
+  applyAliyunEkycToPortalAccount
 } = require('../portal-auth/portal-auth.service');
 const { ensureColivingDetailForPortalEmail } = require('../portal-auth/portal-detail-ensure.service');
+const { getGovIdStatus } = require('../portal-auth/gov-id.service');
 
 /**
  * POST /api/access/context
@@ -135,6 +143,23 @@ router.post('/portal-password-status', async (req, res, next) => {
  * Body: { email, role: 'tenant' | 'owner' }
  * Same as POST /api/portal-auth/coliving-ensure-detail without portal JWT.
  */
+/**
+ * POST /api/access/gov-id-status — body: { email }
+ * Gov ID link flags (Singpass / MyDigital); same trust model as portal-profile (apiAuth, no portal JWT).
+ */
+router.post('/gov-id-status', async (req, res, next) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    if (!email) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    }
+    const result = await getGovIdStatus(email);
+    return res.status(200).json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post('/coliving-ensure-detail', async (req, res, next) => {
   try {
     const role = String(req.body?.role || '').toLowerCase();
@@ -150,6 +175,121 @@ router.post('/coliving-ensure-detail', async (req, res, next) => {
     return res.status(200).json({ ok: true });
   } catch (err) {
     next(err);
+  }
+});
+
+/**
+ * Aliyun eKYC (same trust model as portal-profile): apiAuth + email in body (Next proxy adds ECS token).
+ * POST /api/access/aliyun-idv/start
+ */
+router.post('/aliyun-idv/start', async (req, res) => {
+  if (!isIdVerifyConfigured()) {
+    return res.status(503).json({ ok: false, reason: 'ALIYUN_IDV_NOT_CONFIGURED' });
+  }
+  const email = normalizeEmail(req.body?.email);
+  if (!email) {
+    return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+  }
+  try {
+    const metaInfo = req.body?.metaInfo;
+    const docType = String(req.body?.docType || 'MYS01001').trim();
+    const returnPath = String(req.body?.returnPath || '/demoprofile').trim() || '/demoprofile';
+    const out = await initializeEkycPro(email, { metaInfo, docType, returnPath });
+    return res.status(200).json({
+      ok: true,
+      transactionId: out.transactionId,
+      transactionUrl: out.transactionUrl
+    });
+  } catch (err) {
+    const code = err?.code || 'START_FAILED';
+    console.error('[access] aliyun-idv/start', code, err?.message || err);
+    if (code === 'NOT_CONFIGURED') {
+      return res.status(503).json({ ok: false, reason: 'ALIYUN_IDV_NOT_CONFIGURED' });
+    }
+    if (code === 'MISSING_META_INFO' || code === 'INVALID_DOC_TYPE') {
+      return res.status(400).json({ ok: false, reason: code });
+    }
+    if (code === 'ALIYUN_FORBIDDEN') {
+      const detail = err && err.accessDeniedDetail;
+      if (detail) {
+        console.error('[access] aliyun-idv/start AccessDeniedDetail', JSON.stringify(detail));
+      }
+      return res.status(403).json({
+        ok: false,
+        reason: code,
+        requestId: err && err.requestId,
+        message:
+          'Alibaba Cloud denied: RAM must allow antcloudauth:Initialize. Attach system policy AliyunAntCloudAuthFullAccess (antcloudauth:*) to this RAM user. AliyunYundunCloudAuthFullAccess only grants yundun-cloudauth — it does not include antcloudauth.',
+        accessDeniedDetail: detail || undefined,
+      });
+    }
+    return res.status(502).json({ ok: false, reason: code, message: String(err?.message || '') });
+  }
+});
+
+/**
+ * POST /api/access/aliyun-idv/result — body: { email, transactionId }
+ */
+router.post('/aliyun-idv/result', async (req, res) => {
+  if (!isIdVerifyConfigured()) {
+    return res.status(503).json({ ok: false, reason: 'ALIYUN_IDV_NOT_CONFIGURED' });
+  }
+  const transactionId = String(req.body?.transactionId || '').trim();
+  const email = normalizeEmail(req.body?.email);
+  if (!transactionId) {
+    return res.status(400).json({ ok: false, reason: 'MISSING_TRANSACTION_ID' });
+  }
+  if (!email) {
+    return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+  }
+  try {
+    const out = await checkEkycResult(email, transactionId);
+    let profileApplied = false;
+    let profileReason = null;
+    let profileOcrDebug;
+    if (out.passed) {
+      const ar = await applyAliyunEkycToPortalAccount(
+        email,
+        out.docType || 'MYS01001',
+        out.extIdInfo,
+        out.extBasicInfo,
+        out.ekycResult,
+        out.extInfo
+      );
+      profileApplied = !!ar.ok;
+      profileReason = ar.reason || null;
+      if (ar.ocrDebug) profileOcrDebug = ar.ocrDebug;
+      if (!ar.ok) {
+        console.warn('[access] aliyun-idv profile apply', ar.reason);
+      } else {
+        console.log('[access] aliyun-idv profile apply OK');
+      }
+    }
+    return res.status(200).json({
+      ok: true,
+      ...out,
+      profileApplied,
+      profileReason,
+      ...(profileOcrDebug ? { profileOcrDebug } : {}),
+    });
+  } catch (err) {
+    const code = err?.code || 'CHECK_FAILED';
+    console.error('[access] aliyun-idv/result', code, err?.message || err);
+    if (code === 'SESSION_INVALID') {
+      return res.status(400).json({ ok: false, reason: code });
+    }
+    if (code === 'ALIYUN_FORBIDDEN') {
+      const detail = err && err.accessDeniedDetail;
+      return res.status(403).json({
+        ok: false,
+        reason: code,
+        requestId: err && err.requestId,
+        message:
+          'Alibaba Cloud denied: RAM must allow antcloudauth:* (e.g. AliyunAntCloudAuthFullAccess). Yundun-only policies do not cover antcloudauth.',
+        accessDeniedDetail: detail || undefined,
+      });
+    }
+    return res.status(502).json({ ok: false, reason: code, message: String(err?.message || '') });
   }
 });
 

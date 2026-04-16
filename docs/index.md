@@ -2,6 +2,12 @@
 
 ## 近期更新 Summary（Portal 登入/OAuth / System Integration / CNYIoT 平台主账号 / 门控 / 门禁与 sectiontab）
 
+- **Portal — Alibaba eKYC（护照 / MyKad）、Gov ID 状态与 `portal_account` 迁移（2026-04）：**
+  - **库表：** `0266_portal_account_aliyun_ekyc_locked.sql`（`aliyun_ekyc_locked`）、`0267_portal_account_passport_expiry_date.sql`（`passport_expiry_date`，护照 OCR 到期日）；**建议**已跑 **`0263`**（`phone_verified`）。若库中**尚无 `phone_verified`**，旧逻辑在 `getPortalProfile` 单条 SELECT 失败时会落入极简备用查询，**读不到 `passport_expiry_date`**（界面一直显示「Expiry —」）；**已修复**：`portal-auth.service.js` **`getPortalProfile`** 按序尝试多条 SELECT（例如用 **`0 AS phone_verified`** 代替缺失列），仍返回 **`passport_expiry_date`**、**`aliyun_ekyc_locked`**、Gov 列等。
+  - **后端：** `src/services/aliyun-idverify.service.js` — `POST /api/access/aliyun-idv/start`、`POST /api/access/aliyun-idv/result`；成功回调 **`applyAliyunEkycToPortalAccount`**（`portal-auth.service.js`）写入姓名/证件/护照到期、**`aliyun_ekyc_locked=1`**；护照到期 OCR 支持更多字段名、**`YYYYMMDD`**、树形 JSON **兜底解析**。**`gov-id.service.js`** — `getGovIdStatus` 返回 **`aliyunEkycLocked`**（供前端与 `identityLocked` 一致）。
+  - **前端（Coliving Next）：** `unified-profile-page.tsx`、`unified-profile-portal-api.ts` — Verification Status **绿钮**与 **Singpass/MyDigital/文档 eKYC** 状态对齐；**`fetchGovIdStatus`** 合并 **`aliyunEkycLocked`**；护照到期展示 **`passport_expiry_date`**。
+  - **运维：** `node scripts/reset-portal-account-ekyc.js <portal_account_uuid>` — 清空 Aliyun eKYC 填充与锁定（**不**解除 Singpass/MyDigital）。
+
 - **Coliving Portal — 进入 Tenant / Owner 时 ensure 业务主档（2026-04）：**
   - **问题背景：** 会员资料在 **`portal_account`**（`GET/PUT /api/portal-auth/profile`）可已填齐，但 **`/api/ownerportal/owner`** 只认 **`ownerdetail`** 行；若无行，`OwnerProfileGate` 会把用户留在 `/owner/profile`。登录成功时后端仍会异步 **`ensureColivingTenantdetail` + `ensureColivingOwnerdetail`**（`portal-detail-ensure.service.js`），若登录路径未触发或仅写 portal 表，可能仍缺行。
   - **新增 API：** **`POST /api/portal-auth/coliving-ensure-detail`**（**`Authorization: Bearer <portal JWT>`**），body：`{ "role": "tenant" }` 或 `{ "role": "owner" }`。内部按 `portal_account.id` 调用 **`ensureColivingTenantdetail`** 或 **`ensureColivingOwnerdetail`**（幂等）。实现：`ensureColivingDetailForPortalEmail`（`src/modules/portal-auth/portal-detail-ensure.service.js`），路由：`src/modules/portal-auth/portal-auth.routes.js`。

@@ -72,9 +72,56 @@ type PropertyItem = {
   premisesType?: string
   securitySystem?: string
   securityUsername?: string
+  securitySystemCredentials?: Record<string, unknown> | null
   mailboxPassword?: string
   smartdoorPassword?: string
   smartdoorTokenEnabled?: boolean
+}
+
+const SECURITY_SYSTEM_IDS = ["icare", "ecommunity", "veemios", "gprop", "css"] as const
+type SecuritySystemIdOption = (typeof SECURITY_SYSTEM_IDS)[number]
+
+function parseSecuritySystemFromDb(raw: string | undefined | null): SecuritySystemIdOption {
+  const s = String(raw || "").trim().toLowerCase()
+  return (SECURITY_SYSTEM_IDS as readonly string[]).includes(s) ? (s as SecuritySystemIdOption) : "icare"
+}
+
+function isCompleteSecurityCredentials(
+  system: SecuritySystemIdOption,
+  cred: Record<string, unknown> | null | undefined
+): boolean {
+  if (!cred || typeof cred !== "object") return false
+  switch (system) {
+    case "icare":
+      return !!(String(cred.phoneNumber || "").trim() && String(cred.dateOfBirth || "").trim() && String(cred.password || ""))
+    case "ecommunity":
+      return !!(String(cred.username || (cred as { user?: string }).user || "").trim() && String(cred.password || ""))
+    case "veemios":
+    case "gprop":
+      return !!(String(cred.userId || (cred as { user_id?: string }).user_id || "").trim() && String(cred.password || ""))
+    case "css":
+      return !!(String(cred.loginCode || (cred as { login_code?: string }).login_code || "").trim() && String(cred.password || ""))
+    default:
+      return false
+  }
+}
+
+function formatSecuritySystemSummary(system: SecuritySystemIdOption, cred: Record<string, unknown> | null): string | null {
+  if (!cred || !isCompleteSecurityCredentials(system, cred)) return null
+  const pwPlain = String(cred.password || "").trim()
+  switch (system) {
+    case "icare":
+      return `Phone: ${String(cred.phoneNumber)} · DOB: ${String(cred.dateOfBirth)} · Password: ${pwPlain}`
+    case "ecommunity":
+      return `User: ${String(cred.username || (cred as { user?: string }).user || "")} · Password: ${pwPlain}`
+    case "veemios":
+    case "gprop":
+      return `User ID: ${String(cred.userId || (cred as { user_id?: string }).user_id || "")} · Password: ${pwPlain}`
+    case "css":
+      return `Login code: ${String(cred.loginCode || (cred as { login_code?: string }).login_code || "")} · Password: ${pwPlain}`
+    default:
+      return null
+  }
 }
 type BuildingOption = { apartmentName: string; country: string }
 type BedType = "single" | "supersingle" | "queen" | "king" | "superking"
@@ -593,7 +640,7 @@ export default function PropertySettingsPage() {
     mailboxPassword: "",
     smartdoorPassword: "",
     securityUsername: "",
-    securitySystem: "icare" as "icare" | "ecommunity",
+    securitySystem: "icare" as SecuritySystemIdOption,
     bedSection: {
       single: 0,
       supersingle: 0,
@@ -606,7 +653,21 @@ export default function PropertySettingsPage() {
     numberOfBathroom: "",
   })
 
+  const [persistedSecurityCredentials, setPersistedSecurityCredentials] = useState<Record<string, unknown> | null>(null)
+  const [insertSecurityCredentials, setInsertSecurityCredentials] = useState<Record<string, unknown> | null>(null)
+  const [secCredModalOpen, setSecCredModalOpen] = useState(false)
+  const [secCredModalFromAdd, setSecCredModalFromAdd] = useState(false)
+  const [secCredModalSaving, setSecCredModalSaving] = useState(false)
+  const [secCredModalSystem, setSecCredModalSystem] = useState<SecuritySystemIdOption>("icare")
+  const [secCredPhone, setSecCredPhone] = useState("")
+  const [secCredDob, setSecCredDob] = useState("")
+  const [secCredUser, setSecCredUser] = useState("")
+  const [secCredUserId, setSecCredUserId] = useState("")
+  const [secCredLoginCode, setSecCredLoginCode] = useState("")
+  const [secCredPassword, setSecCredPassword] = useState("")
+
   const resetOpsForm = () => {
+    setInsertSecurityCredentials(null)
     setOpsForm({
       propertyType: "apartment",
       keyCollection: {
@@ -617,7 +678,7 @@ export default function PropertySettingsPage() {
       mailboxPassword: "",
       smartdoorPassword: "",
       securityUsername: "",
-      securitySystem: "icare",
+      securitySystem: "icare" as SecuritySystemIdOption,
       bedSection: {
         single: 0,
         supersingle: 0,
@@ -637,6 +698,101 @@ export default function PropertySettingsPage() {
       const totalBed = Object.values(nextBed).reduce((sum, value) => sum + Number(value || 0), 0)
       return { ...prev, bedSection: nextBed, totalBed }
     })
+  }
+
+  const securitySystemSummaryText =
+    showAddDialog && insertSecurityCredentials
+      ? formatSecuritySystemSummary(parseSecuritySystemFromDb(opsForm.securitySystem), insertSecurityCredentials)
+      : !showAddDialog && persistedSecurityCredentials
+        ? formatSecuritySystemSummary(parseSecuritySystemFromDb(opsForm.securitySystem), persistedSecurityCredentials)
+        : null
+
+  const openSecurityCredentialsModal = (fromAdd: boolean) => {
+    setSecCredModalFromAdd(fromAdd)
+    const sys = parseSecuritySystemFromDb(opsForm.securitySystem)
+    setSecCredModalSystem(sys)
+    const src = fromAdd ? insertSecurityCredentials : persistedSecurityCredentials
+    setSecCredPhone(src && typeof src === "object" ? String((src as { phoneNumber?: string }).phoneNumber || "") : "")
+    setSecCredDob(src && typeof src === "object" ? String((src as { dateOfBirth?: string }).dateOfBirth || "") : "")
+    setSecCredUser(
+      src && typeof src === "object"
+        ? String((src as { username?: string }).username || (src as { user?: string }).user || "")
+        : ""
+    )
+    setSecCredUserId(
+      src && typeof src === "object"
+        ? String((src as { userId?: string }).userId || (src as { user_id?: string }).user_id || "")
+        : ""
+    )
+    setSecCredLoginCode(
+      src && typeof src === "object"
+        ? String((src as { loginCode?: string }).loginCode || (src as { login_code?: string }).login_code || "")
+        : ""
+    )
+    setSecCredPassword(
+      src && typeof src === "object" && String((src as { password?: string }).password || "").trim()
+        ? String((src as { password?: string }).password)
+        : ""
+    )
+    setSecCredModalOpen(true)
+  }
+
+  const handleSecurityCredentialsModalSave = async () => {
+    const sys = secCredModalSystem
+    const prevObj = secCredModalFromAdd ? insertSecurityCredentials : persistedSecurityCredentials
+    const prevPw =
+      prevObj && typeof prevObj === "object" && String((prevObj as { password?: string }).password || "").trim()
+        ? String((prevObj as { password?: string }).password)
+        : ""
+    const pw = secCredPassword.trim() !== "" ? secCredPassword.trim() : prevPw
+    let body: Record<string, unknown> = {}
+    if (sys === "icare") {
+      body = { phoneNumber: secCredPhone.trim(), dateOfBirth: secCredDob.trim(), password: pw }
+    } else if (sys === "ecommunity") {
+      body = { username: secCredUser.trim(), password: pw }
+    } else if (sys === "veemios" || sys === "gprop") {
+      body = { userId: secCredUserId.trim(), password: pw }
+    } else {
+      body = { loginCode: secCredLoginCode.trim(), password: pw }
+    }
+    if (!isCompleteSecurityCredentials(sys, body)) {
+      toast({
+        title: "Missing fields",
+        description: "Fill every field for this security system. Leave password empty only when keeping the existing password.",
+        variant: "destructive",
+      })
+      return
+    }
+    if (secCredModalFromAdd) {
+      setOpsForm((prev) => ({ ...prev, securitySystem: sys }))
+      setInsertSecurityCredentials(body)
+      setSecCredModalOpen(false)
+      toast({ title: "Security credentials saved", description: "They will be stored when you create the property." })
+      return
+    }
+    const pid = editingProp?.id
+    if (!pid) {
+      toast({ title: "No property", description: "Open a property first.", variant: "destructive" })
+      return
+    }
+    setSecCredModalSaving(true)
+    try {
+      await updateProperty(pid, { securitySystem: sys, securitySystemCredentials: body })
+      setPersistedSecurityCredentials(body)
+      setOpsForm((prev) => ({ ...prev, securitySystem: sys }))
+      setSecCredModalOpen(false)
+      toast({ title: "Saved", description: "Security system login details were saved." })
+    } catch (e) {
+      console.error(e)
+      const reason = e instanceof Error ? e.message : String(e)
+      toast({
+        title: "Save failed",
+        description: reason.includes("INVALID_SECURITY") ? "Check all required fields." : reason || "Could not save.",
+        variant: "destructive",
+      })
+    } finally {
+      setSecCredModalSaving(false)
+    }
   }
 
   const openOrDownloadAgreementUrl = (url: string, filename: string) => {
@@ -756,6 +912,7 @@ export default function PropertySettingsPage() {
 
   const openDetail = async (prop: PropertyItem) => {
     setEditingProp(prop)
+    setInsertSecurityCredentials(null)
     try {
       const r = await getProperty(prop.id)
       const p = (r && typeof r === "object" && "property" in r) ? (r as { property: PropertyItem }).property : (r as PropertyItem & { owner_id?: string; signagreement?: string })
@@ -817,13 +974,17 @@ export default function PropertySettingsPage() {
       )
       const secRaw = String((p as PropertyItem).securitySystem || "").trim().toLowerCase()
       const secUser = String((p as { securityUsername?: string }).securityUsername || "").trim()
+      const credRaw = (p as PropertyItem).securitySystemCredentials
+      setPersistedSecurityCredentials(
+        credRaw != null && typeof credRaw === "object" ? (credRaw as Record<string, unknown>) : null
+      )
       const mb = String((p as { mailboxPassword?: string }).mailboxPassword || "").trim()
       const sdp = String((p as { smartdoorPassword?: string }).smartdoorPassword || "").trim()
       const tok = !!(p as { smartdoorTokenEnabled?: boolean }).smartdoorTokenEnabled
       setOpsForm((prev) => ({
         ...prev,
         propertyType: premisesTypeLoaded,
-        securitySystem: secRaw === "ecommunity" ? "ecommunity" : "icare",
+        securitySystem: parseSecuritySystemFromDb(secRaw),
         securityUsername: secUser,
         keyCollection: {
           mailboxPassword: !!mb,
@@ -1365,14 +1526,20 @@ export default function PropertySettingsPage() {
           : (addSettlementModel === "management_fees_fixed" || addSettlementModel === "rental_unit")
             ? { fixedRentToOwner: Number(addFixedManagementFee) }
             : { percentage: Number(addManagementPercent) }),
+        ...(insertSecurityCredentials &&
+        isCompleteSecurityCredentials(parseSecuritySystemFromDb(opsForm.securitySystem), insertSecurityCredentials)
+          ? { securitySystemCredentials: insertSecurityCredentials }
+          : {}),
       }
       const r = await insertProperty([base])
       if (r?.ok !== false) {
         setShowAddDialog(false)
+        setInsertSecurityCredentials(null)
         setEditForm({ shortname: "", apartmentName: "", address: "", unitNumber: "", country: "MY", owner_id: "", folder: "", latitude: "", longitude: "", ownerSettlementModel: "management_percent_gross", managementFeesValue: "", managementFeesFixedValue: "" })
         setAddSettlementModel("management_percent_gross")
         setAddManagementPercent("")
         setAddFixedManagementFee("")
+        resetOpsForm()
         await loadData()
       }
     } catch (e) {
@@ -2053,13 +2220,25 @@ export default function PropertySettingsPage() {
               </div>
               <div>
                 <Label className="text-xs">Security system</Label>
-                <Select value={opsForm.securitySystem} onValueChange={(v) => setOpsForm((prev) => ({ ...prev, securitySystem: v as "icare" | "ecommunity" }))}>
-                  <SelectTrigger className="mt-1"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="icare">icare</SelectItem>
-                    <SelectItem value="ecommunity">ecommunity</SelectItem>
-                  </SelectContent>
-                </Select>
+                <div className="flex flex-col sm:flex-row gap-2 mt-1 sm:items-start sm:justify-between">
+                  <div className="flex-1 min-w-0 space-y-1">
+                    <p className="text-sm font-medium text-foreground capitalize">{parseSecuritySystemFromDb(opsForm.securitySystem)}</p>
+                    {securitySystemSummaryText ? (
+                      <p className="text-xs text-muted-foreground break-words">{securitySystemSummaryText}</p>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">Not configured. Use Edit to choose the system and enter login details (saved in MySQL).</p>
+                    )}
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="shrink-0 w-full sm:w-auto"
+                    disabled={viewMode === "view"}
+                    onClick={() => openSecurityCredentialsModal(false)}
+                  >
+                    Edit
+                  </Button>
+                </div>
               </div>
               {opsForm.propertyType === "other" && (
                 <div className="border rounded-md border-border bg-background p-3 space-y-3">
@@ -2276,11 +2455,78 @@ export default function PropertySettingsPage() {
         </DialogContent>
       </Dialog>
 
+      <Dialog open={secCredModalOpen} onOpenChange={setSecCredModalOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Security system login</DialogTitle>
+            <DialogDescription>
+              Choose the system here and enter login details. Data is saved to MySQL and shown in plain text on this screen when you reopen the property. Leave password empty only when saving without changing an existing password.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 py-2">
+            <div>
+              <Label className="text-xs">Security system</Label>
+              <Select value={secCredModalSystem} onValueChange={(v) => setSecCredModalSystem(v as SecuritySystemIdOption)}>
+                <SelectTrigger className="mt-1"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="icare">icare</SelectItem>
+                  <SelectItem value="ecommunity">ecommunity</SelectItem>
+                  <SelectItem value="veemios">veemios</SelectItem>
+                  <SelectItem value="gprop">gprop</SelectItem>
+                  <SelectItem value="css">css</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            {secCredModalSystem === "icare" ? (
+              <>
+                <div>
+                  <Label className="text-xs">Phone number</Label>
+                  <Input value={secCredPhone} onChange={(e) => setSecCredPhone(e.target.value)} className="mt-1" autoComplete="off" />
+                </div>
+                <div>
+                  <Label className="text-xs">Date of birth</Label>
+                  <Input type="date" value={secCredDob} onChange={(e) => setSecCredDob(e.target.value)} className="mt-1" />
+                </div>
+              </>
+            ) : null}
+            {secCredModalSystem === "ecommunity" ? (
+              <div>
+                <Label className="text-xs">User</Label>
+                <Input value={secCredUser} onChange={(e) => setSecCredUser(e.target.value)} className="mt-1" autoComplete="off" />
+              </div>
+            ) : null}
+            {(secCredModalSystem === "veemios" || secCredModalSystem === "gprop") ? (
+              <div>
+                <Label className="text-xs">User ID</Label>
+                <Input value={secCredUserId} onChange={(e) => setSecCredUserId(e.target.value)} className="mt-1" autoComplete="off" />
+              </div>
+            ) : null}
+            {secCredModalSystem === "css" ? (
+              <div>
+                <Label className="text-xs">Login code</Label>
+                <Input value={secCredLoginCode} onChange={(e) => setSecCredLoginCode(e.target.value)} className="mt-1" autoComplete="off" />
+              </div>
+            ) : null}
+            <div>
+              <Label className="text-xs">Password</Label>
+              <Input type="text" value={secCredPassword} onChange={(e) => setSecCredPassword(e.target.value)} className="mt-1 font-mono text-sm" autoComplete="off" spellCheck={false} placeholder="Required (leave blank to keep existing when editing)" />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setSecCredModalOpen(false)}>Cancel</Button>
+            <Button type="button" style={{ background: "var(--brand)" }} disabled={secCredModalSaving} onClick={() => void handleSecurityCredentialsModalSave()}>
+              {secCredModalSaving ? "Saving…" : "Save"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Dialog
         open={showAddDialog}
         onOpenChange={(o) => {
           if (!o && mapConfirmOpenRef.current) return
           setShowAddDialog(o)
+          if (!o) setInsertSecurityCredentials(null)
         }}
       >
         <DialogContent className="max-w-[95vw] sm:max-w-[90vw] md:max-w-[85vw] max-h-[90vh] overflow-y-auto">
@@ -2377,13 +2623,24 @@ export default function PropertySettingsPage() {
               </div>
               <div>
                 <Label className="text-xs">Security system</Label>
-                <Select value={opsForm.securitySystem} onValueChange={(v) => setOpsForm((prev) => ({ ...prev, securitySystem: v as "icare" | "ecommunity" }))}>
-                  <SelectTrigger className="mt-1"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="icare">icare</SelectItem>
-                    <SelectItem value="ecommunity">ecommunity</SelectItem>
-                  </SelectContent>
-                </Select>
+                <div className="flex flex-col sm:flex-row gap-2 mt-1 sm:items-start sm:justify-between">
+                  <div className="flex-1 min-w-0 space-y-1">
+                    <p className="text-sm font-medium text-foreground capitalize">{parseSecuritySystemFromDb(opsForm.securitySystem)}</p>
+                    {securitySystemSummaryText ? (
+                      <p className="text-xs text-muted-foreground break-words">{securitySystemSummaryText}</p>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">Not configured. Use Edit to choose the system and enter login details (saved in MySQL when you create the property).</p>
+                    )}
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="shrink-0 w-full sm:w-auto"
+                    onClick={() => openSecurityCredentialsModal(true)}
+                  >
+                    Edit
+                  </Button>
+                </div>
               </div>
               {opsForm.propertyType === "other" && (
                 <div className="border rounded-md border-border bg-background p-3 space-y-3">

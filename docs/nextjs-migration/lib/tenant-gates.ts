@@ -32,6 +32,11 @@ export function normalizeTenantPathname(pathname: string): string {
   return (pathname || "").replace(/\/+$/, "") || "/"
 }
 
+/** `/demoprofile` — demo Gov/eKYC UI; no tenant gate redirects or mandatory-field UX. */
+export function isDemoprofilePath(pathname: string): boolean {
+  return normalizeTenantPathname(pathname) === "/demoprofile"
+}
+
 export interface TenantAgreementLite {
   tenantsign?: string
   status?: string

@@ -199,7 +199,8 @@ router.post('/update', requireClient, async (req, res, next) => {
       err.message === 'INVALID_OR_INACTIVE_SMART_DOOR' ||
       err.message === 'SMART_DOOR_ALREADY_USED_BY_PROPERTY' ||
       err.message === 'SMART_DOOR_ALREADY_USED_BY_ROOM' ||
-      err.message === 'INVALID_LAT_LNG'
+      err.message === 'INVALID_LAT_LNG' ||
+      err.message === 'INVALID_SECURITY_CREDENTIALS'
     ) {
       return res.status(400).json({ ok: false, reason: err.message });
     }
