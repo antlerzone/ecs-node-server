@@ -1099,6 +1099,24 @@ async function applyAliyunEkycToPortalAccount(email, docType, extIdInfo, extBasi
     if (deepOnly) passportExpiryDate = normalizePassportExpiryToIsoDate(deepOnly);
   }
 
+  const extObj = unwrapAliyunBlob(parseJsonLenient(extIdInfo) || {});
+  const basicObj = unwrapAliyunBlob(parseJsonLenient(extBasicInfo) || {});
+  const ekycObj = unwrapAliyunBlob(parseJsonLenient(ekycResult) || {});
+  const extInfoObj = unwrapAliyunBlob(parseJsonLenient(extInfo) || {});
+
+  let nationalIdRawForKey = '';
+  if (dt === 'MYS01001') {
+    nationalIdRawForKey = idNumber || '';
+  } else {
+    nationalIdRawForKey =
+      extractPassportNationalIdFromAliyunRoots(extObj, basicObj, ekycObj, extInfoObj) || '';
+    if (!nationalIdRawForKey) nationalIdRawForKey = idNumber || '';
+  }
+  const nkAssert = await assertNationalIdKeyForPortalAccount(portalAccountId, nationalIdRawForKey);
+  if (!nkAssert.ok) {
+    return nkAssert;
+  }
+
   const inner = {
     fullname: legalName,
     nric: idNumber,
@@ -1108,6 +1126,8 @@ async function applyAliyunEkycToPortalAccount(email, docType, extIdInfo, extBasi
     _bypassIdentityLock: true,
     _setAliyunEkycLocked: true,
   };
+  const nkFinal = normalizeNricForMatch(nationalIdRawForKey);
+  if (nkFinal) inner.national_id_key = nkFinal;
   if (addressLine) inner.address = addressLine;
   if (passportExpiryDate) inner.passport_expiry_date = passportExpiryDate;
   if (nricImg.nricfront) inner.nricfront = nricImg.nricfront;
@@ -1137,6 +1157,102 @@ function normalizeNricForMatch(raw) {
     .trim()
     .replace(/[\s\-_/]/g, '')
     .toLowerCase();
+}
+
+/**
+ * Passport OCR (GLB03002) may include national IC/NRIC separately from the passport number.
+ */
+function extractPassportNationalIdFromAliyunRoots(...roots) {
+  const preferKeys = [
+    'nationalId',
+    'nationalID',
+    'NationalId',
+    'NationalID',
+    'national_id',
+    'nric',
+    'NRIC',
+    'icNumber',
+    'ICNumber',
+    'ic_no',
+    'IC_NO',
+    'identityCardNumber',
+    'IdentityCardNumber',
+    'personalIdNumber',
+    'singaporeId',
+    'malaysiaNric',
+    'mykadNumber',
+  ];
+  for (const root of roots) {
+    if (!root || typeof root !== 'object' || Array.isArray(root)) continue;
+    for (const k of preferKeys) {
+      if (!Object.prototype.hasOwnProperty.call(root, k)) continue;
+      const v = root[k];
+      const s =
+        typeof v === 'string'
+          ? v.trim()
+          : v && typeof v === 'object' && typeof v.value === 'string'
+            ? v.value.trim()
+            : '';
+      if (s && s.length >= 6) return s;
+    }
+  }
+  function walk(o, depth) {
+    if (depth > 14 || !o || typeof o !== 'object') return '';
+    if (Array.isArray(o)) {
+      for (const x of o) {
+        const s = walk(x, depth + 1);
+        if (s) return s;
+      }
+      return '';
+    }
+    for (const [k, v] of Object.entries(o)) {
+      if (/faceImg|portrait|image|photo|Picture|extFaceInfo/i.test(k)) continue;
+      if (
+        /national|nric|\bic\b|identitycard|icnumber|singaporeid|mykad/i.test(k) &&
+        typeof v === 'string'
+      ) {
+        const s = v.trim();
+        if (s.length >= 6 && s.length <= 32) return s;
+      }
+      if (v && typeof v === 'object') {
+        const s = walk(v, depth + 1);
+        if (s) return s;
+      }
+    }
+    return '';
+  }
+  for (const root of roots) {
+    const s = walk(root, 0);
+    if (s) return s;
+  }
+  return '';
+}
+
+/**
+ * One national id (normalized) per portal_account UUID — blocks cross-account reuse (passport IC vs Singpass uinfin, etc.).
+ * @returns {{ ok: true } | { ok: false, reason: 'NATIONAL_ID_ALREADY_BOUND', boundEmail?: string }}
+ */
+async function assertNationalIdKeyForPortalAccount(portalAccountId, candidateRaw) {
+  const key = normalizeNricForMatch(candidateRaw);
+  if (!key) return { ok: true };
+  const pid = String(portalAccountId || '').trim();
+  if (!pid) return { ok: true };
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, email FROM portal_account WHERE national_id_key = ? AND id <> ? LIMIT 1`,
+      [key, pid]
+    );
+    if (rows.length) {
+      const em = rows[0].email != null ? String(rows[0].email).trim() : '';
+      return { ok: false, reason: 'NATIONAL_ID_ALREADY_BOUND', boundEmail: em };
+    }
+  } catch (e) {
+    if (e && e.code === 'ER_BAD_FIELD_ERROR') {
+      return { ok: true };
+    }
+    throw e;
+  }
+  return { ok: true };
 }
 
 /** OAuth / legacy rows may have NULL, '', or non-bcrypt junk; only bcrypt-shaped values count as an existing login password. */
@@ -1706,6 +1822,16 @@ async function updatePortalProfile(email, payload) {
       : normalizePassportExpiryToIsoDate(payload.passport_expiry_date)
     : null;
 
+  const national_id_key_provided = hasKey('national_id_key') && payload.national_id_key !== undefined;
+  const national_id_key_val = national_id_key_provided
+    ? payload.national_id_key == null
+      ? null
+      : String(payload.national_id_key).trim() || null
+    : null;
+  if (national_id_key_provided) {
+    delete payload.national_id_key;
+  }
+
   try {
     const [existing] = await pool.query(
       'SELECT id FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
@@ -1715,6 +1841,11 @@ async function updatePortalProfile(email, payload) {
       return { ok: false, reason: 'NO_ACCOUNT' };
     }
     const portalAccountPk = String(existing[0].id);
+
+    if (national_id_key_provided && national_id_key_val) {
+      const nkChk = await assertNationalIdKeyForPortalAccount(portalAccountPk, national_id_key_val);
+      if (!nkChk.ok) return nkChk;
+    }
 
     const lockFrag = setAliyunEkycLockedInThisUpdate ? 'aliyun_ekyc_locked = 1,' : '';
     try {
@@ -1834,6 +1965,21 @@ async function updatePortalProfile(email, payload) {
         console.warn(
           '[portal-auth] passport_expiry_date and/or aliyun_ekyc_locked missing — run migrations 0266/0267 (OCR fields ok, lock/date skipped)'
         );
+      }
+    }
+
+    if (national_id_key_provided && national_id_key_val) {
+      try {
+        await pool.query(
+          'UPDATE portal_account SET national_id_key = ? WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+          [national_id_key_val, normalized]
+        );
+      } catch (nkErr) {
+        if (nkErr && nkErr.code === 'ER_BAD_FIELD_ERROR') {
+          console.warn('[portal-auth] national_id_key column missing — run migration 0268');
+        } else {
+          throw nkErr;
+        }
       }
     }
 
@@ -2311,6 +2457,8 @@ async function getPasswordStatusForEmail(email) {
 module.exports = {
   hashPassword,
   verifyPassword,
+  normalizeNricForMatch,
+  assertNationalIdKeyForPortalAccount,
   register,
   login,
   findOrCreateByGoogle,

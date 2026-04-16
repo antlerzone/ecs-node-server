@@ -82,8 +82,6 @@ type Props = {
   publicProfileTenantId?: string | null
   /** Singpass / MyDigital verification row + avatar badge — only `/demoprofile` (not tenant/owner/operator profile). */
   showGovVerification?: boolean
-  /** `/demoprofile` only: no mandatory-field red outlines or gate hint text */
-  disableProfileGateUi?: boolean
 }
 
 type PhoneCountryOption = {
@@ -243,7 +241,6 @@ export default function UnifiedProfilePage({
   showViewMyProfileButton = false,
   publicProfileTenantId = null,
   showGovVerification = false,
-  disableProfileGateUi = false,
 }: Props) {
   const router = useRouter()
   const member = getMember()
@@ -317,7 +314,17 @@ export default function UnifiedProfilePage({
     const ekyc = sp.get('ekyc')
     const cleanPath = window.location.pathname
     if (gov === 'error' && reason) {
-      toast.error(formatGovIdErrorReason(reason))
+      const boundEmail = sp.get('boundEmail')
+      if (
+        (reason === 'SUB_ALREADY_LINKED' || reason === 'NATIONAL_ID_ALREADY_BOUND') &&
+        boundEmail
+      ) {
+        toast.error(
+          `This identity is already linked to ${decodeURIComponent(boundEmail)}. Please sign in with that email or contact support.`,
+        )
+      } else {
+        toast.error(formatGovIdErrorReason(reason))
+      }
       router.replace(cleanPath, { scroll: false })
     } else if (gov === 'success') {
       toast.success(`Connected${provider ? ` (${provider})` : ''}`)
@@ -389,6 +396,14 @@ export default function UnifiedProfilePage({
             }
             if (r.profileApplied === false && r.profileReason === 'GOV_ID_ALREADY_LINKED') {
               toast.warning('Verified, but name and ID were not saved — a government login is already linked.')
+            } else if (
+              r.profileApplied === false &&
+              r.profileReason === 'NATIONAL_ID_ALREADY_BOUND' &&
+              r.profileBoundEmail
+            ) {
+              toast.error(
+                `National ID already verified on ${r.profileBoundEmail}. Sign in with that email or contact support.`,
+              )
             } else if (r.profileApplied === false && r.profileReason === 'EKYC_OCR_INCOMPLETE') {
               toast.warning('Verified, but name/ID could not be saved automatically. Contact support if needed.')
             }
@@ -475,6 +490,8 @@ export default function UnifiedProfilePage({
   const didInitSnapshotRef = useRef(false)
   /** After Aliyun eKYC, align auto-save baseline once so a pending timer does not POST stale identity fields. */
   const prevAliyunVerifiedForSnapshotRef = useRef(false)
+  /** Close gov verification dialog only when transitioning from unverified → verified (not on every open while already verified). */
+  const prevGovIdVerifiedForUiRef = useRef<boolean | null>(null)
 
   const displayNameForCard = useMemo(
     () => String(nickname || legalName || fullName || 'User').trim() || 'User',
@@ -559,23 +576,6 @@ export default function UnifiedProfilePage({
     entityType,
     idType,
   ])
-
-  const profileGateIncomplete = useMemo(() => {
-    if (disableProfileGateUi) return new Set<TenantGateIncompleteField>()
-    if (!colivingProfileGateModel) return new Set<TenantGateIncompleteField>()
-    return new Set(getTenantProfileIncompleteFields(colivingProfileGateModel))
-  }, [colivingProfileGateModel, disableProfileGateUi])
-
-  const gateErr = (k: TenantGateIncompleteField) => profileGateIncomplete.has(k)
-
-  const profileGateHint =
-    uploadRole === 'tenant'
-      ? 'Red outline: required fields still missing — complete them to use other tenant pages.'
-      : uploadRole === 'owner'
-        ? 'Red outline: required fields still missing — complete them to use other owner pages.'
-        : uploadRole === 'operator'
-          ? 'Red outline: required fields still missing — complete them to use other operator pages.'
-          : ''
 
   useEffect(() => {
     let cancelled = false
@@ -928,17 +928,91 @@ export default function UnifiedProfilePage({
     aliyunEkycVerified &&
     idTypeU === 'PASSPORT' &&
     isPassportRenewalWindow(passportExpiryDate)
-  const idFrontUploadLocked = aliyunMykadEkycLocked || aliyunPassportEkycLocked
-  const idBackUploadLocked = aliyunMykadEkycLocked
 
-  /** Verification Status dialog: disable only the method currently in use; Gov ID row uses linked flags on each button. */
+  /** Verification Status dialog: green Verified → disable Aliyun buttons; passport may Renew when near expiry only. */
   const govIdProviderLinked = govSingpass || govMydigital
-  const verifiedByAliyunMyKadOnly = aliyunEkycVerified && idTypeU === 'NRIC'
-  const verifiedByAliyunPassport = aliyunEkycVerified && idTypeU === 'PASSPORT'
-  const disableVerificationDialogMyKad =
-    shouldUseDemoMock() || (verifiedByAliyunMyKadOnly && !govIdProviderLinked)
+  const govIdVerifiedForUi =
+    showGovVerification &&
+    backendProfile &&
+    !shouldUseDemoMock() &&
+    (govIdProviderLinked || govIdentityLocked || aliyunEkycVerified)
+
+  const identityLockedUntilVerified =
+    showGovVerification && backendProfile && !shouldUseDemoMock() && !govIdVerifiedForUi
+
+  const idFrontUploadLocked =
+    aliyunMykadEkycLocked || aliyunPassportEkycLocked || identityLockedUntilVerified
+  const idBackUploadLocked = aliyunMykadEkycLocked || (requiresBackImage && identityLockedUntilVerified)
+
+  const disableVerificationDialogMyKad = shouldUseDemoMock() || govIdVerifiedForUi
   const disableVerificationDialogPassport =
-    shouldUseDemoMock() || (verifiedByAliyunPassport && !passportRenewalEligible)
+    shouldUseDemoMock() || (govIdVerifiedForUi && !passportRenewalEligible)
+
+  /** `/demoprofile`: open verification dialog until identity is verified. */
+  useEffect(() => {
+    if (isInitializing) return
+    if (!showGovVerification || shouldUseDemoMock() || !backendProfile) return
+    if (!govIdVerifiedForUi) setGovDialogOpen(true)
+  }, [isInitializing, showGovVerification, backendProfile, govIdVerifiedForUi])
+
+  useEffect(() => {
+    const wasUnverified = prevGovIdVerifiedForUiRef.current === false
+    if (govIdVerifiedForUi && wasUnverified) {
+      setGovDialogOpen(false)
+    }
+    prevGovIdVerifiedForUiRef.current = govIdVerifiedForUi
+  }, [govIdVerifiedForUi])
+
+  const profileGateIncomplete = useMemo(() => {
+    if (!colivingProfileGateModel) return new Set<TenantGateIncompleteField>()
+    const raw = getTenantProfileIncompleteFields(colivingProfileGateModel)
+    const out = new Set<TenantGateIncompleteField>()
+    const omitWhenUnverified: TenantGateIncompleteField[] = [
+      'entityType',
+      'legalName',
+      'idType',
+      'idNumber',
+      'nricFront',
+      'nricBack',
+    ]
+    const omitIdScansAfterVerify =
+      showGovVerification &&
+      backendProfile &&
+      !shouldUseDemoMock() &&
+      govIdVerifiedForUi &&
+      (govSingpass || govMydigital || aliyunEkycVerified)
+    for (const k of raw) {
+      if (identityLockedUntilVerified && omitWhenUnverified.includes(k)) continue
+      if (omitIdScansAfterVerify && (k === 'nricFront' || k === 'nricBack')) continue
+      out.add(k)
+    }
+    return out
+  }, [
+    colivingProfileGateModel,
+    identityLockedUntilVerified,
+    showGovVerification,
+    backendProfile,
+    govIdVerifiedForUi,
+    govSingpass,
+    govMydigital,
+    aliyunEkycVerified,
+  ])
+
+  const gateErr = (k: TenantGateIncompleteField) => profileGateIncomplete.has(k)
+
+  const profileGateHint =
+    uploadRole === 'tenant'
+      ? 'Red outline: required fields still missing — complete them to use other tenant pages.'
+      : uploadRole === 'owner'
+        ? 'Red outline: required fields still missing — complete them to use other owner pages.'
+        : uploadRole === 'operator'
+          ? 'Red outline: required fields still missing — complete them to use other operator pages.'
+          : ''
+
+  const coreIdentityFieldDisabled = aliyunCoreIdentityLocked || identityLockedUntilVerified
+
+  /** While unverified on demoprofile: block dismissing the gov verification dialog (X, overlay, Esc, Close). */
+  const govVerificationDialogMandatory = identityLockedUntilVerified
 
   const handleSave = async () => {
     const payload = buildProfilePayload()
@@ -1132,6 +1206,9 @@ export default function UnifiedProfilePage({
       toast.error('Use the live portal with a signed-in account (demo is mock-only).')
       return
     }
+    /** Already completed Aliyun eKYC for this document type — avoid duplicate starts (UI also disables buttons when verified). */
+    const verifiedByAliyunMyKadOnly = aliyunEkycVerified && idTypeU === 'NRIC'
+    const verifiedByAliyunPassport = aliyunEkycVerified && idTypeU === 'PASSPORT'
     if (docType === 'MYS01001') {
       const block =
         verifiedByAliyunMyKadOnly && !govIdProviderLinked
@@ -1361,12 +1438,6 @@ export default function UnifiedProfilePage({
     }
   }
 
-  /** Gov-verified: badge + read-only entity/ID fields (API flags or DB lock, avoids flicker before gov status loads). */
-  const govIdVerified =
-    showGovVerification &&
-    backendProfile &&
-    !shouldUseDemoMock() &&
-    ((govSingpass || govMydigital) || govIdentityLocked || aliyunEkycVerified)
   return (
     <div className="p-4 sm:p-8 max-w-4xl mx-auto">
       <div className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
@@ -1376,8 +1447,7 @@ export default function UnifiedProfilePage({
           <p className="text-xs text-muted-foreground mt-2">{saveHint}</p>
           {(uploadRole === 'tenant' || uploadRole === 'owner' || uploadRole === 'operator') &&
           profileGateIncomplete.size > 0 &&
-          !shouldUseDemoMock() &&
-          !disableProfileGateUi ? (
+          !shouldUseDemoMock() ? (
             <p className="text-xs font-medium text-destructive mt-2">{profileGateHint}</p>
           ) : null}
         </div>
@@ -1417,7 +1487,7 @@ export default function UnifiedProfilePage({
           <div className="text-center">
             <div className="font-black text-foreground text-lg inline-flex items-center justify-center gap-1.5 flex-wrap">
               <span>{displayNameForCard}</span>
-              {govIdVerified ? (
+              {govIdVerifiedForUi ? (
                 <span
                   className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-[#1877F2] text-white shadow-sm"
                   title="Verified account"
@@ -1498,7 +1568,7 @@ export default function UnifiedProfilePage({
                     size="sm"
                     className={cn(
                       'text-xs font-semibold',
-                      govIdVerified &&
+                      govIdVerifiedForUi &&
                         'border-green-600 bg-green-600 text-white hover:bg-green-700 hover:text-white',
                     )}
                     onClick={() => setGovDialogOpen(true)}
@@ -1513,11 +1583,12 @@ export default function UnifiedProfilePage({
                 <Label className="text-[10px] font-semibold tracking-[0.2em] uppercase text-muted-foreground mb-1.5 block">
                   Entity Type
                 </Label>
-                <Select value={entityType} onValueChange={setEntityType} disabled={aliyunCoreIdentityLocked}>
+                <Select value={entityType} onValueChange={setEntityType} disabled={coreIdentityFieldDisabled}>
                   <SelectTrigger
+                    title={identityLockedUntilVerified && !aliyunCoreIdentityLocked ? 'Complete identity verification first' : undefined}
                     className={cn(
                       gateErr('entityType') && 'ring-2 ring-destructive border-destructive',
-                      aliyunCoreIdentityLocked && 'opacity-80 cursor-not-allowed',
+                      coreIdentityFieldDisabled && 'opacity-80 cursor-not-allowed',
                     )}
                   >
                     <SelectValue />
@@ -1539,10 +1610,11 @@ export default function UnifiedProfilePage({
                 <input
                   value={legalName}
                   onChange={(e) => setLegalName(e.target.value)}
-                  disabled={aliyunCoreIdentityLocked}
+                  disabled={coreIdentityFieldDisabled}
+                  title={identityLockedUntilVerified && !aliyunCoreIdentityLocked ? 'Complete identity verification first' : undefined}
                   className={cn(
                     inputCls,
-                    aliyunCoreIdentityLocked && 'opacity-80 cursor-not-allowed',
+                    coreIdentityFieldDisabled && 'opacity-80 cursor-not-allowed',
                     gateErr('legalName') && 'ring-2 ring-destructive border-destructive',
                   )}
                 />
@@ -1575,11 +1647,12 @@ export default function UnifiedProfilePage({
                     </Tooltip>
                   ) : null}
                 </div>
-                <Select value={idType} onValueChange={setIdType} disabled={aliyunCoreIdentityLocked}>
+                <Select value={idType} onValueChange={setIdType} disabled={coreIdentityFieldDisabled}>
                   <SelectTrigger
+                    title={identityLockedUntilVerified && !aliyunCoreIdentityLocked ? 'Complete identity verification first' : undefined}
                     className={cn(
                       gateErr('idType') && 'ring-2 ring-destructive border-destructive',
-                      aliyunCoreIdentityLocked && 'opacity-80 cursor-not-allowed',
+                      coreIdentityFieldDisabled && 'opacity-80 cursor-not-allowed',
                     )}
                   >
                     <SelectValue />
@@ -1598,10 +1671,11 @@ export default function UnifiedProfilePage({
                 <input
                   value={idNumber}
                   onChange={(e) => setIdNumber(e.target.value)}
-                  disabled={aliyunCoreIdentityLocked}
+                  disabled={coreIdentityFieldDisabled}
+                  title={identityLockedUntilVerified && !aliyunCoreIdentityLocked ? 'Complete identity verification first' : undefined}
                   className={cn(
                     inputCls,
-                    aliyunCoreIdentityLocked && 'opacity-80 cursor-not-allowed',
+                    coreIdentityFieldDisabled && 'opacity-80 cursor-not-allowed',
                     gateErr('idNumber') && 'ring-2 ring-destructive border-destructive',
                   )}
                 />
@@ -1760,7 +1834,13 @@ export default function UnifiedProfilePage({
                       <>
                         <Upload size={22} className="text-muted-foreground mb-2" />
                         <span className="text-xs text-muted-foreground">
-                          {uploadingSide === 'front' ? 'Uploading...' : idFrontUploadLocked ? 'Verified — cannot replace' : 'Click to upload'}
+                          {uploadingSide === 'front'
+                            ? 'Uploading...'
+                            : idFrontUploadLocked
+                              ? aliyunMykadEkycLocked || aliyunPassportEkycLocked
+                                ? 'Verified — cannot replace'
+                                : 'Verify identity first — upload after verification'
+                              : 'Click to upload'}
                         </span>
                       </>
                     )}
@@ -1806,7 +1886,13 @@ export default function UnifiedProfilePage({
                       <>
                         <Upload size={22} className="text-muted-foreground mb-2" />
                         <span className="text-xs text-muted-foreground">
-                          {uploadingSide === 'back' ? 'Uploading...' : idBackUploadLocked ? 'Verified — cannot replace' : 'Click to upload'}
+                          {uploadingSide === 'back'
+                            ? 'Uploading...'
+                            : idBackUploadLocked
+                              ? aliyunMykadEkycLocked
+                                ? 'Verified — cannot replace'
+                                : 'Verify identity first — upload after verification'
+                              : 'Click to upload'}
                         </span>
                       </>
                     )}
@@ -1933,8 +2019,26 @@ export default function UnifiedProfilePage({
         </DialogContent>
       </Dialog>
 
-      <Dialog open={govDialogOpen} onOpenChange={setGovDialogOpen}>
-        <DialogContent className="sm:max-w-lg">
+      <Dialog
+        open={govDialogOpen}
+        onOpenChange={(open) => {
+          if (!open && govVerificationDialogMandatory) return
+          setGovDialogOpen(open)
+        }}
+      >
+        <DialogContent
+          className="sm:max-w-lg"
+          showCloseButton={!govVerificationDialogMandatory}
+          onPointerDownOutside={(e) => {
+            if (govVerificationDialogMandatory) e.preventDefault()
+          }}
+          onInteractOutside={(e) => {
+            if (govVerificationDialogMandatory) e.preventDefault()
+          }}
+          onEscapeKeyDown={(e) => {
+            if (govVerificationDialogMandatory) e.preventDefault()
+          }}
+        >
           <DialogHeader>
             <DialogTitle>Government ID verification</DialogTitle>
             <DialogDescription className="sr-only">Choose a verification method.</DialogDescription>
@@ -1979,11 +2083,13 @@ export default function UnifiedProfilePage({
               </p>
             ) : null}
           </div>
-          <DialogFooter>
-            <Button type="button" variant="secondary" onClick={() => setGovDialogOpen(false)}>
-              Close
-            </Button>
-          </DialogFooter>
+          {!govVerificationDialogMandatory ? (
+            <DialogFooter>
+              <Button type="button" variant="secondary" onClick={() => setGovDialogOpen(false)}>
+                Close
+              </Button>
+            </DialogFooter>
+          ) : null}
         </DialogContent>
       </Dialog>
 

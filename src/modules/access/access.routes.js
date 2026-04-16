@@ -246,6 +246,7 @@ router.post('/aliyun-idv/result', async (req, res) => {
     const out = await checkEkycResult(email, transactionId);
     let profileApplied = false;
     let profileReason = null;
+    let profileBoundEmail = null;
     let profileOcrDebug;
     if (out.passed) {
       const ar = await applyAliyunEkycToPortalAccount(
@@ -258,6 +259,7 @@ router.post('/aliyun-idv/result', async (req, res) => {
       );
       profileApplied = !!ar.ok;
       profileReason = ar.reason || null;
+      if (ar.boundEmail) profileBoundEmail = String(ar.boundEmail).trim();
       if (ar.ocrDebug) profileOcrDebug = ar.ocrDebug;
       if (!ar.ok) {
         console.warn('[access] aliyun-idv profile apply', ar.reason);
@@ -270,6 +272,7 @@ router.post('/aliyun-idv/result', async (req, res) => {
       ...out,
       profileApplied,
       profileReason,
+      ...(profileBoundEmail ? { profileBoundEmail } : {}),
       ...(profileOcrDebug ? { profileOcrDebug } : {}),
     });
   } catch (err) {

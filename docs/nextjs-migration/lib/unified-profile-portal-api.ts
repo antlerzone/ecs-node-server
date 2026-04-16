@@ -584,6 +584,7 @@ export async function fetchAliyunIdvResult(transactionId: string): Promise<{
   message?: string;
   profileApplied?: boolean;
   profileReason?: string;
+  profileBoundEmail?: string;
   /** Present when profile apply failed with EKYC_OCR_INCOMPLETE: key names/types only (no PII). */
   profileOcrDebug?: unknown;
   /** Alibaba CheckResult body.result shape: whether name/ID keys & non-empty strings exist (no raw values). */
@@ -615,6 +616,7 @@ export async function fetchAliyunIdvResult(transactionId: string): Promise<{
       message?: string;
       profileApplied?: boolean;
       profileReason?: string;
+      profileBoundEmail?: string;
       profileOcrDebug?: unknown;
       resultHints?: {
         hasNameKey?: boolean;
@@ -639,6 +641,7 @@ export async function fetchAliyunIdvResult(transactionId: string): Promise<{
       subCode: data.subCode,
       profileApplied: data.profileApplied,
       profileReason: data.profileReason,
+      profileBoundEmail: data.profileBoundEmail,
       profileOcrDebug: data.profileOcrDebug,
       resultHints: data.resultHints,
     };

@@ -14,7 +14,13 @@ const jose = require('jose');
 const axios = require('axios');
 const pool = require('../../config/db');
 const { normalizeEmail, getMemberRoles } = require('../access/access.service');
-const { signPortalToken, register, login } = require('./portal-auth.service');
+const {
+  signPortalToken,
+  register,
+  login,
+  assertNationalIdKeyForPortalAccount,
+  normalizeNricForMatch,
+} = require('./portal-auth.service');
 
 const STATE_SECRET = process.env.GOV_ID_OIDC_STATE_SECRET || process.env.PORTAL_JWT_SECRET || 'portal-jwt-secret-change-in-production';
 
@@ -100,7 +106,7 @@ function normalizeGovReturnPath(p) {
  * OAuth error on `/gov-id/callback` (e.g. access_denied): redirect back to the portal path that started Gov ID,
  * using Singpass PAR session or MyDigital signed state when `state` is present.
  */
-function buildGovIdCallbackErrorRedirect({ query, frontendFallback, reason }) {
+function buildGovIdCallbackErrorRedirect({ query, frontendFallback, reason, boundEmail }) {
   const stateStr = String(query?.state || '').trim();
   const reasonStr = String(
     reason != null && String(reason).trim() !== '' ? reason : query?.error || 'CALLBACK_FAILED'
@@ -139,6 +145,8 @@ function buildGovIdCallbackErrorRedirect({ query, frontendFallback, reason }) {
 
   const path = normalizeGovReturnPath(returnPath);
   const q = new URLSearchParams({ gov: 'error', reason: reasonStr });
+  const be = boundEmail != null && String(boundEmail).trim() !== '' ? String(boundEmail).trim() : '';
+  if (be) q.set('boundEmail', be);
   const sep = path.includes('?') ? '&' : '?';
   return `${frontend}${path}${sep}${q.toString()}`;
 }
@@ -677,8 +685,10 @@ async function assertSubAvailable(column, sub, email) {
     [sub, normalized]
   );
   if (rows.length) {
+    const boundEmail = rows[0].email != null ? String(rows[0].email).trim() : '';
     const err = new Error('SUB_ALREADY_LINKED');
     err.code = 'SUB_ALREADY_LINKED';
+    err.boundEmail = boundEmail;
     throw err;
   }
 }
@@ -748,10 +758,27 @@ async function linkUserinfoToAccount(email, provider, userinfo) {
 
   await assertGovIdExclusivityForLink(normalized, provider);
 
+  const [acctRows] = await pool.query(
+    'SELECT id FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+    [normalized]
+  );
+  if (!acctRows.length) throw new Error('NO_ACCOUNT');
+  const accountId = String(acctRows[0].id);
+
   if (provider === 'mydigital') {
     await assertSubAvailable('mydigital_sub', sub, normalized);
     const nric = String(userinfo.nric || userinfo.preferred_username || '').trim() || null;
     const nama = String(userinfo.nama || userinfo.name || userinfo.preferred_username || '').trim() || null;
+    if (nric) {
+      const nk = await assertNationalIdKeyForPortalAccount(accountId, nric);
+      if (!nk.ok) {
+        const err = new Error(nk.reason || 'NATIONAL_ID_ALREADY_BOUND');
+        err.code = nk.reason || 'NATIONAL_ID_ALREADY_BOUND';
+        err.boundEmail = nk.boundEmail;
+        throw err;
+      }
+    }
+    const nkVal = nric ? normalizeNricForMatch(nric) : null;
     await pool.query(
       `UPDATE portal_account SET
         mydigital_sub = ?,
@@ -766,10 +793,31 @@ async function linkUserinfoToAccount(email, provider, userinfo) {
       WHERE LOWER(TRIM(email)) = ?`,
       [sub, nric, nama, normalized]
     );
+    if (nkVal != null) {
+      try {
+        await pool.query(
+          'UPDATE portal_account SET national_id_key = ? WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+          [nkVal, normalized]
+        );
+      } catch (e2) {
+        if (!e2 || e2.code !== 'ER_BAD_FIELD_ERROR') throw e2;
+      }
+    }
   } else if (provider === 'singpass') {
     await assertSubAvailable('singpass_sub', sub, normalized);
     const uin = String(userinfo.uinfin || userinfo.uin || userinfo.sub || '').trim();
     const name = pickSingpassDisplayName(userinfo);
+    const nkRaw = uin || sub;
+    if (nkRaw) {
+      const nk = await assertNationalIdKeyForPortalAccount(accountId, nkRaw);
+      if (!nk.ok) {
+        const err = new Error(nk.reason || 'NATIONAL_ID_ALREADY_BOUND');
+        err.code = nk.reason || 'NATIONAL_ID_ALREADY_BOUND';
+        err.boundEmail = nk.boundEmail;
+        throw err;
+      }
+    }
+    const nkVal = nkRaw ? normalizeNricForMatch(nkRaw) : null;
     await pool.query(
       `UPDATE portal_account SET
         singpass_sub = ?,
@@ -784,6 +832,16 @@ async function linkUserinfoToAccount(email, provider, userinfo) {
       WHERE LOWER(TRIM(email)) = ?`,
       [sub, uin || sub, name, normalized]
     );
+    if (nkVal != null) {
+      try {
+        await pool.query(
+          'UPDATE portal_account SET national_id_key = ? WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+          [nkVal, normalized]
+        );
+      } catch (e2) {
+        if (!e2 || e2.code !== 'ER_BAD_FIELD_ERROR') throw e2;
+      }
+    }
   } else {
     throw new Error('BAD_PROVIDER');
   }
@@ -950,7 +1008,10 @@ async function finalizePendingGovSingpassLink(pend, sessionKey, normalized) {
       return { ok: false, reason: 'GOV_ID_SWITCH_REQUIRED' };
     }
     if (e && e.code === 'SUB_ALREADY_LINKED') {
-      return { ok: false, reason: 'SUB_ALREADY_LINKED' };
+      return { ok: false, reason: 'SUB_ALREADY_LINKED', boundEmail: e.boundEmail };
+    }
+    if (e && e.code === 'NATIONAL_ID_ALREADY_BOUND') {
+      return { ok: false, reason: 'NATIONAL_ID_ALREADY_BOUND', boundEmail: e.boundEmail };
     }
     throw e;
   }

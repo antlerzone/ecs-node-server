@@ -234,8 +234,16 @@ export default function DemoLoginClient() {
       router.replace("/demologin", { scroll: false })
     } else if (gov === "error" && reason) {
       const key = decodeURIComponent(reason).trim()
+      const boundEmail = searchParams.get("boundEmail")
       if (key === "GOV_ID_SWITCH_REQUIRED") {
         setGovSwitchDialogOpen(true)
+      } else if (
+        (key === "SUB_ALREADY_LINKED" || key === "NATIONAL_ID_ALREADY_BOUND") &&
+        boundEmail
+      ) {
+        toast.error(
+          `This identity is already linked to ${decodeURIComponent(boundEmail)}. Please sign in with that email or contact support.`,
+        )
       } else {
         toast.error(formatGovIdErrorReason(reason))
       }

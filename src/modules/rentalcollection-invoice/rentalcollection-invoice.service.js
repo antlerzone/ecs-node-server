@@ -1206,6 +1206,42 @@ async function doCnyIotRechargeForTenantMeter(clientId, tenancyId, amountRm) {
   } else {
     await runOneRecharge(amountKwh);
   }
+
+  // Same rule as lock/cron: if rental invoice is overdue (unpaid, past grace), do not auto-connect after meter top-up.
+  let skipConnectForUnpaidRental = false;
+  try {
+    const { hasUnpaidRentalPastDue } = require('../tenancysetting/tenancy-active.service');
+    skipConnectForUnpaidRental = await hasUnpaidRentalPastDue(tenancyId);
+  } catch (e) {
+    console.warn('[doCnyIotRecharge] hasUnpaidRentalPastDue check failed', tenancyId, e?.message || e);
+  }
+  if (skipConnectForUnpaidRental) {
+    console.log(
+      '[doCnyIotRecharge] skip setRelay (connect): unpaid/overdue rental tenancyId=%s metid=%s',
+      tenancyId,
+      platformMeterId
+    );
+    return { ok: true, recharged: amountKwh, relaySkippedReason: 'UNPAID_RENTAL_PAST_DUE' };
+  }
+
+  // Sync forces relay open (Val=1) when prepaid balance ≤0; top-up adds kWh but does not always re-close the relay — connect after successful sell.
+  try {
+    await meterWrapper.setRelay(clientId, platformMeterId, 2);
+    console.log('[doCnyIotRecharge] setRelay Val=2 (connect) after topup metid=%s', platformMeterId);
+  } catch (e) {
+    try {
+      await meterWrapper.setRelay(clientId, platformMeterId, 2, { usePlatformAccount: true });
+      console.log('[doCnyIotRecharge] setRelay Val=2 (platform retry) OK metid=%s', platformMeterId);
+    } catch (e2) {
+      console.warn(
+        '[doCnyIotRecharge] setRelay connect after topup failed',
+        platformMeterId,
+        e?.message || e,
+        e2?.message || e2
+      );
+    }
+  }
+
   return { ok: true, recharged: amountKwh };
 }
 

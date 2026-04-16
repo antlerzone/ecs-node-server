@@ -845,6 +845,7 @@ router.get('/gov-id/callback', async (req, res) => {
       query: req.query,
       frontendFallback,
       reason: String(reason),
+      boundEmail: err.boundEmail,
     });
     return res.redirect(302, loc);
   }
@@ -979,6 +980,7 @@ router.get('/aliyun-idv/result', requirePortalToken, async (req, res) => {
     const out = await checkEkycResult(req.portalEmail, transactionId);
     let profileApplied = false;
     let profileReason = null;
+    let profileBoundEmail = null;
     let profileOcrDebug;
     if (out.passed) {
       const ar = await applyAliyunEkycToPortalAccount(
@@ -991,6 +993,7 @@ router.get('/aliyun-idv/result', requirePortalToken, async (req, res) => {
       );
       profileApplied = !!ar.ok;
       profileReason = ar.reason || null;
+      if (ar.boundEmail) profileBoundEmail = String(ar.boundEmail).trim();
       if (ar.ocrDebug) profileOcrDebug = ar.ocrDebug;
       if (!ar.ok) {
         console.warn('[portal-auth] aliyun-idv profile apply', ar.reason);
@@ -1003,6 +1006,7 @@ router.get('/aliyun-idv/result', requirePortalToken, async (req, res) => {
       ...out,
       profileApplied,
       profileReason,
+      ...(profileBoundEmail ? { profileBoundEmail } : {}),
       ...(profileOcrDebug ? { profileOcrDebug } : {}),
     });
   } catch (err) {
