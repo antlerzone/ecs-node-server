@@ -1224,22 +1224,59 @@ async function doCnyIotRechargeForTenantMeter(clientId, tenancyId, amountRm) {
     return { ok: true, recharged: amountKwh, relaySkippedReason: 'UNPAID_RENTAL_PAST_DUE' };
   }
 
+  const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+  // 必须等充值链路（sellByApi + sellByApiOk）全部结束后再发合闸；若立刻发 setRelay，CNYIoT 常报 4009（上一笔未下发完）。
+  const postTopupDelayMs = Math.min(
+    Math.max(Number(process.env.CNYIOT_POST_TOPUP_DELAY_MS) || 5000, 1500),
+    120000
+  );
+  console.log(
+    '[doCnyIotRecharge] topup finished; wait %sms before setRelay metid=%s',
+    postTopupDelayMs,
+    platformMeterId
+  );
+  await sleep(postTopupDelayMs);
+
   // Sync forces relay open (Val=1) when prepaid balance ≤0; top-up adds kWh but does not always re-close the relay — connect after successful sell.
-  try {
-    await meterWrapper.setRelay(clientId, platformMeterId, 2);
-    console.log('[doCnyIotRecharge] setRelay Val=2 (connect) after topup metid=%s', platformMeterId);
-  } catch (e) {
+  // If setRelay still returns 4009/4012, retry below with extra delay between rounds.
+  const isRelayBusy = (err) => {
+    const n = Number(err?.cnyiotResult);
+    return n === 4009 || n === 4012 || n === 4038;
+  };
+  for (let round = 1; round <= 6; round++) {
+    if (round > 1) await sleep(3000);
+    let e1;
+    let e2;
+    try {
+      await meterWrapper.setRelay(clientId, platformMeterId, 2);
+      console.log('[doCnyIotRecharge] setRelay Val=2 (connect) after topup metid=%s', platformMeterId);
+      break;
+    } catch (err) {
+      e1 = err;
+    }
     try {
       await meterWrapper.setRelay(clientId, platformMeterId, 2, { usePlatformAccount: true });
-      console.log('[doCnyIotRecharge] setRelay Val=2 (platform retry) OK metid=%s', platformMeterId);
-    } catch (e2) {
-      console.warn(
-        '[doCnyIotRecharge] setRelay connect after topup failed',
-        platformMeterId,
-        e?.message || e,
-        e2?.message || e2
-      );
+      console.log('[doCnyIotRecharge] setRelay Val=2 (platform) OK after topup metid=%s', platformMeterId);
+      break;
+    } catch (err) {
+      e2 = err;
     }
+    const busy = isRelayBusy(e1) || isRelayBusy(e2);
+    if (busy && round < 6) {
+      console.warn(
+        '[doCnyIotRecharge] setRelay busy (CNYIoT queue); retry %s/6 metid=%s',
+        round,
+        platformMeterId
+      );
+      continue;
+    }
+    console.warn(
+      '[doCnyIotRecharge] setRelay connect after topup failed',
+      platformMeterId,
+      e1?.message || e1,
+      e2?.message || e2
+    );
+    break;
   }
 
   return { ok: true, recharged: amountKwh };

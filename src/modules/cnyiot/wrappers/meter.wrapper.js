@@ -183,12 +183,21 @@ async function editMeterSafe(clientId, { meterId, meterName, priceId }, opts = {
 /* ---------- CONTROL ---------- */
 /** setRelay: Val 2 = connect (power on), Val 1 = disconnect (power off). */
 async function setRelay(clientId, meterId, val = 2, opts = {}) {
-  return callCnyIot({
+  const json = await callCnyIot({
     clientId,
     method: 'setRelay',
     body: { MetID: String(meterId), Val: String(val), iswifi: '1' },
     ...opts
   });
+  const r = json?.result;
+  const ok = r === 0 || r === 200 || r === '0' || r === '200';
+  if (!ok) {
+    const err = new Error(`CNYIOT_SET_RELAY:${r}`);
+    err.cnyiotResult = r;
+    err.cnyiotRaw = json;
+    throw err;
+  }
+  return json;
 }
 
 async function setPowerGate(clientId, meterId, value) {
