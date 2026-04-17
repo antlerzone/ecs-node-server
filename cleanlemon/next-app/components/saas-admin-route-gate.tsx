@@ -17,20 +17,22 @@ function isSaasAdminRole(role: string | null | undefined): boolean {
 export function SaasAdminRouteGate({ children }: { children: React.ReactNode }) {
   const { user, isLoading } = useAuth()
   const router = useRouter()
-  const [ready, setReady] = useState(false)
-  const [allowed, setAllowed] = useState(false)
+  const [gateOk, setGateOk] = useState(false)
 
   useEffect(() => {
     if (isLoading) return
 
     if (!user) {
+      setGateOk(false)
       router.replace('/login')
       return
     }
 
+    /** Once allowed, do not re-run checks on every `user` object identity change (stops Loading↔content flicker). */
+    if (gateOk) return
+
     if (isSaasAdminRole(user.role)) {
-      setAllowed(true)
-      setReady(true)
+      setGateOk(true)
       return
     }
 
@@ -44,8 +46,7 @@ export function SaasAdminRouteGate({ children }: { children: React.ReactNode }) 
           (row) => String(row?.type || '').trim().toLowerCase() === 'saas_admin'
         )
         if (isSaas) {
-          setAllowed(true)
-          setReady(true)
+          setGateOk(true)
         } else {
           router.replace('/portal')
         }
@@ -57,9 +58,9 @@ export function SaasAdminRouteGate({ children }: { children: React.ReactNode }) 
     return () => {
       cancelled = true
     }
-  }, [isLoading, user, router])
+  }, [isLoading, user, router, gateOk])
 
-  if (!ready || !allowed) {
+  if (!gateOk) {
     return (
       <div className="flex min-h-[40vh] w-full items-center justify-center text-muted-foreground text-sm">
         Loading…

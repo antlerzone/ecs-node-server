@@ -9,6 +9,7 @@
 
 export const CLEANLEMON_LIVE_PORTAL_HOST = "portal.cleanlemons.com";
 export const CLEANLEMON_DEMO_HOST = "demo.cleanlemons.com";
+export const CLEANLEMON_LOCAL_API_BASE = "http://localhost:5000";
 
 /** Browser → ECS via portal 同域 /api/（与 Nginx、CLEANLEMON_PORTAL_AUTH_BASE_URL 默认一致）。勿用无效证书的 api 子域。 */
 export const DEFAULT_CLEANLEMON_PROD_API = "https://portal.cleanlemons.com";
@@ -20,6 +21,9 @@ export const DEFAULT_CLEANLEMON_PROD_API = "https://portal.cleanlemons.com";
 export function getCleanlemonApiBase(): string {
   const fromEnv = (process.env.NEXT_PUBLIC_CLEANLEMON_API_URL || "").trim().replace(/\/$/, "");
   if (fromEnv) return fromEnv;
+  if (typeof window !== "undefined" && window.location.hostname.toLowerCase() === "localhost") {
+    return CLEANLEMON_LOCAL_API_BASE;
+  }
   if (isLivePortalCleanlemonsBuild()) return DEFAULT_CLEANLEMON_PROD_API;
   if (typeof window !== "undefined" && isLivePortalCleanlemonsHost()) return DEFAULT_CLEANLEMON_PROD_API;
   return "";
@@ -29,6 +33,7 @@ export function getCleanlemonApiBase(): string {
 export function getCleanlemonApiBaseForRequest(hostHeader: string | null | undefined): string {
   const fromEnv = (process.env.NEXT_PUBLIC_CLEANLEMON_API_URL || "").trim().replace(/\/$/, "");
   if (fromEnv) return fromEnv;
+  if (parseRequestHostname(hostHeader) === "localhost") return CLEANLEMON_LOCAL_API_BASE;
   if (isLivePortalCleanlemonsHostname(hostHeader)) return DEFAULT_CLEANLEMON_PROD_API;
   if (isLivePortalCleanlemonsBuild()) return DEFAULT_CLEANLEMON_PROD_API;
   return "";
@@ -106,15 +111,7 @@ export function shouldUseMockOAuthClient(): boolean {
   if (isLivePortalCleanlemonsHost()) return false;
   if (isPortalAuthMockExplicit()) return true;
   const base = getCleanlemonApiBase();
-  if (!base) return true;
-  if (typeof window === "undefined") return false;
-  try {
-    const api = new URL(base.startsWith("http") ? base : `https://${base}`);
-    if (api.hostname === window.location.hostname) return true;
-  } catch {
-    return false;
-  }
-  return false;
+  return !base;
 }
 
 /**

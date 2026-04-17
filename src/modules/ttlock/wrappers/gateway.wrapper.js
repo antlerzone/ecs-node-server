@@ -7,8 +7,8 @@ const { ttlockGet, ttlockPost } = require('./ttlockRequest');
 
 const PAGE_SIZE = 100;
 
-async function listAllGateways(clientId) {
-  const auth = await getTtlockAuth(clientId);
+async function listAllGateways(clientId, options = {}) {
+  const auth = await getTtlockAuth(clientId, options);
   let pageNo = 1;
   const all = [];
   let pages = 1;
@@ -23,13 +23,13 @@ async function listAllGateways(clientId) {
   return { total: all.length, list: all };
 }
 
-async function getGatewayById(clientId, gatewayId) {
-  const data = await listAllGateways(clientId);
+async function getGatewayById(clientId, gatewayId, options = {}) {
+  const data = await listAllGateways(clientId, options);
   return data.list.find(gw => String(gw.gatewayId) === String(gatewayId)) || null;
 }
 
-async function renameGateway(clientId, gatewayId, gatewayName) {
-  const auth = await getTtlockAuth(clientId);
+async function renameGateway(clientId, gatewayId, gatewayName, options = {}) {
+  const auth = await getTtlockAuth(clientId, options);
   const data = await ttlockPost('/gateway/rename', auth, { gatewayId, gatewayName });
   if (data?.errcode !== 0 && data?.errcode !== undefined) {
     const msg = data?.errmsg || 'unknown';

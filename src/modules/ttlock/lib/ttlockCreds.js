@@ -11,11 +11,11 @@ const { getValidTTLockToken } = require('./ttlockToken.service');
  * @param {string} clientId - Our client id (operatordetail.id)
  * @returns {Promise<{ clientId: string, accessToken: string }>}
  */
-async function getTtlockAuth(clientId) {
+async function getTtlockAuth(clientId, opts) {
   const appClientId = process.env.TTLOCK_CLIENT_ID;
   if (!appClientId) throw new Error('TTLOCK_APP_CREDENTIALS_MISSING');
 
-  const token = await getValidTTLockToken(clientId);
+  const token = await getValidTTLockToken(clientId, opts || {});
   if (!token?.accessToken) throw new Error('TTLOCK_NO_TOKEN');
 
   return {

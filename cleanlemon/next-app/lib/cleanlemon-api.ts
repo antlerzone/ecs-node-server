@@ -444,6 +444,59 @@ export async function saveEmployeeProfile(payload: any): Promise<{ ok: boolean; 
   return r.json();
 }
 
+/** Cleanlemons operator companies linked to this B2B client (`cln_client_operator`). */
+export type ClientLinkedOperatorRow = {
+  operatorId: string;
+  operatorName: string;
+  operatorEmail: string;
+};
+
+/** Coliving ↔ Cleanlemons bridge: which Coliving `operatordetail` (company) is integrated. */
+export type ClientIntegrationColivingInfo = {
+  linked: boolean;
+  colivingOperatordetailId?: string;
+  colivingOperatorTitle?: string;
+  colivingOperatorEmail?: string;
+};
+
+export async function fetchClientIntegrationContext(
+  email: string,
+  operatorId: string
+): Promise<{
+  ok?: boolean;
+  linkedOperators?: ClientLinkedOperatorRow[];
+  coliving?: ClientIntegrationColivingInfo;
+  reason?: string;
+}> {
+  const r = await apiFetch({
+    path: '/api/cleanlemon/client/integration/context',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: String(email || '').trim().toLowerCase(),
+      operatorId: String(operatorId || '').trim(),
+    }),
+  });
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean;
+    linkedOperators?: ClientLinkedOperatorRow[];
+    coliving?: ClientIntegrationColivingInfo;
+    reason?: string;
+  };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return data;
+}
+
+/** Client portal — one TTLock login (multi-slot); Coliving-synced rows are `source: 'coliving'`. */
+export type ClientTtlockAccountRow = {
+  slot: number;
+  accountName: string;
+  username: string;
+  source: 'coliving' | 'manual';
+  manageable: boolean;
+  connected: boolean;
+};
+
 /** Client portal — TTLock onboarding status (requires B2B client ↔ operator link). */
 export async function fetchClientTtlockOnboardStatus(
   email: string,
@@ -452,6 +505,7 @@ export async function fetchClientTtlockOnboardStatus(
   ok?: boolean;
   ttlockConnected?: boolean;
   ttlockCreateEverUsed?: boolean;
+  accounts?: ClientTtlockAccountRow[];
   reason?: string;
 }> {
   const r = await apiFetch({
@@ -464,6 +518,7 @@ export async function fetchClientTtlockOnboardStatus(
     ok?: boolean;
     ttlockConnected?: boolean;
     ttlockCreateEverUsed?: boolean;
+    accounts?: ClientTtlockAccountRow[];
     reason?: string;
   };
   if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
@@ -472,18 +527,24 @@ export async function fetchClientTtlockOnboardStatus(
 
 export async function fetchClientTtlockCredentials(
   email: string,
-  operatorId: string
-): Promise<{ ok?: boolean; username?: string; password?: string; reason?: string }> {
+  operatorId: string,
+  ttlockSlot = 0
+): Promise<{ ok?: boolean; username?: string; password?: string; slot?: number; reason?: string }> {
   const r = await apiFetch({
     path: '/api/cleanlemon/client/ttlock/credentials',
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email: String(email || '').trim().toLowerCase(), operatorId: String(operatorId || '').trim() }),
+    body: JSON.stringify({
+      email: String(email || '').trim().toLowerCase(),
+      operatorId: String(operatorId || '').trim(),
+      ttlockSlot,
+    }),
   });
   const data = (await r.json().catch(() => ({}))) as {
     ok?: boolean;
     username?: string;
     password?: string;
+    slot?: number;
     reason?: string;
   };
   if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
@@ -494,8 +555,10 @@ export async function postClientTtlockConnect(
   email: string,
   operatorId: string,
   username: string,
-  password: string
-): Promise<{ ok?: boolean; mode?: string; username?: string; reason?: string }> {
+  password: string,
+  opts?: { accountName?: string }
+): Promise<{ ok?: boolean; mode?: string; username?: string; slot?: number; source?: string; accountName?: string; reason?: string }> {
+  const accountName = opts?.accountName != null ? String(opts.accountName).trim() : '';
   const r = await apiFetch({
     path: '/api/cleanlemon/client/ttlock/connect',
     method: 'POST',
@@ -505,22 +568,36 @@ export async function postClientTtlockConnect(
       operatorId: String(operatorId || '').trim(),
       username: String(username || '').trim(),
       password: String(password || ''),
+      accountName: accountName || undefined,
     }),
   });
-  const data = (await r.json().catch(() => ({}))) as { ok?: boolean; mode?: string; username?: string; reason?: string };
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean;
+    mode?: string;
+    username?: string;
+    slot?: number;
+    source?: string;
+    accountName?: string;
+    reason?: string;
+  };
   if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
   return data;
 }
 
 export async function postClientTtlockDisconnect(
   email: string,
-  operatorId: string
+  operatorId: string,
+  ttlockSlot = 0
 ): Promise<{ ok?: boolean; reason?: string }> {
   const r = await apiFetch({
     path: '/api/cleanlemon/client/ttlock/disconnect',
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email: String(email || '').trim().toLowerCase(), operatorId: String(operatorId || '').trim() }),
+    body: JSON.stringify({
+      email: String(email || '').trim().toLowerCase(),
+      operatorId: String(operatorId || '').trim(),
+      ttlockSlot,
+    }),
   });
   const data = (await r.json().catch(() => ({}))) as { ok?: boolean; reason?: string };
   if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
@@ -566,6 +643,10 @@ export type ClientPortalPropertyRow = {
   operatorEmail?: string;
   /** Pending `client_requests_operator` row — operator has not approved yet. */
   clientOperatorLinkPending?: boolean;
+  /** Property group names (`cln_property_group` via link table), sorted. */
+  groupNames?: string[];
+  /** `owner` = your `cln_property` row; `shared` = visible via group membership only. */
+  portalAccess?: 'owner' | 'shared';
   createdAt?: string;
   updatedAt?: string;
 };
@@ -647,6 +728,18 @@ export type ClientPortalSmartdoorBindings = {
   rooms: ClientPortalSmartdoorBindingsRoom[];
 };
 
+export type GroupPermTriplet = {
+  create: boolean;
+  edit: boolean;
+  delete: boolean;
+};
+
+export type GroupMemberPerm = {
+  property: GroupPermTriplet;
+  booking: GroupPermTriplet;
+  status: GroupPermTriplet;
+};
+
 export type ClientPortalPropertyDetail = {
   id: string;
   name: string;
@@ -684,7 +777,266 @@ export type ClientPortalPropertyDetail = {
   latitude?: number | null;
   longitude?: number | null;
   updatedAt?: string | null;
+  /** When property is accessed via group share (B2B). */
+  groupAccess?: {
+    access: string;
+    groupId: string | null;
+    perm: GroupMemberPerm;
+  };
 };
+
+export type ClientPropertyGroupRow = {
+  id: string;
+  name: string;
+  operatorId: string;
+  propertyCount: number;
+  /** True when this client is the group owner (can manage members). */
+  isOwner?: boolean;
+};
+
+export type ClientPropertyGroupMemberRow = {
+  id: string;
+  inviteEmail: string;
+  inviteStatus: string;
+  perm: GroupMemberPerm;
+  granteeClientdetailId: string | null;
+};
+
+export async function fetchClientPropertyGroups(
+  email: string,
+  operatorId: string
+): Promise<{ ok: boolean; items?: ClientPropertyGroupRow[]; reason?: string }> {
+  const r = await apiFetch({
+    path: '/api/cleanlemon/client/property-groups/list',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    cache: 'no-store',
+    body: JSON.stringify({
+      email: String(email || '').trim().toLowerCase(),
+      operatorId: String(operatorId || '').trim(),
+    }),
+  });
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean;
+    items?: ClientPropertyGroupRow[];
+    reason?: string;
+  };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: !!data.ok, items: Array.isArray(data.items) ? data.items : [] };
+}
+
+export async function createClientPropertyGroup(
+  email: string,
+  operatorId: string,
+  name: string
+): Promise<{ ok: boolean; group?: { id: string; name: string; operatorId: string }; reason?: string }> {
+  const r = await apiFetch({
+    path: '/api/cleanlemon/client/property-groups/create',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: String(email || '').trim().toLowerCase(),
+      operatorId: String(operatorId || '').trim(),
+      name: String(name || '').trim(),
+    }),
+  });
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean;
+    group?: { id: string; name: string; operatorId: string };
+    reason?: string;
+  };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: !!data.ok, group: data.group };
+}
+
+export async function fetchClientPropertyGroupDetail(
+  email: string,
+  operatorId: string,
+  groupId: string
+): Promise<{
+  ok: boolean;
+  group?: {
+    id: string;
+    name: string;
+    operatorId: string;
+    isOwner?: boolean;
+    properties: Array<{ id: string; name: string; unitNumber: string }>;
+  };
+  reason?: string;
+}> {
+  const r = await apiFetch({
+    path: '/api/cleanlemon/client/property-groups/detail',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: String(email || '').trim().toLowerCase(),
+      operatorId: String(operatorId || '').trim(),
+      groupId: String(groupId || '').trim(),
+    }),
+  });
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean;
+    group?: {
+      id: string;
+      name: string;
+      operatorId: string;
+      isOwner?: boolean;
+      properties: Array<{ id: string; name: string; unitNumber: string }>;
+    };
+    reason?: string;
+  };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: !!data.ok, group: data.group };
+}
+
+export async function addPropertiesToClientGroup(
+  email: string,
+  operatorId: string,
+  groupId: string,
+  propertyIds: string[]
+): Promise<{ ok: boolean; added?: number; reason?: string }> {
+  const ids = (propertyIds || []).map((x) => String(x || '').trim()).filter(Boolean);
+  if (!ids.length) return { ok: false, reason: 'MISSING_PROPERTY_ID' };
+  const r = await apiFetch({
+    path: '/api/cleanlemon/client/property-groups/add-property',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: String(email || '').trim().toLowerCase(),
+      operatorId: String(operatorId || '').trim(),
+      groupId,
+      propertyIds: ids,
+    }),
+  });
+  const data = (await r.json().catch(() => ({}))) as { ok?: boolean; added?: number; reason?: string };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: !!data.ok, added: data.added ?? ids.length };
+}
+
+export async function addPropertyToClientGroup(
+  email: string,
+  operatorId: string,
+  groupId: string,
+  propertyId: string
+): Promise<{ ok: boolean; reason?: string }> {
+  return addPropertiesToClientGroup(email, operatorId, groupId, [propertyId]);
+}
+
+export async function removePropertyFromClientGroup(
+  email: string,
+  operatorId: string,
+  groupId: string,
+  propertyId: string
+): Promise<{ ok: boolean; reason?: string }> {
+  const r = await apiFetch({
+    path: '/api/cleanlemon/client/property-groups/remove-property',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: String(email || '').trim().toLowerCase(),
+      operatorId: String(operatorId || '').trim(),
+      groupId,
+      propertyId,
+    }),
+  });
+  const data = (await r.json().catch(() => ({}))) as { ok?: boolean; reason?: string };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: !!data.ok };
+}
+
+export async function inviteClientGroupMember(
+  email: string,
+  operatorId: string,
+  groupId: string,
+  inviteEmail: string,
+  perm: GroupMemberPerm
+): Promise<{ ok: boolean; member?: { id: string; inviteEmail: string }; reason?: string }> {
+  const r = await apiFetch({
+    path: '/api/cleanlemon/client/property-groups/invite',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: String(email || '').trim().toLowerCase(),
+      operatorId: String(operatorId || '').trim(),
+      groupId,
+      inviteEmail: String(inviteEmail || '').trim().toLowerCase(),
+      perm,
+    }),
+  });
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean;
+    member?: { id: string; inviteEmail: string };
+    reason?: string;
+  };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: !!data.ok, member: data.member };
+}
+
+export async function fetchClientPropertyGroupMembers(
+  email: string,
+  operatorId: string,
+  groupId: string
+): Promise<{ ok: boolean; items?: ClientPropertyGroupMemberRow[]; reason?: string }> {
+  const r = await apiFetch({
+    path: '/api/cleanlemon/client/property-groups/members',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: String(email || '').trim().toLowerCase(),
+      operatorId: String(operatorId || '').trim(),
+      groupId,
+    }),
+  });
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean;
+    items?: ClientPropertyGroupMemberRow[];
+    reason?: string;
+  };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: !!data.ok, items: Array.isArray(data.items) ? data.items : [] };
+}
+
+export async function kickClientGroupMember(
+  email: string,
+  operatorId: string,
+  groupId: string,
+  memberId: string
+): Promise<{ ok: boolean; reason?: string }> {
+  const r = await apiFetch({
+    path: '/api/cleanlemon/client/property-groups/kick',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: String(email || '').trim().toLowerCase(),
+      operatorId: String(operatorId || '').trim(),
+      groupId,
+      memberId,
+    }),
+  });
+  const data = (await r.json().catch(() => ({}))) as { ok?: boolean; reason?: string };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: !!data.ok };
+}
+
+export async function deleteClientPropertyGroup(
+  email: string,
+  operatorId: string,
+  groupId: string
+): Promise<{ ok: boolean; reason?: string }> {
+  const r = await apiFetch({
+    path: '/api/cleanlemon/client/property-groups/delete',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: String(email || '').trim().toLowerCase(),
+      operatorId: String(operatorId || '').trim(),
+      groupId,
+    }),
+  });
+  const data = (await r.json().catch(() => ({}))) as { ok?: boolean; reason?: string };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: !!data.ok };
+}
 
 export async function fetchClientPortalPropertyDetail(
   email: string,
@@ -1498,17 +1850,43 @@ export async function decideClientPropertyLinkRequest(
   );
 }
 
-/** B2B client — cleaning jobs for linked properties (JWT or email+operatorId). */
+/** B2B client — cleaning jobs (email + optional portal operator; with groupId, lists all jobs in that group across property operators). */
+/** B2B client — invoices (real `cln_client_invoice` rows for this portal client). */
+export async function fetchClientPortalInvoices(
+  email: string,
+  operatorId: string,
+  opts?: { limit?: number; filterOperatorId?: string }
+): Promise<{
+  ok: boolean;
+  items?: Array<Record<string, unknown>>;
+  operators?: Array<{ id: string; name: string }>;
+  reason?: string;
+}> {
+  const qs = new URLSearchParams({
+    email: String(email || '').trim().toLowerCase(),
+    operatorId: String(operatorId || '').trim(),
+  });
+  if (opts?.limit != null) qs.set('limit', String(opts.limit));
+  if (opts?.filterOperatorId) qs.set('filterOperatorId', String(opts.filterOperatorId).trim());
+  return fetchJsonSafe(
+    apiFetch({
+      path: `/api/cleanlemon/client/invoices?${qs.toString()}`,
+      cache: 'no-store',
+    })
+  );
+}
+
 export async function fetchClientScheduleJobs(
   email: string,
   operatorId: string,
-  opts?: { limit?: number }
+  opts?: { limit?: number; groupId?: string }
 ): Promise<{ ok: boolean; items?: unknown[]; reason?: string }> {
   const qs = new URLSearchParams({
     email: String(email || '').trim().toLowerCase(),
     operatorId: String(operatorId || '').trim(),
   });
   if (opts?.limit != null) qs.set('limit', String(opts.limit));
+  if (opts?.groupId) qs.set('groupId', String(opts.groupId).trim());
   return fetchJsonSafe(
     apiFetch({
       path: `/api/cleanlemon/client/schedule-jobs?${qs.toString()}`,
@@ -1537,6 +1915,8 @@ export async function createClientScheduleJob(body: {
   price?: number;
   /** Optional note appended to schedule remarks (operator-visible). */
   clientRemark?: string;
+  /** When booking from a property group context. */
+  groupId?: string;
 }): Promise<{ ok: boolean; id?: string; reason?: string; message?: string }> {
   return fetchJsonSafe(
     apiFetch({
@@ -1556,6 +1936,7 @@ export async function updateClientScheduleJob(body: {
   workingDay: string;
   status?: string;
   statusSetByEmail?: string;
+  groupId?: string;
 }): Promise<{ ok: boolean; reason?: string }> {
   const { scheduleId, ...rest } = body;
   const r = await apiFetch({
@@ -3140,4 +3521,96 @@ export async function postAdminPropertyDelete(propertyId: string): Promise<{
   };
   if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
   return data;
+}
+
+export type SaasadminAiMdItem = {
+  id: string;
+  /** Stable display id e.g. 0001 (after migration 0270). */
+  ruleCode?: string;
+  title: string;
+  bodyMd: string;
+  sortOrder: number;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+export async function fetchSaasadminAiMdRules(): Promise<{
+  ok: boolean;
+  items?: SaasadminAiMdItem[];
+  reason?: string;
+}> {
+  const r = await apiFetch({ path: '/api/cleanlemon/admin/saasadmin-ai-md', cache: 'no-store' });
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean;
+    items?: SaasadminAiMdItem[];
+    reason?: string;
+  };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: true, items: data.items || [] };
+}
+
+export async function createSaasadminAiMdRule(body: {
+  title: string;
+  bodyMd?: string;
+  sortOrder?: number;
+}): Promise<{ ok: boolean; item?: SaasadminAiMdItem; reason?: string }> {
+  const r = await apiFetch({
+    path: '/api/cleanlemon/admin/saasadmin-ai-md',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean;
+    item?: SaasadminAiMdItem;
+    reason?: string;
+  };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: true, item: data.item };
+}
+
+export async function updateSaasadminAiMdRule(
+  id: string,
+  body: { title?: string; bodyMd?: string; sortOrder?: number }
+): Promise<{ ok: boolean; item?: SaasadminAiMdItem; reason?: string }> {
+  const r = await apiFetch({
+    path: `/api/cleanlemon/admin/saasadmin-ai-md/${encodeURIComponent(id)}`,
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean;
+    item?: SaasadminAiMdItem;
+    reason?: string;
+  };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: true, item: data.item };
+}
+
+export async function deleteSaasadminAiMdRule(id: string): Promise<{ ok: boolean; reason?: string }> {
+  const r = await apiFetch({
+    path: `/api/cleanlemon/admin/saasadmin-ai-md/${encodeURIComponent(id)}`,
+    method: 'DELETE',
+  });
+  const data = (await r.json().catch(() => ({}))) as { ok?: boolean; reason?: string };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: true };
+}
+
+export type SaasadminAiChatMessage = { role: 'user' | 'assistant' | 'system'; content: string };
+
+export async function postSaasadminAiChat(body: {
+  message?: string;
+  messages?: SaasadminAiChatMessage[];
+}): Promise<{ ok: boolean; reply?: string; reason?: string }> {
+  const r = await apiFetch({
+    path: '/api/cleanlemon/admin/saasadmin-ai-chat',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = (await r.json().catch(() => ({}))) as { ok?: boolean; reply?: string; reason?: string };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: true, reply: data.reply };
 }

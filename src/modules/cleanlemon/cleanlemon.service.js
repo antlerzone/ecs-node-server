@@ -24,6 +24,7 @@ const {
   validateBookingLeadTimeForConfig,
   validateServiceInSelectedServices,
 } = require('../../utils/cleanlemonBookingEligibility');
+const clnPropGroup = require('./cleanlemon-property-group.service');
 
 const CLN_ACCOUNT_PROVIDERS = ['bukku', 'xero', 'autocount', 'sql'];
 const CLN_DEFAULT_CURRENCY = (process.env.CLEANLEMON_DEFAULT_CURRENCY || 'MYR').trim().toUpperCase() || 'MYR';
@@ -1316,6 +1317,36 @@ async function getEmployeeProfileByEmail(email, operatorIdOptional = null) {
  */
 async function assertClnClientPortalOperatorAccess(email, operatorId, options) {
   await resolveClnClientdetailIdForClientPortal(email, operatorId, options);
+}
+
+/**
+ * Client portal: Cleanlemons operators (`cln_operatordetail`) linked to this B2B client via `cln_client_operator`.
+ */
+async function listClientPortalLinkedCleanlemonsOperators(clientdetailId) {
+  const cid = String(clientdetailId || '').trim();
+  if (!cid) return [];
+  const ct = await getClnCompanyTable();
+  try {
+    const [rows] = await pool.query(
+      `SELECT o.id, COALESCE(o.name, '') AS name, COALESCE(o.email, '') AS email
+       FROM cln_client_operator j
+       INNER JOIN \`${ct}\` o ON o.id = j.operator_id
+       WHERE j.clientdetail_id = ?
+       ORDER BY name ASC`,
+      [cid]
+    );
+    return (rows || []).map((r) => ({
+      operatorId: String(r.id || '').trim(),
+      operatorName: String(r.name || '').trim() || String(r.id || '').trim(),
+      operatorEmail: String(r.email || '').trim(),
+    }));
+  } catch (e) {
+    const msg = String(e?.sqlMessage || e?.message || '');
+    if (!/doesn't exist/i.test(msg) && !/Unknown table/i.test(msg)) {
+      console.warn('[cleanlemon] listClientPortalLinkedCleanlemonsOperators:', e?.message || e);
+    }
+    return [];
+  }
 }
 
 /**
@@ -2656,15 +2687,21 @@ async function createCleaningScheduleJobUnified(input = {}) {
     addons: input.addons,
     createdByEmail: input.createdByEmail,
     price: input.price,
+    clientPortalGroupId: input.clientPortalGroupId,
   });
 }
 
-async function listClientPortalScheduleJobs({ clientdetailId, operatorId, limit = 200 } = {}) {
+async function listClientPortalScheduleJobs({ clientdetailId, operatorId, limit = 200, groupId } = {}) {
   const cid = String(clientdetailId || '').trim();
   const oid = String(operatorId || '').trim();
-  if (!cid || !oid) return [];
+  const gid = String(groupId || '').trim();
+  if (!cid) return [];
+  const hasGroupTables = await clnPropGroup.propertyGroupTablesExist();
+  /** One group may contain properties under different operators — do not filter by a single p.operator_id. */
+  const multiOperatorGroupScope = Boolean(gid && hasGroupTables);
+  if (!multiOperatorGroupScope && !oid) return [];
   await ensureOperatorTeamTable();
-  const teams = await listOperatorTeams(oid);
+  const teams = multiOperatorGroupScope ? [] : await listOperatorTeams(oid);
   const lim = Math.min(Math.max(Number(limit) || 200, 1), 1000);
   const ct = await getClnCompanyTable();
   const hasPricingAddonsCol = await databaseHasColumn('cln_schedule', 'pricing_addons_json');
@@ -2681,6 +2718,42 @@ async function listClientPortalScheduleJobs({ clientdetailId, operatorId, limit 
             NULL AS readyToCleanAt,`;
   const propNavColsClient = await sqlPropertyNavigationUrlColumns();
   const clientDisp = await buildClnPropertyClientDisplaySql(ct);
+  let groupSql = '';
+  const params = [];
+  let operatorWhere = '';
+  if (!multiOperatorGroupScope) {
+    operatorWhere = 'p.operator_id = ?';
+    params.push(oid);
+  } else {
+    operatorWhere = '1=1';
+  }
+  if (hasGroupTables) {
+    groupSql = ` AND (
+      p.clientdetail_id = ?
+      OR EXISTS (
+        SELECT 1 FROM cln_property_group_property gpp
+        INNER JOIN cln_property_group_member m ON m.group_id = gpp.group_id
+        WHERE gpp.property_id = p.id AND m.grantee_clientdetail_id = ? AND m.invite_status = 'active'
+      )
+    )`;
+    params.push(cid, cid);
+  } else {
+    groupSql = ' AND p.clientdetail_id = ?';
+    params.push(cid);
+  }
+  if (gid && hasGroupTables) {
+    groupSql += ` AND EXISTS (
+      SELECT 1 FROM cln_property_group_property gpp2
+      INNER JOIN cln_property_group gpg2 ON gpg2.id = gpp2.group_id
+      WHERE gpp2.property_id = p.id AND gpg2.id = ?
+        AND (gpg2.owner_clientdetail_id = ? OR EXISTS (
+          SELECT 1 FROM cln_property_group_member m3
+          WHERE m3.group_id = gpg2.id AND m3.grantee_clientdetail_id = ? AND m3.invite_status = 'active'
+        ))
+    )`;
+    params.push(gid, cid, cid);
+  }
+  params.push(lim);
   const [rows] = await pool.query(
     `SELECT s.id,
             s.property_id AS propertyId,
@@ -2705,10 +2778,11 @@ async function listClientPortalScheduleJobs({ clientdetailId, operatorId, limit 
      FROM cln_schedule s
      INNER JOIN cln_property p ON p.id = s.property_id
      ${clientDisp.joinSql}
-     WHERE p.clientdetail_id = ? AND p.operator_id = ?
+     WHERE ${operatorWhere}
+     ${groupSql}
      ORDER BY s.working_day DESC, s.created_at DESC
      LIMIT ?`,
-    [cid, oid, lim]
+    params
   );
   return (rows || []).map((r) => mapScheduleRowToJobItem(r, teams));
 }
@@ -2725,10 +2799,12 @@ async function createClientPortalScheduleJob({
   addons,
   price,
   clientRemark,
+  groupId,
 }) {
   const cid = String(clientdetailId || '').trim();
   const oid = String(operatorId || '').trim();
   const pid = String(propertyId || '').trim();
+  const gid = String(groupId || '').trim();
   if (!cid || !oid || !pid) {
     const e = new Error('MISSING_IDS');
     e.code = 'MISSING_IDS';
@@ -2744,16 +2820,43 @@ async function createClientPortalScheduleJob({
     e.code = 'PROPERTY_NOT_FOUND';
     throw e;
   }
-  if (String(prop.clientdetail_id || '') !== cid) {
-    const e = new Error('PROPERTY_CLIENT_MISMATCH');
-    e.code = 'PROPERTY_CLIENT_MISMATCH';
-    throw e;
-  }
-  const po = prop.operator_id != null ? String(prop.operator_id).trim() : '';
-  if (!po || po !== oid) {
-    const e = new Error('PROPERTY_OPERATOR_MISMATCH');
-    e.code = 'PROPERTY_OPERATOR_MISMATCH';
-    throw e;
+  if (gid) {
+    try {
+      const scope = await clnPropGroup.assertGroupPropertyInScope({
+        clientdetailId: cid,
+        groupId: gid,
+        propertyId: pid,
+        operatorId: oid,
+      });
+      if (!scope.perm.booking.create) {
+        const e = new Error('GROUP_PERMISSION_DENIED');
+        e.code = 'GROUP_PERMISSION_DENIED';
+        throw e;
+      }
+    } catch (e) {
+      if (
+        e?.code === 'GROUP_ACCESS_DENIED' ||
+        e?.code === 'GROUP_PROPERTY_MISMATCH' ||
+        e?.code === 'GROUP_OPERATOR_MISMATCH'
+      ) {
+        const err = new Error(e.code);
+        err.code = e.code;
+        throw err;
+      }
+      throw e;
+    }
+  } else {
+    if (String(prop.clientdetail_id || '') !== cid) {
+      const e = new Error('PROPERTY_CLIENT_MISMATCH');
+      e.code = 'PROPERTY_CLIENT_MISMATCH';
+      throw e;
+    }
+    const po = prop.operator_id != null ? String(prop.operator_id).trim() : '';
+    if (!po || po !== oid) {
+      const e = new Error('PROPERTY_OPERATOR_MISMATCH');
+      e.code = 'PROPERTY_OPERATOR_MISMATCH';
+      throw e;
+    }
   }
   const sp = String(serviceProvider || 'general-cleaning').trim();
   const pkey = pricingKeyFromServiceProvider(sp);
@@ -2780,6 +2883,7 @@ async function createClientPortalScheduleJob({
     addons,
     price,
     source: 'client_portal',
+    clientPortalGroupId: gid || undefined,
   });
 }
 
@@ -2793,10 +2897,12 @@ async function updateClientPortalScheduleJob({
   workingDay,
   status,
   statusSetByEmail,
+  groupId,
 }) {
   const cid = String(clientdetailId || '').trim();
   const oid = String(operatorId || '').trim();
   const sid = String(scheduleId || '').trim();
+  const gidIn = String(groupId || '').trim();
   if (!cid || !oid || !sid) {
     const e = new Error('MISSING_IDS');
     e.code = 'MISSING_IDS';
@@ -2804,7 +2910,7 @@ async function updateClientPortalScheduleJob({
   }
   await assertClientdetailLinkedToOperator(oid, cid);
   const [[row]] = await pool.query(
-    `SELECT p.clientdetail_id AS cd, p.operator_id AS op
+    `SELECT p.id AS propertyId, p.clientdetail_id AS cd, p.operator_id AS op
      FROM cln_schedule s
      INNER JOIN cln_property p ON p.id = s.property_id
      WHERE s.id = ?
@@ -2816,15 +2922,90 @@ async function updateClientPortalScheduleJob({
     e.code = 'NOT_FOUND';
     throw e;
   }
-  if (String(row.cd || '').trim() !== cid) {
-    const e = new Error('PROPERTY_CLIENT_MISMATCH');
-    e.code = 'PROPERTY_CLIENT_MISMATCH';
-    throw e;
-  }
   if (String(row.op || '').trim() !== oid) {
     const e = new Error('PROPERTY_OPERATOR_MISMATCH');
     e.code = 'PROPERTY_OPERATOR_MISMATCH';
     throw e;
+  }
+  const pid = String(row.propertyId || '').trim();
+  const acc = await clnPropGroup.getClientPropertyGroupAccess(cid, pid);
+  if (acc.access === 'none') {
+    const e = new Error('NOT_FOUND');
+    e.code = 'NOT_FOUND';
+    throw e;
+  }
+  if (gidIn && (await clnPropGroup.propertyGroupTablesExist())) {
+    try {
+      const scope = await clnPropGroup.assertGroupPropertyInScope({
+        clientdetailId: cid,
+        groupId: gidIn,
+        propertyId: pid,
+        operatorId: oid,
+      });
+      if (acc.access === 'member' && acc.groupId && acc.groupId !== gidIn) {
+        const e = new Error('GROUP_PROPERTY_MISMATCH');
+        e.code = 'GROUP_PROPERTY_MISMATCH';
+        throw e;
+      }
+      const stIn = status !== undefined ? status : null;
+      const newNorm = stIn != null ? normalizeScheduleStatus(stIn) : '';
+      const isCancel =
+        newNorm === 'cancelled' ||
+        String(stIn || '')
+          .toLowerCase()
+          .includes('cancel');
+      if (workingDay !== undefined) {
+        if (!scope.perm.booking.edit) {
+          const e = new Error('GROUP_PERMISSION_DENIED');
+          e.code = 'GROUP_PERMISSION_DENIED';
+          throw e;
+        }
+      }
+      if (stIn != null) {
+        if (isCancel) {
+          if (!scope.perm.booking.delete) {
+            const e = new Error('GROUP_PERMISSION_DENIED');
+            e.code = 'GROUP_PERMISSION_DENIED';
+            throw e;
+          }
+        } else if (!scope.perm.status.edit && !scope.perm.status.create) {
+          const e = new Error('GROUP_PERMISSION_DENIED');
+          e.code = 'GROUP_PERMISSION_DENIED';
+          throw e;
+        }
+      }
+    } catch (e) {
+      if (e?.code === 'GROUP_ACCESS_DENIED' || e?.code === 'GROUP_PROPERTY_MISMATCH') throw e;
+      throw e;
+    }
+  } else if (String(row.cd || '').trim() !== cid) {
+    const stIn = status !== undefined ? status : null;
+    const newNorm = stIn != null ? normalizeScheduleStatus(stIn) : '';
+    const isCancel =
+      newNorm === 'cancelled' ||
+      String(stIn || '')
+        .toLowerCase()
+        .includes('cancel');
+    if (workingDay !== undefined) {
+      if (!acc.perm.booking.edit) {
+        const e = new Error('GROUP_PERMISSION_DENIED');
+        e.code = 'GROUP_PERMISSION_DENIED';
+        throw e;
+      }
+    }
+    if (stIn != null) {
+      if (isCancel) {
+        if (!acc.perm.booking.delete) {
+          const e = new Error('GROUP_PERMISSION_DENIED');
+          e.code = 'GROUP_PERMISSION_DENIED';
+          throw e;
+        }
+      } else if (!acc.perm.status.edit && !acc.perm.status.create) {
+        const e = new Error('GROUP_PERMISSION_DENIED');
+        e.code = 'GROUP_PERMISSION_DENIED';
+        throw e;
+      }
+    }
   }
   const patch = { operatorId: oid };
   if (workingDay !== undefined) patch.workingDay = workingDay;
@@ -3409,6 +3590,20 @@ async function createOperatorScheduleJob(input) {
     valParts.push('NOW(3)');
   }
   valParts.push('NOW(3)', 'NOW(3)');
+  const hasGroupCol = await databaseHasColumn('cln_schedule', 'client_portal_group_id');
+  const gidIn = input.clientPortalGroupId != null ? String(input.clientPortalGroupId).trim() : '';
+  if (hasGroupCol && gidIn) {
+    const pos = colList.split(', ').indexOf('property_id');
+    if (pos >= 0) {
+      const parts = colList.split(', ');
+      const pi = parts.indexOf('property_id');
+      parts.splice(pi + 1, 0, 'client_portal_group_id');
+      colList = parts.join(', ');
+      const ip = insertParams.indexOf(propertyId);
+      insertParams.splice(ip + 1, 0, gidIn);
+      valParts.splice(ip + 1, 0, '?');
+    }
+  }
   await pool.query(
     `INSERT INTO cln_schedule (${colList}) VALUES (${valParts.join(', ')})`,
     insertParams
@@ -3935,16 +4130,21 @@ async function syncClientPortalPropertiesFromColiving({ clientdetailId } = {}) {
   return { ok: true, syncedOperators: opIds.length, itemCount };
 }
 
-async function listClientPortalProperties({ clientdetailId, limit = 500 } = {}) {
+async function listClientPortalProperties({ clientdetailId, limit = 500, loginEmail } = {}) {
   const cid = String(clientdetailId || '').trim();
   if (!cid) return [];
   const hasClientdetailCol = await databaseHasColumn('cln_property', 'clientdetail_id');
   if (!hasClientdetailCol) return [];
   await ensureColivingPropertyTreeSyncedForClientdetail(cid);
+  if (await clnPropGroup.propertyGroupTablesExist()) {
+    await clnPropGroup.activatePendingInvitesForClientPortal(cid, loginEmail);
+  }
   const hasOpCol = await databaseHasColumn('cln_property', 'operator_id');
   const hasPremisesType = await databaseHasColumn('cln_property', 'premises_type');
   const ct = hasOpCol ? await getClnCompanyTable() : null;
   const lim = Math.min(Math.max(Number(limit) || 500, 1), 500);
+  const hasSyncArch = await databaseHasColumn('cln_property', 'coliving_sync_archived');
+  const archWhere = hasSyncArch ? ' AND (p.coliving_sync_archived IS NULL OR p.coliving_sync_archived = 0)' : '';
   const ptSql = hasPremisesType ? ', p.premises_type AS premisesTypeRaw' : '';
   const opSelect =
     hasOpCol && ct
@@ -3980,12 +4180,76 @@ async function listClientPortalProperties({ clientdetailId, limit = 500 } = {}) 
       ${plrPendingSql}
      FROM cln_property p
      ${joinSql}
-     WHERE p.clientdetail_id = ?
+     WHERE p.clientdetail_id = ?${archWhere}
      ORDER BY p.updated_at DESC, p.created_at DESC
      LIMIT ?`,
     [cid, lim]
   );
-  return (rows || []).map((r) => {
+  const rowMap = new Map();
+  for (const r of rows || []) {
+    rowMap.set(String(r.id), { ...r, _portalAccess: 'owner' });
+  }
+  if ((await clnPropGroup.propertyGroupTablesExist()) && rowMap.size < lim) {
+    const remaining = lim - rowMap.size;
+    if (remaining > 0) {
+      const [extraRows] = await pool.query(
+        `SELECT
+          p.id AS id,
+          COALESCE(p.property_name, '') AS name,
+          COALESCE(p.address, '') AS address,
+          COALESCE(p.unit_name, '') AS unitNumber,
+          p.created_at AS createdAt,
+          p.updated_at AS updatedAt
+          ${ptSql}
+          ${opSelect}
+          ${plrPendingSql}
+         FROM cln_property p
+         ${joinSql}
+         INNER JOIN cln_property_group_property gpp ON gpp.property_id = p.id
+         INNER JOIN cln_property_group gpg ON gpg.id = gpp.group_id
+         INNER JOIN cln_property_group_member m ON m.group_id = gpg.id
+           AND m.grantee_clientdetail_id = ?
+           AND m.invite_status = 'active'
+         WHERE p.clientdetail_id <> ?${archWhere}
+         ORDER BY p.updated_at DESC, p.created_at DESC
+         LIMIT ?`,
+        [cid, cid, remaining]
+      );
+      for (const r of extraRows || []) {
+        const rid = String(r.id);
+        if (!rowMap.has(rid)) rowMap.set(rid, { ...r, _portalAccess: 'shared' });
+      }
+    }
+  }
+  const merged = Array.from(rowMap.values())
+    .sort((a, b) => {
+      const tb = new Date(b.updatedAt || b.createdAt || 0).getTime();
+      const ta = new Date(a.updatedAt || a.createdAt || 0).getTime();
+      return tb - ta;
+    })
+    .slice(0, lim);
+  const groupNamesByPropertyId = new Map();
+  if ((await clnPropGroup.propertyGroupTablesExist()) && merged.length) {
+    const ids = merged.map((row) => String(row.id || '').trim()).filter(Boolean);
+    if (ids.length) {
+      const ph = ids.map(() => '?').join(',');
+      const [gRows] = await pool.query(
+        `SELECT gpp.property_id AS pid, COALESCE(gpg.name, '') AS gname
+         FROM cln_property_group_property gpp
+         INNER JOIN cln_property_group gpg ON gpg.id = gpp.group_id
+         WHERE gpp.property_id IN (${ph})`,
+        ids
+      );
+      for (const gr of gRows || []) {
+        const pid = String(gr.pid || '').trim();
+        const nm = String(gr.gname || '').trim();
+        if (!pid) continue;
+        if (!groupNamesByPropertyId.has(pid)) groupNamesByPropertyId.set(pid, []);
+        if (nm) groupNamesByPropertyId.get(pid).push(nm);
+      }
+    }
+  }
+  return merged.map((r) => {
     const oid = hasOpCol && r.operatorIdRaw ? String(r.operatorIdRaw).trim() : '';
     const email = hasOpCol && r.operatorEmailRaw != null ? String(r.operatorEmailRaw).trim() : '';
     let operatorName = '—';
@@ -3997,8 +4261,12 @@ async function listClientPortalProperties({ clientdetailId, limit = 500 } = {}) 
       r.clientOperatorLinkPendingRaw === true ||
       r.clientOperatorLinkPendingRaw === 1 ||
       Number(r.clientOperatorLinkPendingRaw) === 1;
+    const pid = String(r.id || '');
+    const gList = groupNamesByPropertyId.get(pid) || [];
+    const groupNames = [...new Set(gList)].sort((a, b) => a.localeCompare(b));
+    const portalAccess = r._portalAccess === 'shared' ? 'shared' : 'owner';
     return {
-      id: String(r.id || ''),
+      id: pid,
       name: String(r.name || ''),
       address: String(r.address || ''),
       unitNumber: String(r.unitNumber || ''),
@@ -4007,6 +4275,8 @@ async function listClientPortalProperties({ clientdetailId, limit = 500 } = {}) 
       operatorName,
       operatorEmail: email,
       clientOperatorLinkPending: pending,
+      groupNames,
+      portalAccess,
       createdAt: r.createdAt,
       updatedAt: r.updatedAt,
     };
@@ -4066,6 +4336,8 @@ async function getClientPortalPropertyDetail({ clientdetailId, propertyId } = {}
   if (!cid || !pid) return null;
   const hasClientdetailCol = await databaseHasColumn('cln_property', 'clientdetail_id');
   if (!hasClientdetailCol) return null;
+  const gAcc = await clnPropGroup.getClientPropertyGroupAccess(cid, pid);
+  if (gAcc.access === 'none') return null;
   const hasOpCol = await databaseHasColumn('cln_property', 'operator_id');
   const hasColivingPd = await databaseHasColumn('cln_property', 'coliving_propertydetail_id');
   const hasColivingRd = await databaseHasColumn('cln_property', 'coliving_roomdetail_id');
@@ -4102,6 +4374,7 @@ async function getClientPortalPropertyDetail({ clientdetailId, propertyId } = {}
   if (hasOpCol) clnCols.push('operator_id');
   if (hasColivingPd) clnCols.push('coliving_propertydetail_id');
   if (hasColivingRd) clnCols.push('coliving_roomdetail_id');
+  if (await databaseHasColumn('cln_property', 'coliving_sync_archived')) clnCols.push('coliving_sync_archived');
   for (const c of clnOptional) {
     if (await databaseHasColumn('cln_property', c)) clnCols.push(c);
   }
@@ -4110,11 +4383,12 @@ async function getClientPortalPropertyDetail({ clientdetailId, propertyId } = {}
   const [[row]] = await pool.query(
     `SELECT ${clnCols.map((c) => `p.\`${c}\``).join(', ')}
      FROM cln_property p
-     WHERE p.id = ? AND p.clientdetail_id = ?
+     WHERE p.id = ?
      LIMIT 1`,
-    [pid, cid]
+    [pid]
   );
   if (!row) return null;
+  if (row.coliving_sync_archived != null && Number(row.coliving_sync_archived) === 1) return null;
 
   let cleanlemonsOperatorName = '';
   let cleanlemonsOperatorEmail = '';
@@ -4317,7 +4591,12 @@ async function getClientPortalPropertyDetail({ clientdetailId, propertyId } = {}
       row.longitude != null && String(row.longitude).trim() !== ''
         ? Number(row.longitude)
         : null,
-    smartdoorBindings
+    smartdoorBindings,
+    groupAccess: {
+      access: gAcc.access,
+      groupId: gAcc.groupId,
+      perm: gAcc.perm,
+    },
   };
 }
 
@@ -4358,20 +4637,21 @@ async function patchClientPortalProperty({ clientdetailId, propertyId, body } = 
     e.code = 'CLIENT_PORTAL_PROPERTIES_UNSUPPORTED';
     throw e;
   }
+  await clnPropGroup.assertPropertyActionAllowed(cid, pid, 'property', 'edit');
   const [hasWNavCol, hasGNavCol, hasLatColPatch, hasLngColPatch] = await Promise.all([
     databaseHasColumn('cln_property', 'waze_url'),
     databaseHasColumn('cln_property', 'google_maps_url'),
     databaseHasColumn('cln_property', 'latitude'),
     databaseHasColumn('cln_property', 'longitude'),
   ]);
-  let selExisting = 'id, coliving_propertydetail_id AS colivingPd, address';
+  let selExisting = 'id, clientdetail_id AS propOwnerClientdetailId, coliving_propertydetail_id AS colivingPd, address';
   if (hasWNavCol) selExisting += ', waze_url';
   if (hasGNavCol) selExisting += ', google_maps_url';
   if (hasLatColPatch) selExisting += ', latitude';
   if (hasLngColPatch) selExisting += ', longitude';
   const [[existing]] = await pool.query(
-    `SELECT ${selExisting} FROM cln_property WHERE id = ? AND clientdetail_id = ? LIMIT 1`,
-    [pid, cid]
+    `SELECT ${selExisting} FROM cln_property WHERE id = ? LIMIT 1`,
+    [pid]
   );
   if (!existing) {
     const e = new Error('PROPERTY_NOT_FOUND');
@@ -4379,11 +4659,17 @@ async function patchClientPortalProperty({ clientdetailId, propertyId, body } = 
     throw e;
   }
   const colivingPdId = existing.colivingPd != null ? String(existing.colivingPd) : '';
+  const isPropertyOwner = String(existing.propOwnerClientdetailId || '').trim() === cid;
 
   const b = body && typeof body === 'object' ? body : {};
   const hasOpCol = await databaseHasColumn('cln_property', 'operator_id');
 
   if (b.clearCleanlemonsOperator) {
+    if (!isPropertyOwner) {
+      const e = new Error('GROUP_PERMISSION_DENIED');
+      e.code = 'GROUP_PERMISSION_DENIED';
+      throw e;
+    }
     if (!hasOpCol) {
       const e = new Error('OPERATOR_COLUMN_MISSING');
       e.code = 'OPERATOR_COLUMN_MISSING';
@@ -4391,6 +4677,11 @@ async function patchClientPortalProperty({ clientdetailId, propertyId, body } = 
     }
     await pool.query('UPDATE cln_property SET operator_id = NULL, updated_at = NOW(3) WHERE id = ?', [pid]);
   } else if (b.setCleanlemonsOperator && typeof b.setCleanlemonsOperator === 'object') {
+    if (!isPropertyOwner) {
+      const e = new Error('GROUP_PERMISSION_DENIED');
+      e.code = 'GROUP_PERMISSION_DENIED';
+      throw e;
+    }
     const opId = String(b.setCleanlemonsOperator.operatorId || '').trim();
     const auth = !!b.setCleanlemonsOperator.authorizePropertyAndTtlock;
     const requestApproval =
@@ -5414,6 +5705,105 @@ async function listOperatorInvoices({ limit = 300 } = {}) {
     [lim]
   );
   return rows;
+}
+
+/** Operators linked to this B2B client (for portal invoice filter). */
+async function listLinkedOperatorsForClientPortal(clientdetailId) {
+  const cid = String(clientdetailId || '').trim();
+  if (!cid) return [];
+  const odTable = await resolveClnOperatordetailTable();
+  try {
+    const [rows] = await pool.query(
+      `SELECT j.operator_id AS id,
+              TRIM(COALESCE(NULLIF(od.name, ''), NULLIF(od.email, ''), j.operator_id)) AS name
+       FROM cln_client_operator j
+       INNER JOIN \`${odTable}\` od ON od.id = j.operator_id
+       WHERE j.clientdetail_id = ?
+       ORDER BY name ASC`,
+      [cid]
+    );
+    return (rows || []).map((r) => ({ id: String(r.id), name: String(r.name || r.id) }));
+  } catch (e) {
+    console.warn('[cleanlemon] listLinkedOperatorsForClientPortal', e?.message || e);
+    return [];
+  }
+}
+
+/**
+ * B2B client portal — invoices where `cln_client_invoice.client_id` is the portal `cln_clientdetail.id`
+ * (same id used in operator invoice client picker after merge).
+ */
+async function listClientPortalInvoices({ clientdetailId, filterOperatorId, limit = 500 } = {}) {
+  const cid = String(clientdetailId || '').trim();
+  if (!cid) return { items: [], operators: [] };
+  const operators = await listLinkedOperatorsForClientPortal(cid);
+  const hasOpCol = await databaseHasColumn('cln_client_invoice', 'operator_id');
+  const fop = String(filterOperatorId || '').trim();
+  const lim = Math.min(Math.max(Number(limit) || 500, 1), 1000);
+  const hasPaymentReceivedCol = await databaseHasColumn('cln_client_invoice', 'payment_received');
+  const hasTransactionIdCol = await databaseHasColumn('cln_client_invoice', 'transaction_id');
+  const [[payTableRow]] = await pool.query(
+    `SELECT COUNT(*) AS n FROM information_schema.tables
+     WHERE table_schema = DATABASE() AND table_name = 'cln_client_payment'`
+  );
+  const hasClientPaymentTable = Number(payTableRow?.n || 0) > 0;
+  const paymentStatusExpr = hasPaymentReceivedCol ? 'COALESCE(i.payment_received, 0)' : '0';
+  const accountingInvoiceExpr = hasTransactionIdCol
+    ? "NULLIF(TRIM(COALESCE(i.transaction_id, '')), '')"
+    : 'NULL';
+  const paidDateExpr = hasClientPaymentTable
+    ? "DATE_FORMAT(COALESCE(p.payment_date, NULL), '%Y-%m-%d')"
+    : 'NULL';
+  const paymentJoin = hasClientPaymentTable
+    ? `LEFT JOIN (
+      SELECT invoice_id, MAX(payment_date) AS payment_date
+      FROM cln_client_payment
+      GROUP BY invoice_id
+    ) p ON p.invoice_id = i.id`
+    : '';
+  const odTable = await resolveClnOperatordetailTable();
+  const opJoin = hasOpCol ? `LEFT JOIN \`${odTable}\` od ON od.id = i.operator_id` : '';
+  const opSelect = hasOpCol
+    ? `COALESCE(NULLIF(TRIM(i.operator_id), ''), '') AS operatorId,
+       TRIM(COALESCE(NULLIF(od.name, ''), NULLIF(od.email, ''), '')) AS operatorName`
+    : `'' AS operatorId, '' AS operatorName`;
+
+  let opFilterSql = '';
+  const params = [cid];
+  if (hasOpCol && fop) {
+    opFilterSql = ' AND i.operator_id = ?';
+    params.push(fop);
+  }
+  params.push(lim);
+
+  const [rows] = await pool.query(
+    `SELECT
+      i.id,
+      COALESCE(i.invoice_number, i.id) AS invoiceNo,
+      COALESCE(i.description, '') AS description,
+      COALESCE(i.amount, 0) AS amount,
+      0 AS tax,
+      COALESCE(i.amount, 0) AS total,
+      CASE
+        WHEN ${paymentStatusExpr} = 1 THEN 'paid'
+        WHEN DATE(DATE_ADD(COALESCE(i.created_at, NOW()), INTERVAL 14 DAY)) < CURDATE() THEN 'overdue'
+        ELSE 'pending'
+      END AS status,
+      DATE_FORMAT(COALESCE(i.created_at, NOW()), '%Y-%m-%d') AS issueDate,
+      DATE_FORMAT(DATE_ADD(COALESCE(i.created_at, NOW()), INTERVAL 14 DAY), '%Y-%m-%d') AS dueDate,
+      ${paidDateExpr} AS paidDate,
+      ${accountingInvoiceExpr} AS accountingInvoiceId,
+      ${opSelect}
+     FROM cln_client_invoice i
+     ${opJoin}
+     ${paymentJoin}
+     WHERE i.client_id = ?
+     ${opFilterSql}
+     ORDER BY i.created_at DESC
+     LIMIT ?`,
+    params
+  );
+  return { items: rows || [], operators };
 }
 
 async function updateInvoiceStatus(id, status, opts = {}) {
@@ -9392,19 +9782,38 @@ async function listOperatorInvoiceFormOptions(operatorId) {
 async function createOperatorInvoice(input = {}) {
   const id = input.id || makeId('cln-inv');
   const amount = Number(input.amount || 0);
-  await pool.query(
-    `INSERT INTO cln_client_invoice
-      (id, invoice_number, client_id, description, amount, payment_received, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, NOW(3), NOW(3))`,
-    [
-      id,
-      String(input.invoiceNo || id),
-      String(input.clientId || ''),
-      String(input.description || ''),
-      amount,
-      0,
-    ]
-  );
+  const opId = String(input.operatorId || '').trim();
+  const hasInvOp = await databaseHasColumn('cln_client_invoice', 'operator_id');
+  if (hasInvOp && opId) {
+    await pool.query(
+      `INSERT INTO cln_client_invoice
+        (id, invoice_number, client_id, operator_id, description, amount, payment_received, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, NOW(3), NOW(3))`,
+      [
+        id,
+        String(input.invoiceNo || id),
+        String(input.clientId || ''),
+        opId,
+        String(input.description || ''),
+        amount,
+        0,
+      ]
+    );
+  } else {
+    await pool.query(
+      `INSERT INTO cln_client_invoice
+        (id, invoice_number, client_id, description, amount, payment_received, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, NOW(3), NOW(3))`,
+      [
+        id,
+        String(input.invoiceNo || id),
+        String(input.clientId || ''),
+        String(input.description || ''),
+        amount,
+        0,
+      ]
+    );
+  }
   const operatorId = String(input.operatorId || '').trim();
   if (operatorId) {
     try {
@@ -10529,6 +10938,7 @@ module.exports = {
   listClientPortalScheduleJobs,
   createClientPortalScheduleJob,
   updateClientPortalScheduleJob,
+  listClientPortalInvoices,
   listOperatorAccountingMappings,
   upsertOperatorAccountingMapping,
   syncOperatorAccountingMappings,
@@ -10580,6 +10990,7 @@ module.exports = {
   upsertEmployeeProfileByEmail,
   assertClnClientPortalOperatorAccess,
   resolveClnClientdetailIdForClientPortal,
+  listClientPortalLinkedCleanlemonsOperators,
   assertClnOperatorStaffEmail,
   groupStartEmployeeScheduleJobs,
   groupEndEmployeeScheduleJobs,

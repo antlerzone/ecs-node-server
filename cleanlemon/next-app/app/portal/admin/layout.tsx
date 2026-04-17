@@ -3,11 +3,12 @@
 import { AppSidebar } from '@/components/layout/app-sidebar'
 import { MobileNav } from '@/components/layout/mobile-nav'
 import { SaasAdminRouteGate } from '@/components/saas-admin-route-gate'
-import { LayoutDashboard, CreditCard, GitMerge, ScrollText, Settings } from 'lucide-react'
+import { Bot, LayoutDashboard, CreditCard, GitMerge, ScrollText, Settings } from 'lucide-react'
 
 const navItems = [
   { href: '', icon: LayoutDashboard, label: 'Dashboard' },
   { href: '/subscriptions', icon: CreditCard, label: 'Subscriptions' },
+  { href: '/ai', icon: Bot, label: 'AI rules' },
   { href: '/merge', icon: GitMerge, label: 'Merge' },
   { href: '/log', icon: ScrollText, label: 'Unlock log' },
   { href: '/settings', icon: Settings, label: 'Settings' },

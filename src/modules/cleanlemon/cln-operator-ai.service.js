@@ -6,10 +6,26 @@ const axios = require('axios');
 const crypto = require('crypto');
 const pool = require('../../config/db');
 const clnInt = require('./cleanlemon-integration.service');
+const clnSaasAiMd = require('./cln-saasadmin-ai-md.service');
 const cleanlemonSvc = require('./cleanlemon.service');
 
 function uuid() {
   return crypto.randomUUID();
+}
+
+/** SaaS platform rules from `cln_saasadmin_ai_md` — prepended to operator LLM system prompts. */
+async function safePlatformRulesPrefix() {
+  try {
+    return await clnSaasAiMd.getPlatformRulesPromptPrefix();
+  } catch (e) {
+    const msg = String(e?.message || '');
+    const c = String(e?.code || '');
+    if (c === 'ER_NO_SUCH_TABLE' || msg.includes("doesn't exist") || msg.includes('Unknown table')) {
+      return '';
+    }
+    console.warn('[cln-operator-ai] platform rules prefix:', e?.message || e);
+    return '';
+  }
 }
 
 async function databaseHasColumn(table, column) {
@@ -521,7 +537,8 @@ async function runOperatorAiChat({ operatorId, userMessage, mergeExtractedConstr
     .map((h) => `${h.role}: ${h.content}`)
     .join('\n');
 
-  const system = `You are a scheduling assistant for a cleaning company operator. Be concise.
+  const pr = await safePlatformRulesPrefix();
+  const system = `${pr}You are a scheduling assistant for a cleaning company operator. Be concise.
 Saved schedule preferences (JSON): ${JSON.stringify(settings.schedulePrefs)}
 Pinned constraints: ${JSON.stringify(settings.pinnedConstraints)}
 Operator extra notes: ${settings.promptExtra || '(none)'}
@@ -694,7 +711,8 @@ async function runScheduleAiSuggest({ operatorId, workingDay, apply = false }) {
   const areaBlock = buildAreaTeamAllocationNarrative(settings, ctx, eligible);
   const timingBlock = buildTimingAndStatusRulesNarrative(prefs);
 
-  const system = `You assign cleaning jobs to teams. Output ONLY valid JSON, no markdown.
+  const pr = await safePlatformRulesPrefix();
+  const system = `${pr}You assign cleaning jobs to teams. Output ONLY valid JSON, no markdown.
 Schema: { "assignments": [ { "jobId": "uuid", "teamId": "uuid", "reason": "short" } ] }
 Rules:
 - Every eligible jobId must appear exactly once.
@@ -834,7 +852,8 @@ async function runScheduleAiSuggestIncremental({ operatorId, workingDay, newJobI
   const prefs = settings.schedulePrefs;
   const areaBlock = buildAreaTeamAllocationNarrative(settings, ctx, eligible);
   const timingBlock = buildTimingAndStatusRulesNarrative(prefs);
-  const system = `You assign cleaning jobs to teams. Output ONLY valid JSON, no markdown.
+  const pr = await safePlatformRulesPrefix();
+  const system = `${pr}You assign cleaning jobs to teams. Output ONLY valid JSON, no markdown.
 Schema: { "assignments": [ { "jobId": "uuid", "teamId": "uuid", "reason": "short" } ] }
 This is INCREMENTAL: assign ONLY the jobs listed under "newJobs". Do NOT include other jobIds.
 - Every new jobId must appear exactly once.
@@ -1011,7 +1030,8 @@ async function runScheduleAiRebalance({
       : '';
 
   const timingBlock = buildTimingAndStatusRulesNarrative(prefs);
-  const system = `You rebalance team assignments for one working day. Output ONLY valid JSON, no markdown.
+  const pr = await safePlatformRulesPrefix();
+  const system = `${pr}You rebalance team assignments for one working day. Output ONLY valid JSON, no markdown.
 Schema: { "reassignments": [ { "jobId": "uuid", "toTeamId": "uuid", "reason": "short" } ] }
 Rules:
 - Only include jobIds from the "rebalancable" list (ready-to-clean, already have a team, not locked).

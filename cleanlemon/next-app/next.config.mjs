@@ -8,11 +8,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
  * GET /api/portal-auth/google (relative) and would 404. Redirect runs before filesystem.
  * Production: set NEXT_PUBLIC_CLEANLEMON_API_URL at build time so this is omitted.
  */
-const cleanlemonApiBase = (process.env.NEXT_PUBLIC_CLEANLEMON_API_URL || '').trim()
 const portalAuthMockEnv =
   process.env.NEXT_PUBLIC_PORTAL_AUTH_MOCK === 'true' ||
   process.env.NEXT_PUBLIC_PORTAL_AUTH_MOCK === '1'
-const redirectGoogleOAuthToDemoPage = !cleanlemonApiBase || portalAuthMockEnv
+const redirectGoogleOAuthToDemoPage = portalAuthMockEnv
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {

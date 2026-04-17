@@ -1015,6 +1015,22 @@ async function getMemberRoles(email) {
         resetOperatorMasterTableCacheForTests();
         continue;
       }
+      /** SaaS row was already merged; later master-table / tenant queries may throw on local DB — still return portal card. */
+      if (roles.some((r) => String(r.type || '').toLowerCase() === 'saas_admin')) {
+        let cleanlemonsPartial = null;
+        try {
+          cleanlemonsPartial = await getCleanlemonsPortalContext(normalizedEmail);
+        } catch (e) {
+          console.warn('[access] getCleanlemonsPortalContext (saas partial recover):', e?.message || e);
+        }
+        return {
+          ok: true,
+          email: normalizedEmail,
+          roles,
+          registered: true,
+          cleanlemons: cleanlemonsPartial
+        };
+      }
       console.error('[access] getMemberRoles error:', err.message || err.code || err);
       if (err.sqlMessage) console.error('[access] sqlMessage:', err.sqlMessage);
 

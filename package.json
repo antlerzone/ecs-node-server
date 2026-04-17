@@ -10,6 +10,8 @@
     "start": "node server.js",
     "start:app": "node server.js",
     "dev": "nodemon server.js",
+    "dev:portal": "npm run dev --prefix docs/nextjs-migration -- -p 3001",
+    "dev:cleanlemons-portal": "npm run dev --prefix cleanlemon/next-app -- -p 3100",
     "tutorial:pdf": "node scripts/generate-tutorial-pdf.js",
     "tutorial:pptx": "node scripts/generate-tutorial-pptx.js",
     "tutorial": "node scripts/generate-tutorial-pdf.js && node scripts/generate-tutorial-pptx.js",

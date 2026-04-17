@@ -487,8 +487,8 @@ function OperatorLayoutInner({ children }: { children: React.ReactNode }) {
         <NavContent />
       </aside>
 
-      {/* Main Content */}
-      <div className="flex-1 lg:ml-64">
+      {/* Main Content — min-w-0 so wide pages (e.g. Company) don’t overflow the viewport */}
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col lg:ml-64">
         {/* Top Header */}
         <header className="sticky top-0 z-20 bg-card border-b border-border px-4 py-3">
           <div className="flex items-center justify-between">
@@ -605,7 +605,7 @@ function OperatorLayoutInner({ children }: { children: React.ReactNode }) {
         </header>
 
         {/* Page Content */}
-        <main className="p-4 lg:p-6">
+        <main className="min-w-0 p-4 lg:p-6">
           {children}
         </main>
       </div>

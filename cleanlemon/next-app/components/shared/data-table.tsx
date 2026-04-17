@@ -26,6 +26,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Search, ChevronUp, ChevronDown, Filter, MoreHorizontal, ChevronLeft, ChevronRight, Edit } from 'lucide-react'
 import { Checkbox } from '@/components/ui/checkbox'
+import { cn } from '@/lib/utils'
 
 export interface Column<T> {
   key: keyof T | string
@@ -53,6 +54,11 @@ interface DataTableProps<T> {
   searchKeys?: (keyof T)[]
   pageSize?: number
   emptyMessage?: string
+  /**
+   * Fill parent flex column and scroll the table body only (reduces full-page scroll on dense portal pages).
+   * Parent should be a flex column with min-h-0 / flex-1.
+   */
+  fillContainer?: boolean
   /** Optional row checkboxes (controlled by parent). */
   rowSelection?: {
     selectedIds: ReadonlySet<string>
@@ -60,6 +66,8 @@ interface DataTableProps<T> {
     /** If provided, rows where this returns false show a disabled checkbox. */
     isRowSelectable?: (row: T) => boolean
   }
+  /** Avoid horizontal scrollbar; use with truncated cell content. */
+  noHorizontalScroll?: boolean
 }
 
 export function DataTable<T extends { id: string }>({
@@ -70,7 +78,9 @@ export function DataTable<T extends { id: string }>({
   searchKeys = [],
   pageSize = 10,
   emptyMessage = 'No data found',
+  fillContainer = false,
   rowSelection,
+  noHorizontalScroll = false,
 }: DataTableProps<T>) {
   const [search, setSearch] = useState('')
   const [sortKey, setSortKey] = useState<string | null>(null)
@@ -172,10 +182,14 @@ export function DataTable<T extends { id: string }>({
   const colSpan =
     columns.length + (rowSelection ? 1 : 0) + (actions && actions.length > 0 ? 1 : 0)
 
+  const rootClass = fillContainer
+    ? 'flex min-h-0 flex-1 flex-col gap-3'
+    : 'space-y-4'
+
   return (
-    <div className="space-y-4">
+    <div className={rootClass}>
       {/* Search and Filters */}
-      <div className="flex flex-col sm:flex-row gap-3">
+      <div className="flex shrink-0 flex-col gap-3 sm:flex-row">
         {searchKeys.length > 0 && (
           <div className="relative flex-1">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
@@ -218,8 +232,26 @@ export function DataTable<T extends { id: string }>({
       </div>
 
       {/* Table */}
-      <div className="border rounded-lg overflow-hidden">
-        <Table>
+      <div
+        className={
+          fillContainer
+            ? 'flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border'
+            : 'overflow-hidden rounded-lg border'
+        }
+      >
+        <div
+          className={
+            fillContainer
+              ? noHorizontalScroll
+                ? 'min-h-0 flex-1 overflow-y-auto overflow-x-hidden'
+                : 'min-h-0 flex-1 overflow-auto'
+              : 'contents'
+          }
+        >
+        <Table
+          className={noHorizontalScroll ? 'table-fixed' : undefined}
+          containerClassName={noHorizontalScroll ? 'overflow-x-hidden min-w-0' : undefined}
+        >
           <TableHeader>
             <TableRow className="bg-muted/50">
               {rowSelection ? (
@@ -243,7 +275,10 @@ export function DataTable<T extends { id: string }>({
               {columns.map((col) => (
                 <TableHead
                   key={String(col.key)}
-                  className={col.sortable ? 'cursor-pointer select-none' : ''}
+                  className={cn(
+                    col.sortable ? 'cursor-pointer select-none' : '',
+                    noHorizontalScroll && 'whitespace-normal min-w-0'
+                  )}
                   onClick={() => col.sortable && handleSort(String(col.key))}
                 >
                   <div className="flex items-center gap-1">
@@ -296,7 +331,10 @@ export function DataTable<T extends { id: string }>({
                     </TableCell>
                   ) : null}
                   {columns.map((col) => (
-                    <TableCell key={`${row.id}-${String(col.key)}`}>
+                    <TableCell
+                      key={`${row.id}-${String(col.key)}`}
+                      className={noHorizontalScroll ? 'whitespace-normal break-words min-w-0' : undefined}
+                    >
                       {col.render
                         ? col.render((row as Record<string, unknown>)[String(col.key)] as T[keyof T], row)
                         : String((row as Record<string, unknown>)[String(col.key)] ?? '-')}
@@ -352,11 +390,12 @@ export function DataTable<T extends { id: string }>({
             )}
           </TableBody>
         </Table>
+        </div>
       </div>
 
       {/* Pagination */}
       {totalPages > 1 && (
-        <div className="flex items-center justify-between">
+        <div className="flex shrink-0 items-center justify-between">
           <p className="text-sm text-muted-foreground">
             Showing {(currentPage - 1) * pageSize + 1} to{' '}
             {Math.min(currentPage * pageSize, filteredData.length)} of{' '}

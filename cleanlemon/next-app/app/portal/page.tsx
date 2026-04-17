@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { useAuth } from '@/lib/auth-context'
 import { Button } from '@/components/ui/button'
@@ -25,7 +25,13 @@ export default function PortalSelectionPage() {
   const [hasActiveOperatorSubscription, setHasActiveOperatorSubscription] = useState(false)
   const [hasApiPortalAddon, setHasApiPortalAddon] = useState(false)
   const [isSaasAdmin, setIsSaasAdmin] = useState(false)
+  /** Until both calls finish, portal count/cards can jump (e.g. 2→3 when SaaS Admin appears). */
+  const [subscriptionReady, setSubscriptionReady] = useState(offlineDemo)
+  const [memberRolesReady, setMemberRolesReady] = useState(offlineDemo)
   const email = String(user?.email || '').trim().toLowerCase()
+  /** Member-roles effect must not depend on full `user` — updateUser() would retrigger and clear SaaS from state. */
+  const userRef = useRef(user)
+  userRef.current = user
   /** 與 portal.colivingjb.com/portal 一致：Welcome 用 email 的 @ 前綴，不用 OAuth 佔位名 */
   const welcomeName = useMemo(() => {
     if (email.includes('@')) return email.split('@')[0]
@@ -37,6 +43,11 @@ export default function PortalSelectionPage() {
       router.push('/')
     }
   }, [user, isLoading, router])
+
+  /** New login email → drop previous account’s SaaS flag until member-roles returns. */
+  useEffect(() => {
+    setIsSaasAdmin(false)
+  }, [email])
 
   const handleSelectPortal = (role: UserRole) => {
     if (!role) return
@@ -59,62 +70,83 @@ export default function PortalSelectionPage() {
 
   useEffect(() => {
     if (offlineDemo) return
+    if (!email) {
+      setSubscriptionReady(true)
+      return
+    }
     let cancelled = false
     ;(async () => {
-      if (!email || !user) return
-      const r = await fetchOperatorSubscription({
-        operatorId: user.operatorId || '',
-        email,
-      })
-      if (cancelled) return
-      const active = !!r?.ok && !!r.item && String(r.item.status || '').toLowerCase() === 'active'
-      setHasActiveOperatorSubscription(active)
-      const addonRows = Array.isArray(r?.item?.addons) ? r.item.addons : []
-      const hasAddon = addonRows.some((addon) => {
-        const status = String(addon?.status || '').trim().toLowerCase()
-        if (status !== 'active') return false
-        const rawCode = String(addon?.addonCode || '')
-        const normalizedCode = rawCode.trim().toLowerCase().replace(/[_\s]+/g, '-')
-        return normalizedCode === 'api-portal' || normalizedCode === 'api-integration'
-      })
-      setHasApiPortalAddon(hasAddon)
+      const u = userRef.current
+      if (!u) {
+        if (!cancelled) setSubscriptionReady(true)
+        return
+      }
+      try {
+        const r = await fetchOperatorSubscription({
+          operatorId: u.operatorId || '',
+          email,
+        })
+        if (cancelled) return
+        const active = !!r?.ok && !!r.item && String(r.item.status || '').toLowerCase() === 'active'
+        setHasActiveOperatorSubscription(active)
+        const addonRows = Array.isArray(r?.item?.addons) ? r.item.addons : []
+        const hasAddon = addonRows.some((addon) => {
+          const status = String(addon?.status || '').trim().toLowerCase()
+          if (status !== 'active') return false
+          const rawCode = String(addon?.addonCode || '')
+          const normalizedCode = rawCode.trim().toLowerCase().replace(/[_\s]+/g, '-')
+          return normalizedCode === 'api-portal' || normalizedCode === 'api-integration'
+        })
+        setHasApiPortalAddon(hasAddon)
+      } finally {
+        if (!cancelled) setSubscriptionReady(true)
+      }
     })()
     return () => {
       cancelled = true
     }
-  }, [offlineDemo, user?.operatorId, email, user])
+  }, [offlineDemo, user?.operatorId, email])
 
   useEffect(() => {
     if (offlineDemo) return
+    if (!email) {
+      setMemberRolesReady(true)
+      return
+    }
     let cancelled = false
-    setIsSaasAdmin(String(user?.role || '').toLowerCase() === 'saas-admin')
     ;(async () => {
-      const r = await fetchPortalMemberRoles()
-      if (cancelled) return
-      const rows = Array.isArray(r?.roles) ? r.roles : []
-      if (rows.some((row) => String(row?.type || '').trim().toLowerCase() === 'saas_admin')) {
-        setIsSaasAdmin(true)
-      }
-      // 與後端同步：OAuth JWT 可能缺 operatorChoices（主檔僅在 cln_operatordetail.email）
-      const cln = r?.cleanlemons as CleanlemonsJwtContext | null | undefined
-      if (r?.ok && cln && user) {
-        const choices = Array.isArray(cln.operatorChoices) ? cln.operatorChoices : []
-        const nextOp =
-          choices.length > 0
-            ? String(choices[0].operatorId || '').trim()
-            : pickFirstClientIdFromMemberRoles(rows)
-        if (!nextOp || nextOp === 'op_demo_001') return
-        const prev = String(user.operatorId || '').trim()
-        const staleCln = !user.cleanlemons?.operatorChoices?.length
-        if (staleCln || prev === '' || prev === 'op_demo_001') {
-          updateUser({ cleanlemons: cln, operatorId: nextOp })
+      try {
+        const r = await fetchPortalMemberRoles()
+        if (cancelled) return
+        const rows = Array.isArray(r?.roles) ? r.roles : []
+        const hasSaasRow = rows.some(
+          (row) => String(row?.type || '').trim().toLowerCase() === 'saas_admin'
+        )
+        setIsSaasAdmin(hasSaasRow)
+        // 與後端同步：OAuth JWT 可能缺 operatorChoices（主檔僅在 cln_operatordetail.email）
+        const cln = r?.cleanlemons as CleanlemonsJwtContext | null | undefined
+        const u = userRef.current
+        if (r?.ok && cln && u) {
+          const choices = Array.isArray(cln.operatorChoices) ? cln.operatorChoices : []
+          const nextOp =
+            choices.length > 0
+              ? String(choices[0].operatorId || '').trim()
+              : pickFirstClientIdFromMemberRoles(rows)
+          if (!nextOp || nextOp === 'op_demo_001') return
+          const prev = String(u.operatorId || '').trim()
+          const staleCln = !u.cleanlemons?.operatorChoices?.length
+          if (staleCln || prev === '' || prev === 'op_demo_001') {
+            updateUser({ cleanlemons: cln, operatorId: nextOp })
+          }
         }
+      } finally {
+        if (!cancelled) setMemberRolesReady(true)
       }
     })()
     return () => {
       cancelled = true
     }
-  }, [offlineDemo, user?.role, email, user, updateUser])
+  }, [offlineDemo, email, updateUser])
 
   const portals = useMemo(() => ([
     {
@@ -155,19 +187,27 @@ export default function PortalSelectionPage() {
     },
   ]), [])
 
+  /** JWT often carries `saas-admin` before member-roles API returns — avoids SaaS Admin row flashing off→on. */
+  const canAccessSaasAdmin = useMemo(() => {
+    if (String(user?.role || '').trim().toLowerCase() === 'saas-admin') return true
+    return isSaasAdmin
+  }, [user?.role, isSaasAdmin])
+
   const visiblePortals = useMemo(() => {
     if (offlineDemo) return portals
     return portals.filter((portal) => {
       if (portal.role === 'client') return true
       if (portal.role === 'operator') return hasActiveOperatorSubscription
-      if (portal.role === 'saas-admin') return isSaasAdmin
+      if (portal.role === 'saas-admin') return canAccessSaasAdmin
       if (portal.role === 'api-user') return hasApiPortalAddon
       if (portal.role === 'employee') {
         return true
       }
       return false
     })
-  }, [offlineDemo, portals, hasActiveOperatorSubscription, hasApiPortalAddon, isSaasAdmin])
+  }, [offlineDemo, portals, hasActiveOperatorSubscription, hasApiPortalAddon, canAccessSaasAdmin])
+
+  const portalListReady = offlineDemo || (subscriptionReady && memberRolesReady)
 
   if (isLoading) {
     return (
@@ -221,13 +261,26 @@ export default function PortalSelectionPage() {
             <p className="text-muted-foreground">
               {offlineDemo
                 ? 'Demo mode — all portals shown (no API).'
-                : `You have access to ${visiblePortals.length} portals.`}
+                : !portalListReady
+                  ? 'Loading your portals…'
+                  : `You have access to ${visiblePortals.length} portals.`}
             </p>
           </div>
 
           {/* Portal List */}
           <div className="space-y-3 mb-12">
-            {visiblePortals.map((portal) => {
+            {!portalListReady ? (
+              <div className="w-full space-y-3">
+                {[1, 2, 3].map((i) => (
+                  <div
+                    key={i}
+                    className="h-[88px] w-full animate-pulse rounded-lg border border-border bg-muted/40"
+                  />
+                ))}
+              </div>
+            ) : null}
+            {portalListReady
+              ? visiblePortals.map((portal) => {
               const Icon = portal.icon
               return (
                 <button
@@ -256,8 +309,9 @@ export default function PortalSelectionPage() {
                   </div>
                 </button>
               )
-            })}
-            {visiblePortals.length === 0 ? (
+            })
+              : null}
+            {portalListReady && visiblePortals.length === 0 ? (
               <div className="w-full p-4 border border-dashed border-border rounded-lg text-sm text-muted-foreground">
                 No portal assigned for this account yet. Please contact admin to grant role access.
               </div>

@@ -4,10 +4,11 @@ import { AppSidebar } from '@/components/layout/app-sidebar'
 import { MobileNav } from '@/components/layout/mobile-nav'
 import { SaasAdminRouteGate } from '@/components/saas-admin-route-gate'
 import { AuthProvider } from '@/lib/auth-context'
-import { CreditCard, GitMerge, ScrollText } from 'lucide-react'
+import { Bot, CreditCard, GitMerge, ScrollText } from 'lucide-react'
 
 const navItems = [
   { href: '/subscription', icon: CreditCard, label: 'Subscription' },
+  { href: '/ai', icon: Bot, label: 'AI rules' },
   { href: '/merge', icon: GitMerge, label: 'Merge' },
   { href: '/log', icon: ScrollText, label: 'Unlock log' },
 ]

@@ -3,6 +3,8 @@
  * On demo.colivingjb.com we skip real API calls (return mock or empty).
  */
 
+import { PORTAL_KEYS } from "./portal-session";
+
 export type MemberRoleType = "staff" | "tenant" | "owner" | "saas_admin";
 
 export interface MemberRole {
@@ -823,6 +825,21 @@ function getProxyBase(): string {
   return useProxy ? "/api/portal/proxy" : `${base.replace(/\/$/, "")}/api`;
 }
 
+/** Password / OAuth login stores JWT — ECS /api/access/* requires Authorization. */
+function jsonHeadersWithPortalJwt(): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (typeof window === "undefined") return headers;
+  try {
+    const jwt = localStorage.getItem(PORTAL_KEYS.PORTAL_JWT);
+    if (jwt) {
+      headers.Authorization = `Bearer ${jwt}`;
+    }
+  } catch {
+    /* ignore */
+  }
+  return headers;
+}
+
 async function post<T = unknown>(path: string, body: object): Promise<T> {
   const base = getProxyBase();
   if (!base) {
@@ -839,7 +856,7 @@ async function post<T = unknown>(path: string, body: object): Promise<T> {
     try {
       const res = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: jsonHeadersWithPortalJwt(),
         body: JSON.stringify(body),
       });
       const text = await res.text();
@@ -897,7 +914,7 @@ export async function portalPostJsonAllowError<T = unknown>(
   if (typeof window !== "undefined") console.log("[portal-api] fetch url=", url);
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: jsonHeadersWithPortalJwt(),
     body: JSON.stringify(body),
   });
   const text = await res.text();
@@ -1019,7 +1036,7 @@ export async function portalPostBlob(path: string, body: object): Promise<Blob> 
   }
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: jsonHeadersWithPortalJwt(),
     body: JSON.stringify(body),
   });
   if (isPreviewPdf && typeof window !== "undefined") {

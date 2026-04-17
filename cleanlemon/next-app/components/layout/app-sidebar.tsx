@@ -12,6 +12,7 @@ interface NavItem {
   href: string
   icon: LucideIcon
   label: string
+  activeMatch?: 'exact' | 'prefix'
 }
 
 interface AppSidebarProps {
@@ -52,11 +53,17 @@ export function AppSidebar({ items, basePath, title }: AppSidebarProps) {
       {/* Navigation */}
       <nav className="flex-1 p-4 space-y-2 overflow-y-auto">
         {items.map((item) => {
-          const isActive = pathname === `${basePath}${item.href}` || 
-                          (item.href === '' && pathname === basePath)
+          const full = `${basePath}${item.href}`
+          const match = item.activeMatch ?? 'exact'
+          const isActive =
+            item.href === ''
+              ? pathname === basePath || pathname === `${basePath}/`
+              : match === 'prefix'
+                ? pathname === full || pathname.startsWith(`${full}/`)
+                : pathname === full
           return (
             <Link
-              key={item.href}
+              key={`${basePath}:${item.href || 'root'}`}
               href={`${basePath}${item.href}`}
               className={cn(
                 "flex items-center gap-3 px-4 py-3 rounded-lg transition-colors",

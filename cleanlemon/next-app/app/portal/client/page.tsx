@@ -1,6 +1,7 @@
 "use client"
 
-import { useEffect, useMemo, useState } from 'react'
+import { Suspense, useEffect, useMemo, useState } from 'react'
+import { useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import { useAuth } from '@/lib/auth-context'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -13,6 +14,19 @@ import {
   fetchClientDamageReports,
   type DamageReportItem,
 } from '@/lib/cleanlemon-api'
+import { ClientDashboardSchedule } from '@/components/portal/client/client-dashboard-schedule'
+
+function ScrollToScheduleWhenTab() {
+  const searchParams = useSearchParams()
+  useEffect(() => {
+    if (searchParams.get('tab') !== 'schedule') return
+    const id = window.setTimeout(() => {
+      document.getElementById('client-schedule')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }, 100)
+    return () => window.clearTimeout(id)
+  }, [searchParams])
+  return null
+}
 
 type Summary = {
   properties: number
@@ -106,6 +120,9 @@ export default function ClientDashboardPage() {
         </div>
       ) : (
         <div className="space-y-6">
+          <Suspense fallback={null}>
+            <ScrollToScheduleWhenTab />
+          </Suspense>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
             {cards.map((card) => (
               <Card key={card.label}>
@@ -123,6 +140,8 @@ export default function ClientDashboardPage() {
               </Card>
             ))}
           </div>
+
+          <ClientDashboardSchedule />
 
           {damageRecent.length > 0 ? (
             <Card>

@@ -8,8 +8,11 @@ const multer = require('multer');
 const Stripe = require('stripe');
 const svc = require('./cleanlemon.service');
 const plr = require('./cleanlemon-property-link-request.service');
+const clnPropGroup = require('./cleanlemon-property-group.service');
 const clnInt = require('./cleanlemon-integration.service');
 const clnOpAi = require('./cln-operator-ai.service');
+const clnSaasAiMd = require('./cln-saasadmin-ai-md.service');
+const accessSvc = require('../access/access.service');
 const { verifyPortalToken } = require('../portal-auth/portal-auth.service');
 
 function isMissingClnOperatorAiTable(err) {
@@ -43,6 +46,30 @@ function employeePortalEmailStrict(req) {
   if (!m) return null;
   const payload = verifyPortalToken(m[1].trim());
   return payload?.email ? String(payload.email).trim().toLowerCase() : null;
+}
+
+/** SaaS platform admin only — Cleanlemons admin API (JWT email in `saasadmin`). */
+async function ensureCleanlemonSaasAdmin(req, res) {
+  const email = employeePortalEmailStrict(req);
+  if (!email) {
+    res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    return null;
+  }
+  try {
+    const mr = await accessSvc.getMemberRoles(email);
+    const ok =
+      mr?.ok &&
+      (mr.roles || []).some((r) => String(r.type || '').toLowerCase() === 'saas_admin');
+    if (!ok) {
+      res.status(403).json({ ok: false, reason: 'SAAS_ADMIN_ONLY' });
+      return null;
+    }
+    return email;
+  } catch (err) {
+    console.error('[cleanlemon] ensureCleanlemonSaasAdmin', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+    return null;
+  }
 }
 
 const { getBanksPublic } = require('../enquiry/enquiry.service');
@@ -559,7 +586,8 @@ router.post('/client/ttlock/credentials', async (req, res) => {
     const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
       ensureClientdetailIfMissing: jwtVerified,
     });
-    const data = await clnInt.getTtlockCredentialsClnClientdetail(clientdetailId);
+    const slot = req.body?.ttlockSlot ?? req.body?.ttlock_slot ?? 0;
+    const data = await clnInt.getTtlockCredentialsClnClientdetail(clientdetailId, Number(slot) || 0);
     return res.json(data);
   } catch (err) {
     if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
@@ -579,6 +607,8 @@ router.post('/client/ttlock/connect', async (req, res) => {
     const operatorId = String(req.body?.operatorId || '').trim();
     const username = req.body?.username;
     const password = req.body?.password;
+    const accountName = req.body?.accountName ?? req.body?.account_name ?? req.body?.name;
+    const slotRaw = req.body?.ttlockSlot ?? req.body?.ttlock_slot;
     if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
     if (!jwtVerified && !operatorId) {
       return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL_OR_OPERATOR' });
@@ -586,7 +616,13 @@ router.post('/client/ttlock/connect', async (req, res) => {
     const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
       ensureClientdetailIfMissing: jwtVerified,
     });
-    const result = await clnInt.ttlockConnectClnClientdetail(clientdetailId, { username, password });
+    const result = await clnInt.ttlockConnectClnClientdetail(clientdetailId, {
+      username,
+      password,
+      accountName,
+      slot: slotRaw != null && slotRaw !== '' ? Number(slotRaw) : undefined,
+      source: 'manual'
+    });
     return res.json(result);
   } catch (err) {
     if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
@@ -612,7 +648,8 @@ router.post('/client/ttlock/disconnect', async (req, res) => {
     const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
       ensureClientdetailIfMissing: jwtVerified,
     });
-    await clnInt.ttlockDisconnectClnClientdetail(clientdetailId);
+    const slot = req.body?.ttlockSlot ?? req.body?.ttlock_slot ?? 0;
+    await clnInt.ttlockDisconnectClnClientdetail(clientdetailId, Number(slot) || 0);
     return res.json({ ok: true });
   } catch (err) {
     if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
@@ -621,13 +658,16 @@ router.post('/client/ttlock/disconnect', async (req, res) => {
     if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
       return res.status(409).json({ ok: false, reason: err.code });
     }
+    if (err?.code === 'TTLOCK_COLIVING_MANAGED' || err?.message === 'TTLOCK_COLIVING_MANAGED') {
+      return res.status(400).json({ ok: false, reason: 'TTLOCK_COLIVING_MANAGED' });
+    }
     console.error('[cleanlemon] client/ttlock/disconnect', err);
     return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
   }
 });
 
-/** B2B client portal — list properties where `cln_property.clientdetail_id` matches the logged-in client. */
-router.post('/client/properties/list', async (req, res) => {
+/** B2B client portal — linked Cleanlemons operators + Coliving bridge (which Coliving company account). */
+router.post('/client/integration/context', async (req, res) => {
   try {
     const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
     const operatorId = String(req.body?.operatorId || '').trim();
@@ -638,7 +678,33 @@ router.post('/client/properties/list', async (req, res) => {
     const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
       ensureClientdetailIfMissing: jwtVerified,
     });
-    const items = await svc.listClientPortalProperties({ clientdetailId });
+    const [linkedOperators, coliving] = await Promise.all([
+      svc.listClientPortalLinkedCleanlemonsOperators(clientdetailId),
+      clnInt.getColivingBridgeInfoClnClientdetail(clientdetailId),
+    ]);
+    return res.json({ ok: true, linkedOperators, coliving });
+  } catch (err) {
+    if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
+      return res.status(409).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] client/integration/context', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+/** B2B client portal — list properties where `cln_property.clientdetail_id` matches the logged-in client. */
+router.post('/client/properties/list', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
+      ensureClientdetailIfMissing: jwtVerified,
+    });
+    const items = await svc.listClientPortalProperties({ clientdetailId, loginEmail: email });
     return res.json({ ok: true, items });
   } catch (err) {
     if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
@@ -748,6 +814,7 @@ router.post('/client/properties/patch', async (req, res) => {
     }
     const code = err?.code;
     if (code === 'PROPERTY_NOT_FOUND') return res.status(404).json({ ok: false, reason: code });
+    if (code === 'GROUP_PERMISSION_DENIED') return res.status(403).json({ ok: false, reason: code });
     if (
       code === 'AUTHORIZE_PROPERTY_TTLOCK_REQUIRED' ||
       code === 'MISSING_OPERATOR_ID' ||
@@ -855,6 +922,318 @@ router.post('/client/properties/bulk-disconnect', async (req, res) => {
   }
 });
 
+/** B2B client — property groups (shared access by email). Operator may be unset until client links one. */
+router.post('/client/property-groups/list', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
+      ensureClientdetailIfMissing: jwtVerified,
+    });
+    const items = await clnPropGroup.listGroupsForClientPortal(clientdetailId, { operatorId, loginEmail: email });
+    return res.json({ ok: true, items });
+  } catch (err) {
+    if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
+      return res.status(409).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] client/property-groups/list', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+router.post('/client/property-groups/create', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const name = String(req.body?.name || '').trim();
+    if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
+      ensureClientdetailIfMissing: jwtVerified,
+    });
+    const out = await clnPropGroup.createPropertyGroup({
+      ownerClientdetailId: clientdetailId,
+      operatorId,
+      name,
+    });
+    return res.json({ ok: true, group: out });
+  } catch (err) {
+    if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
+      return res.status(409).json({ ok: false, reason: err.code });
+    }
+    if (
+      err?.code === 'MISSING_IDS' ||
+      err?.code === 'OPERATOR_NOT_FOUND' ||
+      err?.code === 'CLIENTDETAIL_NOT_LINKED' ||
+      err?.code === 'GROUP_FEATURE_UNAVAILABLE'
+    ) {
+      return res.status(400).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] client/property-groups/create', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+router.post('/client/property-groups/detail', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const groupId = String(req.body?.groupId || '').trim();
+    if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    if (!groupId) return res.status(400).json({ ok: false, reason: 'MISSING_GROUP_ID' });
+    const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
+      ensureClientdetailIfMissing: jwtVerified,
+    });
+    const detail = await clnPropGroup.getGroupDetailForClient({
+      groupId,
+      clientdetailId,
+      loginEmail: email,
+    });
+    return res.json({ ok: true, group: detail });
+  } catch (err) {
+    if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
+      return res.status(409).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'GROUP_NOT_FOUND' || err?.code === 'GROUP_ACCESS_DENIED') {
+      return res.status(err?.code === 'GROUP_ACCESS_DENIED' ? 403 : 404).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] client/property-groups/detail', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+router.post('/client/property-groups/add-property', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const groupId = String(req.body?.groupId || '').trim();
+    const rawIds = req.body?.propertyIds;
+    const propertyIds = Array.isArray(rawIds)
+      ? rawIds.map((x) => String(x || '').trim()).filter(Boolean)
+      : [];
+    const propertyId = String(req.body?.propertyId || '').trim();
+    if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
+      ensureClientdetailIfMissing: jwtVerified,
+    });
+    if (propertyIds.length) {
+      for (const pid of propertyIds) {
+        await clnPropGroup.addPropertyToGroup({ groupId, ownerClientdetailId: clientdetailId, propertyId: pid });
+      }
+      return res.json({ ok: true, added: propertyIds.length });
+    }
+    await clnPropGroup.addPropertyToGroup({ groupId, ownerClientdetailId: clientdetailId, propertyId });
+    return res.json({ ok: true });
+  } catch (err) {
+    if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
+      return res.status(409).json({ ok: false, reason: err.code });
+    }
+    if (
+      err?.code === 'GROUP_NOT_FOUND_OR_FORBIDDEN' ||
+      err?.code === 'PROPERTY_NOT_FOUND' ||
+      err?.code === 'PROPERTY_OWNER_MISMATCH' ||
+      err?.code === 'PROPERTY_OPERATOR_MISMATCH' ||
+      err?.code === 'PROPERTY_ALREADY_IN_GROUP' ||
+      err?.code === 'MISSING_PROPERTY_ID'
+    ) {
+      return res.status(400).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] client/property-groups/add-property', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+router.post('/client/property-groups/remove-property', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const groupId = String(req.body?.groupId || '').trim();
+    const propertyId = String(req.body?.propertyId || '').trim();
+    if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
+      ensureClientdetailIfMissing: jwtVerified,
+    });
+    await clnPropGroup.removePropertyFromGroup({ groupId, ownerClientdetailId: clientdetailId, propertyId });
+    return res.json({ ok: true });
+  } catch (err) {
+    if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
+      return res.status(409).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'GROUP_NOT_FOUND_OR_FORBIDDEN') {
+      return res.status(400).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] client/property-groups/remove-property', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+router.post('/client/property-groups/invite', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const groupId = String(req.body?.groupId || '').trim();
+    const inviteEmail = String(req.body?.inviteEmail || '').trim();
+    const b = req.body || {};
+    const perm = clnPropGroup.parsePermFromRequestBody(b);
+    if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
+      ensureClientdetailIfMissing: jwtVerified,
+    });
+    const out = await clnPropGroup.inviteMemberByEmail({
+      groupId,
+      ownerClientdetailId: clientdetailId,
+      inviteEmail,
+      perm,
+    });
+    return res.json({ ok: true, member: out });
+  } catch (err) {
+    if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
+      return res.status(409).json({ ok: false, reason: err.code });
+    }
+    if (
+      err?.code === 'GROUP_NOT_FOUND_OR_FORBIDDEN' ||
+      err?.code === 'INVALID_EMAIL' ||
+      err?.code === 'CANNOT_INVITE_SELF' ||
+      err?.code === 'INVITE_DUPLICATE'
+    ) {
+      return res.status(400).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] client/property-groups/invite', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+router.post('/client/property-groups/members', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const groupId = String(req.body?.groupId || '').trim();
+    if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    if (!groupId) return res.status(400).json({ ok: false, reason: 'MISSING_GROUP_ID' });
+    const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
+      ensureClientdetailIfMissing: jwtVerified,
+    });
+    const items = await clnPropGroup.listGroupMembers({ groupId, clientdetailId, loginEmail: email });
+    return res.json({ ok: true, items });
+  } catch (err) {
+    if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
+      return res.status(409).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'GROUP_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] client/property-groups/members', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+router.post('/client/property-groups/member-permissions', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const groupId = String(req.body?.groupId || '').trim();
+    const memberId = String(req.body?.memberId || '').trim();
+    const perm = clnPropGroup.parsePermFromRequestBody(req.body || {});
+    if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
+      ensureClientdetailIfMissing: jwtVerified,
+    });
+    await clnPropGroup.updateMemberPermissions({
+      groupId,
+      ownerClientdetailId: clientdetailId,
+      memberId,
+      perm,
+    });
+    return res.json({ ok: true });
+  } catch (err) {
+    if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
+      return res.status(409).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'GROUP_NOT_FOUND_OR_FORBIDDEN') {
+      return res.status(400).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] client/property-groups/member-permissions', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+router.post('/client/property-groups/kick', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const groupId = String(req.body?.groupId || '').trim();
+    const memberId = String(req.body?.memberId || '').trim();
+    if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
+      ensureClientdetailIfMissing: jwtVerified,
+    });
+    await clnPropGroup.kickMember({ groupId, ownerClientdetailId: clientdetailId, memberId });
+    return res.json({ ok: true });
+  } catch (err) {
+    if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
+      return res.status(409).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'GROUP_NOT_FOUND_OR_FORBIDDEN') {
+      return res.status(400).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] client/property-groups/kick', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+router.post('/client/property-groups/delete', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const groupId = String(req.body?.groupId || '').trim();
+    if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
+      ensureClientdetailIfMissing: jwtVerified,
+    });
+    await clnPropGroup.deletePropertyGroup({ groupId, ownerClientdetailId: clientdetailId });
+    return res.json({ ok: true });
+  } catch (err) {
+    if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
+      return res.status(409).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'GROUP_NOT_FOUND_OR_FORBIDDEN') {
+      return res.status(400).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] client/property-groups/delete', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
 /** B2B client — list pending property link requests (operator must approve client, or client must approve operator). */
 router.get('/client/property-link-requests', async (req, res) => {
   try {
@@ -884,13 +1263,46 @@ router.get('/client/property-link-requests', async (req, res) => {
 });
 
 /** B2B client — approve or reject operator_requests_client (operator bound client; client decides). */
-/** B2B client — list schedule jobs for properties bound to this clientdetail + operator. */
+/** B2B client — invoices (clientdetail-scoped; optional filter by issuing operator). */
+router.get('/client/invoices', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.query?.email || req.body?.email);
+    const operatorId = String(req.query?.operatorId || req.body?.operatorId || '').trim();
+    const filterOperatorId = String(req.query?.filterOperatorId || '').trim();
+    if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    if (!jwtVerified && !operatorId) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL_OR_OPERATOR' });
+    }
+    const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
+      ensureClientdetailIfMissing: jwtVerified,
+    });
+    const limit = req.query?.limit;
+    const out = await svc.listClientPortalInvoices({
+      clientdetailId,
+      filterOperatorId: filterOperatorId || undefined,
+      limit: limit != null ? Number(limit) : undefined,
+    });
+    return res.json({ ok: true, items: out.items, operators: out.operators });
+  } catch (err) {
+    if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
+      return res.status(409).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] client/invoices:get', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+/** B2B client — list schedule jobs (single-operator scope, or whole group when groupId set — mixed property operators). */
 router.get('/client/schedule-jobs', async (req, res) => {
   try {
     const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.query?.email || req.body?.email);
     const operatorId = String(req.query?.operatorId || req.body?.operatorId || '').trim();
+    const groupId = String(req.query?.groupId || '').trim();
     if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
-    if (!jwtVerified && !operatorId) {
+    if (!jwtVerified && !operatorId && !groupId) {
       return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL_OR_OPERATOR' });
     }
     const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
@@ -901,6 +1313,7 @@ router.get('/client/schedule-jobs', async (req, res) => {
       clientdetailId,
       operatorId,
       limit,
+      groupId: groupId || undefined,
     });
     return res.json({ ok: true, items });
   } catch (err) {
@@ -921,9 +1334,6 @@ router.post('/client/schedule-jobs', async (req, res) => {
     const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
     const operatorId = String(req.body?.operatorId || '').trim();
     if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
-    if (!jwtVerified && !operatorId) {
-      return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL_OR_OPERATOR' });
-    }
     const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
       ensureClientdetailIfMissing: jwtVerified,
     });
@@ -935,6 +1345,7 @@ router.post('/client/schedule-jobs', async (req, res) => {
     const addons = req.body?.addons;
     const price = req.body?.price;
     const clientRemark = req.body?.clientRemark != null ? String(req.body.clientRemark) : undefined;
+    const groupId = String(req.body?.groupId || '').trim();
     if (!propertyId || !date) {
       return res.status(400).json({ ok: false, reason: 'MISSING_PROPERTY_OR_DATE' });
     }
@@ -950,6 +1361,7 @@ router.post('/client/schedule-jobs', async (req, res) => {
       addons,
       price,
       clientRemark,
+      groupId: groupId || undefined,
     });
     return res.json({ ok: true, id });
   } catch (err) {
@@ -964,9 +1376,16 @@ router.post('/client/schedule-jobs', async (req, res) => {
       err?.code === 'PROPERTY_NOT_FOUND' ||
       err?.code === 'PROPERTY_CLIENT_MISMATCH' ||
       err?.code === 'PROPERTY_OPERATOR_MISMATCH' ||
-      err?.code === 'MISSING_IDS'
+      err?.code === 'MISSING_IDS' ||
+      err?.code === 'GROUP_ACCESS_DENIED' ||
+      err?.code === 'GROUP_PROPERTY_MISMATCH' ||
+      err?.code === 'GROUP_OPERATOR_MISMATCH' ||
+      err?.code === 'GROUP_FEATURE_UNAVAILABLE'
     ) {
       return res.status(400).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'GROUP_PERMISSION_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
     }
     if (err?.code === 'BOOKING_LEAD_TIME_NOT_MET' || err?.code === 'BOOKING_SERVICE_NOT_ALLOWED') {
       return res.status(400).json({ ok: false, reason: err.code, message: err.message });
@@ -984,15 +1403,13 @@ router.put('/client/schedule-jobs/:id', async (req, res) => {
     const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
     const operatorId = String(req.body?.operatorId || '').trim();
     if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
-    if (!jwtVerified && !operatorId) {
-      return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL_OR_OPERATOR' });
-    }
     const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
       ensureClientdetailIfMissing: jwtVerified,
     });
     const workingDay = req.body?.workingDay ?? req.body?.working_day;
     const status = req.body?.status;
     const statusSetByEmail = req.body?.statusSetByEmail;
+    const groupId = String(req.body?.groupId || '').trim();
     await svc.updateClientPortalScheduleJob({
       clientdetailId,
       operatorId,
@@ -1000,6 +1417,7 @@ router.put('/client/schedule-jobs/:id', async (req, res) => {
       workingDay,
       status,
       statusSetByEmail,
+      groupId: groupId || undefined,
     });
     return res.json({ ok: true });
   } catch (err) {
@@ -1013,9 +1431,13 @@ router.put('/client/schedule-jobs/:id', async (req, res) => {
       err?.code === 'PROPERTY_CLIENT_MISMATCH' ||
       err?.code === 'PROPERTY_OPERATOR_MISMATCH' ||
       err?.code === 'NOT_FOUND' ||
-      err?.code === 'MISSING_IDS'
+      err?.code === 'MISSING_IDS' ||
+      err?.code === 'GROUP_PROPERTY_MISMATCH'
     ) {
       return res.status(400).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'GROUP_PERMISSION_DENIED' || err?.code === 'GROUP_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
     }
     if (err?.code === 'OPERATOR_MISMATCH' || err?.code === 'BAD_REQUEST') {
       return res.status(400).json({ ok: false, reason: err?.code || err?.message || 'BAD_REQUEST' });
@@ -1898,7 +2320,12 @@ router.get('/operator/subscription', async (req, res) => {
       return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID_OR_EMAIL' });
     }
     console.error('[cleanlemon] operator/subscription:get', err);
-    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+    /** Local / partial schema: avoid 500 so portal cards degrade like “no subscription” instead of breaking the page. */
+    return res.status(200).json({
+      ok: false,
+      item: null,
+      reason: err?.message || 'SUBSCRIPTION_LOOKUP_FAILED',
+    });
   }
 });
 
@@ -3025,6 +3452,91 @@ router.post('/admin/subscriptions/:operatorId/addons', async (req, res) => {
       return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
     }
     console.error('[cleanlemon] admin/subscriptions:addon:post', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+/** Platform operator-AI constraint rules (`cln_saasadmin_ai_md`). SaaS admin JWT only. */
+router.get('/admin/saasadmin-ai-md', async (req, res) => {
+  try {
+    const allowed = await ensureCleanlemonSaasAdmin(req, res);
+    if (!allowed) return;
+    const items = await clnSaasAiMd.listSaasadminAiMd();
+    res.json({ ok: true, items });
+  } catch (err) {
+    console.error('[cleanlemon] admin/saasadmin-ai-md:get', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/admin/saasadmin-ai-md', async (req, res) => {
+  try {
+    const allowed = await ensureCleanlemonSaasAdmin(req, res);
+    if (!allowed) return;
+    const row = await clnSaasAiMd.createSaasadminAiMd(req.body || {});
+    res.json({ ok: true, item: row });
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (msg === 'TITLE_REQUIRED') {
+      return res.status(400).json({ ok: false, reason: msg });
+    }
+    console.error('[cleanlemon] admin/saasadmin-ai-md:post', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.put('/admin/saasadmin-ai-md/:id', async (req, res) => {
+  try {
+    const allowed = await ensureCleanlemonSaasAdmin(req, res);
+    if (!allowed) return;
+    const row = await clnSaasAiMd.updateSaasadminAiMd(req.params.id, req.body || {});
+    res.json({ ok: true, item: row });
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (msg === 'TITLE_REQUIRED' || msg === 'NOTHING_TO_UPDATE') {
+      return res.status(400).json({ ok: false, reason: msg });
+    }
+    if (msg === 'NOT_FOUND') {
+      return res.status(404).json({ ok: false, reason: msg });
+    }
+    console.error('[cleanlemon] admin/saasadmin-ai-md:put', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.delete('/admin/saasadmin-ai-md/:id', async (req, res) => {
+  try {
+    const allowed = await ensureCleanlemonSaasAdmin(req, res);
+    if (!allowed) return;
+    await clnSaasAiMd.deleteSaasadminAiMd(req.params.id);
+    res.json({ ok: true });
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (msg === 'MISSING_ID' || msg === 'NOT_FOUND') {
+      return res.status(msg === 'NOT_FOUND' ? 404 : 400).json({ ok: false, reason: msg });
+    }
+    console.error('[cleanlemon] admin/saasadmin-ai-md:delete', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+/** Assist chat for drafting rules — uses `CLEANLEMON_SAASADMIN_AI_*` env (not operator keys). */
+router.post('/admin/saasadmin-ai-chat', async (req, res) => {
+  try {
+    const allowed = await ensureCleanlemonSaasAdmin(req, res);
+    if (!allowed) return;
+    const out = await clnSaasAiMd.runSaasadminAiChat(req.body || {});
+    res.json({ ok: true, ...out });
+  } catch (err) {
+    const msg = String(err?.message || '');
+    const code = String(err?.code || '');
+    if (msg === 'EMPTY_MESSAGES') {
+      return res.status(400).json({ ok: false, reason: msg });
+    }
+    if (code === 'SAASADMIN_AI_NOT_CONFIGURED' || msg === 'SAASADMIN_AI_NOT_CONFIGURED') {
+      return res.status(503).json({ ok: false, reason: 'SAASADMIN_AI_NOT_CONFIGURED' });
+    }
+    console.error('[cleanlemon] admin/saasadmin-ai-chat:post', err);
     res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
   }
 });

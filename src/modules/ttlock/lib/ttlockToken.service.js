@@ -37,7 +37,8 @@ function parseTtlockValuesJson(raw) {
  * Cleanlemons B2B: cln_client_integration (clientdetail_id = cln_clientdetail.id).
  * Legacy Cleanlemons operator row: cln_operator_integration (operator_id = cln_operatordetail.id).
  */
-async function getTTLockAccountByClient(clientId) {
+async function getTTLockAccountByClient(clientId, ttlockSlotOpt) {
+  const ttlockSlot = Number(ttlockSlotOpt ?? 0) || 0;
   const [rows] = await pool.query(
     `SELECT values_json FROM client_integration
      WHERE client_id = ? AND \`key\` = 'smartDoor' AND provider = 'ttlock' AND enabled = 1
@@ -51,9 +52,9 @@ async function getTTLockAccountByClient(clientId) {
   try {
     const [clnClientRows] = await pool.query(
       `SELECT values_json FROM cln_client_integration
-       WHERE clientdetail_id = ? AND \`key\` = 'smartDoor' AND provider = 'ttlock' AND enabled = 1
+       WHERE clientdetail_id = ? AND \`key\` = 'smartDoor' AND provider = 'ttlock' AND enabled = 1 AND slot = ?
        LIMIT 1`,
-      [String(clientId)]
+      [String(clientId), ttlockSlot]
     );
     if (clnClientRows.length) {
       const creds = parseTtlockValuesJson(clnClientRows[0].values_json);
@@ -183,19 +184,20 @@ async function saveTokenOperatordetail(clientId, data) {
   );
 }
 
-async function saveTokenClnScoped(clientId, scope, data) {
+async function saveTokenClnScoped(clientId, scope, data, ttlockSlot = 0) {
   const accessToken = data.access_token;
   const refreshTokenVal = data.refresh_token ?? null;
   const expiresIn = data.expires_in ?? 0;
   const clientdetailId = scope === 'cln_clientdetail' ? clientId : null;
   const operatorId = scope === 'cln_operatordetail' ? clientId : null;
+  const slot = Number(ttlockSlot) || 0;
 
   let existing;
   try {
     if (clientdetailId) {
       const [rows] = await pool.query(
-        'SELECT id FROM cln_ttlocktoken WHERE clientdetail_id = ? LIMIT 1',
-        [clientId]
+        'SELECT id FROM cln_ttlocktoken WHERE clientdetail_id = ? AND slot = ? LIMIT 1',
+        [clientId, slot]
       );
       existing = rows;
     } else {
@@ -224,16 +226,17 @@ async function saveTokenClnScoped(clientId, scope, data) {
 
   const id = crypto.randomUUID();
   await pool.query(
-    `INSERT INTO cln_ttlocktoken (id, clientdetail_id, operator_id, accesstoken, refreshtoken, expiresin, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, NOW(3), NOW(3))`,
-    [id, clientdetailId, operatorId, accessToken, refreshTokenVal, expiresIn]
+    `INSERT INTO cln_ttlocktoken (id, clientdetail_id, operator_id, slot, accesstoken, refreshtoken, expiresin, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NOW(3), NOW(3))`,
+    [id, clientdetailId, operatorId, clientdetailId ? slot : 0, accessToken, refreshTokenVal, expiresIn]
   );
 }
 
 /**
  * Save or update token. Routes to `ttlocktoken` (Coliving operatordetail) or `cln_ttlocktoken` (Cleanlemons).
+ * @param {object} [opts] - `{ slot }` for cln_clientdetail multi-account (default slot 0).
  */
-async function saveToken(clientId, data) {
+async function saveToken(clientId, data, opts = {}) {
   const cid = String(clientId || '').trim();
   const scope = await detectTtlockTokenScope(cid);
   if (scope === 'operatordetail') {
@@ -241,7 +244,8 @@ async function saveToken(clientId, data) {
     return;
   }
   if (scope === 'cln_clientdetail' || scope === 'cln_operatordetail') {
-    await saveTokenClnScoped(cid, scope, data);
+    const slot = scope === 'cln_clientdetail' ? Number(opts?.slot) || 0 : 0;
+    await saveTokenClnScoped(cid, scope, data, slot);
     return;
   }
   const err = new Error('TTLOCK_TOKEN_CLIENT_UNKNOWN_SCOPE');
@@ -258,8 +262,9 @@ function normalizeToken(raw) {
   };
 }
 
-async function readStoredTtlockTokenRow(clientId) {
+async function readStoredTtlockTokenRow(clientId, ttlockSlotOpt) {
   const cid = String(clientId || '').trim();
+  const slot = Number(ttlockSlotOpt ?? 0) || 0;
   const scope = await detectTtlockTokenScope(cid);
   if (scope === 'operatordetail') {
     const [rows] = await pool.query(
@@ -271,8 +276,8 @@ async function readStoredTtlockTokenRow(clientId) {
   if (scope === 'cln_clientdetail') {
     try {
       const [rows] = await pool.query(
-        'SELECT accesstoken, refreshtoken, expiresin, updated_at FROM cln_ttlocktoken WHERE clientdetail_id = ? LIMIT 1',
-        [cid]
+        'SELECT accesstoken, refreshtoken, expiresin, updated_at FROM cln_ttlocktoken WHERE clientdetail_id = ? AND slot = ? LIMIT 1',
+        [cid, slot]
       );
       return { scope, row: rows[0] || null };
     } catch (e) {
@@ -307,8 +312,9 @@ async function readStoredTtlockTokenRow(clientId) {
  * Get valid TTLock access token (use existing, refresh, or login).
  * @param {string} clientId - operatordetail.id (Coliving) or cln_clientdetail.id / cln_operatordetail.id (Cleanlemons)
  */
-async function getValidTTLockToken(clientId) {
-  const { scope, row } = await readStoredTtlockTokenRow(clientId);
+async function getValidTTLockToken(clientId, opts) {
+  const slot = opts && opts.slot != null ? Number(opts.slot) || 0 : 0;
+  const { scope, row } = await readStoredTtlockTokenRow(clientId, slot);
 
   if (row) {
     const updatedAt = new Date(row.updated_at).getTime();
@@ -319,15 +325,15 @@ async function getValidTTLockToken(clientId) {
     if (row.refreshtoken) {
       const refreshed = await refreshToken(row.refreshtoken);
       if (refreshed.access_token) {
-        await saveToken(clientId, refreshed);
+        await saveToken(clientId, refreshed, { slot });
         return normalizeToken(refreshed);
       }
     }
   }
 
-  const account = await getTTLockAccountByClient(clientId);
+  const account = await getTTLockAccountByClient(clientId, slot);
   const fresh = await requestNewToken(account);
-  await saveToken(clientId, fresh);
+  await saveToken(clientId, fresh, { slot });
   return normalizeToken(fresh);
 }
 

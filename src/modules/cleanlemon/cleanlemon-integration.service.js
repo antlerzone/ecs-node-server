@@ -65,7 +65,7 @@ async function ensureClnClientIntegrationTable() {
       einvoice TINYINT(1) NULL DEFAULT NULL,
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      UNIQUE KEY uniq_cln_client_integration (clientdetail_id, \`key\`, provider),
+      UNIQUE KEY uniq_cln_client_integration_slot (clientdetail_id, \`key\`, provider, slot),
       KEY idx_cln_client_integration_clientdetail (clientdetail_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
   );
@@ -347,9 +347,12 @@ async function upsertClnOperatorIntegration(operatorId, key, slot, provider, val
 async function upsertClnClientIntegration(clientdetailId, key, slot, provider, valuesMerge, enabled = true, einvoice = null) {
   await ensureClnClientIntegrationTable();
   const cid = String(clientdetailId || '').trim();
+  const slotNum = Number(slot) || 0;
+  /** Legacy rows may have slot NULL; `slot = 0` misses them and causes duplicate INSERT vs uniq (client,key,provider). */
   const [rows] = await pool.query(
-    `SELECT id, values_json FROM cln_client_integration WHERE clientdetail_id = ? AND \`key\` = ? AND provider = ? LIMIT 1`,
-    [cid, key, provider]
+    `SELECT id, values_json FROM cln_client_integration
+     WHERE clientdetail_id = ? AND \`key\` = ? AND provider = ? AND COALESCE(slot, 0) = ? LIMIT 1`,
+    [cid, key, provider, slotNum]
   );
   const existing = rows[0];
   const prev = existing?.values_json
@@ -372,7 +375,7 @@ async function upsertClnClientIntegration(clientdetailId, key, slot, provider, v
   await pool.query(
     `INSERT INTO cln_client_integration (id, clientdetail_id, \`key\`, version, slot, enabled, provider, values_json, einvoice, created_at, updated_at)
      VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)`,
-    [id, cid, key, slot, enabled ? 1 : 0, provider, valuesStr, en, now, now]
+    [id, cid, key, slotNum, enabled ? 1 : 0, provider, valuesStr, en, now, now]
   );
 }
 
@@ -873,16 +876,8 @@ async function getClnTtlockRow(operatorId) {
   return { id: row.id, enabled: Number(row.enabled) === 1, values: v };
 }
 
-async function getClnTtlockRowForClientdetail(clientdetailId) {
-  await ensureClnClientIntegrationTable();
-  const [rows] = await pool.query(
-    `SELECT id, enabled, values_json FROM cln_client_integration
-     WHERE clientdetail_id = ? AND \`key\` = ? AND provider = ? LIMIT 1`,
-    [String(clientdetailId).trim(), KEY_SMART_DOOR, PROVIDER_TTLOCK]
-  );
-  if (!rows.length) return null;
-  const row = rows[0];
-  let v = row.values_json;
+function parseClientTtlockValuesJson(raw) {
+  let v = raw;
   if (typeof v === 'string') {
     try {
       v = JSON.parse(v || '{}');
@@ -890,7 +885,73 @@ async function getClnTtlockRowForClientdetail(clientdetailId) {
       v = {};
     }
   } else v = v || {};
-  return { id: row.id, enabled: Number(row.enabled) === 1, values: v };
+  return v;
+}
+
+function normalizeTtlockLoginCompare(s) {
+  return String(s || '').trim().toLowerCase();
+}
+
+/**
+ * @param {object} v - parsed values_json
+ * @param {string|string[]} colivingCandidates - Coliving company TTLock login(s): integration + operatordetail mirror may differ (email vs platform name).
+ */
+function effectiveTtlockSourceFromValues(v, colivingCandidates) {
+  const row = v || {};
+  if (row.ttlock_source === 'coliving') return 'coliving';
+  const arr = Array.isArray(colivingCandidates)
+    ? colivingCandidates
+    : colivingCandidates
+      ? [colivingCandidates]
+      : [];
+  const cln = normalizeTtlockLoginCompare(row.ttlock_username);
+  if (!cln) return 'manual';
+  for (const c of arr) {
+    if (normalizeTtlockLoginCompare(c) === cln) return 'coliving';
+  }
+  return 'manual';
+}
+
+async function getClnTtlockRowForClientdetail(clientdetailId, slot = 0) {
+  await ensureClnClientIntegrationTable();
+  const sl = Number(slot) || 0;
+  const [rows] = await pool.query(
+    `SELECT id, enabled, values_json, slot FROM cln_client_integration
+     WHERE clientdetail_id = ? AND \`key\` = ? AND provider = ? AND COALESCE(slot, 0) = ? LIMIT 1`,
+    [String(clientdetailId).trim(), KEY_SMART_DOOR, PROVIDER_TTLOCK, sl]
+  );
+  if (!rows.length) return null;
+  const row = rows[0];
+  const v = parseClientTtlockValuesJson(row.values_json);
+  return { id: row.id, slot: Number(row.slot) || 0, enabled: Number(row.enabled) === 1, values: v };
+}
+
+async function listClnClientTtlockIntegrationRows(clientdetailId) {
+  await ensureClnClientIntegrationTable();
+  const [rows] = await pool.query(
+    `SELECT id, slot, enabled, values_json FROM cln_client_integration
+     WHERE clientdetail_id = ? AND \`key\` = ? AND provider = ? ORDER BY slot ASC`,
+    [String(clientdetailId).trim(), KEY_SMART_DOOR, PROVIDER_TTLOCK]
+  );
+  return rows || [];
+}
+
+async function nextAvailableTtlockSlot(clientdetailId) {
+  await ensureClnClientIntegrationTable();
+  const [rows] = await pool.query(
+    `SELECT COALESCE(MAX(COALESCE(slot, 0)), -1) + 1 AS n FROM cln_client_integration
+     WHERE clientdetail_id = ? AND \`key\` = ? AND provider = ?`,
+    [String(clientdetailId).trim(), KEY_SMART_DOOR, PROVIDER_TTLOCK]
+  );
+  return Number(rows[0]?.n) || 0;
+}
+
+/** Slot 0 has Coliving-synced TTLock with credentials — blocks duplicate Coliving copy unless replace. */
+async function getClnClientTtlockSlot0Connected(clientdetailId) {
+  const row = await getClnTtlockRowForClientdetail(clientdetailId, 0);
+  if (!row || !row.enabled) return false;
+  const v = row.values || {};
+  return !!(v.ttlock_username && v.ttlock_password);
 }
 
 /**
@@ -939,18 +1000,119 @@ async function upsertColivingBridgeApiKeyClnOperator(operatorId, apiKeyPlain) {
   );
 }
 
-/** Bridge API key scoped to B2B client (cln_clientdetail). */
-async function upsertColivingBridgeApiKeyClnClientdetail(clientdetailId, apiKeyPlain) {
+/** Bridge API key scoped to B2B client (cln_clientdetail). Merges optional Coliving operator metadata. */
+async function upsertColivingBridgeApiKeyClnClientdetail(clientdetailId, apiKeyPlain, colivingMeta = {}) {
   const k = String(apiKeyPlain || '').trim();
   if (!k) throw new Error('API_KEY_REQUIRED');
+  const merge = {
+    api_key: k,
+    ...(colivingMeta && typeof colivingMeta === 'object' ? colivingMeta : {})
+  };
   await upsertClnClientIntegration(
     String(clientdetailId).trim(),
     'colivingBridge',
     0,
     'coliving',
-    { api_key: k },
+    merge,
     true,
     null
+  );
+}
+
+/** Coliving ↔ Cleanlemons bridge row: which Coliving operatordetail is linked (after confirm). */
+async function getColivingBridgeInfoClnClientdetail(clientdetailId) {
+  await ensureClnClientIntegrationTable();
+  const cid = String(clientdetailId || '').trim();
+  if (!cid) return { linked: false };
+  const [rows] = await pool.query(
+    `SELECT enabled, values_json FROM cln_client_integration
+     WHERE clientdetail_id = ? AND \`key\` = 'colivingBridge' AND provider = 'coliving' LIMIT 1`,
+    [cid]
+  );
+  if (!rows.length || Number(rows[0].enabled) !== 1) {
+    return { linked: false };
+  }
+  const v = parseClientTtlockValuesJson(rows[0].values_json);
+  return {
+    linked: true,
+    colivingOperatordetailId:
+      v.coliving_operatordetail_id != null ? String(v.coliving_operatordetail_id).trim() : '',
+    colivingOperatorTitle:
+      v.coliving_operator_title != null ? String(v.coliving_operator_title).trim() : '',
+    colivingOperatorEmail:
+      v.coliving_operator_email != null ? String(v.coliving_operator_email).trim() : ''
+  };
+}
+
+/**
+ * Coliving company TTLock identity: `client_integration` may store platform login; `operatordetail.ttlock_username`
+ * may mirror email — both must match Cleanlemons row for "(coliving)" when `ttlock_source` was missing.
+ */
+async function getColivingOperatordetailTtlockUsernameCandidates(operatordetailId) {
+  const oid = String(operatordetailId || '').trim();
+  if (!oid) return [];
+  const out = [];
+  const seen = new Set();
+  const push = (s) => {
+    const t = s != null ? String(s).trim() : '';
+    if (!t) return;
+    const k = t.toLowerCase();
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push(t);
+  };
+  const [ttRows] = await pool.query(
+    `SELECT values_json FROM client_integration
+     WHERE client_id = ? AND \`key\` = 'smartDoor' AND provider = 'ttlock'
+     ORDER BY enabled DESC, updated_at DESC LIMIT 1`,
+    [oid]
+  );
+  if (ttRows.length) {
+    const v = parseClientTtlockValuesJson(ttRows[0].values_json);
+    push(v.ttlock_username);
+  }
+  try {
+    const [[od]] = await pool.query(
+      'SELECT ttlock_username FROM operatordetail WHERE id = ? LIMIT 1',
+      [oid]
+    );
+    if (od) push(od.ttlock_username);
+  } catch (_) {
+    /* column missing on old DB */
+  }
+  return out;
+}
+
+/**
+ * Coliving-managed TTLock for B2B client: stored `ttlock_source`, or Coliving bridge is linked and
+ * this row's TTLock username matches Coliving's company TTLock (e.g. connected via portal before flag existed).
+ */
+async function getEffectiveTtlockSourceForClnClientdetail(clientdetailId, valuesParsed) {
+  const v = valuesParsed || {};
+  if (v.ttlock_source === 'coliving') return 'coliving';
+  const bridge = await getColivingBridgeInfoClnClientdetail(String(clientdetailId || '').trim());
+  if (!bridge.linked || !bridge.colivingOperatordetailId) return 'manual';
+  const candidates = await getColivingOperatordetailTtlockUsernameCandidates(bridge.colivingOperatordetailId);
+  return effectiveTtlockSourceFromValues(v, candidates);
+}
+
+async function persistClnTtlockSourceColivingIfNeeded(integrationRowId, valuesParsed) {
+  const id = String(integrationRowId || '').trim();
+  if (!id) return;
+  const v = valuesParsed && typeof valuesParsed === 'object' ? { ...valuesParsed } : {};
+  if (v.ttlock_source === 'coliving') return;
+  const merged = {
+    ...v,
+    ttlock_source: 'coliving',
+    from_coliving: true,
+    account_display_name:
+      v.account_display_name != null && String(v.account_display_name).trim()
+        ? String(v.account_display_name).trim()
+        : 'Coliving'
+  };
+  await pool.query(
+    'UPDATE cln_client_integration SET values_json = ?, updated_at = NOW() WHERE id = ?',
+    [JSON.stringify(merged), id]
   );
 }
 
@@ -1005,64 +1167,135 @@ async function getTtlockOnboardStatusClnOperator(operatorId) {
 }
 
 /**
- * Client portal / Coliving link: TTLock per cln_clientdetail; token in `cln_ttlocktoken.clientdetail_id`.
+ * Client portal / Coliving link: TTLock per cln_clientdetail (multi `slot`); token in `cln_ttlocktoken` per slot.
+ * @param {object} opts
+ * @param {string} opts.username
+ * @param {string} opts.password
+ * @param {number} [opts.slot] - omit for manual → next free slot; Coliving bridge uses slot 0.
+ * @param {string} [opts.accountName] - display label (e.g. "Coliving" or user-defined).
+ * @param {'coliving'|'manual'} [opts.source] - Coliving-integrated accounts are not manageable from client portal.
  */
-async function ttlockConnectClnClientdetail(clientdetailId, { username, password } = {}) {
+async function ttlockConnectClnClientdetail(clientdetailId, opts = {}) {
+  const { username, password, slot: slotOpt, accountName, source } = opts;
   const cid = String(clientdetailId || '').trim();
   const usernameTrim = String(username || '').trim();
   const passwordTrim = String(password || '').trim();
   if (!cid) throw new Error('MISSING_CLIENTDETAIL_ID');
   if (!usernameTrim || !passwordTrim) throw new Error('TTLOCK_USERNAME_PASSWORD_REQUIRED');
+  const sourceNorm = source === 'coliving' ? 'coliving' : 'manual';
+  let slot;
+  if (sourceNorm === 'coliving') {
+    slot = 0;
+  } else if (slotOpt != null && slotOpt !== '') {
+    slot = Number(slotOpt);
+    if (!Number.isFinite(slot) || slot < 0) throw new Error('INVALID_TTLOCK_SLOT');
+  } else {
+    slot = await nextAvailableTtlockSlot(cid);
+  }
+  const nameTrim = String(accountName || '').trim();
+  const displayName =
+    sourceNorm === 'coliving'
+      ? 'Coliving'
+      : nameTrim || `TTLock (${slot})`;
   const freshToken = await requestNewToken({
     username: usernameTrim,
     password: passwordTrim
   });
-  await upsertClnClientIntegration(
-    cid,
-    KEY_SMART_DOOR,
-    0,
-    PROVIDER_TTLOCK,
-    {
-      ttlock_username: usernameTrim,
-      ttlock_password: passwordTrim,
-      ttlock_mode: 'existing'
-    },
-    true,
-    null
-  );
-  await saveToken(cid, freshToken);
-  return { ok: true, mode: 'existing', username: usernameTrim };
+  const ttlockValues = {
+    ttlock_username: usernameTrim,
+    ttlock_password: passwordTrim,
+    ttlock_mode: 'existing',
+    ttlock_source: sourceNorm,
+    account_display_name: displayName,
+    /** Explicit audit flag in JSON (canonical remains `ttlock_source`). */
+    from_coliving: sourceNorm === 'coliving'
+  };
+  await upsertClnClientIntegration(cid, KEY_SMART_DOOR, slot, PROVIDER_TTLOCK, ttlockValues, true, null);
+  await saveToken(cid, freshToken, { slot });
+  return { ok: true, mode: 'existing', username: usernameTrim, slot, source: sourceNorm, accountName: displayName };
 }
 
-async function ttlockDisconnectClnClientdetail(clientdetailId) {
+/**
+ * @param {number} [slot=0]
+ * @param {{ force?: boolean }} [options] - `force` allows server-side replace (e.g. Coliving link) even for Coliving-managed row.
+ */
+async function ttlockDisconnectClnClientdetail(clientdetailId, slot = 0, options = {}) {
   const cid = String(clientdetailId || '').trim();
+  const sl = Number(slot) || 0;
   if (!cid) throw new Error('MISSING_CLIENTDETAIL_ID');
   await ensureClnClientIntegrationTable();
   const [rows] = await pool.query(
-    `SELECT id FROM cln_client_integration WHERE clientdetail_id = ? AND \`key\` = ? AND provider = ? LIMIT 1`,
-    [cid, KEY_SMART_DOOR, PROVIDER_TTLOCK]
+    `SELECT id, values_json FROM cln_client_integration
+     WHERE clientdetail_id = ? AND \`key\` = ? AND provider = ? AND COALESCE(slot, 0) = ? LIMIT 1`,
+    [cid, KEY_SMART_DOOR, PROVIDER_TTLOCK, sl]
   );
-  if (rows.length) {
-    await pool.query('UPDATE cln_client_integration SET enabled = 0, updated_at = NOW() WHERE id = ?', [rows[0].id]);
+  if (!rows.length) return { ok: true };
+  const v = parseClientTtlockValuesJson(rows[0].values_json);
+  const src = await getEffectiveTtlockSourceForClnClientdetail(cid, v);
+  if (src === 'coliving' && !options.force) {
+    const err = new Error('TTLOCK_COLIVING_MANAGED');
+    err.code = 'TTLOCK_COLIVING_MANAGED';
+    throw err;
+  }
+  await pool.query('UPDATE cln_client_integration SET enabled = 0, updated_at = NOW() WHERE id = ?', [rows[0].id]);
+  try {
+    await pool.query('DELETE FROM cln_ttlocktoken WHERE clientdetail_id = ? AND slot = ?', [cid, sl]);
+  } catch (e) {
+    const msg = String(e?.sqlMessage || e?.message || '');
+    if (!/Unknown column/i.test(msg) && !/doesn't exist/i.test(msg)) throw e;
   }
   return { ok: true };
 }
 
-async function getTtlockCredentialsClnClientdetail(clientdetailId) {
-  const row = await getClnTtlockRowForClientdetail(clientdetailId);
-  if (!row || !row.enabled) return { ok: true, username: '', password: '' };
+async function getTtlockCredentialsClnClientdetail(clientdetailId, slot = 0) {
+  const row = await getClnTtlockRowForClientdetail(clientdetailId, slot);
+  if (!row || !row.enabled) return { ok: true, username: '', password: '', slot: Number(slot) || 0 };
   const u = row.values.ttlock_username != null ? String(row.values.ttlock_username) : '';
   const p = row.values.ttlock_password != null ? String(row.values.ttlock_password) : '';
-  return { ok: true, username: u, password: p };
+  return { ok: true, username: u, password: p, slot: row.slot };
 }
 
 async function getTtlockOnboardStatusClnClientdetail(clientdetailId) {
-  const row = await getClnTtlockRowForClientdetail(clientdetailId);
-  const v = row?.values || {};
-  const enabled = !!(row && row.enabled);
+  const list = await listClnClientTtlockIntegrationRows(clientdetailId);
+  const cid = String(clientdetailId || '').trim();
+  const bridge = await getColivingBridgeInfoClnClientdetail(cid);
+  const colivingCandidates =
+    bridge.linked && bridge.colivingOperatordetailId
+      ? await getColivingOperatordetailTtlockUsernameCandidates(bridge.colivingOperatordetailId)
+      : [];
+  let ttlockCreateEverUsed = false;
+  let ttlockConnected = false;
+  const accounts = [];
+  for (const r of list) {
+    let v = parseClientTtlockValuesJson(r.values_json);
+    if (v.ttlock_subuser_ever_created) ttlockCreateEverUsed = true;
+    const en = Number(r.enabled) === 1;
+    let src = effectiveTtlockSourceFromValues(v, colivingCandidates);
+    if (src === 'coliving' && v.ttlock_source !== 'coliving' && r.id) {
+      try {
+        await persistClnTtlockSourceColivingIfNeeded(r.id, v);
+        v = { ...v, ttlock_source: 'coliving', account_display_name: v.account_display_name || 'Coliving' };
+      } catch (e) {
+        console.warn('[cleanlemon-integration] persistClnTtlockSourceColivingIfNeeded', e?.message || e);
+      }
+    }
+    const hasCreds = !!(v.ttlock_username && v.ttlock_password);
+    const connected = en && hasCreds;
+    if (connected) ttlockConnected = true;
+    const nm = v.account_display_name != null ? String(v.account_display_name).trim() : '';
+    accounts.push({
+      slot: Number(r.slot) || 0,
+      accountName: nm || (src === 'coliving' ? 'Coliving' : ''),
+      username: v.ttlock_username != null ? String(v.ttlock_username) : '',
+      source: src,
+      manageable: src !== 'coliving',
+      connected
+    });
+  }
   return {
-    ttlockConnected: enabled && !!(v.ttlock_username && v.ttlock_password),
-    ttlockCreateEverUsed: !!v.ttlock_subuser_ever_created
+    ttlockConnected,
+    ttlockCreateEverUsed,
+    accounts
   };
 }
 
@@ -1201,7 +1434,9 @@ module.exports = {
   ttlockDisconnectClnClientdetail,
   getTtlockCredentialsClnClientdetail,
   getTtlockOnboardStatusClnClientdetail,
+  getClnClientTtlockSlot0Connected,
   upsertColivingBridgeApiKeyClnClientdetail,
+  getColivingBridgeInfoClnClientdetail,
   disconnectColivingBridgeClnClientdetail,
   getOrCreateThirdPartyIntegrationApiKey,
   rotateThirdPartyIntegrationApiKey,

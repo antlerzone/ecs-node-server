@@ -1375,7 +1375,7 @@ export default function CompanyPage() {
   }
 
   return (
-    <div className="space-y-6 pb-20 lg:pb-0">
+    <div className="min-w-0 max-w-full space-y-6 pb-20 lg:pb-0">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
@@ -1384,12 +1384,20 @@ export default function CompanyPage() {
         </div>
       </div>
 
-      <Tabs value={activeTab} onValueChange={setActiveTab}>
-        <TabsList>
-          <TabsTrigger value="profile">Profile</TabsTrigger>
-          <TabsTrigger value="integration">Integration</TabsTrigger>
-          <TabsTrigger value="subscription">Subscription</TabsTrigger>
-          <TabsTrigger value="billing">Billing</TabsTrigger>
+      <Tabs value={activeTab} onValueChange={setActiveTab} className="min-w-0">
+        <TabsList className="flex h-auto min-h-9 w-full min-w-0 flex-wrap items-stretch justify-start gap-1 p-1 sm:gap-0">
+          <TabsTrigger value="profile" className="shrink-0 px-3 sm:flex-1">
+            Profile
+          </TabsTrigger>
+          <TabsTrigger value="integration" className="shrink-0 px-3 sm:flex-1">
+            Integration
+          </TabsTrigger>
+          <TabsTrigger value="subscription" className="shrink-0 px-3 sm:flex-1">
+            Subscription
+          </TabsTrigger>
+          <TabsTrigger value="billing" className="shrink-0 px-3 sm:flex-1">
+            Billing
+          </TabsTrigger>
         </TabsList>
 
         <TabsContent value="profile" className="mt-6 space-y-6">
@@ -1434,10 +1442,10 @@ export default function CompanyPage() {
                   <Label htmlFor="subdomain">
                     Subdomain <span className="text-destructive">*</span>
                   </Label>
-                  <p className="text-xs text-muted-foreground">
+                  <p className="text-xs text-muted-foreground break-words">
                     <span className="font-medium text-foreground">Required.</span> Must be unique — no other operator
                     can use the same value. Your public page:{' '}
-                    <span className="font-medium text-foreground">
+                    <span className="font-medium text-foreground break-all sm:break-words">
                       {typeof window !== 'undefined' ? window.location.origin : 'https://portal.cleanlemons.com'}/
                       {String(companyInfo.subdomain || 'your-name').trim() || 'your-name'}
                     </span>
@@ -2106,7 +2114,7 @@ export default function CompanyPage() {
           </Card>
 
           {/* Plans — amounts from `cln_pricingplan` when available */}
-          <div className="grid md:grid-cols-3 gap-4 md:items-stretch">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3 md:items-stretch">
             {PRICING_PLANS.map((plan) => {
               const apiCode = uiPlanToApiPlan(plan.plan)
               const am = clnPlanAmounts?.[apiCode]

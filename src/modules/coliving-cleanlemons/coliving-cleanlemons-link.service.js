@@ -622,6 +622,115 @@ async function mirrorPropertydetailToClnRows(propertydetailId) {
 }
 
 /**
+ * Mirror Coliving lock bindings (propertydetail/roomdetail.smartdoor_id) + hide archived/inactive on `cln_property`.
+ * Removes `cln_property` rows whose Coliving room was deleted (orphan room keys).
+ */
+async function mirrorColivingLockAndArchiveToClnProperty(operatordetailId, cleanlemonsClientdetailId, propertydetailId) {
+  const oid = String(operatordetailId || '').trim();
+  const cid = String(cleanlemonsClientdetailId || '').trim();
+  const pid = String(propertydetailId || '').trim();
+  if (!oid || !cid || !pid) return;
+  const hasPd = await tableHasColumn('cln_property', 'coliving_propertydetail_id');
+  if (!hasPd) return;
+  const hasRd = await tableHasColumn('cln_property', 'coliving_roomdetail_id');
+  const hasArchived = await tableHasColumn('cln_property', 'coliving_sync_archived');
+  const hasSd = await tableHasColumn('cln_property', 'smartdoor_id');
+
+  const [[pd]] = await pool.query(
+    `SELECT id, smartdoor_id, active, archived FROM propertydetail WHERE client_id = ? AND id = ? LIMIT 1`,
+    [oid, pid]
+  );
+  if (!pd) return;
+
+  const propLevelArchived =
+    !!(pd.archived === 1 || pd.archived === true) || !(pd.active === 1 || pd.active === true);
+
+  const [existingRooms] = await pool.query(
+    `SELECT id FROM roomdetail WHERE property_id = ? AND client_id = ?`,
+    [pid, oid]
+  );
+  const roomIds = new Set((existingRooms || []).map((r) => String(r.id)));
+
+  if (hasRd) {
+    const [orphanCln] = await pool.query(
+      `SELECT id, coliving_roomdetail_id FROM cln_property
+       WHERE clientdetail_id = ? AND coliving_propertydetail_id = ?
+         AND coliving_roomdetail_id IS NOT NULL AND TRIM(coliving_roomdetail_id) != ''`,
+      [cid, pid]
+    );
+    for (const row of orphanCln || []) {
+      const rid = row.coliving_roomdetail_id != null ? String(row.coliving_roomdetail_id).trim() : '';
+      if (rid && !roomIds.has(rid)) {
+        await pool.query('DELETE FROM cln_property WHERE id = ? LIMIT 1', [row.id]);
+      }
+    }
+  }
+
+  if (!hasArchived && !hasSd) return;
+
+  let entireSd = null;
+  if (pd.smartdoor_id != null && String(pd.smartdoor_id).trim() !== '') {
+    entireSd = String(pd.smartdoor_id).trim();
+  }
+  const entireArch = propLevelArchived ? 1 : 0;
+
+  if (hasSd && hasArchived) {
+    await pool.query(
+      `UPDATE cln_property SET smartdoor_id = ?, coliving_sync_archived = ?
+       WHERE clientdetail_id = ? AND coliving_propertydetail_id = ?
+         AND (coliving_roomdetail_id IS NULL OR coliving_roomdetail_id = '')`,
+      [entireSd, entireArch, cid, pid]
+    );
+  } else if (hasSd) {
+    await pool.query(
+      `UPDATE cln_property SET smartdoor_id = ?
+       WHERE clientdetail_id = ? AND coliving_propertydetail_id = ?
+         AND (coliving_roomdetail_id IS NULL OR coliving_roomdetail_id = '')`,
+      [entireSd, cid, pid]
+    );
+  } else if (hasArchived) {
+    await pool.query(
+      `UPDATE cln_property SET coliving_sync_archived = ?
+       WHERE clientdetail_id = ? AND coliving_propertydetail_id = ?
+         AND (coliving_roomdetail_id IS NULL OR coliving_roomdetail_id = '')`,
+      [entireArch, cid, pid]
+    );
+  }
+
+  const [rooms] = await pool.query(
+    `SELECT id, smartdoor_id, active FROM roomdetail WHERE property_id = ? AND client_id = ?`,
+    [pid, oid]
+  );
+  for (const r of rooms || []) {
+    const rid = String(r.id);
+    let rsd = null;
+    if (r.smartdoor_id != null && String(r.smartdoor_id).trim() !== '') {
+      rsd = String(r.smartdoor_id).trim();
+    }
+    const roomArch = propLevelArchived || !(r.active === 1 || r.active === true) ? 1 : 0;
+    if (hasSd && hasArchived) {
+      await pool.query(
+        `UPDATE cln_property SET smartdoor_id = ?, coliving_sync_archived = ?
+         WHERE clientdetail_id = ? AND coliving_propertydetail_id = ? AND coliving_roomdetail_id = ?`,
+        [rsd, roomArch, cid, pid, rid]
+      );
+    } else if (hasSd) {
+      await pool.query(
+        `UPDATE cln_property SET smartdoor_id = ?
+         WHERE clientdetail_id = ? AND coliving_propertydetail_id = ? AND coliving_roomdetail_id = ?`,
+        [rsd, cid, pid, rid]
+      );
+    } else if (hasArchived) {
+      await pool.query(
+        `UPDATE cln_property SET coliving_sync_archived = ?
+         WHERE clientdetail_id = ? AND coliving_propertydetail_id = ? AND coliving_roomdetail_id = ?`,
+        [roomArch, cid, pid, rid]
+      );
+    }
+  }
+}
+
+/**
  * After Coliving property/room changes: upsert `cln_property` rows + mirror pd fields (when integration export is on).
  */
 async function maybeSyncPropertydetailToCleanlemons(operatordetailId, propertydetailId) {
@@ -681,6 +790,11 @@ async function maybeSyncPropertydetailToCleanlemons(operatordetailId, propertyde
     }
   }
   await mirrorPropertydetailToClnRows(pid);
+  await mirrorColivingLockAndArchiveToClnProperty(
+    String(operatordetailId),
+    ctx.cleanlemonsClientdetailId,
+    pid
+  );
 }
 
 async function syncPropertiesToCleanlemons(operatordetailId, cleanlemonsClientdetailId) {
@@ -734,7 +848,65 @@ async function syncPropertiesToCleanlemons(operatordetailId, cleanlemonsClientde
         roomEntireUnitListing: entireListing
       });
     }
+    await mirrorPropertydetailToClnRows(String(p.id));
+    await mirrorColivingLockAndArchiveToClnProperty(
+      String(operatordetailId),
+      String(cleanlemonsClientdetailId),
+      String(p.id)
+    );
   }
+}
+
+/**
+ * Copy Coliving company TTLock into Cleanlemons B2B client (marks `ttlock_source: coliving`).
+ * @returns {{ ok: true, integrateTtlockApplied: boolean } | { ok: false, reason: string, needsTtlockReplaceConfirm?: boolean }}
+ */
+async function copyColivingTtlockIntoCleanlemonsClient(
+  colivingOperatordetailId,
+  cleanlemonsClientdetailId,
+  { integrateTtlock, replaceTtlockFromColiving } = {}
+) {
+  let integrateTtlockApplied = false;
+  if (!integrateTtlock) {
+    return { ok: true, integrateTtlockApplied: false };
+  }
+  const clnId = String(cleanlemonsClientdetailId || '').trim();
+  const colivingId = String(colivingOperatordetailId || '').trim();
+  if (!clnId || !colivingId) {
+    return { ok: true, integrateTtlockApplied: false };
+  }
+
+  const slot0Busy = await clnInt.getClnClientTtlockSlot0Connected(clnId);
+  if (slot0Busy) {
+    if (!replaceTtlockFromColiving) {
+      return {
+        ok: false,
+        reason: 'TTLOCK_ALREADY_CONNECTED_ON_CLEANLEMONS',
+        needsTtlockReplaceConfirm: true
+      };
+    }
+    await clnInt.ttlockDisconnectClnClientdetail(clnId, 0, { force: true });
+  }
+  const [ttRows] = await pool.query(
+    `SELECT values_json FROM client_integration
+     WHERE client_id = ? AND \`key\` = 'smartDoor' AND provider = 'ttlock' AND enabled = 1 LIMIT 1`,
+    [colivingId]
+  );
+  if (ttRows.length) {
+    const tv = parseIntegrationValues(ttRows[0].values_json);
+    const username = tv.ttlock_username != null ? String(tv.ttlock_username).trim() : '';
+    const password = tv.ttlock_password != null ? String(tv.ttlock_password) : '';
+    if (username && password) {
+      await clnInt.ttlockConnectClnClientdetail(clnId, {
+        username,
+        password,
+        source: 'coliving',
+        accountName: 'Coliving'
+      });
+      integrateTtlockApplied = true;
+    }
+  }
+  return { ok: true, integrateTtlockApplied };
 }
 
 /**
@@ -766,7 +938,31 @@ async function confirmCleanlemonsLink(
     throw err;
   }
 
+  /** Link already confirmed once — still allow TTLock copy when user checks "integrate TTLock" (first path skipped this). */
   if (v0.confirmed_at) {
+    if (integrateTtlock) {
+      await assertCleanlemonsOfferedToOperator(clientId);
+      const cleanlemonsClientdetailIdEarly = String(v0.cleanlemons_clientdetail_id).trim();
+      const ttEarly = await copyColivingTtlockIntoCleanlemonsClient(clientId, cleanlemonsClientdetailIdEarly, {
+        integrateTtlock: true,
+        replaceTtlockFromColiving: !!replaceTtlockFromColiving
+      });
+      if (!ttEarly.ok) {
+        return ttEarly;
+      }
+      if (ttEarly.integrateTtlockApplied) {
+        await upsertClientIntegration(clientId, KEY_SAAS, 0, PROVIDER_CLEANLEMONS, {
+          ...v0,
+          integrate_ttlock_enabled: true
+        }, true, null);
+      }
+      return {
+        ok: true,
+        alreadyConfirmed: true,
+        confirmedAt: v0.confirmed_at,
+        integrateTtlockApplied: !!(v0.integrate_ttlock_enabled || ttEarly.integrateTtlockApplied)
+      };
+    }
     return {
       ok: true,
       alreadyConfirmed: true,
@@ -779,34 +975,14 @@ async function confirmCleanlemonsLink(
 
   const cleanlemonsClientdetailId = String(v0.cleanlemons_clientdetail_id).trim();
 
-  let integrateTtlockApplied = false;
-  if (integrateTtlock) {
-    const st = await clnInt.getTtlockOnboardStatusClnClientdetail(cleanlemonsClientdetailId);
-    if (st.ttlockConnected) {
-      if (!replaceTtlockFromColiving) {
-        return {
-          ok: false,
-          reason: 'TTLOCK_ALREADY_CONNECTED_ON_CLEANLEMONS',
-          needsTtlockReplaceConfirm: true
-        };
-      }
-      await clnInt.ttlockDisconnectClnClientdetail(cleanlemonsClientdetailId);
-    }
-    const [ttRows] = await pool.query(
-      `SELECT values_json FROM client_integration
-       WHERE client_id = ? AND \`key\` = 'smartDoor' AND provider = 'ttlock' AND enabled = 1 LIMIT 1`,
-      [String(clientId)]
-    );
-    if (ttRows.length) {
-      const tv = parseIntegrationValues(ttRows[0].values_json);
-      const username = tv.ttlock_username != null ? String(tv.ttlock_username).trim() : '';
-      const password = tv.ttlock_password != null ? String(tv.ttlock_password) : '';
-      if (username && password) {
-        await clnInt.ttlockConnectClnClientdetail(cleanlemonsClientdetailId, { username, password });
-        integrateTtlockApplied = true;
-      }
-    }
+  const ttRes = await copyColivingTtlockIntoCleanlemonsClient(clientId, cleanlemonsClientdetailId, {
+    integrateTtlock: !!integrateTtlock,
+    replaceTtlockFromColiving: !!replaceTtlockFromColiving
+  });
+  if (!ttRes.ok) {
+    return ttRes;
   }
+  const integrateTtlockApplied = ttRes.integrateTtlockApplied;
 
   if (exportPropertyToCleanlemons) {
     await syncPropertiesToCleanlemons(clientId, cleanlemonsClientdetailId);
@@ -825,7 +1001,24 @@ async function confirmCleanlemonsLink(
 
   const apiKey = randomBytes(32).toString('base64url');
   const apiKeySha256 = createHash('sha256').update(apiKey).digest('hex');
-  await clnInt.upsertColivingBridgeApiKeyClnClientdetail(cleanlemonsClientdetailId, apiKey);
+
+  let colivingOdTitle = '';
+  let colivingOdEmail = '';
+  try {
+    const [[od]] = await pool.query('SELECT title, email FROM operatordetail WHERE id = ? LIMIT 1', [String(clientId)]);
+    if (od) {
+      colivingOdTitle = od.title != null ? String(od.title).trim() : '';
+      colivingOdEmail = od.email != null ? String(od.email).trim().toLowerCase() : '';
+    }
+  } catch (_) {
+    /* optional — show id-only if operatordetail missing */
+  }
+
+  await clnInt.upsertColivingBridgeApiKeyClnClientdetail(cleanlemonsClientdetailId, apiKey, {
+    coliving_operatordetail_id: String(clientId),
+    coliving_operator_title: colivingOdTitle,
+    coliving_operator_email: colivingOdEmail
+  });
 
   const nowIso = new Date().toISOString();
   await upsertClientIntegration(clientId, KEY_SAAS, 0, PROVIDER_CLEANLEMONS, {

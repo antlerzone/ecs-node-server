@@ -59,8 +59,21 @@ function stripSmartDoorBody(req) {
 function clnOperatorScope(clnOperatorId) {
   return { kind: 'cln_operator', clnOperatorId: String(clnOperatorId || '').trim() };
 }
-function clnClientScope(clnClientId) {
-  return { kind: 'cln_client', clnClientId: String(clnClientId || '').trim() };
+/** Optional TTLock account slot (Cleanlemons B2B multi-login). Omitted / invalid → slot 0. */
+function parseTtlockSlotFromRequest(req) {
+  const v = req.body?.ttlockSlot ?? req.body?.ttlock_slot ?? req.query?.ttlockSlot ?? req.query?.ttlock_slot;
+  if (v == null || v === '') return undefined;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return undefined;
+  return n;
+}
+
+function clnClientScope(clnClientId, ttlockSlotOpt) {
+  const base = { kind: 'cln_client', clnClientId: String(clnClientId || '').trim() };
+  if (ttlockSlotOpt == null || ttlockSlotOpt === '') return base;
+  const n = Number(ttlockSlotOpt);
+  if (!Number.isFinite(n) || n < 0) return base;
+  return { ...base, ttlockSlot: n };
 }
 
 async function resolveOperatorTtlockClientId(req, res) {
@@ -436,7 +449,7 @@ router.post('/client/smartdoorsetting/list', async (req, res, next) => {
   try {
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnClientScope(clientId);
+    const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const b = stripSmartDoorBody(req);
     const result = await getSmartDoorList(sdScope, {
       keyword: b.keyword,
@@ -457,7 +470,7 @@ router.post('/client/smartdoorsetting/filters', async (req, res, next) => {
   try {
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnClientScope(clientId);
+    const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const result = await getSmartDoorFilters(sdScope);
     res.json(result);
   } catch (err) {
@@ -469,7 +482,7 @@ router.post('/client/smartdoorsetting/get-lock', async (req, res, next) => {
   try {
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnClientScope(clientId);
+    const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const id = req.body?.id;
     if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
     const row = await getLock(sdScope, id);
@@ -484,7 +497,7 @@ router.post('/client/smartdoorsetting/get-gateway', async (req, res, next) => {
   try {
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnClientScope(clientId);
+    const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const id = req.body?.id;
     if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
     const row = await getGateway(sdScope, id);
@@ -499,7 +512,7 @@ router.post('/client/smartdoorsetting/update-lock', async (req, res, next) => {
   try {
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnClientScope(clientId);
+    const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const id = req.body?.id;
     if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
     const result = await updateLock(sdScope, id, {
@@ -518,7 +531,7 @@ router.post('/client/smartdoorsetting/update-gateway', async (req, res, next) =>
   try {
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnClientScope(clientId);
+    const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const id = req.body?.id;
     if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
     const result = await updateGateway(sdScope, id, { gatewayName: req.body?.gatewayName });
@@ -534,7 +547,7 @@ router.post('/client/smartdoorsetting/unlock', async (req, res, next) => {
     const { email } = clientPortalAuthFromRequest(req, req.body?.email);
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnClientScope(clientId);
+    const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const id = req.body?.id;
     if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
     await remoteUnlockLock(sdScope, id, {
@@ -554,7 +567,7 @@ router.post('/client/smartdoorsetting/preview-selection', async (req, res, next)
   try {
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnClientScope(clientId);
+    const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const result = await previewSmartDoorSelection(sdScope);
     res.json(result);
   } catch (err) {
@@ -566,7 +579,7 @@ router.post('/client/smartdoorsetting/sync-status-from-ttlock', async (req, res,
   try {
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnClientScope(clientId);
+    const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const result = await syncSmartDoorStatusFromTtlock(sdScope);
     res.json(result);
   } catch (err) {
@@ -578,7 +591,7 @@ router.post('/client/smartdoorsetting/sync-locks-from-ttlock', async (req, res, 
   try {
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnClientScope(clientId);
+    const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const result = await syncSmartDoorStatusFromTtlock(sdScope);
     res.json(result);
   } catch (err) {
@@ -590,7 +603,7 @@ router.post('/client/smartdoorsetting/sync-single-lock-from-ttlock', async (req,
   try {
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnClientScope(clientId);
+    const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const id = req.body?.id;
     if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
     const result = await syncSingleLockStatusFromTtlock(sdScope, id);
@@ -605,7 +618,7 @@ router.post('/client/smartdoorsetting/sync-single-gateway-from-ttlock', async (r
   try {
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnClientScope(clientId);
+    const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const id = req.body?.id;
     if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
     const result = await syncSingleGatewayStatusFromTtlock(sdScope, id);
@@ -620,7 +633,7 @@ router.post('/client/smartdoorsetting/sync-name', async (req, res, next) => {
   try {
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnClientScope(clientId);
+    const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const { type, externalId, name } = req.body || {};
     if (!type || !externalId || !name) {
       return res.status(400).json({ ok: false, reason: 'TYPE_EXTERNALID_NAME_REQUIRED' });
@@ -639,7 +652,7 @@ router.post('/client/smartdoorsetting/ids-by-property', async (req, res, next) =
   try {
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnClientScope(clientId);
+    const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const propertyId = req.body?.propertyId;
     if (!propertyId) return res.json({ ids: [] });
     const ids = await getSmartDoorIdsByProperty(sdScope, propertyId);
@@ -653,7 +666,7 @@ router.post('/client/smartdoorsetting/location-label', async (req, res, next) =>
   try {
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnClientScope(clientId);
+    const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const lockDetailId = req.body?.lockDetailId;
     if (!lockDetailId) return res.json({ label: 'no connect' });
     const label = await resolveSmartDoorLocationLabel(sdScope, lockDetailId);
@@ -667,7 +680,7 @@ router.post('/client/smartdoorsetting/child-lock-options', async (req, res, next
   try {
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnClientScope(clientId);
+    const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const excludeLockId = req.body?.excludeLockId;
     const options = await getChildLockOptions(sdScope, excludeLockId);
     res.json({ options });
@@ -680,7 +693,7 @@ router.post('/client/smartdoorsetting/insert-smartdoors', async (req, res, next)
   try {
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnClientScope(clientId);
+    const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const gateways = Array.isArray(req.body?.gateways) ? req.body.gateways : [];
     const locks = Array.isArray(req.body?.locks) ? req.body.locks : [];
     const gatewayMap = new Map();
@@ -701,7 +714,7 @@ router.post('/client/smartdoorsetting/delete-lock', async (req, res, next) => {
   try {
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnClientScope(clientId);
+    const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const id = req.body?.id;
     if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
     const result = await deleteLock(sdScope, id);
@@ -716,7 +729,7 @@ router.post('/client/smartdoorsetting/delete-gateway', async (req, res, next) =>
   try {
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnClientScope(clientId);
+    const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const id = req.body?.id;
     if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
     const result = await deleteGateway(sdScope, id);

@@ -92,15 +92,15 @@ export default function ClientApprovalPage() {
   }
 
   return (
-    <div className="p-6 lg:p-8 max-w-6xl mx-auto">
-      <div className="mb-8">
+    <div className="w-full p-4 md:p-6 lg:p-8">
+      <div className="mb-6 md:mb-8">
         <h1 className="text-3xl font-black text-foreground">Operator approvals</h1>
         <p className="text-muted-foreground mt-1">
           Review when an operator asks to bind your account to a new or updated property.
         </p>
       </div>
 
-      <div className="mb-8">
+      <div className="mb-8 w-full">
         <h2 className="text-xs font-semibold tracking-[0.2em] uppercase text-muted-foreground mb-4">
           Pending ({loading ? "…" : items.length})
         </h2>
@@ -110,7 +110,7 @@ export default function ClientApprovalPage() {
             Loading…
           </div>
         ) : (
-          <div className="flex flex-col gap-3">
+          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
             {items.map((item) => (
               <button
                 key={item.id}

@@ -11,15 +11,7 @@ function shouldUseMockOAuthServer(request: NextRequest): boolean {
   if (isLivePortalCleanlemonsHostname(host) || isLivePortalCleanlemonsBuild()) return false;
   if (isPortalAuthMockExplicit()) return true;
   const base = getCleanlemonApiBaseForRequest(host);
-  if (!base) return true;
-  try {
-    const api = new URL(base.startsWith("http") ? base : `https://${base}`);
-    const h = host?.split(":")[0];
-    if (h && api.hostname === h) return true;
-  } catch {
-    /* ignore */
-  }
-  return false;
+  return !base;
 }
 
 /**

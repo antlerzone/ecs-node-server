@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:portal": "next dev -p 3001",
     "build": "NODE_OPTIONS='--max-old-space-size=512' next build --webpack",
     "build:low": "NODE_OPTIONS='--max-old-space-size=512' next build --webpack",
     "build:lowmem": "NODE_OPTIONS='--max-old-space-size=256' next build --webpack",

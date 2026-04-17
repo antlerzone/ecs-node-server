@@ -740,12 +740,14 @@ async function updateRoomMeter(clientId, roomId, meterId) {
  * Update room smart door (bind or unbind).
  */
 async function updateRoomSmartDoor(clientId, roomId, smartDoorId) {
-  const [roomRows] = await pool.query('SELECT id FROM roomdetail WHERE id = ? AND client_id = ?', [roomId, clientId]);
+  const [roomRows] = await pool.query('SELECT id, property_id FROM roomdetail WHERE id = ? AND client_id = ?', [roomId, clientId]);
   const room = roomRows && roomRows[0];
   if (!room) throw new Error('NO_PERMISSION');
+  const propertyIdForSync = room.property_id != null ? String(room.property_id).trim() : '';
 
   if (!smartDoorId) {
     await pool.query('UPDATE roomdetail SET smartdoor_id = NULL, updated_at = NOW() WHERE id = ? AND client_id = ?', [roomId, clientId]);
+    if (propertyIdForSync) await maybeSyncPropertydetailToCleanlemonsAfter(clientId, propertyIdForSync);
     return { ok: true };
   }
 
@@ -820,6 +822,7 @@ async function setRoomActive(clientId, roomId, active) {
     }
   }
   await pool.query('UPDATE roomdetail SET active = ?, updated_at = NOW() WHERE id = ? AND client_id = ?', [active ? 1 : 0, roomId, clientId]);
+  await maybeSyncPropertydetailToCleanlemonsAfter(clientId, room.property_id);
   return { ok: true };
 }
 
@@ -832,11 +835,12 @@ async function setRoomActive(clientId, roomId, active) {
 async function deleteRoom(clientId, roomId) {
   if (!roomId) throw new Error('NO_ROOM_ID');
   const [roomRows] = await pool.query(
-    'SELECT id, meter_id, smartdoor_id FROM roomdetail WHERE id = ? AND client_id = ? LIMIT 1',
+    'SELECT id, meter_id, smartdoor_id, property_id FROM roomdetail WHERE id = ? AND client_id = ? LIMIT 1',
     [roomId, clientId]
   );
   const room = roomRows && roomRows[0];
   if (!room) throw new Error('ROOM_NOT_FOUND');
+  const propertyIdForSync = room.property_id != null ? String(room.property_id).trim() : '';
 
   if (room.meter_id) throw new Error('ROOM_METER_BOUND');
   if (room.smartdoor_id) throw new Error('ROOM_SMARTDOOR_BOUND');
@@ -854,6 +858,7 @@ async function deleteRoom(clientId, roomId) {
   if (tenancyRows && tenancyRows.length) throw new Error('ROOM_HAS_ONGOING_TENANCY');
 
   await pool.query('DELETE FROM roomdetail WHERE id = ? AND client_id = ? LIMIT 1', [roomId, clientId]);
+  if (propertyIdForSync) await maybeSyncPropertydetailToCleanlemonsAfter(clientId, propertyIdForSync);
   return { ok: true };
 }
 

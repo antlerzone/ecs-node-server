@@ -19,7 +19,7 @@ const lockdetailLog = require('./lockdetail-log.service');
 /**
  * Smart door row ownership (lockdetail / gatewaydetail).
  * - Coliving portal: { kind: 'coliving', clientId: operatordetail.id }
- * - Cleanlemons client: { kind: 'cln_client', clnClientId: cln_clientdetail.id }
+ * - Cleanlemons client: { kind: 'cln_client', clnClientId, ttlockSlot?: number } (multi TTLock logins)
  * - Cleanlemons operator: { kind: 'cln_operator', clnOperatorId: cln_operatordetail.id }
  * Legacy: plain string = Coliving operatordetail id.
  */
@@ -30,7 +30,10 @@ function normalizeSmartDoorScope(scopeOrColivingClientId) {
       return { kind: 'coliving', clientId: String(s.clientId || '').trim() };
     }
     if (s.kind === 'cln_client') {
-      return { kind: 'cln_client', clnClientId: String(s.clnClientId || '').trim() };
+      const rawSlot = s.ttlockSlot;
+      const slotNum = rawSlot == null || rawSlot === '' ? 0 : Number(rawSlot);
+      const ttlockSlot = Number.isFinite(slotNum) && slotNum >= 0 ? slotNum : 0;
+      return { kind: 'cln_client', clnClientId: String(s.clnClientId || '').trim(), ttlockSlot };
     }
     if (s.kind === 'cln_operator') {
       return { kind: 'cln_operator', clnOperatorId: String(s.clnOperatorId || '').trim() };
@@ -45,6 +48,29 @@ function ttLockIntegrationKey(scopeOrColivingClientId) {
   if (s.kind === 'coliving') return s.clientId;
   if (s.kind === 'cln_client') return s.clnClientId;
   return s.clnOperatorId;
+}
+
+/** Options for TTLock API (multi-account Cleanlemons B2B clients). */
+function ttLockApiOptions(scopeOrColivingClientId) {
+  const s = normalizeSmartDoorScope(scopeOrColivingClientId);
+  if (s.kind === 'cln_client') return { slot: s.ttlockSlot ?? 0 };
+  return {};
+}
+
+/** Merge slot from a lockdetail/gatewaydetail row into scope for TTLock calls. */
+function scopeWithTtlockSlotFromRow(scopeOrColivingClientId, slotFromRow) {
+  const s = normalizeSmartDoorScope(scopeOrColivingClientId);
+  if (s.kind !== 'cln_client') return scopeOrColivingClientId;
+  const n = slotFromRow == null ? 0 : Number(slotFromRow);
+  const ttlockSlot = Number.isFinite(n) && n >= 0 ? n : 0;
+  return { kind: 'cln_client', clnClientId: s.clnClientId, ttlockSlot };
+}
+
+/** DB value for lockdetail.cln_ttlock_slot / gatewaydetail.cln_ttlock_slot on insert/update. */
+function clnTtlockSlotColumnValue(scopeOrColivingClientId) {
+  const s = normalizeSmartDoorScope(scopeOrColivingClientId);
+  if (s.kind === 'cln_client') return s.ttlockSlot ?? 0;
+  return 0;
 }
 
 /** SQL fragment + params for "this portal owns the row" on lockdetail/gatewaydetail. */
@@ -209,7 +235,10 @@ function filterSmartDoorItemsByPropertyNameTokens(items, propertyDisplayName) {
 async function remoteUnlockLock(scopeOrColivingClientId, lockDetailId, logContext = null) {
   const lock = await getLock(scopeOrColivingClientId, lockDetailId);
   if (!lock || !lock.lockId) throw new Error('LOCK_NOT_FOUND');
-  await lockWrapper.remoteUnlock(ttLockIntegrationKey(scopeOrColivingClientId), lock.lockId);
+  const scopeForTt = scopeWithTtlockSlotFromRow(scopeOrColivingClientId, lock.clnTtlockSlot);
+  const ttKey = ttLockIntegrationKey(scopeForTt);
+  const ttOpt = ttLockApiOptions(scopeForTt);
+  await lockWrapper.remoteUnlock(ttKey, lock.lockId, ttOpt);
   if (logContext) {
     try {
       const em = String(logContext.actorEmail || '').trim().toLowerCase() || '(unknown)';
@@ -458,7 +487,7 @@ async function getLock(scopeOrColivingClientId, id) {
   const scope = normalizeSmartDoorScope(scopeOrColivingClientId);
   const { sql, params } = scopeRowOwnerWhere(scopeOrColivingClientId);
   const [rows] = await pool.query(
-    `SELECT l.id, l.lockid, l.lockalias, l.lockname, l.gateway_id, l.hasgateway, l.electricquantity, l.type, l.brand, l.isonline, l.active, l.childmeter, l.client_id, l.cln_clientid, l.cln_operatorid,
+    `SELECT l.id, l.lockid, l.lockalias, l.lockname, l.gateway_id, l.hasgateway, l.electricquantity, l.type, l.brand, l.isonline, l.active, l.childmeter, l.client_id, l.cln_clientid, l.cln_operatorid, l.cln_ttlock_slot,
      cd.fullname AS cln_client_fullname, cd.email AS cln_client_email
      FROM lockdetail l
      LEFT JOIN cln_clientdetail cd ON cd.id = l.cln_clientid
@@ -491,6 +520,7 @@ async function getLock(scopeOrColivingClientId, id) {
     ownedByClientEmail: em,
     needsGatewayDbLink: !!r.hasgateway && !gwFk,
     operatorCanDelete: scope.kind !== 'cln_operator' || !clnCid,
+    clnTtlockSlot: r.cln_ttlock_slot != null ? Number(r.cln_ttlock_slot) : 0,
   };
 }
 
@@ -501,7 +531,7 @@ async function getGateway(scopeOrColivingClientId, id) {
   const scope = normalizeSmartDoorScope(scopeOrColivingClientId);
   const { sql, params } = scopeRowOwnerWhere(scopeOrColivingClientId);
   const [rows] = await pool.query(
-    `SELECT g.id, g.gatewayid, g.gatewayname, g.networkname, g.locknum, g.isonline, g.type, g.client_id, g.cln_clientid, g.cln_operatorid,
+    `SELECT g.id, g.gatewayid, g.gatewayname, g.networkname, g.locknum, g.isonline, g.type, g.client_id, g.cln_clientid, g.cln_operatorid, g.cln_ttlock_slot,
      cd.fullname AS cln_client_fullname, cd.email AS cln_client_email
      FROM gatewaydetail g
      LEFT JOIN cln_clientdetail cd ON cd.id = g.cln_clientid
@@ -527,6 +557,7 @@ async function getGateway(scopeOrColivingClientId, id) {
     ownedByClientName: name,
     ownedByClientEmail: em,
     operatorCanDelete: scope.kind !== 'cln_operator' || !clnCid,
+    clnTtlockSlot: r.cln_ttlock_slot != null ? Number(r.cln_ttlock_slot) : 0,
   };
 }
 
@@ -621,6 +652,7 @@ async function resolveGatewayDbIdByTtlockId(_scopeIgnored, ttGatewayId) {
  */
 async function mergeOneLockFromTtlockListItem(scopeOrColivingClientId, l, getSingleGatewayDbIdFallback) {
   const ttKey = ttLockIntegrationKey(scopeOrColivingClientId);
+  const ttOpt = ttLockApiOptions(scopeOrColivingClientId);
   const lockId = Number(l.lockId);
   if (!Number.isFinite(lockId)) return;
   const newAlias = l.lockAlias || l.lockName || '';
@@ -629,7 +661,7 @@ async function mergeOneLockFromTtlockListItem(scopeOrColivingClientId, l, getSin
   let ttGwRaw = ttlockListItemGatewayExternalId(l);
   if (ttHasGateway && ttGwRaw == null) {
     try {
-      const detailRes = await lockWrapper.getLockDetail(ttKey, lockId);
+      const detailRes = await lockWrapper.getLockDetail(ttKey, lockId, ttOpt);
       const fromDetail = gatewayIdFromLockDetailResponse(detailRes);
       if (fromDetail != null) ttGwRaw = fromDetail;
     } catch (e) {
@@ -710,11 +742,13 @@ async function syncSingleLockStatusFromTtlock(scopeOrColivingClientId, lockDetai
   const lockIdNum = Number(dbLock.lockId);
   if (!Number.isFinite(lockIdNum)) return { ok: false, reason: 'INVALID_LOCK_ID' };
 
-  const ttKey = ttLockIntegrationKey(scopeOrColivingClientId);
-  const lockRes = await lockWrapper.listAllLocks(ttKey);
+  const scopeForTt = scopeWithTtlockSlotFromRow(scopeOrColivingClientId, dbLock.clnTtlockSlot);
+  const ttKey = ttLockIntegrationKey(scopeForTt);
+  const ttOpt = ttLockApiOptions(scopeForTt);
+  const lockRes = await lockWrapper.listAllLocks(ttKey, ttOpt);
   let l = (lockRes?.list || []).find((x) => Number(x.lockId) === lockIdNum);
   if (!l) {
-    const detailRes = await lockWrapper.getLockDetail(ttKey, lockIdNum);
+    const detailRes = await lockWrapper.getLockDetail(ttKey, lockIdNum, ttOpt);
     if (detailRes && (detailRes.errcode == null || Number(detailRes.errcode) === 0)) {
       const inner = detailRes.lock != null && typeof detailRes.lock === 'object' ? detailRes.lock : detailRes;
       if (inner && inner.lockId != null) l = inner;
@@ -735,7 +769,7 @@ async function syncSingleLockStatusFromTtlock(scopeOrColivingClientId, lockDetai
     return singleGatewayFallbackPromise;
   };
 
-  await mergeOneLockFromTtlockListItem(scopeOrColivingClientId, l, getSingleGatewayDbIdFallback);
+  await mergeOneLockFromTtlockListItem(scopeForTt, l, getSingleGatewayDbIdFallback);
   const updated = await getLock(scopeOrColivingClientId, id);
   return { ok: true, lock: updated };
 }
@@ -775,7 +809,8 @@ async function mergeOneGatewayFromTtlockListItem(scopeOrColivingClientId, g) {
  */
 async function fetchTtlockGatewayListAndMergeToDb(scopeOrColivingClientId) {
   const ttKey = ttLockIntegrationKey(scopeOrColivingClientId);
-  const gatewayRes = await gatewayWrapper.listAllGateways(ttKey);
+  const ttOpt = ttLockApiOptions(scopeOrColivingClientId);
+  const gatewayRes = await gatewayWrapper.listAllGateways(ttKey, ttOpt);
   const gwList = gatewayRes?.list || [];
   for (const g of gwList) {
     await mergeOneGatewayFromTtlockListItem(scopeOrColivingClientId, g);
@@ -794,8 +829,10 @@ async function syncSingleGatewayStatusFromTtlock(scopeOrColivingClientId, gatewa
   const extId = Number(dbGw.gatewayId);
   if (!Number.isFinite(extId)) return { ok: false, reason: 'INVALID_GATEWAY_ID' };
 
-  const ttKey = ttLockIntegrationKey(scopeOrColivingClientId);
-  const gatewayRes = await gatewayWrapper.listAllGateways(ttKey);
+  const scopeForTt = scopeWithTtlockSlotFromRow(scopeOrColivingClientId, dbGw.clnTtlockSlot);
+  const ttKey = ttLockIntegrationKey(scopeForTt);
+  const ttOpt = ttLockApiOptions(scopeForTt);
+  const gatewayRes = await gatewayWrapper.listAllGateways(ttKey, ttOpt);
   const g = (gatewayRes?.list || []).find((x) => Number(x.gatewayId) === extId);
   if (!g) {
     return { ok: false, reason: 'TTLOCK_GATEWAY_NOT_FOUND' };
@@ -821,10 +858,11 @@ async function syncSmartDoorStatusFromTtlock(scopeOrColivingClientId) {
  */
 async function previewSmartDoorSelection(scopeOrColivingClientId) {
   const ttKey = ttLockIntegrationKey(scopeOrColivingClientId);
+  const ttOpt = ttLockApiOptions(scopeOrColivingClientId);
   const result = [];
 
   try {
-    const lockRes = await lockWrapper.listAllLocks(ttKey);
+    const lockRes = await lockWrapper.listAllLocks(ttKey, ttOpt);
     const lockList = lockRes?.list || [];
     for (const l of lockList) {
       const lockId = Number(l.lockId);
@@ -862,7 +900,7 @@ async function previewSmartDoorSelection(scopeOrColivingClientId) {
   }
 
   try {
-    const gatewayRes = await gatewayWrapper.listAllGateways(ttKey);
+    const gatewayRes = await gatewayWrapper.listAllGateways(ttKey, ttOpt);
     const gwList = gatewayRes?.list || [];
     for (const g of gwList) {
       const gatewayId = Number(g.gatewayId);
@@ -902,12 +940,13 @@ async function previewSmartDoorSelection(scopeOrColivingClientId) {
 async function syncTTLockName(scopeOrColivingClientId, { type, externalId, name }) {
   if (!name || !externalId) throw new Error('NAME_AND_EXTERNAL_ID_REQUIRED');
   const ttKey = ttLockIntegrationKey(scopeOrColivingClientId);
+  const ttOpt = ttLockApiOptions(scopeOrColivingClientId);
   if (type === 'lock') {
-    await lockWrapper.changeLockName(ttKey, Number(externalId), name);
+    await lockWrapper.changeLockName(ttKey, Number(externalId), name, ttOpt);
     return { ok: true };
   }
   if (type === 'gateway') {
-    await gatewayWrapper.renameGateway(ttKey, Number(externalId), name);
+    await gatewayWrapper.renameGateway(ttKey, Number(externalId), name, ttOpt);
     return { ok: true };
   }
   throw new Error(`UNKNOWN_TYPE: ${type}`);
@@ -1089,19 +1128,21 @@ async function getChildLockOptions(scopeOrColivingClientId, excludeLockId) {
  */
 async function insertGateways(scopeOrColivingClientId, records) {
   const triple = scopeInsertTriple(scopeOrColivingClientId);
+  const slotCol = clnTtlockSlotColumnValue(scopeOrColivingClientId);
   const inserted = [];
   for (const g of records) {
     const extGw = g.gatewayId != null ? Number(g.gatewayId) : NaN;
     if (!Number.isFinite(extGw)) {
       const id = randomUUID();
       await pool.query(
-        `INSERT INTO gatewaydetail (id, client_id, cln_clientid, cln_operatorid, gatewayid, gatewayname, networkname, locknum, isonline, type, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+        `INSERT INTO gatewaydetail (id, client_id, cln_clientid, cln_operatorid, cln_ttlock_slot, gatewayid, gatewayname, networkname, locknum, isonline, type, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
         [
           id,
           triple.client_id,
           triple.cln_clientid,
           triple.cln_operatorid,
+          slotCol,
           null,
           g.gatewayName || '',
           g.networkName || '',
@@ -1121,11 +1162,12 @@ async function insertGateways(scopeOrColivingClientId, records) {
       const row = existRows[0];
       const merged = mergeOwnerTripleIntoRow(row, triple);
       await pool.query(
-        `UPDATE gatewaydetail SET client_id = ?, cln_clientid = ?, cln_operatorid = ?, gatewayname = ?, networkname = ?, locknum = ?, isonline = ?, type = ?, updated_at = NOW() WHERE id = ?`,
+        `UPDATE gatewaydetail SET client_id = ?, cln_clientid = ?, cln_operatorid = ?, cln_ttlock_slot = ?, gatewayname = ?, networkname = ?, locknum = ?, isonline = ?, type = ?, updated_at = NOW() WHERE id = ?`,
         [
           merged.client_id,
           merged.cln_clientid,
           merged.cln_operatorid,
+          slotCol,
           g.gatewayName || '',
           g.networkName || '',
           g.lockNum != null ? Number(g.lockNum) : 0,
@@ -1138,13 +1180,14 @@ async function insertGateways(scopeOrColivingClientId, records) {
     } else {
       const id = randomUUID();
       await pool.query(
-        `INSERT INTO gatewaydetail (id, client_id, cln_clientid, cln_operatorid, gatewayid, gatewayname, networkname, locknum, isonline, type, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+        `INSERT INTO gatewaydetail (id, client_id, cln_clientid, cln_operatorid, cln_ttlock_slot, gatewayid, gatewayname, networkname, locknum, isonline, type, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
         [
           id,
           triple.client_id,
           triple.cln_clientid,
           triple.cln_operatorid,
+          slotCol,
           extGw,
           g.gatewayName || '',
           g.networkName || '',
@@ -1164,6 +1207,7 @@ async function insertGateways(scopeOrColivingClientId, records) {
  */
 async function insertLocks(scopeOrColivingClientId, records, gatewayIdToDbId = new Map()) {
   const triple = scopeInsertTriple(scopeOrColivingClientId);
+  const slotCol = clnTtlockSlotColumnValue(scopeOrColivingClientId);
   const inserted = [];
   for (const l of records) {
     const lockNum = l.lockId != null ? Number(l.lockId) : NaN;
@@ -1201,13 +1245,14 @@ async function insertLocks(scopeOrColivingClientId, records, gatewayIdToDbId = n
     } else {
       const id = randomUUID();
       await pool.query(
-        `INSERT INTO lockdetail (id, client_id, cln_clientid, cln_operatorid, lockid, lockname, lockalias, electricquantity, type, hasgateway, gateway_id, brand, isonline, active, childmeter, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+        `INSERT INTO lockdetail (id, client_id, cln_clientid, cln_operatorid, cln_ttlock_slot, lockid, lockname, lockalias, electricquantity, type, hasgateway, gateway_id, brand, isonline, active, childmeter, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
         [
           id,
           triple.client_id,
           triple.cln_clientid,
           triple.cln_operatorid,
+          slotCol,
           lockNum,
           l.lockName || '',
           l.lockAlias || '',

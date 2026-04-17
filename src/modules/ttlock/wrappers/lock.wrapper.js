@@ -1,6 +1,6 @@
 /**
  * TTLock Lock API wrapper (SaaS – per client).
- * All functions take clientId first; use getTtlockAuth(clientId) for auth.
+ * All functions take clientId first; optional last arg `options = { slot }` for Cleanlemons B2B multi TTLock.
  */
 
 const { getTtlockAuth } = require('../lib/ttlockCreds');
@@ -8,8 +8,8 @@ const { ttlockGet, ttlockPost } = require('./ttlockRequest');
 
 const PAGE_SIZE = 100;
 
-async function listAllLocks(clientId) {
-  const auth = await getTtlockAuth(clientId);
+async function listAllLocks(clientId, options = {}) {
+  const auth = await getTtlockAuth(clientId, options);
   let pageNo = 1;
   const all = [];
   let pages = 1;
@@ -24,13 +24,13 @@ async function listAllLocks(clientId) {
   return { total: all.length, list: all };
 }
 
-async function getLockDetail(clientId, lockId) {
-  const auth = await getTtlockAuth(clientId);
+async function getLockDetail(clientId, lockId, options = {}) {
+  const auth = await getTtlockAuth(clientId, options);
   return ttlockGet('/lock/detail', auth, { lockId });
 }
 
-async function changeLockName(clientId, lockId, lockName) {
-  const auth = await getTtlockAuth(clientId);
+async function changeLockName(clientId, lockId, lockName, options = {}) {
+  const auth = await getTtlockAuth(clientId, options);
   const data = await ttlockPost('/lock/rename', auth, { lockId, lockName });
   if (data?.errcode !== 0 && data?.errcode !== undefined) {
     throw new Error(`TTLOCK_RENAME_FAILED: ${data?.errmsg || 'unknown'}`);
@@ -38,13 +38,13 @@ async function changeLockName(clientId, lockId, lockName) {
   return data;
 }
 
-async function queryLockElectricQuantity(clientId, lockId) {
-  const auth = await getTtlockAuth(clientId);
+async function queryLockElectricQuantity(clientId, lockId, options = {}) {
+  const auth = await getTtlockAuth(clientId, options);
   return ttlockGet('/lock/queryElectricQuantity', auth, { lockId });
 }
 
-async function listLockPasscodes(clientId, lockId) {
-  const auth = await getTtlockAuth(clientId);
+async function listLockPasscodes(clientId, lockId, options = {}) {
+  const auth = await getTtlockAuth(clientId, options);
   const lid = coerceLockIdForTtlockApi(lockId);
   let pageNo = 1;
   const all = [];
@@ -59,8 +59,8 @@ async function listLockPasscodes(clientId, lockId) {
   return all;
 }
 
-async function getPasscode(clientId, lockId, keyboardPwdId) {
-  const list = await listLockPasscodes(clientId, lockId);
+async function getPasscode(clientId, lockId, keyboardPwdId, options = {}) {
+  const list = await listLockPasscodes(clientId, lockId, options);
   return list.find(p => String(p.keyboardPwdId) === String(keyboardPwdId)) || null;
 }
 
@@ -118,9 +118,9 @@ function formatTtlockKeyboardPwdAddFailure(lastData) {
   return raw;
 }
 
-async function findKeyboardPwdIdByPlainPassword(clientId, lockId, plainPassword) {
+async function findKeyboardPwdIdByPlainPassword(clientId, lockId, plainPassword, options = {}) {
   const lid = coerceLockIdForTtlockApi(lockId);
-  const list = await listLockPasscodes(clientId, lid);
+  const list = await listLockPasscodes(clientId, lid, options);
   const want = String(plainPassword ?? '');
   const row = list.find((p) => String(p.keyboardPwd) === want);
   return row?.keyboardPwdId ?? null;
@@ -130,8 +130,8 @@ async function findKeyboardPwdIdByPlainPassword(clientId, lockId, plainPassword)
  * Add keyboard passcode. Tries addType 2 (gateway) → 3 (NB-IoT) → 1 (Bluetooth default per TTLock doc).
  * "Same passcode already exists" is not auto-resolved — caller must reject (may be another tenant).
  */
-async function addPasscode(clientId, lockId, payload) {
-  const auth = await getTtlockAuth(clientId);
+async function addPasscode(clientId, lockId, payload, options = {}) {
+  const auth = await getTtlockAuth(clientId, options);
   const lid = coerceLockIdForTtlockApi(lockId);
   const pwdStr = String(payload.password ?? '');
   const bodyBase = {
@@ -174,8 +174,8 @@ async function addPasscode(clientId, lockId, payload) {
   throw new Error(`TTLOCK_ADD_PASSCODE_FAILED: ${formatTtlockKeyboardPwdAddFailure(lastData)}`);
 }
 
-async function changePasscode(clientId, lockId, payload) {
-  const auth = await getTtlockAuth(clientId);
+async function changePasscode(clientId, lockId, payload, options = {}) {
+  const auth = await getTtlockAuth(clientId, options);
   const lid = coerceLockIdForTtlockApi(lockId);
   const newPwd =
     payload.newKeyboardPwd != null && String(payload.newKeyboardPwd).trim() !== ''
@@ -223,8 +223,8 @@ async function changePasscode(clientId, lockId, payload) {
  * Delete a keyboard passcode on the lock (cloud). Tries deleteType gateway → NB-IoT → default.
  * @see https://euopen.ttlock.com/doc/api/v3/keyboardPwd/delete
  */
-async function deletePasscode(clientId, lockId, keyboardPwdId) {
-  const auth = await getTtlockAuth(clientId);
+async function deletePasscode(clientId, lockId, keyboardPwdId, options = {}) {
+  const auth = await getTtlockAuth(clientId, options);
   const lid = coerceLockIdForTtlockApi(lockId);
   const kid = keyboardPwdId != null ? String(keyboardPwdId).trim() : '';
   if (!kid) throw new Error('TTLOCK_DELETE_PASSCODE_FAILED: missing keyboardPwdId');
@@ -257,8 +257,8 @@ async function deletePasscode(clientId, lockId, keyboardPwdId) {
   );
 }
 
-async function remoteUnlock(clientId, lockId) {
-  const auth = await getTtlockAuth(clientId);
+async function remoteUnlock(clientId, lockId, options = {}) {
+  const auth = await getTtlockAuth(clientId, options);
   const lid = coerceLockIdForTtlockApi(lockId);
   const data = await ttlockPost('/lock/unlock', auth, { lockId: lid });
   if (data?.errcode !== 0 && data?.errcode !== undefined) {
@@ -279,8 +279,8 @@ function isPasscodeActive(passcode) {
   return true;
 }
 
-async function listActivePasscodes(clientId, lockId) {
-  const list = await listLockPasscodes(clientId, lockId);
+async function listActivePasscodes(clientId, lockId, options = {}) {
+  const list = await listLockPasscodes(clientId, lockId, options);
   return list.filter(isPasscodeActive);
 }
 

@@ -3,11 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev --webpack",
+    "dev:turbo": "next dev",
     "_pm2AfterBuild": "node ./scripts/pm2-restart-after-build.mjs",
-    "build": "NODE_OPTIONS='--max-old-space-size=512' next build --webpack && npm run _pm2AfterBuild",
-    "build:low": "NODE_OPTIONS='--max-old-space-size=512' next build --webpack && npm run _pm2AfterBuild",
-    "build:lowmem": "NODE_OPTIONS='--max-old-space-size=256' next build --webpack && npm run _pm2AfterBuild",
+    "build": "node --max-old-space-size=512 ./node_modules/next/dist/bin/next build --webpack && npm run _pm2AfterBuild",
+    "build:low": "node --max-old-space-size=512 ./node_modules/next/dist/bin/next build --webpack && npm run _pm2AfterBuild",
+    "build:lowmem": "node --max-old-space-size=256 ./node_modules/next/dist/bin/next build --webpack && npm run _pm2AfterBuild",
     "start": "next start -p 3100",
     "lint": "eslint ."
   },
