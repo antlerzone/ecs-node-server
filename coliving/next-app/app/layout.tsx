@@ -1,13 +1,11 @@
 import type { Metadata } from 'next'
-import { Inter, DM_Serif_Display } from 'next/font/google'
 import './globals.css'
 import { Toaster } from '@/components/ui/toaster'
 import { Toaster as SonnerToaster } from 'sonner'
 import { SeoJsonLd } from '@/components/seo-json-ld'
 import { SITE_URL, SITE_NAME, DEFAULT_DESCRIPTION, defaultOpenGraph, defaultTwitter } from '@/lib/seo'
 
-const inter = Inter({ subsets: ["latin"], variable: "--font-inter" });
-const dmSerif = DM_Serif_Display({ subsets: ["latin"], weight: "400", variable: "--font-dm-serif" });
+/** Fonts load via <link> so `next build` does not fetch Google (ECS / offline builds often ETIMEDOUT). */
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),
@@ -69,10 +67,16 @@ export default function RootLayout({
   return (
     <html lang="en">
       <head>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
+        <link
+          href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=Inter:wght@400;500;600;700&display=swap"
+          rel="stylesheet"
+        />
         <link rel="preload" href="/favicon-cm.ico" as="image" />
         <link rel="icon" href="/favicon-cm.ico" sizes="any" />
       </head>
-      <body className={`${inter.variable} ${dmSerif.variable} font-sans antialiased`}>
+      <body className="font-sans antialiased">
         <SeoJsonLd />
         {children}
         <Toaster />
