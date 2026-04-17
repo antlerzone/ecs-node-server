@@ -7,7 +7,7 @@ Portal（Next.js）通过 **API 代理** 或 **同源 /api** 调用 ECS Node 后
 | 服务       | 端口  | 说明 |
 |------------|-------|------|
 | Node 后端  | 5000  | `npm start` → `server.js`（根目录） |
-| Next Portal| 3001  | `npm run start`（nextjs-migration 目录） |
+| Next Portal| 3001  | `npm run start`（coliving/next-app 目录） |
 | Next dev   | 3000  | `npm run dev` 默认 3000，可与 Node 5000 同时跑 |
 
 ## 本地开发：同时跑 Next + Node
@@ -21,12 +21,12 @@ npm start
 # 监听 http://0.0.0.0:5000
 ```
 
-### 2. 配置 Next 环境变量（nextjs-migration 目录）
+### 2. 配置 Next 环境变量（coliving/next-app 目录）
 
 复制并编辑 `.env.local`（若不存在则从 `.env.example` 复制）：
 
 ```bash
-cd docs/nextjs-migration
+cd coliving/next-app
 cp .env.example .env.local
 ```
 
@@ -51,7 +51,7 @@ ECS_API_USERNAME=saas_wix
 ### 3. 启动 Next
 
 ```bash
-cd docs/nextjs-migration
+cd coliving/next-app
 npm run dev
 # 默认 http://localhost:3000
 # 或生产模式: npm run build && npm run start  → http://localhost:3001

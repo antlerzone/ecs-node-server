@@ -11,6 +11,12 @@ export const CLEANLEMON_LIVE_PORTAL_HOST = "portal.cleanlemons.com";
 export const CLEANLEMON_DEMO_HOST = "demo.cleanlemons.com";
 export const CLEANLEMON_LOCAL_API_BASE = "http://localhost:5000";
 
+/** True for local dev in the browser or in Host header (localhost / 127.0.0.1 / ::1). */
+export function isLocalLoopbackHostname(hostname: string): boolean {
+  const h = hostname.trim().toLowerCase();
+  return h === "localhost" || h === "127.0.0.1" || h === "::1";
+}
+
 /** Browser → ECS via portal 同域 /api/（与 Nginx、CLEANLEMON_PORTAL_AUTH_BASE_URL 默认一致）。勿用无效证书的 api 子域。 */
 export const DEFAULT_CLEANLEMON_PROD_API = "https://portal.cleanlemons.com";
 
@@ -21,7 +27,7 @@ export const DEFAULT_CLEANLEMON_PROD_API = "https://portal.cleanlemons.com";
 export function getCleanlemonApiBase(): string {
   const fromEnv = (process.env.NEXT_PUBLIC_CLEANLEMON_API_URL || "").trim().replace(/\/$/, "");
   if (fromEnv) return fromEnv;
-  if (typeof window !== "undefined" && window.location.hostname.toLowerCase() === "localhost") {
+  if (typeof window !== "undefined" && isLocalLoopbackHostname(window.location.hostname)) {
     return CLEANLEMON_LOCAL_API_BASE;
   }
   if (isLivePortalCleanlemonsBuild()) return DEFAULT_CLEANLEMON_PROD_API;
@@ -33,7 +39,7 @@ export function getCleanlemonApiBase(): string {
 export function getCleanlemonApiBaseForRequest(hostHeader: string | null | undefined): string {
   const fromEnv = (process.env.NEXT_PUBLIC_CLEANLEMON_API_URL || "").trim().replace(/\/$/, "");
   if (fromEnv) return fromEnv;
-  if (parseRequestHostname(hostHeader) === "localhost") return CLEANLEMON_LOCAL_API_BASE;
+  if (isLocalLoopbackHostname(parseRequestHostname(hostHeader))) return CLEANLEMON_LOCAL_API_BASE;
   if (isLivePortalCleanlemonsHostname(hostHeader)) return DEFAULT_CLEANLEMON_PROD_API;
   if (isLivePortalCleanlemonsBuild()) return DEFAULT_CLEANLEMON_PROD_API;
   return "";

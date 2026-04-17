@@ -15,7 +15,7 @@
 
 Portal 和 Node 在同一台 ECS 时，可让 Next 代理不经过 Nginx，直接请求本机 5000：
 
-在 **`docs/nextjs-migration/.env.local`** 里改成：
+在 **`coliving/next-app/.env.local`** 里改成：
 
 ```bash
 # 直接打本机 5000，不经过 api.colivingjb.com
@@ -26,7 +26,7 @@ NEXT_PUBLIC_ECS_BASE_URL=https://api.colivingjb.com
 保留 `NEXT_PUBLIC_USE_PROXY=true`。然后：
 
 ```bash
-cd /home/ecs-user/app/docs/nextjs-migration && npm run build && pm2 restart portal-next
+cd /home/ecs-user/app/coliving/next-app && npm run build && pm2 restart portal-next
 ```
 
 这样 `/api/portal/proxy/*` 会请求 `http://127.0.0.1:5000/api/*`，不再经 Nginx，避免端口对错。

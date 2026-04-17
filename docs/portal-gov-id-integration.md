@@ -1,6 +1,6 @@
 # Portal: Singpass & MyDigital ID (Gov ID) 集成说明
 
-本文档对应产品计划：**多登录方式**、`portal_account` 绑定官方 OIDC、**demologin** / **demoprofile** 演示路由、以及运维在 ECS 填写环境变量。实现代码见 `src/modules/portal-auth/gov-id.service.js`、`portal-auth.routes.js`（`/api/portal-auth/gov-id/*`）、Next `docs/nextjs-migration/app/demologin`、`app/demoprofile`。
+本文档对应产品计划：**多登录方式**、`portal_account` 绑定官方 OIDC、**demologin** / **demoprofile** 演示路由、以及运维在 ECS 填写环境变量。实现代码见 `src/modules/portal-auth/gov-id.service.js`、`portal-auth.routes.js`（`/api/portal-auth/gov-id/*`）、Next `coliving/next-app/app/demologin`、`app/demoprofile`。
 
 ---
 

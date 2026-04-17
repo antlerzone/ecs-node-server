@@ -23,7 +23,7 @@
 ## 手動步驟
 
 ```bash
-cd /home/ecs-user/app/docs/nextjs-migration
+cd /home/ecs-user/app/coliving/next-app
 npm install
 npm run build
 pm2 restart portal-next
@@ -44,7 +44,7 @@ pm2 restart app
 ## 502 Bad Gateway（portal 調後端時）
 
 若 portal 與 Node API 在同一台 ECS 上，proxy 預設會打 `http://127.0.0.1:3000`，不經 nginx，可避免 502。  
-若 portal 與 API 在不同機器，在 `docs/nextjs-migration/.env.local` 設：
+若 portal 與 API 在不同機器，在 `coliving/next-app/.env.local` 設：
 
 ```
 ECS_BASE_URL=https://api.colivingjb.com
@@ -54,7 +54,7 @@ ECS_BASE_URL=https://api.colivingjb.com
 
 ## 環境變數
 
-若要在 portal 上**強制不顯示** Demo Credentials，build 前在 `docs/nextjs-migration` 目錄新增或編輯 `.env.local`：
+若要在 portal 上**強制不顯示** Demo Credentials，build 前在 `coliving/next-app` 目錄新增或編輯 `.env.local`：
 
 ```
 NEXT_PUBLIC_SHOW_DEMO_CREDENTIALS=false

@@ -30,4 +30,4 @@
 
 ## Demo / Next mock
 
-- `docs/nextjs-migration/lib/portal-api.ts` mocks `create-payment-method-setup` with a redirect to `?xendit_setup=1` so the payment page refetch runs without ECS.
+- `coliving/next-app/lib/portal-api.ts` mocks `create-payment-method-setup` with a redirect to `?xendit_setup=1` so the payment page refetch runs without ECS.

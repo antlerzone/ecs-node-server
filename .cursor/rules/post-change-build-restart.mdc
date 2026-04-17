@@ -7,7 +7,7 @@ alwaysApply: true
 
 用户与 agent 协作时，只要任务里**改了代码**，**在结束任务之前**必须在项目根目录 `/home/ecs-user/app` 自行做完下面事项，**不要**只改源码就收尾，也不要让用户自己去重启（除非终端无法执行命令）。
 
-## 改了 UI（Next.js：`docs/nextjs-migration/**` 等）
+## 改了 UI（Next.js：`coliving/next-app/**` 等）
 
 1. **`npm run build:portal`** — 产出最新前端构建，否则浏览器仍可能是旧资源。
 2. **重启提供服务的 Next 进程**（如 `portal-next`）— `next start` 在启动时登记静态资源；**仅 build 不重启**可导致 `/_next/static/chunks/*.js` **404**（即使磁盘上已有文件）。

@@ -1,7 +1,7 @@
 # Tenant Dashboard：Wix 前端 vs Next.js 對照表
 
 對照依據：**Wix** `docs/wix/frontend/tenant-dashboard-page-full.js`（單一頁多 section）  
-vs **Next.js** `docs/nextjs-migration/app/tenant/*`（多頁 + 後端已接好之功能）。
+vs **Next.js** `coliving/next-app/app/tenant/*`（多頁 + 後端已接好之功能）。
 
 `tenant-invoice-page-full.js` 為 **營運端** 開單/報表頁，非租客前台，此表不納入。
 

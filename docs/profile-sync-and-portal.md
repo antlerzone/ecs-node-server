@@ -44,7 +44,7 @@
 
 ### Coliving Next（portal.colivingjb.com）— 統一個人資料頁（2026-03）
 
-- **Tenant / Owner / Operator** 的 `/tenant/profile`、`/owner/profile`、`/operator/profile` 共用 **`docs/nextjs-migration/components/shared/unified-profile-page.tsx`**，**直接**呼叫 **`GET/PUT /api/portal-auth/profile`**（Bearer **`portal_jwt`**），由 `updatePortalProfile` 寫入 `portal_account` 並同步三張 detail 表。
+- **Tenant / Owner / Operator** 的 `/tenant/profile`、`/owner/profile`、`/operator/profile` 共用 **`coliving/next-app/components/shared/unified-profile-page.tsx`**，**直接**呼叫 **`GET/PUT /api/portal-auth/profile`**（Bearer **`portal_jwt`**），由 `updatePortalProfile` 寫入 `portal_account` 並同步三張 detail 表。
 - 封裝：`lib/unified-profile-portal-api.ts`；`portal_jwt` 見 `lib/portal-session.ts`（OAuth callback 與密碼登入 `login` 回傳的 `token`）。
 - 與 **Cleanlemons** 側 `unified-profile-page` 布局對齊；Cleanlemons 員工端仍可能經 `cleanlemon` API 轉到同一 `portal_account` 映射。
 

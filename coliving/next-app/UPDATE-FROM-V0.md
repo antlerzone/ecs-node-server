@@ -2,13 +2,13 @@
 
 ---
 
-## 先搞清楚：server 和 nextjs-migration 的关系
+## 先搞清楚：server 和 coliving/next-app 的关系
 
-- **这个仓库（server）里**确实有 `docs/nextjs-migration` 这个文件夹，里面就是 Next 前端。
+- **这个仓库（server）里**确实有 `coliving/next-app` 这个文件夹，里面就是 Next 前端。
 - **Node 的 server.js** 只提供 **API**（例如 `/api/tenantdashboard/*`），**不提供** Next 的页面；Next 是单独跑的（例如 `next start -p 3001`），ECS 上可能是 Nginx 把「前端域名」转到 Next，把「API 域名」转到 Node。
-- **nextjs-migration 里的前端已经接好了 ECS 后端**：有 `lib/tenant-api.ts`、`lib/portal-api.ts`、各页面的保存/上传/登录等逻辑，都是对着你们 Node API 的。
+- **coliving/next-app 里的前端已经接好了 ECS 后端**：有 `lib/tenant-api.ts`、`lib/portal-api.ts`、各页面的保存/上传/登录等逻辑，都是对着你们 Node API 的。
 
-所以：**不能每次整盘覆盖 nextjs-migration 或里面的 `app/`**。一覆盖，这些对接就都没了。你可以**每次用 v0 更新 UI**，但要按下面「非开发者流程」做，只换界面、保留后端对接。
+所以：**不能每次整盘覆盖 coliving/next-app 或里面的 `app/`**。一覆盖，这些对接就都没了。你可以**每次用 v0 更新 UI**，但要按下面「非开发者流程」做，只换界面、保留后端对接。
 
 ---
 
@@ -16,7 +16,7 @@
 
 我们有一个**固定文件夹**专门放 v0 的设计，你可以**每次整盘替换这个文件夹里的内容**；真正跑的前端（`app/`、`components/`）不会直接引用这里，而是由 Cursor（或开发者）**查看这个文件夹里的代码，把差异写进前端**。
 
-- **你可以随便覆盖的地方**：`docs/nextjs-migration/v0-import/` 里的文件或子文件夹。
+- **你可以随便覆盖的地方**：`coliving/next-app/v0-import/` 里的文件或子文件夹。
 - **前端代码所在**：`app/`、`components/`（已接好后端，不要直接覆盖）。
 - **流程**：v0 新设计 → 粘贴/替换到 `v0-import/` → 在 Cursor 里说「根据 v0-import 里的 xxx 更新前端对应页面，保留后端对接」。
 

@@ -13,7 +13,7 @@
 set -e
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
-PORTAL_DIR="$ROOT/docs/nextjs-migration"
+PORTAL_DIR="$ROOT/coliving/next-app"
 
 if [ "$1" = "--pull" ] || [ "$1" = "-p" ]; then
   echo "[deploy] git pull..."

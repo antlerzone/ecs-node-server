@@ -51,7 +51,7 @@
 
 ## 4. 相关代码位置
 
-- 前端 Mark as Paid：`docs/nextjs-migration/app/operator/report/page.tsx`（`handleSubmitPay` → `updateOwnerReport` / `bulkUpdateOwnerReport`）。
+- 前端 Mark as Paid：`coliving/next-app/app/operator/report/page.tsx`（`handleSubmitPay` → `updateOwnerReport` / `bulkUpdateOwnerReport`）。
 - 后端更新 + 触发会计：`src/modules/generatereport/generatereport.service.js`（`updateOwnerReport` / `bulkUpdateOwnerReport` 内调 `createAccountingForOwnerPayout`）。
 - 会计创建逻辑：`src/modules/generatereport/generatereport-accounting.service.js`（`createAccountingForOwnerPayout`：cash invoice + cash bill，使用 `paymentDate`）。
 - 会计解析与按 provider 创建：`rentalcollection-invoice.service.js`（`createCashInvoice`、`resolveClientAccounting`）、`expenses-purchase.service.js`（`createCashPurchaseOne`）。

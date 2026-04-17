@@ -11,7 +11,7 @@ const fs = require("fs");
 const path = require("path");
 
 const SOURCE = path.join(__dirname, "..", "docs", "tutorial", "screenshots");
-const PUBLIC = path.join(__dirname, "..", "docs", "nextjs-migration", "public", "tutorial");
+const PUBLIC = path.join(__dirname, "..", "coliving", "next-app", "public", "tutorial");
 
 const OWNER_MAP = [
   ["login.png", "login.png"],

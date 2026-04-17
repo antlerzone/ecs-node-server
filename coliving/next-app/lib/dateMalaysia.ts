@@ -9,7 +9,7 @@ const MY_OFFSET_MS = 8 * 60 * 60 * 1000
 
 /**
  * Parse rental `dueDate` from API (ISO Z, or MySQL "YYYY-MM-DD HH:mm:ss" as Malaysia wall time, or date-only YYYY-MM-DD).
- * Same rules as `docs/nextjs-migration/app/operator/invoice/page.tsx` — keeps tenant vs operator list aligned.
+ * Same rules as `coliving/next-app/app/operator/invoice/page.tsx` — keeps tenant vs operator list aligned.
  */
 export function parseRentalDateAsMalaysiaWall(d: unknown): Date | null {
   if (d == null || d === "") return null

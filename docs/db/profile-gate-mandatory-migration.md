@@ -87,6 +87,6 @@ If any column above is missing on a table, add it via a new migration **after** 
 
 ## Code references
 
-- Operator gate: `docs/nextjs-migration/contexts/operator-context.tsx`
-- Tenant gate: `docs/nextjs-migration/contexts/tenant-context.tsx`
-- Owner gate: `docs/nextjs-migration/contexts/owner-context.tsx`
+- Operator gate: `coliving/next-app/contexts/operator-context.tsx`
+- Tenant gate: `coliving/next-app/contexts/tenant-context.tsx`
+- Owner gate: `coliving/next-app/contexts/owner-context.tsx`

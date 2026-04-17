@@ -13,15 +13,15 @@ alwaysApply: true
 |------|------|
 | **`api.*`** | **后端**（Node / Express + MySQL），无 Next 站。 |
 | **`portal.*`** | **正式站（live）**：Next 前端，按产品设计 **接真实后端**（经同域 `/api/` 反代或公网 API 等）。 |
-| **`demo.*`** | **Mockup / 演示**：与 portal **同套 Next 构建**，但 **不接后端**（前端 mock / localStorage；Coliving 见 `docs/nextjs-migration/lib/portal-api.ts`，Cleanlemons 见 `cleanlemon/next-app/lib/portal-auth-mock.ts`）。 |
+| **`demo.*`** | **Mockup / 演示**：与 portal **同套 Next 构建**，但 **不接后端**（前端 mock / localStorage；Coliving 见 `coliving/next-app/lib/portal-api.ts`，Cleanlemons 见 `cleanlemon/next-app/lib/portal-auth-mock.ts`）。 |
 
 ## Coliving（colivingjb.com）
 
 | 公网域名 | 典型反代目标（本仓库文档 / PM2） |
 |----------|-----------------------------------|
 | `api.colivingjb.com` | **后端** Node **`127.0.0.1:5000`**（常见 `api-coliving`） |
-| `portal.colivingjb.com` | **Live** Next **`127.0.0.1:3001`**（`next-coliving`，`docs/nextjs-migration`） |
-| `demo.colivingjb.com` | **Mockup**：与 portal 同套 Next（**3001**），**不接后端**。见 `docs/nextjs-migration/lib/portal-api.ts` |
+| `portal.colivingjb.com` | **Live** Next **`127.0.0.1:3001`**（`next-coliving`，`coliving/next-app`） |
+| `demo.colivingjb.com` | **Mockup**：与 portal 同套 Next（**3001**），**不接后端**。见 `coliving/next-app/lib/portal-api.ts` |
 
 若你方 Nginx/PM2 实际使用 **3000** 或其它端口，**以线上 `pm2 list` 与 Nginx `proxy_pass` 为准**，本表为仓库默认约定。
 

@@ -17,7 +17,7 @@ This is a monorepo with **two products** served from a single Express backend:
 | Service | Directory | Port | Command |
 |---------|-----------|------|---------|
 | **Backend API** (Coliving + Cleanlemons) | `/workspace` | 5000 | `npm run dev` (nodemon) or `npm start` |
-| **Coliving Portal** (Next.js 16) | `/workspace/docs/nextjs-migration` | 3001 | `npm run dev` |
+| **Coliving Portal** (Next.js 16) | `/workspace/coliving/next-app` | 3001 | `npm run dev` |
 | **Cleanlemons Portal** (Next.js 16) | `/workspace/cleanlemon/next-app` | 3100 | `npm run dev` |
 
 All three share a single **MySQL** database. The backend serves Coliving routes at `/api/*` and Cleanlemons routes at `/api/cleanlemon/*`.
@@ -43,7 +43,7 @@ Start mysqld before the backend: `sudo mysqld --user=mysql &`
 ### .env files
 
 - **Backend** (`/workspace/.env`): needs `DB_HOST`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`, `PORT=5000`, `PORTAL_JWT_SECRET`.
-- **Coliving portal** (`docs/nextjs-migration/.env`): needs `NEXT_PUBLIC_ECS_BASE_URL=http://127.0.0.1:5000` and `ECS_BASE_URL=http://127.0.0.1:5000`.
+- **Coliving portal** (`coliving/next-app/.env`): needs `NEXT_PUBLIC_ECS_BASE_URL=http://127.0.0.1:5000` and `ECS_BASE_URL=http://127.0.0.1:5000`.
 - **Cleanlemons portal** (`cleanlemon/next-app/.env`): needs `NEXT_PUBLIC_CLEANLEMON_API_URL=http://127.0.0.1:5000`.
 
 ### Running migrations
@@ -64,7 +64,7 @@ bash scripts/run-all-migrations.sh
 
 - **No ESLint config**: the `lint` scripts in both Next.js `package.json` files call `eslint .` but there is no `eslint.config.*` or `.eslintrc*` in the repo. TypeScript checking (`npx tsc --noEmit`) works but has pre-existing type errors.
 - **MySQL 8 reserved words**: migration 0052 uses `system` as a column name without backticks, which fails on MySQL 8. Create the `account_client` table manually with backtick-quoted column names.
-- **Three separate `npm install`**: dependencies must be installed independently in the root, `docs/nextjs-migration/`, and `cleanlemon/next-app/` directories.
+- **Three separate `npm install`**: dependencies must be installed independently in the root, `coliving/next-app/`, and `cleanlemon/next-app/` directories.
 - **Backend hot reload**: `npm run dev` uses nodemon. If you add new npm packages, restart the dev server.
 - **Next.js 16**: `next lint` no longer exists as a CLI subcommand in Next.js 16.
 
@@ -72,7 +72,7 @@ bash scripts/run-all-migrations.sh
 
 1. Start MySQL: `sudo mysqld --user=mysql &` (or via tmux)
 2. Start backend: `cd /workspace && npm run dev`
-3. Start Coliving portal: `cd /workspace/docs/nextjs-migration && npm run dev -- -p 3001`
+3. Start Coliving portal: `cd /workspace/coliving/next-app && npm run dev -- -p 3001`
 4. Start Cleanlemons portal: `cd /workspace/cleanlemon/next-app && npm run dev -- -p 3100`
 
 ### Key API endpoints for testing

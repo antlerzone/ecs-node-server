@@ -15,7 +15,7 @@ fi
 
 echo ""
 echo "=== 2) Next.js 完整重建並重啟 portal-next ==="
-cd docs/nextjs-migration
+cd coliving/next-app
 rm -rf .next
 npm run build
 pm2 restart portal-next

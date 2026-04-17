@@ -102,7 +102,7 @@ function OperatorLayoutInner({ children }: { children: React.ReactNode }) {
           <p className="text-muted-foreground mb-2">{msg}</p>
           {is502 && (
             <p className="text-xs text-muted-foreground mb-4">
-              The portal cannot reach the API server. Check that ECS (api.colivingjb.com) is running and reachable from this server. See docs/nextjs-migration/portal-frontend-backend-connection.md
+              The portal cannot reach the API server. Check that ECS (api.colivingjb.com) is running and reachable from this server. See coliving/next-app/portal-frontend-backend-connection.md
             </p>
           )}
           <Link href="/portal" className="text-primary font-semibold hover:underline">Back to Portal</Link>

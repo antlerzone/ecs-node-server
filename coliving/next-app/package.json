@@ -5,10 +5,10 @@
   "scripts": {
     "dev": "next dev",
     "dev:portal": "next dev -p 3001",
-    "build": "NODE_OPTIONS='--max-old-space-size=512' next build --webpack",
-    "build:low": "NODE_OPTIONS='--max-old-space-size=512' next build --webpack",
-    "build:lowmem": "NODE_OPTIONS='--max-old-space-size=256' next build --webpack",
-    "build:full": "NODE_OPTIONS='--max-old-space-size=1536' next build",
+    "build": "node --max-old-space-size=1024 ./node_modules/next/dist/bin/next build --webpack",
+    "build:low": "node --max-old-space-size=512 ./node_modules/next/dist/bin/next build --webpack",
+    "build:lowmem": "node --max-old-space-size=256 ./node_modules/next/dist/bin/next build --webpack",
+    "build:full": "node --max-old-space-size=1536 ./node_modules/next/dist/bin/next build",
     "start": "next start -p 3001",
     "lint": "eslint ."
   },

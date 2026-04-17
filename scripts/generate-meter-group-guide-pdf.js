@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Generate meter-group-guide.pdf from docs/readme/meter-group-guide.md content.
- * Output: docs/nextjs-migration/public/meter-group-guide.pdf (so visitors can download at /meter-group-guide.pdf)
+ * Output: coliving/next-app/public/meter-group-guide.pdf (so visitors can download at /meter-group-guide.pdf)
  * Run from repo root: node scripts/generate-meter-group-guide-pdf.js
  */
 
@@ -9,7 +9,7 @@ const PDFDocument = require('pdfkit');
 const fs = require('fs');
 const path = require('path');
 
-const OUT_PATH = path.join(__dirname, '..', 'docs', 'nextjs-migration', 'public', 'meter-group-guide.pdf');
+const OUT_PATH = path.join(__dirname, '..', 'coliving', 'next-app', 'public', 'meter-group-guide.pdf');
 
 const sections = [
   { title: 'Meter Group Guide', body: 'This guide explains the three meter group types available when creating a meter group in Operator → Meter Setting. Detailed formulas: docs/meter-billing-spec.md.' },

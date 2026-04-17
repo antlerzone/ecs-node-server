@@ -8,5 +8,5 @@ export const CLEANLEMONS_PORTAL_AUTH_SUCCESS_MSG = 'CLEANLEMONS_PORTAL_AUTH_SUCC
 export const CLEANLEMONS_OAUTH_POPUP_FLAG_KEY = 'cleanlemons_oauth_popup'
 export const CLEANLEMONS_AFTER_AUTH_REDIRECT_KEY = 'cleanlemons_after_auth_redirect'
 
-/** After Coliving↔Cleanlemons link Allow — notify Coliving opener (must match docs/nextjs-migration/lib/cleanlemons-coliving-bridge). */
+/** After Coliving↔Cleanlemons link Allow — notify Coliving opener (must match coliving/next-app/lib/cleanlemons-coliving-bridge). */
 export const COLIVING_CLEANLEMONS_LINK_VERIFY_DONE = 'COLIVING_CLEANLEMONS_LINK_VERIFY_DONE'

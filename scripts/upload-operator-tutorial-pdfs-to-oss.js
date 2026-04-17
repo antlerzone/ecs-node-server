@@ -3,7 +3,7 @@
  * many buckets forbid public-read ACL; use a bucket policy allowing GetObject on
  * portal/tutorial/operator/* for anonymous read, or the URLs will 403 until policy is added.
  *
- * Source: docs/nextjs-migration/public/tutorial/operator/*.pdf
+ * Source: coliving/next-app/public/tutorial/operator/*.pdf
  *
  * Usage: node scripts/upload-operator-tutorial-pdfs-to-oss.js
  * Requires: .env with OSS_REGION, OSS_BUCKET, OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET
@@ -14,7 +14,7 @@ const path = require('path');
 const OSS = require('ali-oss');
 
 const PREFIX = 'portal/tutorial/operator';
-const SOURCE_DIR = path.join(__dirname, '..', 'docs', 'nextjs-migration', 'public', 'tutorial', 'operator');
+const SOURCE_DIR = path.join(__dirname, '..', 'coliving', 'next-app', 'public', 'tutorial', 'operator');
 
 function getClient() {
   const region = process.env.OSS_REGION;
@@ -57,7 +57,7 @@ async function main() {
 
   const base = `https://${bucket}.${region}.aliyuncs.com/${PREFIX}`;
   console.log('');
-  console.log('Add to docs/nextjs-migration/.env.local (then rebuild portal):');
+  console.log('Add to coliving/next-app/.env.local (then rebuild portal):');
   console.log(`NEXT_PUBLIC_OPERATOR_TUTORIAL_OSS_BASE=${base}`);
   console.log('');
   const example = publicObjectUrl(bucket, region, `${PREFIX}/${files[0]}`);

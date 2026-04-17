@@ -8,7 +8,7 @@
 |------|------|
 | **`api.*`** | **后端**：Node / Express + MySQL，无 Next 站。 |
 | **`portal.*`** | **正式站（live）**：Next 前端，接真实后端（同域 `/api/` 反代或配置的公网 API）。 |
-| **`demo.*`** | **Mockup / 演示**：与 portal **同套 Next**，**不接后端**（前端 mock；Coliving 见 `docs/nextjs-migration/lib/portal-api.ts`，Cleanlemons 见 `cleanlemon/next-app/lib/portal-auth-mock.ts`）。 |
+| **`demo.*`** | **Mockup / 演示**：与 portal **同套 Next**，**不接后端**（前端 mock；Coliving 见 `coliving/next-app/lib/portal-api.ts`，Cleanlemons 见 `cleanlemon/next-app/lib/portal-auth-mock.ts`）。 |
 
 ## 对照表
 
@@ -19,7 +19,7 @@
 | **后端（Node / Express API）** | `https://api.colivingjb.com` | `https://api.cleanlemons.com` |
 | **公司主表（operator 行）** | `clientdetail` → **`operatordetail`**（迁移 0181） | `cln_client` → **`cln_operator`** → **`cln_operatordetail`**（0182、0198；与 Coliving `operatordetail` 命名对齐） |
 | **典型本机端口（PM2）** | API `5000`，Next `next-coliving` → `3001` | API `5001`，Next `next-cleanlemons` → `3100`（以实际 `ecosystem`/PM2 为准） |
-| **Portal 调 API** | `NEXT_PUBLIC_ECS_BASE_URL` / `PORTAL_FRONTEND_URL` 等，见 `docs/nextjs-migration` | `NEXT_PUBLIC_CLEANLEMON_API_URL`：默认与代码一致为 **`https://portal.cleanlemons.com`**（经 Nginx `location /api/` → Node）；若 `api.cleanlemons.com` 已配好 TLS 且希望直连，可显式设为 `https://api.cleanlemons.com`。 |
+| **Portal 调 API** | `NEXT_PUBLIC_ECS_BASE_URL` / `PORTAL_FRONTEND_URL` 等，见 `coliving/next-app` | `NEXT_PUBLIC_CLEANLEMON_API_URL`：默认与代码一致为 **`https://portal.cleanlemons.com`**（经 Nginx `location /api/` → Node）；若 `api.cleanlemons.com` 已配好 TLS 且希望直连，可显式设为 `https://api.cleanlemons.com`。 |
 | **Google OAuth（Cleanlemons 专用 client）** | `PORTAL_AUTH_BASE_URL=https://api.colivingjb.com`，回调 `…/api/portal-auth/google/callback` | **`CLEANLEMON_PORTAL_AUTH_BASE_URL`** 默认 **`https://portal.cleanlemons.com`**（与 Nginx 将 portal 的 `/api/` 反代到 Node 一致，避免 api 子域证书未配导致 `ERR_CERT_COMMON_NAME_INVALID`）。须在 Google Cloud Console 登记 **`https://portal.cleanlemons.com/api/portal-auth/google/callback`**（若仍使用 api 子域回调则另登记并设环境变量覆盖）。 |
 
 ## 代码入口（便于排查）

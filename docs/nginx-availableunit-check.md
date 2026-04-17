@@ -33,11 +33,11 @@ curl -s -o /dev/null -w "%{http_code}" -X POST https://api.colivingjb.com/api/av
    - 若仍是 `/api/available-unit/list` 或别的域名，说明跑的是旧前端构建，需要重新 build 并部署 Next，再试。
 
 3. **确认 Next 构建时的环境变量**  
-   `docs/nextjs-migration` 里 build 时会把 `NEXT_PUBLIC_ECS_BASE_URL` 打进前端。若未设置或设错，前端可能请求错域名。  
+   `coliving/next-app` 里 build 时会把 `NEXT_PUBLIC_ECS_BASE_URL` 打进前端。若未设置或设错，前端可能请求错域名。  
    构建前确认 `.env.local` 或构建环境中有：  
    `NEXT_PUBLIC_ECS_BASE_URL=https://api.colivingjb.com`  
    然后重新执行：  
-   `cd docs/nextjs-migration && npm run build && pm2 restart portal-next`
+   `cd coliving/next-app && npm run build && pm2 restart portal-next`
 
 ## 可选：重载 Nginx
 

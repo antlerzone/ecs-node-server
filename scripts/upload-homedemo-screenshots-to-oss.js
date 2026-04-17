@@ -1,7 +1,7 @@
 /**
  * Upload homedemo Section 3 phone screenshots to Aliyun OSS (image/jpeg).
  *
- * Source: docs/nextjs-migration/homedemo-screenshot-upload/
+ * Source: coliving/next-app/homedemo-screenshot-upload/
  * Dest:   portal/homedemo/<sanitized-name>.jpeg
  *
  * Usage: node scripts/upload-homedemo-screenshots-to-oss.js
@@ -18,8 +18,8 @@ const PREFIX = "portal/homedemo";
 const SOURCE_DIR = path.join(
   __dirname,
   "..",
-  "docs",
-  "nextjs-migration",
+  "coliving",
+  "next-app",
   "homedemo-screenshot-upload"
 );
 

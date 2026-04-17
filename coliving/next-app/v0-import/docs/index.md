@@ -21,4 +21,4 @@
 
 **不是自动合并**：没有脚本或 CI 监听 v0-import；每次要更新前端时，你在 Cursor 里说一句，AI 做一次合并。
 
-真正跑的前端在 `docs/nextjs-migration/app/` 与 `components/`，已接好 ECS Node 后端；本文件夹仅作「v0 设计来源」，供 Cursor 合并写入用。
+真正跑的前端在 `coliving/next-app/app/` 与 `components/`，已接好 ECS Node 后端；本文件夹仅作「v0 设计来源」，供 Cursor 合并写入用。
