@@ -213,14 +213,6 @@ export function SlidingRegisterPanel({
         </Button>
       </form>
 
-      {govIdReturnPath ? (
-        <GovIdConnectButtons
-          returnPath={govIdReturnPath}
-          variant="stacked"
-          appearance="enquiry"
-          disabled={isLoading || shouldUseDemoMock()}
-        />
-      ) : null}
     </div>
   )
 }
