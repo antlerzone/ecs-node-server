@@ -138,8 +138,6 @@ export function buildPortalPayloadFromUnified(
     delete body.fullname;
     delete body.nric;
     delete body.entity_type;
-    delete body.reg_no_type;
-    delete body.id_type;
   }
   /** After Aliyun eKYC, auto-save must not overwrite server-filled legal name / NRIC / OCR address (DB aliyun_ekyc_locked may be missing). */
   if (options?.aliyunEkycVerified) {
@@ -501,12 +499,11 @@ export async function confirmPortalPhoneChange(params: {
 
 /**
  * Full browser redirect must hit the **Node API** host (not the Next `/api/portal/proxy` path).
- * MyDigital：须带 portal JWT。Singpass：`opts.direct` 时可无 JWT（主登录，回调用 MyInfo 邮箱匹配已有账号）。
+ * Gov ID linking is account-bound, so portal JWT is required for both providers.
  */
 export function buildGovIdStartUrl(
   provider: "singpass" | "mydigital",
-  returnPath = "/demologin",
-  opts?: { direct?: boolean }
+  returnPath = "/demologin"
 ): string {
   const jwt = getPortalJwt();
   const ecs =
@@ -521,12 +518,8 @@ export function buildGovIdStartUrl(
     frontend,
     returnPath: returnPath.startsWith("/") ? returnPath : `/${returnPath}`,
   });
-  if (provider === "singpass" && opts?.direct) {
-    params.set("direct", "1");
-  } else {
-    if (!jwt) return "";
-    params.set("portal_token", jwt);
-  }
+  if (!jwt) return "";
+  params.set("portal_token", jwt);
   return `${ecs}/api/portal-auth/gov-id/start?${params.toString()}`;
 }
 

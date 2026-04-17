@@ -30,17 +30,21 @@ export function GovIdConnectButtons({
   const start = (provider: "singpass" | "mydigital") => {
     if (disabled) return
     const jwt = typeof window !== "undefined" ? localStorage.getItem(PORTAL_KEYS.PORTAL_JWT) : null
+    if (!getMember()?.email || !jwt) {
+      toast.info(
+        provider === "singpass"
+          ? "Sign in first, then use Retrieve Myinfo with Singpass."
+          : "Sign in with email or Google / Facebook first, then connect MyDigital ID."
+      )
+      return
+    }
     if (provider === "singpass") {
-      const url = buildGovIdStartUrl("singpass", returnPath, { direct: !jwt })
+      const url = buildGovIdStartUrl("singpass", returnPath)
       if (!url) {
         toast.error("Could not start Singpass. Check NEXT_PUBLIC_ECS_BASE_URL.")
         return
       }
       window.location.href = url
-      return
-    }
-    if (!getMember()?.email || !jwt) {
-      toast.info("Sign in with email or Google / Facebook first, then connect MyDigital ID.")
       return
     }
     const url = buildGovIdStartUrl("mydigital", returnPath)
@@ -135,7 +139,9 @@ export function GovIdConnectButtons({
                   className="h-7 w-auto max-w-full object-contain object-left"
                 />
               </span>
-              <span className="text-sm font-semibold text-foreground text-left leading-tight">Log in with Singpass</span>
+              <span className="text-sm font-semibold text-foreground text-left leading-tight">
+                Retrieve Myinfo with Singpass
+              </span>
             </>
           ) : (
             <>
@@ -150,7 +156,7 @@ export function GovIdConnectButtons({
               </span>
               <span className="flex flex-col items-start text-left min-w-0">
                 <span className="text-[10px] font-bold uppercase tracking-wider text-white/85 leading-none mb-0.5">Singapore</span>
-                <span className="text-sm font-semibold leading-tight">Log in with Singpass</span>
+                <span className="text-sm font-semibold leading-tight">Retrieve Myinfo with Singpass</span>
               </span>
             </>
           )}

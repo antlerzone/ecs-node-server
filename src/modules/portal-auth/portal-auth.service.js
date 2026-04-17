@@ -1753,7 +1753,7 @@ async function updatePortalProfile(email, payload) {
       }
       if (lc[0] && Number(lc[0].gov_identity_locked) === 1) {
         const nric_provided = hasKey('nric') && payload.nric !== undefined;
-        if (fullname_provided || entity_type_provided || id_type_provided || nric_provided) {
+        if (fullname_provided || entity_type_provided || nric_provided) {
           return { ok: false, reason: 'IDENTITY_LOCKED' };
         }
       }

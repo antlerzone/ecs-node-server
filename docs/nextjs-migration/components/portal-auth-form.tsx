@@ -16,11 +16,11 @@ function getEcsBase(): string {
   return (process.env.NEXT_PUBLIC_ECS_BASE_URL ?? "").replace(/\/$/, "")
 }
 
-/** OAuth：enquiry=1 時後端允許首登（Google/Facebook state）。govPending = Singpass 補郵 pendingId。 */
+/** OAuth：enquiry=1 時後端允許首登（Google/Facebook state）。 */
 export function buildPortalOAuthStartUrl(
   base: string,
   provider: "google" | "facebook",
-  opts?: { enquiry?: boolean; govPending?: string }
+  opts?: { enquiry?: boolean }
 ): string {
   const frontend =
     typeof window !== "undefined"
@@ -29,55 +29,8 @@ export function buildPortalOAuthStartUrl(
   const params = new URLSearchParams()
   if (frontend) params.set("frontend", frontend)
   if (opts?.enquiry) params.set("enquiry", "1")
-  if (opts?.govPending) params.set("gov_pending", opts.govPending)
   const q = params.toString() ? `?${params.toString()}` : ""
   return `${base}/api/portal-auth/${provider}${q}`
-}
-
-/** Singpass 補郵：登入已取得 JWT 後免密完成綁定。 */
-export async function completeGovPendingWithPortalJwt(opts: {
-  pendingId: string
-  email: string
-  token: string
-  frontend?: string
-}): Promise<{ ok?: boolean; reason?: string; token?: string; nextPath?: string }> {
-  const base = getEcsBase()
-  if (!base) return { ok: false, reason: "NO_API" }
-  const res = await fetch(`${base}/api/portal-auth/gov-id/complete-pending-email`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${opts.token}`,
-    },
-    body: JSON.stringify({
-      pendingId: opts.pendingId,
-      email: opts.email.trim(),
-      frontend: opts.frontend ?? (typeof window !== "undefined" ? `${window.location.protocol}//${window.location.host}` : undefined),
-    }),
-  })
-  return (await res.json().catch(() => ({}))) as { ok?: boolean; reason?: string; token?: string; nextPath?: string }
-}
-
-/** Singpass 補郵：註冊表單提交密碼後完成綁定（密碼不在首屏補郵卡上收集）。 */
-export async function completeGovPendingWithPassword(opts: {
-  pendingId: string
-  email: string
-  password: string
-  frontend?: string
-}): Promise<{ ok?: boolean; reason?: string; token?: string; nextPath?: string }> {
-  const base = getEcsBase()
-  if (!base) return { ok: false, reason: "NO_API" }
-  const res = await fetch(`${base}/api/portal-auth/gov-id/complete-pending-email`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      pendingId: opts.pendingId,
-      email: opts.email.trim(),
-      password: opts.password,
-      frontend: opts.frontend ?? (typeof window !== "undefined" ? `${window.location.protocol}//${window.location.host}` : undefined),
-    }),
-  })
-  return (await res.json().catch(() => ({}))) as { ok?: boolean; reason?: string; token?: string; nextPath?: string }
 }
 
 export async function loginWithPassword(
