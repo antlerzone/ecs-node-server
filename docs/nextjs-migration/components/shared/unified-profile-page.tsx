@@ -1550,9 +1550,9 @@ export default function UnifiedProfilePage({
                     <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 text-primary px-2.5 py-1 text-xs font-semibold">
                       <ShieldCheck className="h-3.5 w-3.5" />
                       {govSingpass && !govMydigital
-                        ? 'Singpass connected'
+                        ? 'Singpass verification active'
                         : govMydigital && !govSingpass
-                          ? 'MyDigital connected'
+                          ? 'MyDigital verification active'
                           : 'Verified'}
                     </span>
                   )}

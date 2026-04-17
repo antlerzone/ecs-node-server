@@ -9,13 +9,11 @@ import { Eye, EyeOff, LogIn } from "lucide-react"
 import { Spinner } from "@/components/ui/spinner"
 import {
   buildPortalOAuthStartUrl,
-  completeGovPendingWithPortalJwt,
   loginWithPassword,
 } from "@/components/portal-auth-form"
 import { GovIdConnectButtons } from "@/components/gov-id-connect-buttons"
 import { PORTAL_KEYS, setMember, setCurrentRole } from "@/lib/portal-session"
 import { isDemoSite, shouldUseDemoMock } from "@/lib/portal-api"
-import { toast } from "sonner"
 
 function getEcsBase(): string {
   return (process.env.NEXT_PUBLIC_ECS_BASE_URL ?? "").replace(/\/$/, "")
@@ -26,15 +24,12 @@ export function SlidingSignInPanel({
   oauthEnquiry = false,
   /** When set (e.g. `/demologin`), show MyDigital ID & Singpass under Google/Facebook. */
   govIdReturnPath,
-  /** Singpass need-email flow: after password login, complete pending link with JWT (no password on pending screen). */
-  govPendingId,
   emailHint,
 }: {
   afterLogin: string
   /** Pass enquiry OAuth flag when onboarding from /enquiry */
   oauthEnquiry?: boolean
   govIdReturnPath?: string
-  govPendingId?: string
   emailHint?: string
 }) {
   const router = useRouter()
@@ -102,37 +97,6 @@ export function SlidingSignInPanel({
     try {
       const result = await loginWithPassword(email.trim(), password)
       if (result.ok && result.email && Array.isArray(result.roles)) {
-        if (govPendingId && result.token) {
-          const link = await completeGovPendingWithPortalJwt({
-            pendingId: govPendingId,
-            email: result.email,
-            token: result.token,
-          })
-          if (link.ok && link.token) {
-            const next = link.nextPath && link.nextPath.startsWith("/") ? link.nextPath : afterLogin
-            window.location.href = `/auth/callback?token=${encodeURIComponent(link.token)}&next=${encodeURIComponent(next)}`
-            return
-          }
-          setMember({ email: result.email, roles: result.roles })
-          if (typeof window !== "undefined" && result.token) {
-            try {
-              localStorage.setItem(PORTAL_KEYS.PORTAL_JWT, result.token)
-            } catch {
-              /* ignore */
-            }
-          }
-          if (link.reason === "GOV_ID_SWITCH_REQUIRED") {
-            toast.error(
-              "This account already uses another government ID. Open Profile → Verification to disconnect first.",
-            )
-          } else if (link.reason === "PENDING_EXPIRED_OR_INVALID") {
-            toast.error("This Singpass step expired. Start Singpass login again.")
-          } else {
-            toast.error("Could not link Singpass. You are signed in; try connecting Singpass again from the demo.")
-          }
-          router.replace(afterLogin.split("?")[0] + "?gov=error&reason=" + encodeURIComponent(link.reason || "LINK_FAILED"))
-          return
-        }
         setMember({ email: result.email, roles: result.roles })
         if (typeof window !== "undefined") {
           if (result.token) {
@@ -207,7 +171,6 @@ export function SlidingSignInPanel({
     window.location.assign(
       buildPortalOAuthStartUrl(base, provider, {
         enquiry: oauthEnquiry,
-        ...(govPendingId ? { govPending: govPendingId } : {}),
       }),
     )
   }
@@ -321,14 +284,6 @@ export function SlidingSignInPanel({
         </Button>
       </form>
 
-      {govIdReturnPath ? (
-        <GovIdConnectButtons
-          returnPath={govIdReturnPath}
-          variant="stacked"
-          appearance="enquiry"
-          disabled={isLoading || shouldUseDemoMock()}
-        />
-      ) : null}
     </div>
   )
 }

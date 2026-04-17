@@ -28,8 +28,6 @@ const {
 const {
   buildAuthorizeUrl,
   handleOAuthCallback,
-  completePendingGovEmail,
-  lookupPortalEmailForGovPending,
   disconnectGovId,
   getGovIdStatus,
   isGovIdConfigured,
@@ -92,21 +90,19 @@ function parseFrontendFromState(stateRaw) {
   return parseOAuthState(stateRaw).frontend;
 }
 
-/** OAuth state: { frontend, enquiry?: boolean, govPendingId?: string } */
+/** OAuth state: { frontend, enquiry?: boolean } */
 function parseOAuthState(stateRaw) {
   const state = String(stateRaw || '').trim();
-  if (!state) return { frontend: '', enquiry: false, govPendingId: '' };
+  if (!state) return { frontend: '', enquiry: false };
   try {
     const decoded = Buffer.from(state, 'base64url').toString('utf8');
     const obj = JSON.parse(decoded);
-    const gpid = obj?.govPendingId != null ? String(obj.govPendingId).trim() : '';
     return {
       frontend: String(obj?.frontend || '').trim(),
       enquiry: obj?.enquiry === true,
-      govPendingId: gpid,
     };
   } catch {
-    return { frontend: '', enquiry: false, govPendingId: '' };
+    return { frontend: '', enquiry: false };
   }
 }
 
@@ -275,12 +271,10 @@ router.get('/google', (req, res, next) => {
   const strategyName = getGoogleStrategyName(frontendUrl);
   const enquiryFlow =
     String(req.query?.enquiry || '').trim() === '1' || String(req.query?.for || '').trim() === 'enquiry';
-  const govPendingId = String(req.query?.gov_pending || '').trim();
   const state = Buffer.from(
     JSON.stringify({
       frontend: frontendUrl,
       ...(enquiryFlow ? { enquiry: true } : {}),
-      ...(govPendingId ? { govPendingId } : {}),
     }),
     'utf8'
   ).toString('base64url');
@@ -304,18 +298,18 @@ router.get('/google', (req, res, next) => {
 });
 
 router.get('/google/callback', (req, res, next) => {
-  const { frontend: stateFrontend, enquiry, govPendingId } = parseOAuthState(req.query?.state);
+  const { frontend: stateFrontend, enquiry } = parseOAuthState(req.query?.state);
   const frontendUrl = stateFrontend || getFrontendUrl(req);
   const loginPath = getLoginEntryPath(frontendUrl);
   const enquiryPath = getEnquiryEntryPath();
   const callbackBase = getGoogleCallbackBase(req, frontendUrl);
   const strategyName = getGoogleStrategyName(frontendUrl);
-  const errorPath = enquiry ? enquiryPath : govPendingId ? '/demologin' : loginPath;
+  const errorPath = enquiry ? enquiryPath : loginPath;
   if (!hasGoogleOauthConfig(frontendUrl)) {
     return res.redirect(`${frontendUrl}${errorPath}?error=OAUTH_NOT_CONFIGURED`);
   }
   try {
-    console.log('[portal-auth] google callback', { frontendUrl, strategyName, callbackBase, enquiry, govPendingId });
+    console.log('[portal-auth] google callback', { frontendUrl, strategyName, callbackBase, enquiry });
     passport.authenticate(strategyName, {
       session: false,
       callbackURL: `${callbackBase}/api/portal-auth/google/callback`,
@@ -328,28 +322,6 @@ router.get('/google/callback', (req, res, next) => {
         const reason = info?.reason || 'OAUTH_FAILED';
         console.error('[portal-auth] google callback no user, reason:', reason);
         return res.redirect(`${frontendUrl}${errorPath}?error=${encodeURIComponent(reason)}`);
-      }
-      if (govPendingId) {
-        try {
-          const pendResult = await completePendingGovEmail({
-            pendingId: govPendingId,
-            email: user.email,
-            trustedIdentityEmail: user.email,
-          });
-          if (!pendResult.ok || !pendResult.token) {
-            return res.redirect(
-              `${frontendUrl}/demologin?gov=error&reason=${encodeURIComponent(pendResult.reason || 'LINK_FAILED')}`
-            );
-          }
-          void scheduleEnsureAfterPortalAuth(req, user.email, frontendUrl);
-          const nextPath = encodeURIComponent(pendResult.nextPath || '/portal');
-          return res.redirect(
-            `${frontendUrl}/auth/callback?token=${encodeURIComponent(pendResult.token)}&next=${nextPath}`
-          );
-        } catch (e) {
-          console.error('[portal-auth] google callback gov pending link', e?.message || e);
-          return res.redirect(`${frontendUrl}/demologin?gov=error&reason=LINK_FAILED`);
-        }
       }
       void scheduleEnsureAfterPortalAuth(req, user.email, frontendUrl);
       const token = signPortalToken({
@@ -377,12 +349,10 @@ router.get('/facebook', (req, res, next) => {
   const strategyName = getFacebookStrategyName(frontendUrl);
   const enquiryFlow =
     String(req.query?.enquiry || '').trim() === '1' || String(req.query?.for || '').trim() === 'enquiry';
-  const govPendingIdFb = String(req.query?.gov_pending || '').trim();
   const state = Buffer.from(
     JSON.stringify({
       frontend: frontendUrl,
       ...(enquiryFlow ? { enquiry: true } : {}),
-      ...(govPendingIdFb ? { govPendingId: govPendingIdFb } : {}),
     }),
     'utf8'
   ).toString('base64url');
@@ -404,18 +374,18 @@ router.get('/facebook', (req, res, next) => {
 });
 
 router.get('/facebook/callback', (req, res, next) => {
-  const { frontend: stateFrontend, enquiry, govPendingId } = parseOAuthState(req.query?.state);
+  const { frontend: stateFrontend, enquiry } = parseOAuthState(req.query?.state);
   const frontendUrl = stateFrontend || getFrontendUrl(req);
   const loginPath = getLoginEntryPath(frontendUrl);
   const enquiryPath = getEnquiryEntryPath();
   const callbackBase = getGoogleCallbackBase(req, frontendUrl);
   const strategyName = getFacebookStrategyName(frontendUrl);
-  const errorPath = enquiry ? enquiryPath : govPendingId ? '/demologin' : loginPath;
+  const errorPath = enquiry ? enquiryPath : loginPath;
   if (!hasFacebookOauthConfig(frontendUrl)) {
     return res.redirect(`${frontendUrl}${errorPath}?error=OAUTH_NOT_CONFIGURED`);
   }
   try {
-    console.log('[portal-auth] facebook callback', { frontendUrl, strategyName, callbackBase, enquiry, govPendingId });
+    console.log('[portal-auth] facebook callback', { frontendUrl, strategyName, callbackBase, enquiry });
     passport.authenticate(strategyName, {
       session: false,
       callbackURL: `${callbackBase}/api/portal-auth/facebook/callback`,
@@ -428,28 +398,6 @@ router.get('/facebook/callback', (req, res, next) => {
         const reason = info?.reason || 'OAUTH_FAILED';
         console.error('[portal-auth] facebook callback no user, reason:', reason);
         return res.redirect(`${frontendUrl}${errorPath}?error=${encodeURIComponent(reason)}`);
-      }
-      if (govPendingId) {
-        try {
-          const pendResult = await completePendingGovEmail({
-            pendingId: govPendingId,
-            email: user.email,
-            trustedIdentityEmail: user.email,
-          });
-          if (!pendResult.ok || !pendResult.token) {
-            return res.redirect(
-              `${frontendUrl}/demologin?gov=error&reason=${encodeURIComponent(pendResult.reason || 'LINK_FAILED')}`
-            );
-          }
-          void scheduleEnsureAfterPortalAuth(req, user.email, frontendUrl);
-          const nextPath = encodeURIComponent(pendResult.nextPath || '/portal');
-          return res.redirect(
-            `${frontendUrl}/auth/callback?token=${encodeURIComponent(pendResult.token)}&next=${nextPath}`
-          );
-        } catch (e) {
-          console.error('[portal-auth] facebook callback gov pending link', e?.message || e);
-          return res.redirect(`${frontendUrl}/demologin?gov=error&reason=LINK_FAILED`);
-        }
       }
       void scheduleEnsureAfterPortalAuth(req, user.email, frontendUrl);
       const token = signPortalToken({
@@ -755,7 +703,7 @@ router.get('/singpass/jwks', (req, res) => {
 
 /**
  * GET /api/portal-auth/gov-id/start?provider=mydigital|singpass&frontend=...&portal_token=JWT&returnPath=/demologin
- * Singpass only: `direct=1` — 无 portal_token，用 MyInfo 返回邮箱匹配已有 portal_account 后直接发 JWT（主登录）。
+ * Gov ID linking is account-bound: portal_token is required for both providers.
  */
 router.get('/gov-id/start', async (req, res) => {
   const provider = String(req.query?.provider || '').toLowerCase();
@@ -767,17 +715,12 @@ router.get('/gov-id/start', async (req, res) => {
   }
   const frontendUrl = getFrontendUrl(req);
   const returnPath = String(req.query?.returnPath || '/demologin').trim() || '/demologin';
-  const directSingpass = provider === 'singpass' && String(req.query?.direct || '').trim() === '1';
-
-  let email = '';
-  if (!directSingpass) {
-    const token = String(req.query?.portal_token || '').trim();
-    const payload = verifyPortalToken(token);
-    if (!payload || !payload.email) {
-      return res.status(401).send('Unauthorized');
-    }
-    email = payload.email;
+  const token = String(req.query?.portal_token || '').trim();
+  const payload = verifyPortalToken(token);
+  if (!payload || !payload.email) {
+    return res.status(401).send('Unauthorized');
   }
+  const email = payload.email;
 
   try {
     const url = await buildAuthorizeUrl({
@@ -785,7 +728,6 @@ router.get('/gov-id/start', async (req, res) => {
       email,
       frontend: frontendUrl || getFrontendUrl(req),
       returnPath,
-      directSingpass,
     });
     return res.redirect(302, url);
   } catch (err) {
@@ -815,23 +757,6 @@ router.get('/gov-id/callback', async (req, res) => {
       code: req.query?.code,
       state: req.query?.state,
     });
-    if (out.needEmail && out.pendingId) {
-      return res.redirect(
-        302,
-        `${out.frontend}/demologin?gov=need_email&pending=${encodeURIComponent(out.pendingId)}`
-      );
-    }
-    if (out.directLogin && out.directLogin.token) {
-      const em = normalizeEmail(out.directLogin.email);
-      if (em) void scheduleEnsureAfterPortalAuth(req, em, out.frontend);
-      const nextPath = String(out.directLogin.nextPath || '/demologin').startsWith('/')
-        ? out.directLogin.nextPath
-        : '/demologin';
-      return res.redirect(
-        302,
-        `${out.frontend}/auth/callback?token=${encodeURIComponent(out.directLogin.token)}&next=${encodeURIComponent(nextPath)}`
-      );
-    }
     const path = String(out.returnPath || '/demologin').startsWith('/') ? out.returnPath : '/demologin';
     const successSep = String(path).includes('?') ? '&' : '?';
     return res.redirect(
@@ -848,64 +773,6 @@ router.get('/gov-id/callback', async (req, res) => {
       boundEmail: err.boundEmail,
     });
     return res.redirect(302, loc);
-  }
-});
-
-/**
- * POST /api/portal-auth/gov-id/complete-pending-email
- * Body: { pendingId, email, password? } — Singpass direct 无 IdP email 时补绑（注册或验证已有账号）。
- */
-router.post('/gov-id/complete-pending-email', async (req, res) => {
-  try {
-    const { pendingId, email, password, frontend: frontendBody } = req.body || {};
-    const bearer = getPortalBearerToken(req);
-    const jwtPayload = bearer ? verifyPortalToken(bearer) : null;
-    const bodyEmailNorm = normalizeEmail(email);
-    const trustedIdentityEmail =
-      jwtPayload &&
-      bodyEmailNorm &&
-      normalizeEmail(jwtPayload.email) === bodyEmailNorm
-        ? jwtPayload.email
-        : undefined;
-    const result = await completePendingGovEmail({
-      pendingId,
-      email,
-      password,
-      trustedIdentityEmail,
-    });
-    if (result.ok && result.email) {
-      let frontendHint = String(frontendBody || '').trim().replace(/\/$/, '');
-      if (!frontendHint) {
-        const ref = String(req.get('referer') || '');
-        try {
-          const u = new URL(ref);
-          frontendHint = `${u.protocol}//${u.host}`.replace(/\/$/, '');
-        } catch {
-          frontendHint = '';
-        }
-      }
-      if (!frontendHint) frontendHint = FRONTEND_URL.replace(/\/$/, '');
-      void scheduleEnsureAfterPortalAuth(req, result.email, frontendHint);
-    }
-    res.status(200).json(result);
-  } catch (err) {
-    console.error('[portal-auth] gov-id/complete-pending-email', err?.message || err);
-    res.status(500).json({ ok: false, reason: 'DB_ERROR' });
-  }
-});
-
-/**
- * POST /api/portal-auth/gov-id/lookup-email
- * Body: { email } — 仅返回是否已有 portal_account（demologin 补邮分流）。
- */
-router.post('/gov-id/lookup-email', async (req, res) => {
-  try {
-    const { email } = req.body || {};
-    const result = await lookupPortalEmailForGovPending(email);
-    res.status(200).json(result);
-  } catch (err) {
-    console.error('[portal-auth] gov-id/lookup-email', err?.message || err);
-    res.status(500).json({ ok: false, reason: 'DB_ERROR' });
   }
 });
 

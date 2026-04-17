@@ -10,8 +10,8 @@
 |------|------|
 | **Staging vs Production** | Singpass 在 [Developer Portal](https://developer.singpass.gov.sg/) 创建 Staging App，生产审批可能长达约 2 周（见官方 Quick Start）。 |
 | **Redirect URI** | 必须与 Node 环境变量 **完全一致**：默认 `https://<API 公网>/api/portal-auth/gov-id/callback`（或通过 `GOV_ID_OIDC_REDIRECT_URI` 覆盖）。在 IdP 控制台登记该 URL。 |
-| **Singpass（FAPI）** | 实现为 **PAR** + **`private_key_jwt`** + **PKCE** + **DPoP**（见 [Authorization Request](https://docs.developer.singpass.gov.sg/docs/technical-specifications/integration-guide/1.-authorization-request)、[Token exchange](https://docs.developer.singpass.gov.sg/docs/technical-specifications/integration-guide/3.-token-exchange)）。**不设 `client_secret`。** `SINGPASS_OIDC_ISSUER` 须为 **FAPI discovery 根**，Staging 示例：`https://stg-id.singpass.gov.sg/fapi`（不要用已弃用的 `stg-login` 主机作 issuer）。 |
-| **Claims** | MyDigital：`openid` + 所需 scope 下 **userinfo** 的 `nric`/`nama` 等。Singpass：**`SINGPASS_OIDC_SCOPE`** 须与开发门户勾选一致；代码会读 `uinfin`、`name` 等（见 `gov-id.service.js`）。 |
+| **Singpass（FAPI）** | 实现为 **PAR** + **`private_key_jwt`** + **PKCE** + **DPoP**（见 [Authorization Request](https://docs.developer.singpass.gov.sg/docs/technical-specifications/integration-guide/1.-authorization-request)、[Token exchange](https://docs.developer.singpass.gov.sg/docs/technical-specifications/integration-guide/3.-token-exchange)）。**不设 `client_secret`。** `SINGPASS_OIDC_ISSUER` 须为 **FAPI discovery 根**，Staging 示例：`https://stg-id.singpass.gov.sg/fapi`（不要用已弃用的 `stg-login` 主机作 issuer）。当前实现用于**账号注册/绑定的 Myinfo 取数**，不作为独立登录入口。 |
+| **Claims** | MyDigital：`openid` + 所需 scope 下 **userinfo** 的 `nric`/`nama` 等。Singpass：**`SINGPASS_OIDC_SCOPE`** 须与开发门户勾选一致；按审核要求移除 `user.identity`，改用 `nric` 范围，代码读取 `nric` / `name`（见 `gov-id.service.js`）。 |
 | **服务协议与品牌** | Singpass 对用户旅程、品牌展示有要求；MyDigital 与 `sso@myid.my` 确认 client 类型与条款。 |
 
 ---
@@ -55,7 +55,7 @@
 | `SINGPASS_OIDC_CLIENT_ID` | 开发门户 App ID。 |
 | `SINGPASS_OIDC_PRIVATE_KEY_PATH` 或 `SINGPASS_OIDC_PRIVATE_KEY` | 与门户登记 **JWKS signing 公钥** 成对的 **ES256 私钥**（PEM）。 |
 | `SINGPASS_OIDC_SIGNING_KID` | 可选；须与 JWKS 里 `kid` 一致，默认 `coliving-rp-staging-sig-1`。 |
-| `SINGPASS_OIDC_SCOPE` | 空格分隔；默认 `openid user.identity uinfin name dob mobileno email`，须与门户勾选一致。 |
+| `SINGPASS_OIDC_SCOPE` | 空格分隔；默认 `openid nric name dob mobileno email`（不使用 `user.identity`），须与门户勾选一致。 |
 
 Next 前端使用 **`NEXT_PUBLIC_ECS_BASE_URL`** 拼 **浏览器整页跳转** 到 `/api/portal-auth/gov-id/start`（不能使用仅 Next 内部的 proxy 路径）。
 

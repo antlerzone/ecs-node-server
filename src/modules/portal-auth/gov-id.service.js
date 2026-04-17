@@ -13,11 +13,8 @@ const jwt = require('jsonwebtoken');
 const jose = require('jose');
 const axios = require('axios');
 const pool = require('../../config/db');
-const { normalizeEmail, getMemberRoles } = require('../access/access.service');
+const { normalizeEmail } = require('../access/access.service');
 const {
-  signPortalToken,
-  register,
-  login,
   assertNationalIdKeyForPortalAccount,
   normalizeNricForMatch,
 } = require('./portal-auth.service');
@@ -35,18 +32,6 @@ function cleanupSingpassParSessions() {
   }
 }
 setInterval(cleanupSingpassParSessions, 5 * 60 * 1000).unref();
-
-const GOV_EMAIL_PENDING_TTL_MS = 15 * 60 * 1000;
-/** pendingId -> { provider, userinfo, frontend, returnPath, createdAt } — Singpass direct 无 email 时补绑 */
-const govEmailPendingSessions = new Map();
-
-function cleanupGovEmailPendingSessions() {
-  const now = Date.now();
-  for (const [k, v] of govEmailPendingSessions.entries()) {
-    if (now - v.createdAt > GOV_EMAIL_PENDING_TTL_MS) govEmailPendingSessions.delete(k);
-  }
-}
-setInterval(cleanupGovEmailPendingSessions, 5 * 60 * 1000).unref();
 
 function getApiPublicBase() {
   return String(process.env.PORTAL_AUTH_BASE_URL || process.env.API_PUBLIC_BASE_URL || '').replace(/\/$/, '');
@@ -178,10 +163,10 @@ function getSingpassSigningKid() {
   return String(process.env.SINGPASS_OIDC_SIGNING_KID || 'coliving-rp-staging-sig-1').trim();
 }
 
-/** Singpass Login: parse encrypted `id_token` only. Myinfo (v5): call `/userinfo` after token exchange. */
+/** Singpass MyInfo is the default flow; login-only id_token parsing is optional for separate app setups. */
 function getSingpassOidcFlow() {
-  const raw = String(process.env.SINGPASS_OIDC_FLOW || 'login').trim().toLowerCase();
-  return raw === 'myinfo' ? 'myinfo' : 'login';
+  const raw = String(process.env.SINGPASS_OIDC_FLOW || 'myinfo').trim().toLowerCase();
+  return raw === 'login' ? 'login' : 'myinfo';
 }
 
 /**
@@ -302,24 +287,6 @@ function singpassIdTokenPayloadToUserinfoShape(payload) {
     ...(nameRaw ? { name: nameRaw } : {}),
     uinfin: idNum || undefined,
   };
-}
-
-/** MyInfo userinfo: email may be string or { value }. */
-function pickSingpassVerifiedEmail(userinfo) {
-  if (!userinfo || typeof userinfo !== 'object') return '';
-  const raw = userinfo.email;
-  if (typeof raw === 'string') return normalizeEmail(raw);
-  if (raw && typeof raw === 'object' && typeof raw.value === 'string') return normalizeEmail(raw.value);
-  // Some Singpass/MyInfo payloads nest email under sub_attributes.email
-  const sa = userinfo.sub_attributes;
-  if (sa && typeof sa === 'object') {
-    const saEmail = sa.email;
-    if (typeof saEmail === 'string') return normalizeEmail(saEmail);
-    if (saEmail && typeof saEmail === 'object' && typeof saEmail.value === 'string') {
-      return normalizeEmail(saEmail.value);
-    }
-  }
-  return '';
 }
 
 function pickSingpassDisplayName(userinfo) {
@@ -454,15 +421,15 @@ function isGovIdConfigured(provider) {
 
 /**
  * Build URL to start OIDC (browser redirect).
- * @param {{ provider: 'mydigital'|'singpass', email: string, frontend: string, returnPath?: string, directSingpass?: boolean }} opts
+ * @param {{ provider: 'mydigital'|'singpass', email: string, frontend: string, returnPath?: string }} opts
  */
 async function buildAuthorizeUrl(opts) {
-  const { provider, email, frontend, returnPath, directSingpass } = opts;
+  const { provider, email, frontend, returnPath } = opts;
   const redirectUri = getRedirectUri();
   if (!redirectUri) throw new Error('REDIRECT_URI_NOT_CONFIGURED');
 
   if (provider === 'singpass') {
-    return buildSingpassAuthorizeUrl({ email, frontend, returnPath, redirectUri, directSingpass: !!directSingpass });
+    return buildSingpassAuthorizeUrl({ email, frontend, returnPath, redirectUri });
   }
 
   const d = await getDiscovery(provider);
@@ -493,7 +460,7 @@ async function buildAuthorizeUrl(opts) {
   return `${d.authorization_endpoint}?${params.toString()}`;
 }
 
-async function buildSingpassAuthorizeUrl({ email, frontend, returnPath, redirectUri, directSingpass }) {
+async function buildSingpassAuthorizeUrl({ email, frontend, returnPath, redirectUri }) {
   cleanupSingpassParSessions();
   const d = await getDiscovery('singpass');
   if (!d.pushed_authorization_request_endpoint) {
@@ -506,10 +473,8 @@ async function buildSingpassAuthorizeUrl({ email, frontend, returnPath, redirect
     loadSingpassDecryptionPrivateKey();
   }
 
-  if (!directSingpass) {
-    const em = normalizeEmail(email);
-    if (!em) throw new Error('NO_EMAIL');
-  }
+  const em = normalizeEmail(email);
+  if (!em) throw new Error('NO_EMAIL');
 
   const signingKey = loadSingpassSigningPrivateKey();
   const audIssuer = String(d.issuer || '').replace(/\/$/, '');
@@ -525,13 +490,12 @@ async function buildSingpassAuthorizeUrl({ email, frontend, returnPath, redirect
   const nonce = crypto.randomUUID();
 
   const scope = String(
-    process.env.SINGPASS_OIDC_SCOPE || 'openid user.identity uinfin name dob mobileno email'
+    process.env.SINGPASS_OIDC_SCOPE || 'openid nric name dob mobileno email'
   ).trim();
 
   singpassParSessions.set(stateId, {
     createdAt: Date.now(),
-    email: directSingpass ? null : normalizeEmail(email),
-    direct: !!directSingpass,
+    email: em,
     frontend: String(frontend || '').replace(/\/$/, ''),
     returnPath: returnPath ? String(returnPath) : '/demologin',
     provider: 'singpass',
@@ -693,33 +657,6 @@ async function assertSubAvailable(column, sub, email) {
   }
 }
 
-async function findPortalEmailByGovSub(provider, sub) {
-  const subVal = String(sub || '').trim();
-  if (!subVal) return '';
-  const column = provider === 'singpass' ? 'singpass_sub' : 'mydigital_sub';
-  const [rows] = await pool.query(
-    `SELECT email FROM portal_account WHERE ${column} = ? LIMIT 1`,
-    [subVal]
-  );
-  const em = rows[0]?.email != null ? String(rows[0].email).trim() : '';
-  return normalizeEmail(em);
-}
-
-async function ensurePortalAccountForEmail(email) {
-  const normalized = normalizeEmail(email);
-  if (!normalized) return { ok: false, reason: 'NO_EMAIL' };
-  const [rows] = await pool.query(
-    'SELECT id FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
-    [normalized]
-  );
-  if (rows.length) return { ok: true, created: false };
-  await pool.query(
-    'INSERT INTO portal_account (id, email, password_hash) VALUES (?, ?, NULL)',
-    [crypto.randomUUID(), normalized]
-  );
-  return { ok: true, created: true };
-}
-
 /**
  * Gov ID 三选一：同一 portal_account 不能同时绑 Singpass 与 MyDigital（及后期 RPV）。
  * RPV 若上线：再在回调里区分 Passport / NRIC；当前 Singpass / MyDigital 由 linkUserinfoToAccount 写死为 NRIC。
@@ -857,7 +794,6 @@ async function handleOAuthCallback({ code, state }) {
       v: 1,
       provider: 'singpass',
       email: parSession.email,
-      direct: !!parSession.direct,
       frontend: parSession.frontend,
       returnPath: parSession.returnPath,
       nonce: parSession.nonce,
@@ -888,7 +824,6 @@ async function handleOAuthCallback({ code, state }) {
 
   let tokens;
   let userinfo;
-  let directLogin = null;
   try {
     if (singpassPar) {
       tokens = await exchangeSingpassCode(code, st);
@@ -922,71 +857,9 @@ async function handleOAuthCallback({ code, state }) {
       userinfo = await fetchUserinfo(st.provider, access);
     }
 
-    let linkEmail = st.email;
-    if (st.provider === 'singpass' && st.direct) {
-      linkEmail = pickSingpassVerifiedEmail(userinfo);
-      if (!linkEmail) {
-        const linkedEmail = await findPortalEmailByGovSub('singpass', userinfo?.sub);
-        if (linkedEmail) {
-          linkEmail = linkedEmail;
-        } else {
-          cleanupGovEmailPendingSessions();
-          const pendingId = base64url(crypto.randomBytes(24));
-          govEmailPendingSessions.set(pendingId, {
-            provider: 'singpass',
-            userinfo,
-            frontend: st.frontend,
-            /** 补邮绑定成功后默认进 portal（与产品主入口一致） */
-            returnPath: '/portal',
-            createdAt: Date.now(),
-          });
-          return {
-            needEmail: true,
-            pendingId,
-            frontend: st.frontend,
-            returnPath: st.returnPath || '/demologin',
-            provider: st.provider,
-            directLogin: null,
-          };
-        }
-      }
-      const ensured = await ensurePortalAccountForEmail(linkEmail);
-      if (!ensured.ok) {
-        const err = new Error(ensured.reason || 'ENSURE_PORTAL_ACCOUNT_FAILED');
-        err.code = ensured.reason || 'ENSURE_PORTAL_ACCOUNT_FAILED';
-        throw err;
-      }
-    }
-
-    if (st.provider === 'singpass' && st.direct) {
-      const [acctRows] = await pool.query(
-        'SELECT id FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
-        [linkEmail]
-      );
-      if (!acctRows.length) {
-        const err = new Error('NO_PORTAL_ACCOUNT');
-        err.code = 'NO_PORTAL_ACCOUNT';
-        throw err;
-      }
-    }
+    const linkEmail = st.email;
 
     await linkUserinfoToAccount(linkEmail, st.provider, userinfo);
-
-    if (st.provider === 'singpass' && st.direct) {
-      const member = await getMemberRoles(linkEmail);
-      const token = signPortalToken({
-        email: linkEmail,
-        roles: member.roles || [],
-        cleanlemons: member.cleanlemons ?? null,
-      });
-      directLogin = {
-        token,
-        nextPath: String(st.returnPath || '/demologin').startsWith('/')
-          ? st.returnPath
-          : '/demologin',
-        email: linkEmail,
-      };
-    }
   } finally {
     if (parSession) singpassParSessions.delete(stateStr);
   }
@@ -996,118 +869,21 @@ async function handleOAuthCallback({ code, state }) {
     frontend: st.frontend,
     returnPath: st.returnPath || '/demologin',
     provider: st.provider,
-    directLogin,
-  };
-}
-
-async function finalizePendingGovSingpassLink(pend, sessionKey, normalized) {
-  try {
-    await linkUserinfoToAccount(normalized, 'singpass', pend.userinfo);
-  } catch (e) {
-    if (e && e.code === 'GOV_ID_SWITCH_REQUIRED') {
-      return { ok: false, reason: 'GOV_ID_SWITCH_REQUIRED' };
-    }
-    if (e && e.code === 'SUB_ALREADY_LINKED') {
-      return { ok: false, reason: 'SUB_ALREADY_LINKED', boundEmail: e.boundEmail };
-    }
-    if (e && e.code === 'NATIONAL_ID_ALREADY_BOUND') {
-      return { ok: false, reason: 'NATIONAL_ID_ALREADY_BOUND', boundEmail: e.boundEmail };
-    }
-    throw e;
-  }
-
-  govEmailPendingSessions.delete(sessionKey);
-
-  const member = await getMemberRoles(normalized);
-  const token = signPortalToken({
-    email: normalized,
-    roles: member.roles || [],
-    cleanlemons: member.cleanlemons ?? null,
-  });
-  const rp = pend.returnPath || '/portal';
-  const nextPath = String(rp).startsWith('/') ? String(rp) : '/portal';
-
-  return {
-    ok: true,
-    token,
-    email: normalized,
-    roles: member.roles || [],
-    nextPath,
   };
 }
 
 /**
- * POST body: { pendingId, email, password? } + optional Bearer JWT（email 与 JWT 一致时免密）— 完成 Singpass direct 无 IdP email 的补绑。
- * OAuth（Google/Facebook）回调传 trustedIdentityEmail（与 email 同）免密。
+ * Legacy pending-email APIs are disabled after removing direct Singpass login flow.
+ * Kept as explicit responses to avoid runtime crashes on stale frontend paths.
  */
-async function completePendingGovEmail({ pendingId, email, password, trustedIdentityEmail }) {
-  cleanupGovEmailPendingSessions();
-  const id = String(pendingId || '').trim();
-  const pend = govEmailPendingSessions.get(id);
-  if (!pend || Date.now() - pend.createdAt > GOV_EMAIL_PENDING_TTL_MS) {
-    return { ok: false, reason: 'PENDING_EXPIRED_OR_INVALID' };
-  }
-  if (pend.provider !== 'singpass') {
-    return { ok: false, reason: 'BAD_PENDING' };
-  }
-
-  const normalized = normalizeEmail(email);
-  if (!normalized) return { ok: false, reason: 'NO_EMAIL' };
-
-  const trusted =
-    trustedIdentityEmail && normalizeEmail(trustedIdentityEmail) === normalized;
-
-  if (trusted) {
-    const [acctRows] = await pool.query(
-      'SELECT id FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
-      [normalized]
-    );
-    if (!acctRows.length) {
-      return { ok: false, reason: 'ACCOUNT_NOT_FOUND' };
-    }
-    return finalizePendingGovSingpassLink(pend, id, normalized);
-  }
-
-  const [acctRows] = await pool.query(
-    'SELECT id FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
-    [normalized]
-  );
-  const hasAcct = acctRows.length > 0;
-  const pwd = typeof password === 'string' ? password : '';
-
-  if (hasAcct) {
-    if (!pwd.trim()) {
-      return { ok: false, reason: 'PASSWORD_REQUIRED' };
-    }
-    const loginRes = await login(normalized, pwd);
-    if (!loginRes.ok) {
-      return { ok: false, reason: loginRes.reason === 'INVALID_CREDENTIALS' ? 'INVALID_CREDENTIALS' : loginRes.reason || 'LOGIN_FAILED' };
-    }
-  } else {
-    if (!pwd.trim()) {
-      return { ok: false, reason: 'NEED_REGISTER' };
-    }
-    const regRes = await register(normalized, pwd);
-    if (!regRes.ok) {
-      if (regRes.reason === 'EMAIL_ALREADY_REGISTERED') {
-        return { ok: false, reason: 'PASSWORD_REQUIRED' };
-      }
-      return { ok: false, reason: regRes.reason || 'REGISTER_FAILED' };
-    }
-  }
-
-  return finalizePendingGovSingpassLink(pend, id, normalized);
+async function completePendingGovEmail() {
+  return { ok: false, reason: 'GOV_PENDING_DISABLED' };
 }
 
-/** demologin 补邮：仅查是否存在 portal_account（供前端分流登录/注册）。 */
 async function lookupPortalEmailForGovPending(email) {
   const normalized = normalizeEmail(email);
   if (!normalized) return { ok: false, reason: 'NO_EMAIL' };
-  const [rows] = await pool.query(
-    'SELECT 1 AS x FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
-    [normalized]
-  );
-  return { ok: true, exists: rows.length > 0 };
+  return { ok: false, reason: 'GOV_PENDING_DISABLED' };
 }
 
 async function disconnectGovId(email, provider) {
