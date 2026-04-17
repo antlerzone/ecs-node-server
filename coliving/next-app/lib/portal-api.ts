@@ -817,10 +817,12 @@ function getDemoMock(path: string, body: object): unknown {
  * 3) Default → api.colivingjb.com directly (CORS required) */
 function getProxyBase(): string {
   if (shouldUseDemoMock()) return "";
-  if (typeof window !== "undefined" && process.env.NEXT_PUBLIC_USE_SAME_ORIGIN_API === "true") {
+  if (process.env.NEXT_PUBLIC_USE_SAME_ORIGIN_API === "true") {
     return "/api";
   }
-  const useProxy = typeof window !== "undefined" && process.env.NEXT_PUBLIC_USE_PROXY === "true";
+  // Do not gate on `window`: SSR must use the same proxy as the browser or requests hit api.colivingjb.com
+  // without ECS apiAuth headers and return 401.
+  const useProxy = process.env.NEXT_PUBLIC_USE_PROXY === "true";
   const base = process.env.NEXT_PUBLIC_ECS_BASE_URL || "https://api.colivingjb.com";
   return useProxy ? "/api/portal/proxy" : `${base.replace(/\/$/, "")}/api`;
 }
