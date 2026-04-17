@@ -11,10 +11,19 @@ export const CLEANLEMON_LIVE_PORTAL_HOST = "portal.cleanlemons.com";
 export const CLEANLEMON_DEMO_HOST = "demo.cleanlemons.com";
 export const CLEANLEMON_LOCAL_API_BASE = "http://localhost:5000";
 
+/** Strip trailing dot, IPv6 brackets (e.g. [::1] → ::1). */
+function normalizeBrowserHostname(hostname: string): string {
+  let h = String(hostname || "").trim().toLowerCase().replace(/\.$/, "");
+  if (h.startsWith("[") && h.endsWith("]")) h = h.slice(1, -1);
+  return h;
+}
+
 /** True for local dev in the browser or in Host header (localhost / 127.0.0.1 / ::1). */
 export function isLocalLoopbackHostname(hostname: string): boolean {
-  const h = hostname.trim().toLowerCase();
-  return h === "localhost" || h === "127.0.0.1" || h === "::1";
+  const h = normalizeBrowserHostname(hostname);
+  if (h === "localhost" || h === "127.0.0.1" || h === "::1") return true;
+  if (h === "0:0:0:0:0:0:0:1") return true;
+  return false;
 }
 
 /** Browser → ECS via portal 同域 /api/（与 Nginx、CLEANLEMON_PORTAL_AUTH_BASE_URL 默认一致）。勿用无效证书的 api 子域。 */
@@ -32,6 +41,10 @@ export function getCleanlemonApiBase(): string {
   }
   if (isLivePortalCleanlemonsBuild()) return DEFAULT_CLEANLEMON_PROD_API;
   if (typeof window !== "undefined" && isLivePortalCleanlemonsHost()) return DEFAULT_CLEANLEMON_PROD_API;
+  // next dev: do not require `window` (some client chunks mishandle `typeof window`); SSR in dev is fine with local API.
+  if (process.env.NODE_ENV === "development") {
+    return fromEnv || CLEANLEMON_LOCAL_API_BASE;
+  }
   return "";
 }
 
@@ -42,6 +55,7 @@ export function getCleanlemonApiBaseForRequest(hostHeader: string | null | undef
   if (isLocalLoopbackHostname(parseRequestHostname(hostHeader))) return CLEANLEMON_LOCAL_API_BASE;
   if (isLivePortalCleanlemonsHostname(hostHeader)) return DEFAULT_CLEANLEMON_PROD_API;
   if (isLivePortalCleanlemonsBuild()) return DEFAULT_CLEANLEMON_PROD_API;
+  if (process.env.NODE_ENV === "development") return CLEANLEMON_LOCAL_API_BASE;
   return "";
 }
 
@@ -76,7 +90,10 @@ export function parseRequestHostname(hostHeader: string | null | undefined): str
   if (!raw) return "";
   // X-Forwarded-Host may list multiple hosts: "client, proxy"
   const first = raw.split(",")[0].trim();
-  // host:port (typical); avoid IPv6 bracket forms in Host for this product
+  if (first.startsWith("[")) {
+    const end = first.indexOf("]");
+    if (end > 1) return first.slice(1, end).trim().toLowerCase();
+  }
   return first.split(":")[0].trim().toLowerCase();
 }
 

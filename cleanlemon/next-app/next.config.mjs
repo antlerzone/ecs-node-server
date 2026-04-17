@@ -15,6 +15,11 @@ const redirectGoogleOAuthToDemoPage = portalAuthMockEnv
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  // Ensure .env.local is visible to client bundles on all platforms (some dev setups omit inlined NEXT_PUBLIC_*).
+  env: {
+    NEXT_PUBLIC_CLEANLEMON_API_URL:
+      process.env.NEXT_PUBLIC_CLEANLEMON_API_URL ?? '',
+  },
   // Monorepo roots; production build uses webpack in package.json (aligned with Coliving portal).
   outputFileTracingRoot: path.join(__dirname, '../..'),
   turbopack: {
