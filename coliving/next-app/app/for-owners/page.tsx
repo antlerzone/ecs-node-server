@@ -5,6 +5,7 @@ import { ArrowRight, TrendingUp, Shield, Clock, Users, Zap, PiggyBank } from "lu
 import { motion } from "framer-motion"
 import { MarketingNavbar } from "@/components/marketing/navbar"
 import { MarketingFooter } from "@/components/marketing/footer"
+import { ForOwnersFaqSection } from "@/components/marketing/for-owners-faq"
 
 const problems = [
   { icon: Clock, title: "Time-Consuming Management", desc: "Manual tenant coordination, maintenance requests, and WhatsApp overload consume hours daily." },
@@ -76,7 +77,7 @@ export default function ForOwnersPage() {
               Get Started <ArrowRight size={16} />
             </Link>
             <Link
-              href="/home"
+              href="/"
               className="inline-flex items-center justify-center gap-2 px-8 py-4 rounded-full text-sm font-bold tracking-widest uppercase border-2"
               style={{ borderColor: "var(--brand)", color: "var(--brand)" }}
             >
@@ -291,6 +292,8 @@ export default function ForOwnersPage() {
           </Link>
         </div>
       </section>
+
+      <ForOwnersFaqSection />
 
       <MarketingFooter />
     </div>

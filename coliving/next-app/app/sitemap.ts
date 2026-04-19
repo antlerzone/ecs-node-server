@@ -19,7 +19,6 @@ const publicPaths = [
   { path: "/privacy-policy", priority: 0.6, changeFrequency: "yearly" as const },
   { path: "/terms-and-conditions", priority: 0.6, changeFrequency: "yearly" as const },
   { path: "/refund-policy", priority: 0.6, changeFrequency: "yearly" as const },
-  { path: "/home", priority: 0.85, changeFrequency: "monthly" as const },
   { path: "/proposal", priority: 0.8, changeFrequency: "monthly" as const },
   { path: "/for-owners", priority: 0.8, changeFrequency: "monthly" as const },
   { path: "/enquiry", priority: 0.8, changeFrequency: "monthly" as const },

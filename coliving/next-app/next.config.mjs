@@ -22,7 +22,7 @@ const nextConfig = {
   },
   async redirects() {
     return [
-      { source: '/', destination: '/login', permanent: true },
+      // / → /login is handled in middleware for portal.* only; www rewrites to /home
       { source: '/homedemo', destination: '/home', permanent: true },
       { source: '/homedemo/:path*', destination: '/home', permanent: true },
       { source: '/availableunit', destination: '/available-unit', permanent: false },

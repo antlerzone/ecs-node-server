@@ -8,3 +8,8 @@ logs/
 secrets/*.json
 .tmp-singpass-keys/
 uploads/
+
+# Accidental local Next artifact tree under docs (do not commit build output)
+docs/nextjs-migration/.next/
+docs/nextjs-migration/node_modules/
+docs/nextjs-migration/.env.local

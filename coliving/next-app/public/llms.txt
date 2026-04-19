@@ -1,0 +1,19 @@
+# Coliving Management (www.colivingjb.com)
+
+# Product
+Coliving Management is a web-based SaaS for coliving and room-by-room rental operators in Malaysia and Singapore: tenant portal, owner portal, operator dashboard, payments (Stripe/Xendit), agreements, smart access, and metered billing.
+
+# Authoritative URLs
+- Home / product: https://www.colivingjb.com/
+- Pricing (operator plans MYR/SGD): https://www.colivingjb.com/pricing
+- B2B enquiry: https://www.colivingjb.com/enquiry
+- Property owners: https://www.colivingjb.com/for-owners
+- Operator proposal: https://www.colivingjb.com/proposal
+- Available units (public listings): https://www.colivingjb.com/available-unit
+
+# Legal
+- Privacy: https://www.colivingjb.com/privacy-policy
+- Terms: https://www.colivingjb.com/terms-and-conditions
+
+# Operator
+ColivingJB Sdn Bhd — Coliving Management platform.

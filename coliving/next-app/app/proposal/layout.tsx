@@ -1,12 +1,15 @@
 import type { Metadata } from "next"
-import { SITE_URL } from "@/lib/seo"
+import { SITE_NAME, SITE_URL } from "@/lib/seo"
+
+const desc =
+  "Request a tailored proposal for Coliving Management: operator SaaS, credits, and integrations for your coliving or room-rental portfolio in Malaysia and Singapore."
 
 export const metadata: Metadata = {
-  title: "Proposal",
-  description:
-    "Request a proposal for Coliving Management operator plans. Get a tailored quote for your property portfolio.",
+  title: "Tailored operator proposal",
+  description: desc,
   openGraph: {
-    title: "Proposal | Coliving Management",
+    title: `Proposal | ${SITE_NAME}`,
+    description: desc,
     url: `${SITE_URL}/proposal`,
   },
   alternates: { canonical: `${SITE_URL}/proposal` },

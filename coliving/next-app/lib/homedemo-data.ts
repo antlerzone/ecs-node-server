@@ -156,7 +156,7 @@ export const HOMEDEMO_SCROLL_SECTIONS: HomedemoSection[] = [
     title: "Apartment to office — one product",
     subtitle: "Rent, leases, access, owner reports, and operator ops in one platform built for Malaysia & Singapore operations.",
     pricingCta: {
-      href: "https://portal.colivingjb.com/pricing",
+      href: "https://www.colivingjb.com/pricing",
       label: "View pricing",
     },
     accent: "from-stone-200/90 to-amber-100/80",

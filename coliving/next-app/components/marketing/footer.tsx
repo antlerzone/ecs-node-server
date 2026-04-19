@@ -3,13 +3,13 @@ import { cn } from "@/lib/utils"
 
 const footerLinks = {
   platform: [
-    { label: "Features", href: "/home#platform-steps" },
+    { label: "Features", href: "/#platform-steps" },
     { label: "Available Unit", href: "/available-unit" },
     { label: "For Operators", href: "/proposal" },
     { label: "For Owners", href: "/for-owners" },
   ],
   company: [
-    { label: "About", href: "/home#about" },
+    { label: "About", href: "/#about" },
     { label: "Contact", href: "/enquiry" },
   ],
   legal: [

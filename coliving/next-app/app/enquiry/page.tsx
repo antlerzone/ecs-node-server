@@ -13,7 +13,8 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import Link from "next/link"
-import { ArrowLeft, CheckCircle, Send, Phone, ExternalLink } from "lucide-react"
+import { ArrowLeft, CheckCircle, Send, Phone, ExternalLink, Menu, X } from "lucide-react"
+import { AnimatePresence, motion } from "framer-motion"
 import { cn } from "@/lib/utils"
 import { EnquirySwapAuthLayout } from "@/components/enquiry-swap-auth-layout"
 import { SlidingSignInPanel } from "@/components/sliding-sign-in-panel"
@@ -42,7 +43,7 @@ import {
 import { submitTicket, getOperatorClientId } from "@/lib/operator-api"
 
 /** 完整方案说明（与 live portal 定价页一致） */
-const PORTAL_PRICING_URL = "https://portal.colivingjb.com/pricing"
+const PORTAL_PRICING_URL = "https://www.colivingjb.com/pricing"
 
 function FullPricingLink({ className }: { className?: string }) {
   return (
@@ -206,6 +207,7 @@ function EnquiryPageInner() {
     units: "",
   })
 
+  const [enquiryNavOpen, setEnquiryNavOpen] = useState(false)
   const [legacySubmitted, setLegacySubmitted] = useState(false)
   /** Step 3：demo 或付費；MYR / SGD → 平台 Xendit（FPX 或 Session / v3 卡） */
   const [pathChoice, setPathChoice] = useState<null | "demo" | "paid">(null)
@@ -727,31 +729,105 @@ function EnquiryPageInner() {
 
   return (
     <div className="flex min-h-[100dvh] flex-col bg-background">
-      <header className="shrink-0 border-b border-border bg-card px-4 sm:px-8 py-4 flex items-center justify-between">
-        <div className="flex flex-col leading-tight">
-          <span className="text-lg font-bold tracking-widest text-primary uppercase">Coliving</span>
-          <span className="text-[10px] tracking-[0.3em] text-muted-foreground uppercase">Management</span>
-        </div>
-        <div className="flex items-center gap-4 flex-wrap">
-          <Link href="/pricing" className="text-xs font-semibold tracking-widest uppercase text-muted-foreground hover:text-primary transition-colors">
-            Pricing
+      <header className="shrink-0 border-b border-border bg-card z-20">
+        <div className="flex items-center justify-between gap-3 px-4 sm:px-8 py-3 sm:py-4">
+          <Link href="/" className="flex flex-col leading-tight min-w-0 text-left">
+            <span className="text-lg font-bold tracking-widest text-primary uppercase truncate">Coliving</span>
+            <span className="text-[10px] tracking-[0.3em] text-muted-foreground uppercase">Management</span>
           </Link>
-          <Link href="/privacy-policy" className="text-xs font-semibold tracking-widest uppercase text-muted-foreground hover:text-primary transition-colors">
-            Privacy Policy
-          </Link>
-          <Link href="/enquiry?mode=signup" className="text-xs font-semibold tracking-widest uppercase text-muted-foreground hover:text-primary transition-colors">
-            Sign up
-          </Link>
-          <Link href="/enquiry" className="text-xs font-semibold tracking-widest uppercase text-muted-foreground hover:text-primary transition-colors">
-            Sign in
-          </Link>
-          <a
-            href="https://www.colivingjb.com"
-            className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
+          <nav className="hidden md:flex items-center gap-5 flex-wrap justify-end">
+            <Link
+              href="/pricing"
+              className="text-xs font-semibold tracking-widest uppercase text-muted-foreground hover:text-primary transition-colors"
+            >
+              Pricing
+            </Link>
+            <Link
+              href="/privacy-policy"
+              className="text-xs font-semibold tracking-widest uppercase text-muted-foreground hover:text-primary transition-colors"
+            >
+              Privacy Policy
+            </Link>
+            <Link
+              href="/enquiry?mode=signup"
+              className="text-xs font-semibold tracking-widest uppercase text-muted-foreground hover:text-primary transition-colors"
+            >
+              Sign up
+            </Link>
+            <Link
+              href="/enquiry"
+              className="text-xs font-semibold tracking-widest uppercase text-muted-foreground hover:text-primary transition-colors"
+            >
+              Sign in
+            </Link>
+            <a
+              href="https://www.colivingjb.com"
+              className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
+            >
+              <ArrowLeft size={14} aria-hidden /> Back to Home
+            </a>
+          </nav>
+          <button
+            type="button"
+            className="md:hidden p-2 -mr-2 rounded-lg hover:bg-muted/80"
+            aria-expanded={enquiryNavOpen}
+            aria-controls="enquiry-mobile-nav"
+            aria-label={enquiryNavOpen ? "Close menu" : "Open menu"}
+            onClick={() => setEnquiryNavOpen((o) => !o)}
           >
-            <ArrowLeft size={14} /> Back to Home
-          </a>
+            {enquiryNavOpen ? <X size={22} /> : <Menu size={22} />}
+          </button>
         </div>
+        <AnimatePresence>
+          {enquiryNavOpen ? (
+            <motion.nav
+              id="enquiry-mobile-nav"
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: "auto" }}
+              exit={{ opacity: 0, height: 0 }}
+              transition={{ duration: 0.2 }}
+              className="md:hidden border-t border-border bg-card overflow-hidden"
+            >
+              <div className="px-4 pb-4 pt-1 flex flex-col gap-0.5">
+                <Link
+                  href="/pricing"
+                  onClick={() => setEnquiryNavOpen(false)}
+                  className="text-sm font-semibold tracking-widest uppercase text-foreground hover:bg-muted/70 rounded-xl px-3 py-3"
+                >
+                  Pricing
+                </Link>
+                <Link
+                  href="/privacy-policy"
+                  onClick={() => setEnquiryNavOpen(false)}
+                  className="text-sm font-semibold tracking-widest uppercase text-foreground hover:bg-muted/70 rounded-xl px-3 py-3"
+                >
+                  Privacy Policy
+                </Link>
+                <Link
+                  href="/enquiry?mode=signup"
+                  onClick={() => setEnquiryNavOpen(false)}
+                  className="text-sm font-semibold tracking-widest uppercase text-foreground hover:bg-muted/70 rounded-xl px-3 py-3"
+                >
+                  Sign up
+                </Link>
+                <Link
+                  href="/enquiry"
+                  onClick={() => setEnquiryNavOpen(false)}
+                  className="text-sm font-semibold tracking-widest uppercase text-foreground hover:bg-muted/70 rounded-xl px-3 py-3"
+                >
+                  Sign in
+                </Link>
+                <a
+                  href="https://www.colivingjb.com"
+                  onClick={() => setEnquiryNavOpen(false)}
+                  className="inline-flex items-center gap-2 text-sm font-medium text-muted-foreground hover:text-foreground rounded-xl px-3 py-3"
+                >
+                  <ArrowLeft size={14} aria-hidden /> Back to Home
+                </a>
+              </div>
+            </motion.nav>
+          ) : null}
+        </AnimatePresence>
       </header>
 
       {showLiveFlow && !jwtReady ? (

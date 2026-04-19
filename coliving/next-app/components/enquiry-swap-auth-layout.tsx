@@ -80,7 +80,7 @@ export function EnquirySwapAuthLayout({
             Create account
           </button>
         </div>
-        <div className="w-full shrink-0 bg-background px-4 py-8">
+        <div className="w-full shrink-0 bg-background px-4 py-6 sm:py-8">
           <div className="w-full max-w-[360px] mx-auto">{page === "signin" ? signIn : signUp}</div>
         </div>
       </div>

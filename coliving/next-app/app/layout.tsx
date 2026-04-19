@@ -38,7 +38,6 @@ export const metadata: Metadata = {
   openGraph: {
     ...defaultOpenGraph,
     title: `${SITE_NAME} | Tenant & Owner Portal`,
-    // Add images: [{ url: '/og-portal.png', width: 1200, height: 630, alt: SITE_NAME }] when you have the asset in public/
   },
   twitter: {
     ...defaultTwitter,
@@ -57,6 +56,13 @@ export const metadata: Metadata = {
     apple: '/apple-icon-cm.png',
   },
   alternates: { canonical: SITE_URL },
+  ...(process.env.NEXT_PUBLIC_GOOGLE_SITE_VERIFICATION
+    ? {
+        verification: {
+          google: process.env.NEXT_PUBLIC_GOOGLE_SITE_VERIFICATION,
+        },
+      }
+    : {}),
 }
 
 export default function RootLayout({
