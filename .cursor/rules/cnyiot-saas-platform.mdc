@@ -16,9 +16,9 @@ alwaysApply: true
 
 ## 代码约定
 
-1. **加表到 CNYIoT**：`insertMeters` → `meterWrapper.addMeters` — `addMeter` / `link2User` **必须用母账号 token**（`usePlatformAccount: true`），再把表 `link2User` 到该公司的 `UserID = station_index`。勿改成「仅用租客 token 完成加表」。
-2. **日常 API**：`callCnyIot` 默认 `usePlatformAccount: false` 时使用 **client_integration 里存的平台代创登录**（`cnyiot_subuser_login` 等），用于部分指令；**sync / getMetStatus** 等常用 **母账号**。新增 **setRelay / 断电通电** 路径时，与 `metersetting.updateMeterStatus` 一致：**子账号失败后应用母账号重试**（见 `src/modules/metersetting/metersetting.service.js`、欠租路径 `tenancy-active.service.js`）。
-3. **术语**：`cnyiot_subuser_id` / `ensureClientCnyiotSubuser` = CNYIoT 平台上由 **母账号 API** 创建的租客，用于分组与 link；**不要**在文档里写成「Operator 子账号」与「母账号」两套无关体系。
+1. **`callCnyIot`（[`cnyiotRequest.js`](src/modules/cnyiot/wrappers/cnyiotRequest.js)）默认 `usePlatformAccount: true`**：所有 CNYIoT HTTP 调用一律用 **env 母账号**（`CNYIOT_LOGIN_NAME` / `CNYIOT_LOGIN_PSW`），除非显式传入 `usePlatformAccount: false`（**禁止**在新功能中使用；仅保留供极端排障）。
+2. **加表**：`insertMeters` → `addMeter` / `link2User` 在母账号下执行，再把表挂到该公司的 **station_index**（`UserID`）。勿改成「仅用租客 token 加表」。
+3. **术语**：`cnyiot_subuser_id` / `ensureClientCnyiotSubuser` = 平台在母账号下创建的 **CNY 租客**，用于分组与 link；本地仍存 `cnyiot_subuser_login` 等供审计/历史，**不是**让 API 默认改走租客登录。
 
 ## 参考文件
 

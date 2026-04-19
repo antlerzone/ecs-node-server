@@ -22,7 +22,7 @@ This is a monorepo with **two products** served from a single Express backend:
 
 All three share a single **MySQL** database. The backend serves Coliving routes at `/api/*` and Cleanlemons routes at `/api/cleanlemon/*`.
 
-**CNYIoT (Coliving smart meters):** Platform-only meter integration (env mother account + platform-created tenant per operator; operators do not connect their own CNY master account). See `.cursor/rules/cnyiot-saas-platform.mdc`.
+**CNYIoT (Coliving smart meters):** Platform-only meter integration; `callCnyIot` defaults to the env mother account for all API calls. See `.cursor/rules/cnyiot-saas-platform.mdc`.
 
 ### Source control (GitHub)
 

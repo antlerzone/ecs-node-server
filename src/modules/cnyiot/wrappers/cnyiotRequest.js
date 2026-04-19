@@ -15,10 +15,11 @@ const CNYIOT_FETCH_TIMEOUT_MS = Number(process.env.CNYIOT_FETCH_TIMEOUT_MS) || 2
 /**
  * Call CNYIoT API.
  * @param {{ clientId: string, method: string, body?: object, retry?: boolean, usePlatformAccount?: boolean }} opts
- * usePlatformAccount: use Secret Manager 母账号 (CNYIOT_LOGIN_NAME, CNYIOT_LOGIN_PSW) for addUser/getUsers when creating subuser.
+ * usePlatformAccount: default **true** — env 母账号 (CNYIOT_LOGIN_NAME / CNYIOT_LOGIN_PSW)。SaaS 下所有 Operator 的电表均在母账号体系。
+ * 仅当显式传入 `usePlatformAccount: false` 时用 client_integration 代创租客登录（一般不应使用）。
  * @returns {Promise<object>} - JSON response; if opts.returnPayloads then { result, requestPayload, responsePayload }
  */
-async function callCnyIot({ clientId, method, body = {}, retry = false, usePlatformAccount = false, returnPayloads = false }) {
+async function callCnyIot({ clientId, method, body = {}, retry = false, usePlatformAccount = true, returnPayloads = false }) {
   if (!clientId) throw new Error('CLIENT_ID_REQUIRED');
   if (!method) throw new Error('METHOD_REQUIRED');
 

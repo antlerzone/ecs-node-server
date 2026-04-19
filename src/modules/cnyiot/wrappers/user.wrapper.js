@@ -6,13 +6,12 @@
 
 const { callCnyIot } = require('./cnyiotRequest');
 
-/** §10 获取租客列表。opts.usePlatformAccount=true 时用母账号 token。opts.returnPayloads=true 时返回 { result, requestPayload, responsePayload }. */
+/** §10 获取租客列表。默认母账号 token。opts.returnPayloads=true 时返回 { result, requestPayload, responsePayload }. */
 async function getUsers(clientId, opts = {}) {
   return callCnyIot({
     clientId,
     method: 'getUsers',
     body: {},
-    usePlatformAccount: !!opts.usePlatformAccount,
     returnPayloads: !!opts.returnPayloads
   });
 }
@@ -32,7 +31,6 @@ async function addUser(clientId, payload, opts = {}) {
     clientId,
     method: 'addUser',
     body,
-    usePlatformAccount: !!opts.usePlatformAccount,
     returnPayloads: !!opts.returnPayloads
   });
 }
@@ -51,16 +49,15 @@ async function editUser(clientId, payload) {
   });
 }
 
-/** §21 电表绑定租客。UserID=0 表示解绑。opts.usePlatformAccount=true 时用主账号调用（addMeter 后绑定用）。 */
-async function link2User(clientId, meterId, userId, opts = {}) {
+/** §21 电表绑定租客。UserID=0 表示解绑。默认母账号（addMeter 后绑定）。 */
+async function link2User(clientId, meterId, userId) {
   return callCnyIot({
     clientId,
     method: 'link2User',
     body: {
       MeterID: String(meterId),
       UserID: String(userId ?? 0)
-    },
-    usePlatformAccount: !!opts.usePlatformAccount
+    }
   });
 }
 
@@ -100,8 +97,8 @@ async function editPsw(clientId, payload) {
   });
 }
 
-/** §5 修改登入信息。na=昵称，te=电话，ps=登入密码。主账号调时若平台支持可带 uI=租客 Station_index 指定要改的租客。 */
-async function editLogin(clientId, payload, opts = {}) {
+/** §5 修改登入信息。na=昵称，te=电话，ps=登入密码。母账号；可带 uI=租客 Station_index。 */
+async function editLogin(clientId, payload) {
   const body = {};
   if (payload.na != null && String(payload.na).trim() !== '') body.na = String(payload.na).trim();
   if (payload.te != null && String(payload.te).trim() !== '') body.te = String(payload.te).trim();
@@ -111,8 +108,7 @@ async function editLogin(clientId, payload, opts = {}) {
   return callCnyIot({
     clientId,
     method: 'editLogin',
-    body,
-    usePlatformAccount: !!opts.usePlatformAccount
+    body
   });
 }
 

@@ -120,12 +120,7 @@ async function syncMeterByCmsMeterId(clientId, meterId) {
       await meterWrapper.setRelay(clientId, metidToUse, 1);
       console.log('[sync] setRelay Val=1 (disconnect) OK for prepaid zero balance metid=%s', metidToUse);
     } catch (e) {
-      try {
-        await meterWrapper.setRelay(clientId, metidToUse, 1, { usePlatformAccount: true });
-        console.log('[sync] setRelay Val=1 (platform retry) OK metid=%s', metidToUse);
-      } catch (e2) {
-        console.warn('[sync] setRelay disconnect for zero balance failed', metidToUse, e?.message || e, e2?.message || e2);
-      }
+      console.warn('[sync] setRelay disconnect for zero balance failed', metidToUse, e?.message || e);
     }
   }
 

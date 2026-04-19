@@ -130,13 +130,12 @@ async function ensureClientCnyiotSubuser(clientId, opts = {}) {
 
   const telStr = (opts.tel != null && String(opts.tel).trim() !== '') ? String(opts.tel).trim() : (process.env.CNYIOT_SUBUSER_DEFAULT_TEL || '0');
   let loginName = subdomainBase;
-  const platformOpts = { usePlatformAccount: true };
   let addRes;
   for (let suffix = 0; suffix <= 99; suffix++) {
     const tryName = suffix === 0 ? subdomainBase : `${subdomainBase}${suffix}`;
     const addT0 = Date.now();
     console.log('[ensureClientCnyiotSubuser] addUser tryName=%s suffix=%s tel=%s', tryName, suffix, telStr ? '***' : '');
-    addRes = await userWrapper.addUser(clientId, { uN: tryName, uI: tryName, tel: telStr }, platformOpts);
+    addRes = await userWrapper.addUser(clientId, { uN: tryName, uI: tryName, tel: telStr });
     console.log('[ensureClientCnyiotSubuser] addUser done tryName=%s result=%s value=%j ms=%s', tryName, addRes && addRes.result, addRes && addRes.value, Date.now() - addT0);
     if (addRes.result === 200 || addRes.result === 0) {
       loginName = tryName;
@@ -150,7 +149,7 @@ async function ensureClientCnyiotSubuser(clientId, opts = {}) {
 
   const getUsersT0 = Date.now();
   console.log('[ensureClientCnyiotSubuser] getUsers start');
-  const listRes = await userWrapper.getUsers(clientId, platformOpts);
+  const listRes = await userWrapper.getUsers(clientId);
   const list = listRes?.value || [];
   console.log('[ensureClientCnyiotSubuser] getUsers done list.length=%s ms=%s', list.length, Date.now() - getUsersT0);
   const loginLower = loginName.toLowerCase();
@@ -173,7 +172,7 @@ async function ensureClientCnyiotSubuser(clientId, opts = {}) {
   const passwordToStore = (typeof passwordFromApi === 'string' && passwordFromApi) ? passwordFromApi : DEFAULT_SUBUSER_PASSWORD;
   if (!passwordFromApi) {
     try {
-      const editLoginRes = await userWrapper.editLogin(clientId, { uI: String(stationIndex), ps: passwordToStore }, platformOpts);
+      const editLoginRes = await userWrapper.editLogin(clientId, { uI: String(stationIndex), ps: passwordToStore });
       console.log('[ensureClientCnyiotSubuser] editLogin result=%s', editLoginRes?.result);
     } catch (e) {
       console.warn('[ensureClientCnyiotSubuser] editLogin failed (platform may not support uI/ps)', e.message);

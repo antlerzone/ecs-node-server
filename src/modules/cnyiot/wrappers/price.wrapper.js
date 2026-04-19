@@ -4,28 +4,21 @@
 
 const { callCnyIot } = require('./cnyiotRequest');
 
-/** @param {string} clientId
- *  @param {{ usePlatformAccount?: boolean }} [opts]
- */
-async function getPrices(clientId, opts = {}) {
+/** @param {string} clientId */
+async function getPrices(clientId) {
   return callCnyIot({
     clientId,
     method: 'getPrices',
-    body: { offset: -1, limit: -1, ptype: 1 },
-    usePlatformAccount: !!opts.usePlatformAccount
+    body: { offset: -1, limit: -1, ptype: 1 }
   });
 }
 
-/** @param {string} clientId
- *  @param {object} price
- *  @param {{ usePlatformAccount?: boolean }} [opts]
- */
-async function addPrice(clientId, price, opts = {}) {
+/** @param {string} clientId @param {object} price */
+async function addPrice(clientId, price) {
   return callCnyIot({
     clientId,
     method: 'addPrice',
-    body: price,
-    usePlatformAccount: !!opts.usePlatformAccount
+    body: price
   });
 }
 

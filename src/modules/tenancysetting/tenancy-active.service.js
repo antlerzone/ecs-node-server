@@ -292,7 +292,7 @@ async function getLockAndMeterFromTenancy(tenancyId, options = {}) {
  * @returns {Promise<{ parentLockId: number, parentLockDetailId: string }|null>}
  */
 /**
- * CNYIoT setRelay for tenancy inactive/active: operator first, then platform (same pattern as metersetting.updateMeterStatus).
+ * CNYIoT setRelay for tenancy inactive/active (母账号，见 callCnyIot 默认)。
  * @returns {Promise<boolean>} true if API accepted the command
  */
 async function setRelayForTenancy(clientId, platformMeterId, val) {
@@ -303,20 +303,8 @@ async function setRelayForTenancy(clientId, platformMeterId, val) {
     await meterWrapper.setRelay(clientId, mid, val);
     return true;
   } catch (err) {
-    try {
-      await meterWrapper.setRelay(clientId, mid, val, { usePlatformAccount: true });
-      console.log('[tenancy-active] setRelay val=%s (platform) OK meterId=%s', val, mid);
-      return true;
-    } catch (err2) {
-      console.warn(
-        '[tenancy-active] setRelay failed val=%s meterId=%s',
-        val,
-        mid,
-        err?.message || err,
-        err2?.message || err2
-      );
-      return false;
-    }
+    console.warn('[tenancy-active] setRelay failed val=%s meterId=%s', val, mid, err?.message || err);
+    return false;
   }
 }
 

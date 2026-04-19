@@ -1255,7 +1255,7 @@ async function doCnyIotRechargeForTenantMeter(clientId, tenancyId, amountRm) {
       e1 = err;
     }
     try {
-      await meterWrapper.setRelay(clientId, platformMeterId, 2, { usePlatformAccount: true });
+      await meterWrapper.setRelay(clientId, platformMeterId, 2);
       console.log('[doCnyIotRecharge] setRelay Val=2 (platform) OK after topup metid=%s', platformMeterId);
       break;
     } catch (err) {

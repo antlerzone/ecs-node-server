@@ -1284,7 +1284,7 @@ async function getCnyiotUsers(email, opts = {}) {
   await requireCtx(email, ['integration', 'admin']);
   const userWrapper = require('../cnyiot/wrappers/user.wrapper');
   const clientId = 'platform';
-  const res = await userWrapper.getUsers(clientId, { usePlatformAccount: true, returnPayloads: !!opts.debug });
+  const res = await userWrapper.getUsers(clientId, { returnPayloads: !!opts.debug });
   if (opts.debug && res && res.requestPayload != null) {
     const list = res.result?.value || [];
     return {
@@ -1313,7 +1313,7 @@ async function createCnyiotUser(email, { loginName, password, tel } = {}) {
     uN: loginName,
     tel: telStr,
     psw: password
-  }, { usePlatformAccount: true, returnPayloads: true });
+  }, { returnPayloads: true });
   if (res && res.requestPayload != null) {
     return {
       ok: true,

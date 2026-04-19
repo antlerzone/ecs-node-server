@@ -1,6 +1,6 @@
 /**
  * CNYIoT Meter API wrapper (SaaS – per client).
- * All methods use callCnyIot; tel from client_profile.
+ * callCnyIot 默认母账号；addMeter 内 Tel 等仍用 client_profile 联系人。
  */
 
 const { callCnyIot } = require('./cnyiotRequest');
@@ -82,7 +82,7 @@ async function addMeters(clientId, meters) {
         if (mid) {
           try {
             console.log('[CNYIOT] addMeters 4) link2User (platform) MeterID=%s UserID=%s', mid, subuserId);
-            await userWrapper.link2User(clientId, mid, subuserId, platformOpts);
+            await userWrapper.link2User(clientId, mid, subuserId);
             console.log('[CNYIOT] addMeters link2User OK MeterID=%s', mid);
           } catch (e) {
             console.warn('[addMeters] link2User skip', mid, e.message);
@@ -157,22 +157,19 @@ async function deleteMeters(clientId, meterIds) {
   });
 }
 
-/** @param {{ usePlatformAccount?: boolean }} [opts] */
-async function editMeterSafe(clientId, { meterId, meterName, priceId }, opts = {}) {
-  const usePlatform = !!opts.usePlatformAccount;
-  const tel = usePlatform ? '0' : (await getClientTel(clientId));
+async function editMeterSafe(clientId, { meterId, meterName, priceId }) {
   const payload = {
     MeterID: String(meterId),
     MeterName: meterName,
     PriceID: String(priceId),
-    Tel: tel || '0',
+    Tel: '0',
     warmKwh: '0',
     Remarks: '',
     UserID: '0',
     sellMin: '0'
   };
-  console.log('[editMeterSafe] clientId=%s usePlatformAccount=%s payload=%j', clientId, usePlatform, payload);
-  const res = await callCnyIot({ clientId, method: 'editMeter', body: payload, usePlatformAccount: usePlatform });
+  console.log('[editMeterSafe] clientId=%s (platform) payload=%j', clientId, payload);
+  const res = await callCnyIot({ clientId, method: 'editMeter', body: payload, usePlatformAccount: true });
   console.log('[editMeterSafe] editMeter result=%s', res?.result);
   if (res?.result !== 0 && res?.result !== 200) {
     throw new Error(`EDIT_METER_FAILED_${res?.result}`);
@@ -181,13 +178,14 @@ async function editMeterSafe(clientId, { meterId, meterName, priceId }, opts = {
 }
 
 /* ---------- CONTROL ---------- */
-/** setRelay: Val 2 = connect (power on), Val 1 = disconnect (power off). */
+/** setRelay: Val 2 = connect (power on), Val 1 = disconnect (power off). 始终母账号。 */
 async function setRelay(clientId, meterId, val = 2, opts = {}) {
   const json = await callCnyIot({
     clientId,
     method: 'setRelay',
     body: { MetID: String(meterId), Val: String(val), iswifi: '1' },
-    ...opts
+    ...opts,
+    usePlatformAccount: true
   });
   const r = json?.result;
   const ok = r === 0 || r === 200 || r === '0' || r === '200';
@@ -204,7 +202,8 @@ async function setPowerGate(clientId, meterId, value) {
   return callCnyIot({
     clientId,
     method: 'setPowerGate',
-    body: { MetID: String(meterId), Val: String(value), iswifi: '1' }
+    body: { MetID: String(meterId), Val: String(value), iswifi: '1' },
+    usePlatformAccount: true
   });
 }
 
@@ -212,7 +211,8 @@ async function setRatio(clientId, meterId, ratio) {
   return callCnyIot({
     clientId,
     method: 'setRatio',
-    body: { MetID: String(meterId), Ratio: String(ratio), iswifi: '1' }
+    body: { MetID: String(meterId), Ratio: String(ratio), iswifi: '1' },
+    usePlatformAccount: true
   });
 }
 
@@ -258,8 +258,8 @@ async function clearKwh(clientId, platformMeterId, opts = {}) {
     clientId,
     method: 'clearKwh',
     body: { metid: mid, MetID: mid, iswifi: '1' },
-    usePlatformAccount: true,
-    ...opts
+    ...opts,
+    usePlatformAccount: true
   });
 }
 
@@ -375,32 +375,30 @@ async function resolvePriceIdByRate(clientId, rate) {
 
 /**
  * Get PriceID for rate: getPrices, find Price === rate. If not in list, create price (addPrice) then return new PriceID.
- * @param {{ usePlatformAccount?: boolean }} [opts]
  */
-async function resolveOrCreatePriceIdByRate(clientId, rate, opts = {}) {
+async function resolveOrCreatePriceIdByRate(clientId, rate) {
   const priceValue = Number(rate);
   if (Number.isNaN(priceValue) || priceValue <= 0) throw new Error('INVALID_RATE');
-  const platformOpts = opts.usePlatformAccount ? { usePlatformAccount: true } : {};
 
-  const pricesRes = await getPrices(clientId, platformOpts);
+  const pricesRes = await getPrices(clientId);
   const prices = Array.isArray(pricesRes?.value) ? pricesRes.value : [];
   const existing = prices.find(p => (Number(p.priceType) === 1 || p.priceType == null) && Number(p.Price) === priceValue);
   if (existing && (existing.PriceID != null || existing.priceId != null)) {
     return String(existing.PriceID ?? existing.priceId);
   }
 
-  console.log('[resolveOrCreatePriceIdByRate] rate=%s not in list, creating price usePlatformAccount=%s', priceValue, !!opts.usePlatformAccount);
+  console.log('[resolveOrCreatePriceIdByRate] rate=%s not in list, creating price', priceValue);
   const addRes = await addPrice(clientId, {
     PriceName: `${priceValue}/kwhz`,
     Price: priceValue,
     Pnote: '',
     priceType: 1
-  }, platformOpts);
+  });
   const newId = addRes?.value?.PriceID ?? addRes?.value?.priceId ?? addRes?.value?.[0]?.PriceID ?? addRes?.value?.[0]?.priceId;
   if (newId != null) {
     return String(newId);
   }
-  const pricesRes2 = await getPrices(clientId, platformOpts);
+  const pricesRes2 = await getPrices(clientId);
   const prices2 = Array.isArray(pricesRes2?.value) ? pricesRes2.value : [];
   const created = prices2.find(p => (Number(p.priceType) === 1 || p.priceType == null) && Number(p.Price) === priceValue);
   if (created && (created.PriceID != null || created.priceId != null)) {
@@ -412,20 +410,18 @@ async function resolveOrCreatePriceIdByRate(clientId, rate, opts = {}) {
 /**
  * Update meter rate on CNYIOT: editMeter(PriceID + MeterName).
  * currentMeterName: editMeter 的 MeterName；metersetting 传 client subdomain only（非 Portal title）。
- * usePlatformAccount: true = use main account token (no client_integration required).
  */
-async function updateMeterNameAndRate(clientId, { meterId, currentMeterName, rate, usePlatformAccount = false }) {
+async function updateMeterNameAndRate(clientId, { meterId, currentMeterName, rate }) {
   if (!clientId || !meterId) throw new Error('CLIENT_OR_METER_REQUIRED');
 
   const priceValue = Number(rate);
   if (Number.isNaN(priceValue) || priceValue <= 0) throw new Error('INVALID_RATE');
 
-  const opts = usePlatformAccount ? { usePlatformAccount: true } : {};
-  const priceId = await resolveOrCreatePriceIdByRate(clientId, rate, opts);
+  const priceId = await resolveOrCreatePriceIdByRate(clientId, rate);
   const meterName = (currentMeterName != null && String(currentMeterName).trim() !== '') ? String(currentMeterName).trim() : '';
 
-  console.log('[updateMeterNameAndRate] editMeterSafe meterId=%s meterName=%s priceId=%s usePlatformAccount=%s', meterId, meterName, priceId, usePlatformAccount);
-  await editMeterSafe(clientId, { meterId, meterName, priceId }, opts);
+  console.log('[updateMeterNameAndRate] editMeterSafe meterId=%s meterName=%s priceId=%s', meterId, meterName, priceId);
+  await editMeterSafe(clientId, { meterId, meterName, priceId });
   return { ok: true, rate: priceValue, priceId };
 }
 

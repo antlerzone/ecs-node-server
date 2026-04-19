@@ -244,8 +244,7 @@ async function updateMeter(clientId, meterId, data) {
           await meterWrapper.updateMeterNameAndRate(clientId, {
             meterId: platformMeterId,
             currentMeterName: cnyiotMeterName,
-            rate,
-            usePlatformAccount: true
+            rate
           });
           console.log('[updateMeter] updateMeterNameAndRate OK (CNYIOT MeterName=subdomain only: %s)', cnyiotMeterName);
         }
@@ -853,21 +852,14 @@ async function updateMeterStatus(clientId, meterId, status) {
   const platformMeterId = row.meterid ? String(row.meterid).trim() : '';
   let relayOk = !platformMeterId;
   if (platformMeterId) {
-    // CNYIOT setRelay (per operator UI): Active ON → Val 2 connect, OFF → Val 1 disconnect
     const val = status ? 2 : 1;
     try {
       await meterWrapper.setRelay(clientId, platformMeterId, val);
       relayOk = true;
       console.log('[updateMeterStatus] setRelay clientId=%s meterId=%s status=%s val=%s', clientId, platformMeterId, status, val);
     } catch (e) {
-      try {
-        await meterWrapper.setRelay(clientId, platformMeterId, val, { usePlatformAccount: true });
-        relayOk = true;
-        console.log('[updateMeterStatus] setRelay (platform) OK meterId=%s', platformMeterId);
-      } catch (e2) {
-        relayOk = false;
-        console.warn('[updateMeterStatus] setRelay failed (DB already updated)', clientId, platformMeterId, e?.message || e, e2?.message || e2);
-      }
+      relayOk = false;
+      console.warn('[updateMeterStatus] setRelay failed (DB already updated)', clientId, platformMeterId, e?.message || e);
     }
   }
 
@@ -887,22 +879,12 @@ async function updateMeterStatus(clientId, meterId, status) {
 
 /**
  * After prepaid top-up with positive kWh balance: ensure Active ON + setRelay Val=2 (通电).
- * If first setRelay fails, retries with usePlatformAccount (same pattern as updateMeterStatus).
  */
 async function connectRelayAfterPrepaidTopupIfHasBalance(clientId, meterCmsId, platformMid, newBal) {
   if (!platformMid || newBal <= 0) {
     return { ok: true, relayOk: true, skipped: true, hint: 'SKIP_NO_BALANCE', balance: newBal, mode: 'prepaid' };
   }
-  const st = await updateMeterStatus(clientId, meterCmsId, true);
-  if (st.relayOk) return st;
-  try {
-    await meterWrapper.setRelay(clientId, platformMid, 2, { usePlatformAccount: true });
-    console.log('[prepaid topup] setRelay Val=2 platform retry OK meter=%s', platformMid);
-    return { ok: true, relayOk: true, hint: st.hint, balance: st.balance, mode: st.mode };
-  } catch (e2) {
-    console.warn('[prepaid topup] setRelay Val=2 platform retry failed', platformMid, e2?.message || e2);
-    return st;
-  }
+  return updateMeterStatus(clientId, meterCmsId, true);
 }
 
 /**
