@@ -291,6 +291,35 @@ async function getLockAndMeterFromTenancy(tenancyId, options = {}) {
  * Find parent lock of a lockdetail (lock that has this one in childmeter).
  * @returns {Promise<{ parentLockId: number, parentLockDetailId: string }|null>}
  */
+/**
+ * CNYIoT setRelay for tenancy inactive/active: operator first, then platform (same pattern as metersetting.updateMeterStatus).
+ * @returns {Promise<boolean>} true if API accepted the command
+ */
+async function setRelayForTenancy(clientId, platformMeterId, val) {
+  if (!clientId || !platformMeterId) return true;
+  const mid = String(platformMeterId).trim();
+  if (!mid) return true;
+  try {
+    await meterWrapper.setRelay(clientId, mid, val);
+    return true;
+  } catch (err) {
+    try {
+      await meterWrapper.setRelay(clientId, mid, val, { usePlatformAccount: true });
+      console.log('[tenancy-active] setRelay val=%s (platform) OK meterId=%s', val, mid);
+      return true;
+    } catch (err2) {
+      console.warn(
+        '[tenancy-active] setRelay failed val=%s meterId=%s',
+        val,
+        mid,
+        err?.message || err,
+        err2?.message || err2
+      );
+      return false;
+    }
+  }
+}
+
 async function getParentLockForLockDetail(clientId, lockDetailId) {
   if (!clientId || !lockDetailId) return null;
   const [rows] = await pool.query(
@@ -663,10 +692,16 @@ async function setTenancyInactive(tenancyId) {
   }
 
   if (info.cnyiotMeterId) {
-    try {
-      await meterWrapper.setRelay(info.clientId, info.cnyiotMeterId, 1);
-    } catch (err) {
-      console.warn('[tenancy-active] setRelay disconnect failed', tenancyId, err.message);
+    const relayOk = await setRelayForTenancy(info.clientId, info.cnyiotMeterId, 1);
+    if (relayOk) {
+      try {
+        await pool.query(
+          'UPDATE meterdetail SET status = 0, updated_at = NOW() WHERE client_id = ? AND meterid = ?',
+          [info.clientId, String(info.cnyiotMeterId).trim()]
+        );
+      } catch (e) {
+        console.warn('[tenancy-active] meterdetail status OFF after disconnect failed', tenancyId, e.message);
+      }
     }
   }
 
@@ -735,10 +770,16 @@ async function setTenancyActive(tenancyId, options = {}) {
 
   if (!extendLocksOnly) {
     if (info.cnyiotMeterId) {
-      try {
-        await meterWrapper.setRelay(info.clientId, info.cnyiotMeterId, 2);
-      } catch (err) {
-        console.warn('[tenancy-active] setRelay connect failed', tenancyId, err.message);
+      const relayOk = await setRelayForTenancy(info.clientId, info.cnyiotMeterId, 2);
+      if (relayOk) {
+        try {
+          await pool.query(
+            'UPDATE meterdetail SET status = 1, updated_at = NOW() WHERE client_id = ? AND meterid = ?',
+            [info.clientId, String(info.cnyiotMeterId).trim()]
+          );
+        } catch (e) {
+          console.warn('[tenancy-active] meterdetail status ON after connect failed', tenancyId, e.message);
+        }
       }
     }
 
