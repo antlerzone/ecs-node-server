@@ -22,6 +22,8 @@ This is a monorepo with **two products** served from a single Express backend:
 
 All three share a single **MySQL** database. The backend serves Coliving routes at `/api/*` and Cleanlemons routes at `/api/cleanlemon/*`.
 
+**CNYIoT (Coliving smart meters):** Platform-only meter integration (env mother account + platform-created tenant per operator; operators do not connect their own CNY master account). See `.cursor/rules/cnyiot-saas-platform.mdc`.
+
 ### Source control (GitHub)
 
 - **Authoritative history:** Every code change must **end up on the GitHub `main` branch** (via commit, push, PR, and merge—follow your team’s usual review rules). GitHub `main` is the long-term source of truth, not any single machine.
