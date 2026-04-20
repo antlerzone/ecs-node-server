@@ -109,12 +109,12 @@ export function toViewableImageUrl(url: string | null | undefined): string {
 
 /** Backend keys from agreement profile validation (`missingFields`); shown when Prepare PDF fails with `profile_incomplete`. */
 const PROFILE_FIELD_LABELS: Record<string, string> = {
-  "tenant.fullname": "Tenant full name",
+  "tenant.fullname": "Tenant legal name (profile) or full name",
   "tenant.nric": "Tenant NRIC / ID",
   "tenant.address": "Tenant address",
   "tenant.phone": "Tenant phone",
   "tenant.email": "Tenant email",
-  "owner.ownername": "Owner name",
+  "owner.ownername": "Owner legal name (profile) or registered name",
   "owner.nric": "Owner NRIC / ID",
   "owner.email": "Owner email",
   "owner.mobilenumber": "Owner mobile",

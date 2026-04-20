@@ -118,6 +118,32 @@ function markMissing(list, key, value) {
   if (!hasValue(value)) list.push(key);
 }
 
+/** Prefer IANA JSON field legal_name; accept legalName if present. */
+function profileLegalNameFromJson(profileJson) {
+  const prof = parseJson(profileJson) || {};
+  if (typeof prof !== 'object') return '';
+  const a = prof.legal_name != null ? String(prof.legal_name).trim() : '';
+  if (a) return a;
+  const b = prof.legalName != null ? String(prof.legalName).trim() : '';
+  return b || '';
+}
+
+/** Agreement PDF: prefer profile legal name, else ownerdetail.ownername. */
+function ownerLegalNameForAgreement(owner) {
+  if (!owner) return '';
+  const legal = profileLegalNameFromJson(owner.profile);
+  if (legal) return legal;
+  return owner.ownername != null ? String(owner.ownername).trim() : '';
+}
+
+/** Agreement PDF: prefer profile legal name, else tenantdetail.fullname. */
+function tenantLegalNameForAgreement(tenant) {
+  if (!tenant) return '';
+  const legal = profileLegalNameFromJson(tenant.profile);
+  if (legal) return legal;
+  return tenant.fullname != null ? String(tenant.fullname).trim() : '';
+}
+
 /**
  * @param {object} tenant - tenantdetail row
  * @param {string} [addressForAgreement] - when set, used for {{tenantaddress}} / required-field check (e.g. fallback from property)
@@ -125,7 +151,7 @@ function markMissing(list, key, value) {
 function validateTenantPersonalProfile(tenant, addressForAgreement) {
   const missing = [];
   const addr = addressForAgreement !== undefined ? addressForAgreement : tenant?.address;
-  markMissing(missing, 'tenant.fullname', tenant?.fullname);
+  markMissing(missing, 'tenant.fullname', tenantLegalNameForAgreement(tenant));
   markMissing(missing, 'tenant.nric', tenant?.nric);
   markMissing(missing, 'tenant.address', addr);
   markMissing(missing, 'tenant.phone', tenant?.phone);
@@ -137,7 +163,7 @@ function validateOwnerPersonalProfile(owner) {
   const missing = [];
   const ownerProfile = parseJson(owner?.profile) || {};
   const ownerAddress = formatOwnerAddress(ownerProfile);
-  markMissing(missing, 'owner.ownername', owner?.ownername);
+  markMissing(missing, 'owner.ownername', ownerLegalNameForAgreement(owner));
   markMissing(missing, 'owner.nric', owner?.nric);
   markMissing(missing, 'owner.email', owner?.email);
   markMissing(missing, 'owner.mobilenumber', owner?.mobilenumber);
@@ -174,7 +200,7 @@ async function getTenancy(tenancyId) {
 
 async function getTenant(tenantId) {
   const [rows] = await pool.query(
-    'SELECT id, fullname, nric, address, phone, email FROM tenantdetail WHERE id = ? LIMIT 1',
+    'SELECT id, fullname, nric, address, phone, email, profile FROM tenantdetail WHERE id = ? LIMIT 1',
     [tenantId]
   );
   return rows[0] || null;
@@ -446,7 +472,7 @@ async function getTenantAgreementContext(tenancyId, agreementTemplateId, staffVa
     usernric: staffVars.staffnric || '',
     useremail: staffVars.staffemail || '',
     userphone: staffVars.staffcontact || '',
-    tenantname: tenant.fullname || '',
+    tenantname: tenantLegalNameForAgreement(tenant),
     tenantnric: tenant.nric || '',
     tenantaddress: tenantAddressResolved,
     tenantphone: tenant.phone || '',
@@ -478,7 +504,7 @@ async function getTenantAgreementContext(tenancyId, agreementTemplateId, staffVa
     agreementtype: 'tenant_operator',
     templateid: template.templateurl,
     folderid: template.folderurl,
-    filename: `Tenancy Agreement - ${tenant.fullname || 'Tenant'}`,
+    filename: `Tenancy Agreement - ${tenantLegalNameForAgreement(tenant) || 'Tenant'}`,
     callbackid: tenancy.id,
     variables
   };
@@ -535,7 +561,7 @@ async function getOwnerAgreementContext(ownerId, propertyId, clientId, agreement
     clientphone: clientProfile.contact || '',
     clientemail: client.email || '',
     clientchop,
-    ownername: owner.ownername || '',
+    ownername: ownerLegalNameForAgreement(owner),
     ownernric: owner.nric || '',
     owneremail: owner.email || '',
     ownercontact: owner.mobilenumber || '',
@@ -640,7 +666,7 @@ async function getOwnerTenantAgreementContext(tenancyId, agreementTemplateId, st
     period: calcPeriod(tenancy.begin, tenancy.end),
     paymentdate: paymentdateVal,
     paymentday: paymentdayVal,
-    ownername: owner.ownername || '',
+    ownername: ownerLegalNameForAgreement(owner),
     ownernric: owner.nric || '',
     owneremail: owner.email || '',
     ownercontact: owner.mobilenumber || '',
@@ -648,12 +674,12 @@ async function getOwnerTenantAgreementContext(tenancyId, agreementTemplateId, st
     ownersign: owner.signature || '',
     nricfront: owner.nricfront || '',
     nricback: owner.nricback || '',
-    tenantname: tenant.fullname || '',
+    tenantname: tenantLegalNameForAgreement(tenant),
     tenantnric: tenant.nric || '',
     tenantemail: tenant.email || '',
     tenantphone: tenant.phone || '',
     // Aliases: tenant profile (so templates can use {{username}} / {{usernric}} etc)
-    username: tenant.fullname || '',
+    username: tenantLegalNameForAgreement(tenant),
     usernric: tenant.nric || '',
     useremail: tenant.email || '',
     userphone: tenant.phone || '',
@@ -690,7 +716,7 @@ async function getOwnerTenantAgreementContext(tenancyId, agreementTemplateId, st
     agreementtype: 'owner_tenant',
     templateid: template.templateurl,
     folderid: template.folderurl,
-    filename: `Owner-Tenant Agreement - ${tenant.fullname || 'Tenant'}`,
+    filename: `Owner-Tenant Agreement - ${tenantLegalNameForAgreement(tenant) || 'Tenant'}`,
     callbackid: tenancy.id,
     variables
   };
