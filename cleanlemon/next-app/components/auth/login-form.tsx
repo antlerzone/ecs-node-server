@@ -65,9 +65,6 @@ function resolvePortalApiBaseForOAuth(): string {
   return (getCleanlemonApiBase() || '').trim()
 }
 
-/** Debug build id — if logs show v0, browser is serving a stale bundle. */
-const OAUTH_RESOLVER_INSTRUMENTATION = 'v1-5cf1c7'
-
 export function LoginForm({ initialMode = 'login', redirectTo, oauthUsePopup }: LoginFormProps = {}) {
   const [isLogin, setIsLogin] = useState(initialMode === 'login')
   const [email, setEmail] = useState('')
@@ -114,43 +111,6 @@ export function LoginForm({ initialMode = 'login', redirectTo, oauthUsePopup }: 
     setIsSubmitting(true)
     try {
       const apiBase = resolvePortalApiBaseForOAuth()
-      const gcb = (getCleanlemonApiBase() || '').trim()
-      const fromNp = (process.env.NEXT_PUBLIC_CLEANLEMON_API_URL || '')
-        .trim()
-        .replace(/\/$/, '')
-      let host = ''
-      try {
-        host =
-          typeof window !== 'undefined'
-            ? String(window.location.hostname || '')
-            : '(no-window)'
-      } catch {
-        host = '(host-error)'
-      }
-      // #region agent log
-      fetch('http://127.0.0.1:7739/ingest/e3e79611-3662-4b91-9509-c2e13537425d', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Debug-Session-Id': '5cf1c7',
-        },
-        body: JSON.stringify({
-          sessionId: '5cf1c7',
-          location: 'login-form.tsx:handleGoogleLogin',
-          message: 'Google OAuth resolver snapshot',
-          data: {
-            hypothesisId: 'H1-H5',
-            instrument: OAUTH_RESOLVER_INSTRUMENTATION,
-            nodeEnv: String(process.env.NODE_ENV),
-            fromNextPublicLen: fromNp.length,
-            gcbLen: gcb.length,
-            apiBaseLen: apiBase.length,
-            hostname: host,
-          },
-          timestamp: Date.now(),
-        }),
-      }).catch(() => {})
-      // #endregion
       if (!apiBase) {
         setError('Google sign-in is not available. Please contact support.')
         setIsSubmitting(false)
