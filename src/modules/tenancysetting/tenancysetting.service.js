@@ -717,15 +717,18 @@ async function previewExtendTenancy(
   }
 
   const oldEnd = current.end ? new Date(current.end) : null;
-  const oldDeposit = Number(current.deposit || 0);
+  /** Same basis as getExtendOptions / portal prefill — not raw column when column is 0 but RC has paid deposit. */
+  const depositFromTenancyColumn = round2(Number(current.deposit || 0));
+  const paidDepositSumPreview = await sumPaidDepositRentalCollectionForTenancy(clientId, tenancyId);
+  const oldDepositEffective = depositDisplayFromTenancyOrPaidRc(depositFromTenancyColumn, paidDepositSumPreview);
   const nextDeposit =
     newDeposit !== undefined && newDeposit !== null
       ? (() => {
           const n = Number(newDeposit);
-          return Number.isFinite(n) ? n : oldDeposit;
+          return Number.isFinite(n) ? n : oldDepositEffective;
         })()
-      : oldDeposit;
-  const depositDiff = nextDeposit - oldDeposit;
+      : oldDepositEffective;
+  const depositDiff = round2(round2(nextDeposit) - round2(oldDepositEffective));
   const previousEndVal = oldEnd ? tenancyCalendarYmdFromDb(oldEnd) : null;
   const beginYmd = tenancyCalendarYmdFromDb(current.begin);
 
@@ -821,7 +824,7 @@ async function previewExtendTenancy(
 
   const oldRentalSummary = round2(Number(current.rental || 0));
   const newRentalSummary = round2(Number(newRental || 0));
-  const depositSummaryOld = round2(oldDeposit);
+  const depositSummaryOld = round2(oldDepositEffective);
   const depositSummaryNew = round2(nextDeposit);
   let parkingMonthlySummary = null;
   if (hadRecurringParkingFees) {
@@ -1295,15 +1298,17 @@ async function extendTenancy(clientId, staffId, tenancyId, { newEnd, newRental, 
   }
   const oldEnd = current.end ? new Date(current.end) : null;
   const oldRental = Number(current.rental || 0);
-  const oldDeposit = Number(current.deposit || 0);
+  const depositFromTenancyColumnExt = round2(Number(current.deposit || 0));
+  const paidDepositSumExtend = await sumPaidDepositRentalCollectionForTenancy(clientId, tenancyId);
+  const oldDepositEffective = depositDisplayFromTenancyOrPaidRc(depositFromTenancyColumnExt, paidDepositSumExtend);
   const nextDeposit =
     newDeposit !== undefined && newDeposit !== null
       ? (() => {
           const n = Number(newDeposit);
-          return Number.isFinite(n) ? n : oldDeposit;
+          return Number.isFinite(n) ? n : oldDepositEffective;
         })()
-      : oldDeposit;
-  const depositDiff = nextDeposit - oldDeposit;
+      : oldDepositEffective;
+  const depositDiff = round2(round2(nextDeposit) - round2(oldDepositEffective));
   const previousEndVal = oldEnd ? tenancyCalendarYmdFromDb(oldEnd) : null;
   const beginYmd = tenancyCalendarYmdFromDb(current.begin);
 
