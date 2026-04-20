@@ -56,6 +56,26 @@ function clientScheduleBadgeLabel(status: string): string {
   return 'Scheduled'
 }
 
+/** Align with backend `normalizeScheduleStatus` for dropdown value + API. */
+function canonicalClientScheduleStatus(s: string) {
+  const x = String(s || '')
+    .toLowerCase()
+    .replace(/\s+/g, '-')
+  if (x.includes('complete') || x === 'done') return 'completed'
+  if (x.includes('progress')) return 'in-progress'
+  if (x.includes('cancel')) return 'cancelled'
+  if (x.includes('checkout') || x === 'pending-checkout') return 'pending-checkout'
+  return 'ready-to-clean'
+}
+
+const CLIENT_SCHEDULE_STATUS_OPTIONS: { value: string; label: string }[] = [
+  { value: 'pending-checkout', label: 'Pending approval' },
+  { value: 'ready-to-clean', label: 'Ready to clean' },
+  { value: 'in-progress', label: 'In progress' },
+  { value: 'completed', label: 'Completed' },
+  { value: 'cancelled', label: 'Cancelled' },
+]
+
 const getStatusColor = (status: string) => {
   switch (status) {
     case 'completed':
@@ -108,6 +128,7 @@ export function ClientDashboardSchedule() {
   const [rescheduleTarget, setRescheduleTarget] = useState<ScheduleItem | null>(null)
   const [rescheduleYmd, setRescheduleYmd] = useState('')
   const [rescheduleSubmitting, setRescheduleSubmitting] = useState(false)
+  const [statusUpdatingId, setStatusUpdatingId] = useState<string | null>(null)
 
   const todayYmd = useMemo(() => getMalaysiaCalendarYmd(), [])
   const tomorrowYmd = useMemo(() => addDaysToMalaysiaYmd(todayYmd, 1), [todayYmd])
@@ -282,17 +303,50 @@ export function ClientDashboardSchedule() {
     setCustomizeOpen(true)
   }
 
+  async function applyScheduleStatus(item: ScheduleItem, nextStatus: string) {
+    const email = String(user?.email || '').trim().toLowerCase()
+    const op = String(item.operatorId || user?.operatorId || '').trim()
+    if (!email || !op) {
+      toast.error('Sign in required')
+      return
+    }
+    const current = canonicalClientScheduleStatus(item.scheduleStatus)
+    if (nextStatus === current) return
+    setStatusUpdatingId(item.id)
+    try {
+      const r = await updateClientScheduleJob({
+        email,
+        operatorId: op,
+        scheduleId: item.id,
+        status: nextStatus,
+        statusSetByEmail: email,
+        ...(selectedGroupId ? { groupId: selectedGroupId } : {}),
+      })
+      if (!r.ok) {
+        toast.error(typeof r.reason === 'string' ? r.reason : 'Update failed')
+        return
+      }
+      toast.success('Status updated')
+      setScheduleRefreshTick((t) => t + 1)
+    } finally {
+      setStatusUpdatingId(null)
+    }
+  }
+
   return (
     <>
-    <Card id="client-schedule" className="w-full scroll-mt-24 border-border shadow-sm">
+    <Card id="client-schedule" className="w-full scroll-mt-16 border-border shadow-sm md:scroll-mt-24">
       <CardHeader className="pb-2">
         <CardTitle className="text-lg">Schedule</CardTitle>
-        <CardDescription>Jobs for the selected day or range — sort columns in the header row.</CardDescription>
+        <CardDescription>
+          Jobs for the selected day or range. On desktop, sort columns in the table header; on mobile, change status from
+          the dropdown on each job.
+        </CardDescription>
         {propertyGroups.length > 0 ? (
-          <div className="pt-2 max-w-xs space-y-1">
-            <Label className="text-xs text-muted-foreground">Group</Label>
+          <div className="flex w-full min-w-0 flex-col gap-1.5 pt-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+            <Label className="text-xs text-muted-foreground shrink-0">Group</Label>
             <Select value={selectedGroupId || 'all'} onValueChange={(v) => setSelectedGroupId(v === 'all' ? '' : v)}>
-              <SelectTrigger className="h-9">
+              <SelectTrigger className="h-9 min-w-0 w-full flex-1 border-input sm:max-w-xs sm:flex-none">
                 <SelectValue placeholder="All properties" />
               </SelectTrigger>
               <SelectContent>
@@ -309,7 +363,7 @@ export function ClientDashboardSchedule() {
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
-          <div className="inline-flex w-full max-w-md rounded-lg border border-border bg-muted/40 p-0.5">
+          <div className="inline-flex w-full max-w-md shrink-0 rounded-lg border border-border bg-muted/40 p-0.5">
             <Button
               type="button"
               variant="ghost"
@@ -344,10 +398,10 @@ export function ClientDashboardSchedule() {
               Customize
             </Button>
           </div>
-          <div className="flex items-center gap-2 min-w-0">
+          <div className="flex w-full min-w-0 items-center gap-2 sm:ml-auto sm:w-auto sm:max-w-md sm:justify-end">
             <span className="text-sm text-muted-foreground shrink-0">Property</span>
             <Select value={propertyFilter} onValueChange={setPropertyFilter}>
-              <SelectTrigger className="w-[min(100%,220px)] border-input">
+              <SelectTrigger className="min-w-0 flex-1 border-input sm:min-w-[12rem] sm:max-w-[min(100%,20rem)] sm:flex-none">
                 <SelectValue placeholder="All" />
               </SelectTrigger>
               <SelectContent>
@@ -368,7 +422,61 @@ export function ClientDashboardSchedule() {
           </p>
         ) : null}
 
-        <div className="rounded-md border border-border overflow-x-auto">
+        {/* Mobile: stacked rows, no horizontal scroll; status dropdown on the right */}
+        <div className="md:hidden divide-y divide-border rounded-md border border-border bg-card">
+          {sortedRows.length === 0 ? (
+            <div className="px-3 py-10 text-center text-sm text-muted-foreground">No jobs in this view.</div>
+          ) : (
+            sortedRows.map((item) => {
+              const statusVal = canonicalClientScheduleStatus(item.scheduleStatus)
+              const dateLine = `${formatDisplayDate(item.date)}${item.time ? ` · ${item.time}` : ''}`
+              return (
+                <div key={item.id} className="flex gap-2 px-3 py-4">
+                  <div className="min-w-0 flex-1 space-y-1">
+                    <h2 className="text-lg font-bold leading-snug text-foreground">{item.property || '—'}</h2>
+                    <p className="text-sm text-muted-foreground">{item.unit || '—'}</p>
+                    <p className="text-sm text-foreground">{item.cleaningType}</p>
+                    <p className="text-sm text-muted-foreground">{dateLine}</p>
+                    <Button
+                      type="button"
+                      variant="link"
+                      className="h-auto p-0 text-xs"
+                      onClick={() => {
+                        setRescheduleTarget(item)
+                        const d = String(item.date || '').slice(0, 10)
+                        setRescheduleYmd(/^\d{4}-\d{2}-\d{2}$/.test(d) ? d : new Date().toISOString().slice(0, 10))
+                        setRescheduleOpen(true)
+                      }}
+                    >
+                      Reschedule / extend date
+                    </Button>
+                  </div>
+                  <div className="flex w-[min(9.5rem,42vw)] shrink-0 flex-col justify-start gap-1">
+                    <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Status</span>
+                    <Select
+                      value={statusVal}
+                      disabled={statusUpdatingId === item.id}
+                      onValueChange={(v) => void applyScheduleStatus(item, v)}
+                    >
+                      <SelectTrigger className="h-9 w-full text-left text-xs" aria-label="Change job status">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent position="popper" className="z-[200]">
+                        {CLIENT_SCHEDULE_STATUS_OPTIONS.map((opt) => (
+                          <SelectItem key={opt.value} value={opt.value} className="text-xs">
+                            {opt.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+              )
+            })
+          )}
+        </div>
+
+        <div className="hidden md:block rounded-md border border-border overflow-x-auto">
           <Table>
             <TableHeader>
               <TableRow className="hover:bg-transparent">

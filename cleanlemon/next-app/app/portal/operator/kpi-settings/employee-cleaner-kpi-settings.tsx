@@ -145,12 +145,16 @@ export function EmployeeCleanerKpiSettings({ operatorId }: { operatorId: string 
     kpiRuleForm.countBy === "by_job"
       ? "By job = fixed points per job, regardless of price."
       : kpiRuleForm.countBy === "by_price"
-        ? "By price = percentage of the job amount (example: 10% of RM90 = 9 points)."
+        ? "By price: choose Fixed (points) or Percentage of the job amount below."
         : "By room = number of rooms x fixed points (example: 4 rooms x 5 = 20 points)."
   const rewardHint =
-    kpiRuleForm.rewardMode === "percentage"
-      ? "Enter percentage value (for by price only)."
-      : "Enter fixed points value."
+    kpiRuleForm.countBy === "by_price" && kpiRuleForm.rewardMode === "percentage"
+      ? "Enter percentage of job price (e.g. 10 = 10%)."
+      : kpiRuleForm.countBy === "by_price" && kpiRuleForm.rewardMode === "fixed"
+        ? "Enter fixed points earned per qualifying completion (by price basis)."
+        : kpiRuleForm.rewardMode === "percentage"
+          ? "Enter percentage value."
+          : "Enter fixed points value."
 
   const reload = useCallback(async () => {
     setLoading(true)
@@ -390,12 +394,13 @@ export function EmployeeCleanerKpiSettings({ operatorId }: { operatorId: string 
       toast.error("Value must be more than 0")
       return
     }
-    const enforcedMode: "fixed" | "percentage" = kpiRuleForm.countBy === "by_price" ? "percentage" : "fixed"
+    const rewardMode: "fixed" | "percentage" =
+      kpiRuleForm.countBy === "by_price" ? kpiRuleForm.rewardMode : "fixed"
     const next: StaffKpiRuleCard = {
       id: mkId("staff-kpi-rule"),
       serviceProvider: kpiRuleForm.serviceProvider,
       countBy: kpiRuleForm.countBy,
-      rewardMode: enforcedMode,
+      rewardMode,
       rewardValue: kpiRuleForm.rewardValue,
       createdAt: nowIso(),
     }
@@ -674,7 +679,10 @@ export function EmployeeCleanerKpiSettings({ operatorId }: { operatorId: string 
                       <p>
                         <strong>Each complete can get:</strong>{" "}
                         {rule.countBy === "by_job" && `fixed ${rule.rewardValue} points / job`}
-                        {rule.countBy === "by_price" && `${rule.rewardValue}% of job price`}
+                        {rule.countBy === "by_price" &&
+                          (rule.rewardMode === "percentage"
+                            ? `${rule.rewardValue}% of job price`
+                            : `fixed ${rule.rewardValue} points (by price)`)}
                         {rule.countBy === "by_room" && `${rule.rewardValue} points x number of rooms`}
                       </p>
                     </CardContent>
@@ -735,7 +743,13 @@ export function EmployeeCleanerKpiSettings({ operatorId }: { operatorId: string 
             <div className="space-y-2">
               <Label>Each complete can get</Label>
               <div className="grid grid-cols-2 gap-2">
-                <Select value={kpiRuleForm.rewardMode} disabled>
+                <Select
+                  value={kpiRuleForm.rewardMode}
+                  disabled={kpiRuleForm.countBy !== "by_price"}
+                  onValueChange={(v) =>
+                    setKpiRuleForm((p) => ({ ...p, rewardMode: v as "fixed" | "percentage" }))
+                  }
+                >
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value="fixed">Fixed</SelectItem>

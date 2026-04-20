@@ -12,7 +12,10 @@ const pool = mysql.createPool({
   database: process.env.DB_NAME,
   waitForConnections: true,
   connectionLimit: 10,
-  timezone: '+00:00'
+  timezone: '+00:00',
+  /** Avoid JSON.stringify "Do not know how to serialize a BigInt" on API responses. */
+  supportBigNumbers: true,
+  bigNumberStrings: true,
 });
 
 module.exports = pool;

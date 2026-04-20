@@ -1,8 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useState } from "react"
-import Link from "next/link"
-import { Loader2, AlertTriangle, CheckCircle2, Eye, Search } from "lucide-react"
+import { Loader2, AlertTriangle, CheckCircle2, Eye, Search, Download, ListFilter } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import {
@@ -24,6 +23,12 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { useAuth } from "@/lib/auth-context"
 import {
   fetchClientDamageReports,
@@ -83,17 +88,23 @@ export default function ClientDamagePage() {
   const [ackFilter, setAckFilter] = useState<"all" | "pending" | "acknowledged" | "complete">("all")
   const [dateFrom, setDateFrom] = useState("")
   const [dateTo, setDateTo] = useState("")
+  const [filterExpanded, setFilterExpanded] = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const r = await fetchClientDamageReports({ operatorId: operatorId || undefined, limit: 500 })
+      const email = String(user?.email || "").trim().toLowerCase()
+      if (!email) {
+        setItems([])
+        return
+      }
+      const r = await fetchClientDamageReports({ email, operatorId: operatorId || undefined, limit: 500 })
       if (r?.ok && Array.isArray(r.items)) setItems(r.items)
       else setItems([])
     } finally {
       setLoading(false)
     }
-  }, [operatorId])
+  }, [operatorId, user?.email])
 
   useEffect(() => {
     void load()
@@ -152,14 +163,130 @@ export default function ClientDamagePage() {
     })
   }, [items, search, operatorFilter, propertyFilter, ackFilter, dateFrom, dateTo])
 
+  const hasActiveFilters = useMemo(() => {
+    return (
+      operatorFilter !== "all" ||
+      propertyFilter !== "all" ||
+      ackFilter !== "all" ||
+      Boolean(dateFrom) ||
+      Boolean(dateTo)
+    )
+  }, [operatorFilter, propertyFilter, ackFilter, dateFrom, dateTo])
+
+  const exportFileStem = useMemo(() => {
+    const d = new Date()
+    const y = d.getFullYear()
+    const m = String(d.getMonth() + 1).padStart(2, "0")
+    const day = String(d.getDate()).padStart(2, "0")
+    return `damage-reports-${y}${m}${day}`
+  }, [])
+
+  const rowToExportCells = useCallback((r: DamageReportItem) => {
+    const statusLabel = damageStatusLabel(r)
+    return {
+      property: r.propertyName || "—",
+      unit: r.unitNumber || "",
+      status: statusLabel,
+      operator: r.operatorName || "—",
+      staff: r.staffEmail || "—",
+      when: formatWhen(r),
+      remark: (r.remark || "").replace(/\r?\n/g, " "),
+    }
+  }, [])
+
+  const escapeCsvCell = (s: string) => {
+    const t = String(s)
+    if (/[",\n\r]/.test(t)) return `"${t.replace(/"/g, '""')}"`
+    return t
+  }
+
+  const exportCsv = useCallback(() => {
+    if (filteredItems.length === 0) {
+      toast.error("No rows to export.")
+      return
+    }
+    const header = ["Property", "Unit", "Status", "Operator", "Staff email", "When", "Remark"]
+    const lines = [header.join(",")]
+    for (const r of filteredItems) {
+      const c = rowToExportCells(r)
+      lines.push(
+        [
+          escapeCsvCell(c.property),
+          escapeCsvCell(c.unit),
+          escapeCsvCell(c.status),
+          escapeCsvCell(c.operator),
+          escapeCsvCell(c.staff),
+          escapeCsvCell(c.when),
+          escapeCsvCell(c.remark),
+        ].join(",")
+      )
+    }
+    const blob = new Blob(["\uFEFF" + lines.join("\r\n")], { type: "text/csv;charset=utf-8" })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement("a")
+    a.href = url
+    a.download = `${exportFileStem}.csv`
+    a.click()
+    URL.revokeObjectURL(url)
+    toast.success("CSV downloaded.")
+  }, [filteredItems, exportFileStem, rowToExportCells])
+
+  const exportPdf = useCallback(async () => {
+    if (filteredItems.length === 0) {
+      toast.error("No rows to export.")
+      return
+    }
+    try {
+      const [{ jsPDF }, autoTableMod] = await Promise.all([
+        import("jspdf"),
+        import("jspdf-autotable"),
+      ])
+      const autoTable = autoTableMod.default
+      const doc = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" })
+      doc.setFontSize(11)
+      doc.text("Damage reports (filtered)", 8, 10)
+      const body = filteredItems.map((r) => {
+        const c = rowToExportCells(r)
+        return [c.property, c.unit || "—", c.status, c.operator, c.staff, c.when, c.remark]
+      })
+      autoTable(doc, {
+        startY: 14,
+        head: [["Property", "Unit", "Status", "Operator", "Staff", "When", "Remark"]],
+        body,
+        styles: { fontSize: 7, cellPadding: 1.5 },
+        headStyles: { fillColor: [30, 64, 175] },
+        columnStyles: {
+          0: { cellWidth: 38 },
+          1: { cellWidth: 18 },
+          2: { cellWidth: 24 },
+          3: { cellWidth: 32 },
+          4: { cellWidth: 38 },
+          5: { cellWidth: 42 },
+          6: { cellWidth: "auto" },
+        },
+        margin: { left: 8, right: 8 },
+      })
+      doc.save(`${exportFileStem}.pdf`)
+      toast.success("PDF downloaded.")
+    } catch (e) {
+      console.error("[damage] PDF export", e)
+      toast.error("PDF export failed.")
+    }
+  }, [filteredItems, exportFileStem, rowToExportCells])
+
   const onAck = async (id: string) => {
     if (!operatorId) {
       toast.error("Missing operator context.")
       return
     }
+    const email = String(user?.email || "").trim().toLowerCase()
+    if (!email) {
+      toast.error("Missing account email.")
+      return
+    }
     setBusyId(id)
     try {
-      const r = await acknowledgeClientDamageReport(id, { operatorId })
+      const r = await acknowledgeClientDamageReport(id, { email, operatorId })
       if (!r?.ok) {
         toast.error(r?.reason || "Acknowledge failed")
         return
@@ -173,7 +300,7 @@ export default function ClientDamagePage() {
 
   return (
     <div className="w-full space-y-6 p-4 md:p-6">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <h1 className="text-2xl font-bold text-foreground flex items-center gap-2">
             <AlertTriangle className="h-7 w-7 text-amber-600" />
@@ -183,14 +310,25 @@ export default function ClientDamagePage() {
             Reports from your operator&apos;s staff. Acknowledge when you have noted the issue.
           </p>
         </div>
-        <Button variant="outline" size="sm" asChild>
-          <Link href="/client">Back to dashboard</Link>
-        </Button>
+        <div className="hidden shrink-0 md:block">
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="outline" size="sm" className="shrink-0" disabled={loading}>
+                <Download className="h-4 w-4 mr-2" />
+                Export
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onClick={() => void exportPdf()}>Export as PDF</DropdownMenuItem>
+              <DropdownMenuItem onClick={exportCsv}>Export as CSV</DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
       </div>
 
       <div className="flex flex-col gap-3">
-        <div className="flex flex-col gap-3 lg:flex-row lg:flex-wrap lg:items-end">
-          <div className="relative min-w-[200px] flex-1">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+          <div className="relative min-w-0 flex-1">
             <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
             <Input
               value={search}
@@ -200,77 +338,107 @@ export default function ClientDamagePage() {
               disabled={loading}
             />
           </div>
-          <Select value={operatorFilter} onValueChange={setOperatorFilter} disabled={loading}>
-            <SelectTrigger className="w-full border-input lg:w-[200px]">
-              <SelectValue placeholder="Operator" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All operators</SelectItem>
-              {operatorOptions.map((o) => (
-                <SelectItem key={o.id} value={o.id}>
-                  {o.name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Select value={propertyFilter} onValueChange={setPropertyFilter} disabled={loading}>
-            <SelectTrigger className="w-full border-input lg:w-[240px]">
-              <SelectValue placeholder="Property" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All properties</SelectItem>
-              {propertyOptions.map(([key, label]) => (
-                <SelectItem key={key} value={key}>
-                  {label.length > 42 ? `${label.slice(0, 42)}…` : label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Select
-            value={ackFilter}
-            onValueChange={(v) =>
-              setAckFilter(v as "all" | "pending" | "acknowledged" | "complete")
-            }
+          <Button
+            type="button"
+            variant={filterExpanded ? "secondary" : "outline"}
+            className="shrink-0"
             disabled={loading}
+            onClick={() => setFilterExpanded((v) => !v)}
+            aria-expanded={filterExpanded}
           >
-            <SelectTrigger className="w-full border-input lg:w-[180px]">
-              <SelectValue placeholder="Status" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All</SelectItem>
-              <SelectItem value="pending">Pending</SelectItem>
-              <SelectItem value="acknowledged">Acknowledged</SelectItem>
-              <SelectItem value="complete">Complete</SelectItem>
-            </SelectContent>
-          </Select>
+            <ListFilter className="h-4 w-4 mr-2" />
+            Filter
+            {hasActiveFilters ? (
+              <span className="ml-2 inline-flex h-2 w-2 rounded-full bg-primary" aria-hidden />
+            ) : null}
+          </Button>
         </div>
-        <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-end">
-          <div className="space-y-1">
-            <Label className="text-xs text-muted-foreground">Date from</Label>
-            <Input
-              type="date"
-              value={dateFrom}
-              onChange={(e) => setDateFrom(e.target.value.slice(0, 10))}
-              className="w-full border-input sm:w-[160px]"
-              disabled={loading}
-            />
+
+        {filterExpanded ? (
+          <div className="rounded-lg border bg-muted/30 p-4 space-y-4">
+            <div className="flex flex-col gap-3 lg:flex-row lg:flex-wrap lg:items-end">
+              <Select value={operatorFilter} onValueChange={setOperatorFilter} disabled={loading}>
+                <SelectTrigger className="w-full border-input lg:w-[200px]">
+                  <SelectValue placeholder="Operator" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All operators</SelectItem>
+                  {operatorOptions.map((o) => (
+                    <SelectItem key={o.id} value={o.id}>
+                      {o.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Select value={propertyFilter} onValueChange={setPropertyFilter} disabled={loading}>
+                <SelectTrigger className="w-full border-input lg:w-[240px]">
+                  <SelectValue placeholder="Property" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All properties</SelectItem>
+                  {propertyOptions.map(([key, label]) => (
+                    <SelectItem key={key} value={key}>
+                      {label.length > 42 ? `${label.slice(0, 42)}…` : label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Select
+                value={ackFilter}
+                onValueChange={(v) =>
+                  setAckFilter(v as "all" | "pending" | "acknowledged" | "complete")
+                }
+                disabled={loading}
+              >
+                <SelectTrigger className="w-full border-input lg:w-[180px]">
+                  <SelectValue placeholder="Status" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All</SelectItem>
+                  <SelectItem value="pending">Pending</SelectItem>
+                  <SelectItem value="acknowledged">Acknowledged</SelectItem>
+                  <SelectItem value="complete">Complete</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-end">
+              <div className="space-y-1">
+                <Label className="text-xs text-muted-foreground">Date from</Label>
+                <Input
+                  type="date"
+                  value={dateFrom}
+                  onChange={(e) => setDateFrom(e.target.value.slice(0, 10))}
+                  className="w-full border-input sm:w-[160px]"
+                  disabled={loading}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-muted-foreground">Date to</Label>
+                <Input
+                  type="date"
+                  value={dateTo}
+                  onChange={(e) => setDateTo(e.target.value.slice(0, 10))}
+                  className="w-full border-input sm:w-[160px]"
+                  disabled={loading}
+                />
+              </div>
+              {(dateFrom || dateTo) && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-9"
+                  onClick={() => {
+                    setDateFrom("")
+                    setDateTo("")
+                  }}
+                >
+                  Clear dates
+                </Button>
+              )}
+            </div>
           </div>
-          <div className="space-y-1">
-            <Label className="text-xs text-muted-foreground">Date to</Label>
-            <Input
-              type="date"
-              value={dateTo}
-              onChange={(e) => setDateTo(e.target.value.slice(0, 10))}
-              className="w-full border-input sm:w-[160px]"
-              disabled={loading}
-            />
-          </div>
-          {(dateFrom || dateTo) && (
-            <Button type="button" variant="ghost" size="sm" className="h-9" onClick={() => { setDateFrom(""); setDateTo("") }}>
-              Clear dates
-            </Button>
-          )}
-        </div>
+        ) : null}
       </div>
 
       <Card className="w-full">

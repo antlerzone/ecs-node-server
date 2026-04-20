@@ -12,10 +12,10 @@ function ClientProfileContent() {
     <>
       {gated ? (
         <div className="mx-auto mt-4 max-w-4xl rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-          Please complete required profile details first: entity type, legal name, ID type, ID number, phone number, and address.
+          Complete your profile and tap &quot;Confirm profile and continue&quot; before using other pages (entity type, legal name, ID, phone, address).
         </div>
       ) : null}
-      <UnifiedProfilePage roleLabel="Client" backendProfile />
+      <UnifiedProfilePage roleLabel="Client" backendProfile={true} selfVerifyMode={true} />
     </>
   )
 }

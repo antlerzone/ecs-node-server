@@ -22,7 +22,8 @@ import {
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { useAuth } from '@/lib/auth-context'
-import { employeeCheckIn, employeeCheckOut, fetchEmployeeAttendance, fetchOperatorSettings, uploadEmployeeFileToOss } from '@/lib/cleanlemon-api'
+import { employeeCheckIn, employeeCheckOut, fetchEmployeeAttendance, uploadEmployeeFileToOss } from '@/lib/cleanlemon-api'
+import { EmployeeWorkingPayrollTable } from '@/components/portal/employee/employee-working-payroll-table'
 
 interface GeoLocationState {
   lat: number
@@ -41,13 +42,6 @@ interface AttendanceRecord {
   workingOutIso: string | null
 }
 
-interface AttendancePolicy {
-  enabled: boolean
-  scheduledInMinutes: number
-  scheduledOutMinutes: number
-  deductionPerLateMinute: number
-}
-
 export default function WorkingPage() {
   const UTC8_TIME_ZONE = 'Asia/Kuala_Lumpur'
   const { user } = useAuth()
@@ -55,7 +49,6 @@ export default function WorkingPage() {
   const [isWorking, setIsWorking] = useState(false)
   const [workStartTime, setWorkStartTime] = useState<Date | null>(null)
   const [workEndTime, setWorkEndTime] = useState<Date | null>(null)
-  const [elapsedTime, setElapsedTime] = useState(0)
   const [showCheckInDialog, setShowCheckInDialog] = useState(false)
   const [showCheckOutDialog, setShowCheckOutDialog] = useState(false)
   const [selfieUrl, setSelfieUrl] = useState<string | null>(null)
@@ -63,75 +56,9 @@ export default function WorkingPage() {
   const [checkInLocation, setCheckInLocation] = useState<GeoLocationState | null>(null)
   const [checkInProof, setCheckInProof] = useState<CheckInProof | null>(null)
   const [attendanceRecords, setAttendanceRecords] = useState<AttendanceRecord[]>([])
-  const [attendancePolicy, setAttendancePolicy] = useState<AttendancePolicy>({
-    enabled: false,
-    scheduledInMinutes: 8 * 60,
-    scheduledOutMinutes: 18 * 60,
-    deductionPerLateMinute: 1,
-  })
   const [isCapturing, setIsCapturing] = useState(false)
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
-
-  // Timer effect
-  useEffect(() => {
-    let interval: NodeJS.Timeout
-    if (isWorking && workStartTime) {
-      interval = setInterval(() => {
-        setElapsedTime(Math.floor((Date.now() - workStartTime.getTime()) / 1000))
-      }, 1000)
-    }
-    return () => clearInterval(interval)
-  }, [isWorking, workStartTime])
-
-  useEffect(() => {
-    let cancelled = false
-
-    const parseTimeToMinutes = (value: unknown, fallbackMinutes: number) => {
-      if (typeof value !== 'string') return fallbackMinutes
-      const [h, m] = value.split(':').map(Number)
-      if (!Number.isFinite(h) || !Number.isFinite(m)) return fallbackMinutes
-      return h * 60 + m
-    }
-
-    ;(async () => {
-      const response = await fetchOperatorSettings(operatorId)
-      if (!response?.ok || cancelled) return
-
-      const settings = response.settings || {}
-      const policy = settings.attendancePolicy || settings.attendanceLatePolicy || {}
-
-      const enabled = Boolean(
-        policy.enabled ||
-          settings.attendanceLateEnabled ||
-          settings.enableAttendanceDeduction
-      )
-      const scheduledInMinutes = parseTimeToMinutes(
-        policy.workingInTime || settings.workingInTime,
-        8 * 60
-      )
-      const scheduledOutMinutes = parseTimeToMinutes(
-        policy.workingOutTime || settings.workingOutTime,
-        18 * 60
-      )
-      const deductionPerLateMinute = Number(
-        policy.deductionPerLateMinute ?? settings.deductionPerLateMinute ?? 1
-      )
-
-      setAttendancePolicy({
-        enabled,
-        scheduledInMinutes,
-        scheduledOutMinutes,
-        deductionPerLateMinute: Number.isFinite(deductionPerLateMinute)
-          ? Math.max(0, deductionPerLateMinute)
-          : 1,
-      })
-    })()
-
-    return () => {
-      cancelled = true
-    }
-  }, [operatorId])
 
   useEffect(() => {
     let cancelled = false
@@ -157,14 +84,6 @@ export default function WorkingPage() {
       cancelled = true
     }
   }, [user?.email, operatorId])
-
-  // Format time
-  const formatTime = (seconds: number) => {
-    const hrs = Math.floor(seconds / 3600)
-    const mins = Math.floor((seconds % 3600) / 60)
-    const secs = seconds % 60
-    return `${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`
-  }
 
   const formatUtc8Time = (value: Date | null) =>
     value
@@ -192,49 +111,6 @@ export default function WorkingPage() {
       month: '2-digit',
       day: '2-digit',
     }).format(value)
-
-  const getUtc8MinutesOfDay = (value: Date) => {
-    const parts = new Intl.DateTimeFormat('en-GB', {
-      timeZone: UTC8_TIME_ZONE,
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-    }).formatToParts(value)
-
-    const hour = Number(parts.find((item) => item.type === 'hour')?.value ?? 0)
-    const minute = Number(parts.find((item) => item.type === 'minute')?.value ?? 0)
-    return hour * 60 + minute
-  }
-
-  const getAttendanceLateInfo = (record: AttendanceRecord) => {
-    if (!attendancePolicy.enabled) {
-      return {
-        isLateIn: false,
-        isLateOut: false,
-        deduction: 0,
-      }
-    }
-
-    const workingIn = new Date(record.workingInIso)
-    const inMinutes = getUtc8MinutesOfDay(workingIn)
-    const lateInMinutes = Math.max(0, inMinutes - attendancePolicy.scheduledInMinutes)
-
-    let lateOutMinutes = 0
-    if (record.workingOutIso) {
-      const workingOut = new Date(record.workingOutIso)
-      const outMinutes = getUtc8MinutesOfDay(workingOut)
-      lateOutMinutes = Math.max(0, outMinutes - attendancePolicy.scheduledOutMinutes)
-    }
-
-    const totalLateMinutes = lateInMinutes + lateOutMinutes
-    const deduction = totalLateMinutes * attendancePolicy.deductionPerLateMinute
-
-    return {
-      isLateIn: lateInMinutes > 0,
-      isLateOut: lateOutMinutes > 0,
-      deduction,
-    }
-  }
 
   const hashLocationAndTime = async (locationValue: GeoLocationState, timeIso: string) => {
     const raw = `${locationValue.lat.toFixed(6)},${locationValue.lng.toFixed(6)}|${timeIso}`
@@ -455,77 +331,68 @@ export default function WorkingPage() {
 
   return (
     <div className="space-y-6">
-      {/* Main Clock Card */}
-      <Card className={`${isWorking ? 'border-green-500' : ''}`}>
-        <CardContent className="p-8">
-          <div className="flex flex-col items-center text-center">
-            <div className={`w-32 h-32 rounded-full flex items-center justify-center mb-6 ${
-              isWorking ? 'bg-green-100' : 'bg-muted'
-            }`}>
-              {isWorking ? (
-                <Clock className="h-16 w-16 text-green-600" />
-              ) : (
-                <Play className="h-16 w-16 text-muted-foreground" />
-              )}
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-sm text-muted-foreground">Clock in, selfie & GPS for attendance</p>
+        <Badge
+          variant={isWorking ? 'default' : 'secondary'}
+          className={`shrink-0 h-7 px-2.5 text-[11px] font-medium ${isWorking ? 'bg-green-600 hover:bg-green-600' : ''}`}
+        >
+          <Clock className="mr-1 h-3 w-3" aria-hidden />
+          {isWorking ? 'On duty' : 'Off duty'}
+        </Badge>
+      </div>
+
+      <Card className={isWorking ? 'border-green-500' : ''}>
+        <CardContent className="p-4 sm:p-5">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-start gap-3">
+              <div
+                className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-full ${
+                  isWorking ? 'bg-green-100' : 'bg-muted'
+                }`}
+              >
+                {isWorking ? (
+                  <Clock className="h-5 w-5 text-green-600" />
+                ) : (
+                  <Play className="h-5 w-5 text-muted-foreground" />
+                )}
+              </div>
+              <div className="min-w-0 space-y-1 text-left">
+                <Badge variant={isWorking ? 'default' : 'secondary'} className={isWorking ? 'bg-green-600' : ''}>
+                  {isWorking ? 'Working' : 'Not working'}
+                </Badge>
+                <p className="text-sm text-muted-foreground">
+                  Start{' '}
+                  <span className="font-mono text-foreground">{formatUtc8Time(workStartTime)}</span>
+                  {workEndTime && !isWorking ? (
+                    <>
+                      {' '}
+                      · End <span className="font-mono text-foreground">{formatUtc8Time(workEndTime)}</span>
+                    </>
+                  ) : null}
+                  <span className="text-muted-foreground"> · UTC+8</span>
+                </p>
+              </div>
             </div>
-            
-            <h2 className="text-4xl font-bold font-mono mb-2">
-              {formatTime(elapsedTime)}
-            </h2>
-            
-            <Badge variant={isWorking ? 'default' : 'secondary'} className={`mb-6 ${
-              isWorking ? 'bg-green-600' : ''
-            }`}>
-              {isWorking ? 'Working' : 'Not Working'}
-            </Badge>
-
-            {workStartTime && (
-              <p className="text-muted-foreground mb-6">
-                Started at {formatUtc8Time(workStartTime)} (UTC+8)
-              </p>
-            )}
-
-            <Button 
-              size="lg" 
-              className={`w-full max-w-xs ${isWorking ? 'bg-destructive hover:bg-destructive/90' : ''}`}
+            <Button
+              className={`w-full shrink-0 sm:w-auto ${isWorking ? 'bg-destructive hover:bg-destructive/90' : ''}`}
               onClick={isWorking ? handleEndWork : handleStartWork}
             >
               {isWorking ? (
                 <>
-                  <Square className="h-5 w-5 mr-2" />
-                  End Work
+                  <Square className="mr-2 h-4 w-4" />
+                  End work
                 </>
               ) : (
                 <>
-                  <Play className="h-5 w-5 mr-2" />
-                  Start Work
+                  <Play className="mr-2 h-4 w-4" />
+                  Start work
                 </>
               )}
             </Button>
           </div>
         </CardContent>
       </Card>
-
-      <div className="grid gap-4 md:grid-cols-2">
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-base">Start Time</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-2xl font-mono font-bold">{formatUtc8Time(workStartTime)}</p>
-            <p className="text-xs text-muted-foreground mt-1">UTC+8</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-base">End Time</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-2xl font-mono font-bold">{formatUtc8Time(workEndTime)}</p>
-            <p className="text-xs text-muted-foreground mt-1">UTC+8</p>
-          </CardContent>
-        </Card>
-      </div>
 
       {checkInProof && (
         <Card>
@@ -544,51 +411,61 @@ export default function WorkingPage() {
         </Card>
       )}
 
-      {/* Attendance Records */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-lg">My Attendance Records</CardTitle>
-          <CardDescription>All times shown in UTC+8</CardDescription>
+          <CardTitle className="text-lg">My attendance records</CardTitle>
+          <CardDescription>Times in UTC+8</CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="rounded-md border overflow-x-auto">
+          <div className="space-y-2 md:hidden">
+            {attendanceRecords.length === 0 ? (
+              <p className="py-6 text-center text-sm text-muted-foreground">No check-in record yet.</p>
+            ) : (
+              attendanceRecords.map((record) => (
+                <div key={record.dateKey} className="rounded-xl border bg-card p-3 text-sm shadow-sm">
+                  <p className="font-medium text-foreground">{formatUtc8Date(new Date(record.workingInIso))}</p>
+                  <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-muted-foreground">
+                    <span>
+                      In <span className="font-mono text-foreground">{formatUtc8Time(new Date(record.workingInIso))}</span>
+                    </span>
+                    <span>
+                      Out{' '}
+                      <span className="font-mono text-foreground">
+                        {record.workingOutIso ? formatUtc8Time(new Date(record.workingOutIso)) : '—'}
+                      </span>
+                    </span>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+
+          <div className="hidden overflow-x-auto rounded-lg border md:block">
             <table className="w-full text-sm">
               <thead className="bg-muted/40">
                 <tr>
-                  <th className="text-left font-medium px-4 py-3">Date</th>
-                  <th className="text-left font-medium px-4 py-3">Working In</th>
-                  <th className="text-left font-medium px-4 py-3">Working Out</th>
-                  <th className="text-left font-medium px-4 py-3">Deduction</th>
+                  <th className="px-3 py-2 text-left font-medium">Date</th>
+                  <th className="px-3 py-2 text-left font-medium">In</th>
+                  <th className="px-3 py-2 text-left font-medium">Out</th>
                 </tr>
               </thead>
               <tbody>
                 {attendanceRecords.length === 0 ? (
                   <tr>
-                    <td className="px-4 py-4 text-muted-foreground" colSpan={4}>
+                    <td className="px-3 py-4 text-muted-foreground" colSpan={3}>
                       No check-in record yet.
                     </td>
                   </tr>
                 ) : (
-                  attendanceRecords.map((record) => {
-                    const lateInfo = getAttendanceLateInfo(record)
-
-                    return (
-                      <tr key={record.dateKey} className="border-t">
-                        <td className="px-4 py-3 font-mono">
-                          {formatUtc8Date(new Date(record.workingInIso))}
-                        </td>
-                        <td className={`px-4 py-3 font-mono ${lateInfo.isLateIn ? 'text-red-600 font-semibold' : ''}`}>
-                          {formatUtc8Time(new Date(record.workingInIso))}
-                        </td>
-                        <td className={`px-4 py-3 font-mono ${lateInfo.isLateOut ? 'text-red-600 font-semibold' : ''}`}>
-                          {record.workingOutIso ? formatUtc8Time(new Date(record.workingOutIso)) : '--:--'}
-                        </td>
-                        <td className={`px-4 py-3 font-mono ${lateInfo.deduction > 0 ? 'text-red-600 font-semibold' : ''}`}>
-                          RM {lateInfo.deduction.toFixed(2)}
-                        </td>
-                      </tr>
-                    )
-                  })
+                  attendanceRecords.map((record) => (
+                    <tr key={record.dateKey} className="border-t">
+                      <td className="px-3 py-2 font-mono">{formatUtc8Date(new Date(record.workingInIso))}</td>
+                      <td className="px-3 py-2 font-mono">{formatUtc8Time(new Date(record.workingInIso))}</td>
+                      <td className="px-3 py-2 font-mono">
+                        {record.workingOutIso ? formatUtc8Time(new Date(record.workingOutIso)) : '—'}
+                      </td>
+                    </tr>
+                  ))
                 )}
               </tbody>
             </table>
@@ -596,24 +473,13 @@ export default function WorkingPage() {
         </CardContent>
       </Card>
 
-      {/* Current Session (UTC+8) */}
-      {(workStartTime || workEndTime) && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-lg">Current Session</CardTitle>
-          </CardHeader>
-          <CardContent className="grid gap-4 md:grid-cols-2">
-            <div>
-              <p className="text-xs text-muted-foreground mb-1">Working In (UTC+8)</p>
-              <p className="text-xl font-mono font-bold">{formatUtc8Time(workStartTime)}</p>
-            </div>
-            <div>
-              <p className="text-xs text-muted-foreground mb-1">Working Out (UTC+8)</p>
-              <p className="text-xl font-mono font-bold">{formatUtc8Time(workEndTime)}</p>
-            </div>
-          </CardContent>
-        </Card>
-      )}
+      {user?.email ? (
+        <EmployeeWorkingPayrollTable
+          operatorId={operatorId}
+          email={user.email}
+          attendanceRecords={attendanceRecords}
+        />
+      ) : null}
 
       {/* Check In Dialog */}
       <Dialog open={showCheckInDialog} onOpenChange={setShowCheckInDialog}>
@@ -731,11 +597,6 @@ export default function WorkingPage() {
           </DialogHeader>
           
           <div className="space-y-4 py-4">
-            <div className="p-4 bg-muted rounded-lg text-center">
-              <p className="text-2xl font-bold font-mono">{formatTime(elapsedTime)}</p>
-              <p className="text-sm text-muted-foreground">Total working time</p>
-            </div>
-
             {/* Camera Section */}
             <div className="space-y-2">
               <label className="text-sm font-medium">Selfie</label>

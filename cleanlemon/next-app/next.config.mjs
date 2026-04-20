@@ -34,6 +34,11 @@ const nextConfig = {
   async redirects() {
     const list = [
       {
+        source: '/portal/employee/order',
+        destination: '/employee/transport',
+        permanent: true,
+      },
+      {
         source: '/portal/employee/:path*',
         destination: '/employee/:path*',
         permanent: true,
@@ -48,7 +53,22 @@ const nextConfig = {
         destination: '/client/:path*',
         permanent: true,
       },
+      {
+        source: '/portal/dobi/:path*',
+        destination: '/employee/dobi/:path*',
+        permanent: true,
+      },
+      {
+        source: '/portal/driver/:path*',
+        destination: '/employee/driver/:path*',
+        permanent: true,
+      },
     ]
+    list.push({
+      source: '/employee/order',
+      destination: '/employee/transport',
+      permanent: true,
+    })
     if (redirectGoogleOAuthToDemoPage) {
       list.push({
         source: '/api/portal-auth/google',

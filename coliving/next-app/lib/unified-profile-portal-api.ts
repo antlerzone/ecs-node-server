@@ -89,6 +89,14 @@ export function mapPortalGetResponseToUnified(
       if (ymd) return ymd[1];
       return s.replace(/\s*T.*$/, "").slice(0, 10);
     })(),
+    profileSelfVerifiedAt: (() => {
+      const raw =
+        (p as { profile_self_verified_at?: unknown }).profile_self_verified_at ??
+        (p as { profileSelfVerifiedAt?: unknown }).profileSelfVerifiedAt;
+      if (raw == null || raw === "") return "";
+      if (raw instanceof Date && !Number.isNaN(raw.getTime())) return raw.toISOString();
+      return String(raw).trim();
+    })(),
   };
 }
 
@@ -110,7 +118,7 @@ export function buildPortalPayloadFromUnified(
     nricFrontUrl: string | null;
     nricBackUrl: string | null;
   },
-  options?: { identityLocked?: boolean; aliyunEkycVerified?: boolean }
+  options?: { identityLocked?: boolean; aliyunEkycVerified?: boolean; selfVerify?: boolean }
 ): Record<string, unknown> {
   const fullname = payload.fullName != null ? String(payload.fullName).trim() : "";
   const legal = payload.legalName != null ? String(payload.legalName).trim() : "";
@@ -148,6 +156,9 @@ export function buildPortalPayloadFromUnified(
     delete body.id_type;
     delete body.address;
     delete body.passport_expiry_date;
+  }
+  if (options?.selfVerify === true) {
+    body.selfVerify = true;
   }
   return body;
 }
@@ -202,13 +213,14 @@ export async function savePortalProfile(
     clientId?: string;
     email?: string;
   },
-  options?: { govIdentityLocked?: boolean; aliyunEkycVerified?: boolean }
+  options?: { govIdentityLocked?: boolean; aliyunEkycVerified?: boolean; selfVerify?: boolean }
 ): Promise<{ ok: boolean; reason?: string }> {
   const base = getPortalApiBase();
   if (!base) return { ok: true };
   const body = buildPortalPayloadFromUnified(payload, {
     identityLocked: options?.govIdentityLocked,
     aliyunEkycVerified: options?.aliyunEkycVerified,
+    selfVerify: options?.selfVerify,
   });
   try {
     const data = (await portalPost("access/portal-profile-save", {

@@ -23,9 +23,8 @@ export default function OwnerProfileGate({ children }: { children: ReactNode }) 
     if (state.loading) return
     if (typeof window !== "undefined" && isDemoSite()) return
 
-    const noOwner = !state.owner
-    if (noOwner && !isProfilePath(pathname)) {
-      router.replace("/owner/profile")
+    if (!state.profileComplete && !isProfilePath(pathname)) {
+      router.replace("/owner/profile?gate=required")
       return
     }
 

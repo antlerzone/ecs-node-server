@@ -12,6 +12,9 @@ const clnPropGroup = require('./cleanlemon-property-group.service');
 const clnInt = require('./cleanlemon-integration.service');
 const clnOpAi = require('./cln-operator-ai.service');
 const clnSaasAiMd = require('./cln-saasadmin-ai-md.service');
+const clnSalary = require('./cleanlemon-operator-salary.service');
+const clnDriverTrip = require('./cleanlemon-driver-trip.service');
+const clnDobi = require('./cleanlemon-dobi.service');
 const accessSvc = require('../access/access.service');
 const { verifyPortalToken } = require('../portal-auth/portal-auth.service');
 
@@ -404,6 +407,694 @@ router.put('/employee/profile', async (req, res) => {
   }
 });
 
+/** Driver vehicle photo — OSS path scoped by employeedetail id (Portal JWT). */
+router.post('/employee/driver-vehicle-photo', uploadMiddleware, async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    if (!req.file) return res.status(400).json({ ok: false, reason: 'FILE_REQUIRED' });
+    const pool = require('../../config/db');
+    const [[row]] = await pool.query('SELECT id FROM cln_employeedetail WHERE LOWER(TRIM(email)) = ? LIMIT 1', [
+      email,
+    ]);
+    const eid = row?.id ? String(row.id).trim() : '';
+    if (!eid) return res.status(400).json({ ok: false, reason: 'EMPLOYEE_ROW_MISSING' });
+    const result = await uploadToOss(req.file.buffer, req.file.originalname || 'photo.jpg', eid);
+    if (!result.ok) {
+      const status = result.reason === 'OSS_CREDENTIAL_INVALID' ? 503 : 400;
+      return res.status(status).json({ ok: false, reason: result.reason || 'UPLOAD_FAILED' });
+    }
+    return res.json({ ok: true, url: result.url });
+  } catch (err) {
+    console.error('[cleanlemon] employee/driver-vehicle-photo', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'UPLOAD_FAILED' });
+  }
+});
+
+router.get('/employee/driver-vehicle', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const out = await svc.getDriverVehicleByEmail(email);
+    return res.json(out);
+  } catch (err) {
+    console.error('[cleanlemon] employee/driver-vehicle:get', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.put('/employee/driver-vehicle', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const out = await svc.updateDriverVehicleByEmail(email, req.body || {});
+    return res.json(out);
+  } catch (err) {
+    const code = err?.code;
+    if (code === 'MISSING_EMAIL' || code === 'MIGRATION_REQUIRED') {
+      return res.status(code === 'MIGRATION_REQUIRED' ? 503 : 400).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] employee/driver-vehicle:put', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+/** Employee — driver route order (`cln_driver_trip`). */
+router.post('/employee/driver-trip', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const body = req.body || {};
+    const out = await clnDriverTrip.createDriverTrip({
+      email,
+      operatorId: body.operatorId,
+      pickup: body.pickup,
+      dropoff: body.dropoff,
+      scheduleOffset: body.scheduleOffset,
+      orderTimeIso: body.orderTimeIso,
+    });
+    return res.json(out);
+  } catch (err) {
+    const code = String(err?.code || '');
+    if (
+      code === 'MISSING_FIELDS' ||
+      code === 'PICKUP_DROPOFF_SAME' ||
+      code === 'EMPLOYEE_PROFILE_REQUIRED' ||
+      code === 'ACTIVE_TRIP_EXISTS'
+    ) {
+      return res.status(400).json({ ok: false, reason: code });
+    }
+    if (code === 'OPERATOR_ACCESS_DENIED' || code === 'OPERATORDETAIL_REQUIRED') {
+      return res.status(403).json({ ok: false, reason: code });
+    }
+    if (code === 'MIGRATION_REQUIRED') {
+      return res.status(503).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] employee/driver-trip:post', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.get('/employee/driver-trip/active', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.query.operatorId || '').trim();
+    const out = await clnDriverTrip.getActiveTripForEmployee({ email, operatorId });
+    return res.json(out);
+  } catch (err) {
+    const code = String(err?.code || '');
+    if (code === 'MISSING_OPERATOR_ID') return res.status(400).json({ ok: false, reason: code });
+    if (code === 'OPERATOR_ACCESS_DENIED' || code === 'OPERATORDETAIL_REQUIRED') {
+      return res.status(403).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] employee/driver-trip/active:get', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/employee/driver-trip/cancel', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const body = req.body || {};
+    await clnDriverTrip.cancelDriverTrip({
+      email,
+      operatorId: body.operatorId,
+      tripId: body.tripId,
+    });
+    return res.json({ ok: true });
+  } catch (err) {
+    const code = String(err?.code || '');
+    if (code === 'MISSING_FIELDS' || code === 'EMPLOYEE_PROFILE_REQUIRED' || code === 'TRIP_NOT_CANCELLABLE') {
+      return res.status(400).json({ ok: false, reason: code });
+    }
+    if (code === 'NOT_FOUND') return res.status(404).json({ ok: false, reason: code });
+    if (code === 'FORBIDDEN') return res.status(403).json({ ok: false, reason: code });
+    if (code === 'OPERATOR_ACCESS_DENIED' || code === 'OPERATORDETAIL_REQUIRED') {
+      return res.status(403).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] employee/driver-trip/cancel:post', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.get('/employee/driver-trip/open', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.query.operatorId || '').trim();
+    const out = await clnDriverTrip.listOpenTripsForDriver({ email, operatorId });
+    return res.json(out);
+  } catch (err) {
+    const code = String(err?.code || '');
+    if (code === 'MISSING_OPERATOR_ID') return res.status(400).json({ ok: false, reason: code });
+    if (code === 'DRIVER_ROLE_REQUIRED') return res.status(403).json({ ok: false, reason: code });
+    if (code === 'OPERATOR_ACCESS_DENIED' || code === 'OPERATORDETAIL_REQUIRED') {
+      return res.status(403).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] employee/driver-trip/open:get', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/employee/driver-trip/accept', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const body = req.body || {};
+    const out = await clnDriverTrip.acceptTripAsDriver({
+      email,
+      operatorId: body.operatorId,
+      tripId: body.tripId,
+    });
+    return res.json(out);
+  } catch (err) {
+    const code = String(err?.code || '');
+    if (code === 'MISSING_FIELDS' || code === 'EMPLOYEE_PROFILE_REQUIRED' || code === 'TRIP_NOT_OPEN') {
+      return res.status(400).json({ ok: false, reason: code });
+    }
+    if (code === 'NOT_FOUND') return res.status(404).json({ ok: false, reason: code });
+    if (code === 'CANNOT_ACCEPT_OWN_TRIP') return res.status(400).json({ ok: false, reason: code });
+    if (code === 'ACTIVE_TRIP_EXISTS') return res.status(409).json({ ok: false, reason: code });
+    if (code === 'DRIVER_ROLE_REQUIRED') return res.status(403).json({ ok: false, reason: code });
+    if (code === 'OPERATOR_ACCESS_DENIED' || code === 'OPERATORDETAIL_REQUIRED') {
+      return res.status(403).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] employee/driver-trip/accept:post', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/employee/driver-trip/start', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const body = req.body || {};
+    const out = await clnDriverTrip.startDriverTrip({
+      email,
+      operatorId: body.operatorId,
+      tripId: body.tripId,
+    });
+    return res.json(out);
+  } catch (err) {
+    const code = String(err?.code || '');
+    if (code === 'MISSING_FIELDS' || code === 'EMPLOYEE_PROFILE_REQUIRED' || code === 'TRIP_START_DENIED') {
+      return res.status(400).json({ ok: false, reason: code });
+    }
+    if (code === 'MIGRATION_REQUIRED') return res.status(503).json({ ok: false, reason: code });
+    if (code === 'DRIVER_ROLE_REQUIRED') return res.status(403).json({ ok: false, reason: code });
+    if (code === 'OPERATOR_ACCESS_DENIED' || code === 'OPERATORDETAIL_REQUIRED') {
+      return res.status(403).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] employee/driver-trip/start:post', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/employee/driver-trip/release-accept', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const body = req.body || {};
+    const out = await clnDriverTrip.releaseDriverAcceptance({
+      email,
+      operatorId: body.operatorId,
+      tripId: body.tripId,
+    });
+    return res.json(out);
+  } catch (err) {
+    const code = String(err?.code || '');
+    if (code === 'MISSING_FIELDS' || code === 'EMPLOYEE_PROFILE_REQUIRED' || code === 'RELEASE_DENIED') {
+      return res.status(400).json({ ok: false, reason: code });
+    }
+    if (code === 'DRIVER_ROLE_REQUIRED') return res.status(403).json({ ok: false, reason: code });
+    if (code === 'OPERATOR_ACCESS_DENIED' || code === 'OPERATORDETAIL_REQUIRED') {
+      return res.status(403).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] employee/driver-trip/release-accept:post', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.get('/employee/driver-trip/driver-active', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.query.operatorId || '').trim();
+    const out = await clnDriverTrip.getActiveTripForDriver({ email, operatorId });
+    return res.json(out);
+  } catch (err) {
+    const code = String(err?.code || '');
+    if (code === 'MISSING_OPERATOR_ID') return res.status(400).json({ ok: false, reason: code });
+    if (code === 'DRIVER_ROLE_REQUIRED') return res.status(403).json({ ok: false, reason: code });
+    if (code === 'OPERATOR_ACCESS_DENIED' || code === 'OPERATORDETAIL_REQUIRED') {
+      return res.status(403).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] employee/driver-trip/driver-active:get', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/employee/driver-trip/finish', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const body = req.body || {};
+    const out = await clnDriverTrip.finishTripAsDriver({
+      email,
+      operatorId: body.operatorId,
+      tripId: body.tripId,
+    });
+    return res.json(out);
+  } catch (err) {
+    const code = String(err?.code || '');
+    if (code === 'MISSING_FIELDS' || code === 'EMPLOYEE_PROFILE_REQUIRED' || code === 'TRIP_FINISH_DENIED') {
+      return res.status(code === 'TRIP_FINISH_DENIED' ? 409 : 400).json({ ok: false, reason: code });
+    }
+    if (code === 'TRIP_NOT_STARTED') return res.status(409).json({ ok: false, reason: code });
+    if (code === 'DRIVER_ROLE_REQUIRED') return res.status(403).json({ ok: false, reason: code });
+    if (code === 'OPERATOR_ACCESS_DENIED' || code === 'OPERATORDETAIL_REQUIRED') {
+      return res.status(403).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] employee/driver-trip/finish:post', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.get('/employee/driver-trip/driver-history', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.query.operatorId || '').trim();
+    const out = await clnDriverTrip.listCompletedTripsForDriver({
+      email,
+      operatorId,
+      limit: req.query.limit,
+    });
+    return res.json(out);
+  } catch (err) {
+    const code = String(err?.code || '');
+    if (code === 'MISSING_OPERATOR_ID') return res.status(400).json({ ok: false, reason: code });
+    if (code === 'DRIVER_ROLE_REQUIRED') return res.status(403).json({ ok: false, reason: code });
+    if (code === 'OPERATOR_ACCESS_DENIED' || code === 'OPERATORDETAIL_REQUIRED') {
+      return res.status(403).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] employee/driver-trip/driver-history:get', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+/** Dobi laundry (`cln_dobi_*`) — employee + operator (same JWT + operator binding). */
+function dobiHttpError(res, err) {
+  const code = String(err?.code || '');
+  if (code === 'MIGRATION_REQUIRED') return res.status(503).json({ ok: false, reason: code });
+  if (code === 'OPERATOR_ACCESS_DENIED' || code === 'MISSING_OPERATOR_OR_EMAIL') {
+    return res.status(403).json({ ok: false, reason: 'OPERATOR_ACCESS_DENIED' });
+  }
+    const bad400 = new Set([
+    'INVALID_STAGE',
+    'MACHINE_REQUIRED',
+    'INVALID_MACHINE',
+    'HANDOFF_REMARK_REQUIRED',
+    'EMPTY_LINES',
+    'UNKNOWN_ACTION',
+    'LOT_NOT_FOUND',
+    'INTAKE_LOCKED',
+    'INVALID_BUSINESS_DATE',
+    'MISSING_REMARK',
+    'NO_LINEN_ITEM_TYPE_MATCH',
+    'INVALID_TARGET_STAGE',
+    'INVALID_TAKEOUTS',
+    'TAKEOUT_REQUIRED',
+    'INVALID_ITEM_LINE',
+    'TAKEOUT_EXCEEDS',
+  ]);
+  if (bad400.has(code)) {
+    const out = { ok: false, reason: code };
+    if (code === 'HANDOFF_REMARK_REQUIRED' && err?.gapMinutes != null) out.gapMinutes = err.gapMinutes;
+    if (code === 'NO_LINEN_ITEM_TYPE_MATCH' && err?.missingKeys) out.missingKeys = err.missingKeys;
+    return res.status(400).json(out);
+  }
+  return null;
+}
+
+router.get('/employee/dobi/day', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.query.operatorId || '').trim();
+    const businessDate = String(req.query.businessDate || '').trim().slice(0, 10);
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const out = await clnDobi.getDayBundle(operatorId, businessDate, email);
+    return res.json(out);
+  } catch (err) {
+    const d = dobiHttpError(res, err);
+    if (d) return d;
+    console.error('[cleanlemon] employee/dobi/day:get', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/employee/dobi/preview-split', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const out = await clnDobi.previewSplit(operatorId, email, req.body?.lines || []);
+    return res.json(out);
+  } catch (err) {
+    const d = dobiHttpError(res, err);
+    if (d) return d;
+    console.error('[cleanlemon] employee/dobi/preview-split:post', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/employee/dobi/commit-intake', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const businessDate = String(req.body?.businessDate || '').trim().slice(0, 10);
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const out = await clnDobi.commitIntake(operatorId, email, businessDate, req.body?.lines || []);
+    return res.json(out);
+  } catch (err) {
+    const d = dobiHttpError(res, err);
+    if (d) return d;
+    console.error('[cleanlemon] employee/dobi/commit-intake:post', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+/** Dobi staff: add pending-wash batches manually (no QR), same packing rules as intake. */
+router.post('/employee/dobi/append-intake', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const businessDate = String(req.body?.businessDate || '').trim().slice(0, 10);
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const rawTs = String(req.body?.targetStage || req.body?.target_stage || '').trim().toLowerCase();
+    const targetStage = rawTs === 'ready' ? 'ready' : 'pending_wash';
+    const out = await clnDobi.appendIntakeLots(operatorId, email, businessDate, req.body?.lines || [], {
+      source: 'manual_append',
+      targetStage,
+    });
+    return res.json(out);
+  } catch (err) {
+    const d = dobiHttpError(res, err);
+    if (d) return d;
+    console.error('[cleanlemon] employee/dobi/append-intake:post', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/employee/dobi/lot-action', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const out = await clnDobi.lotAction(operatorId, email, req.body || {});
+    return res.json(out);
+  } catch (err) {
+    const d = dobiHttpError(res, err);
+    if (d) return d;
+    console.error('[cleanlemon] employee/dobi/lot-action:post', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/employee/dobi/damage-linen', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const body = req.body || {};
+    const out = await clnDobi.submitDobiDamageLinen({
+      operatorId,
+      email,
+      businessDate: body.businessDate,
+      remark: body.remark,
+      lines: body.lines,
+      photoUrls: body.photoUrls,
+    });
+    return res.json(out);
+  } catch (err) {
+    const d = dobiHttpError(res, err);
+    if (d) return d;
+    console.error('[cleanlemon] employee/dobi/damage-linen:post', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+/** Linen handoff: cleaner requests QR → dobi scans to approve (no signature). */
+router.get('/employee/linens/qr-mode', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.query.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    await svc.assertClnOperatorStaffEmail(operatorId, email);
+    const cfg = await clnDobi.getConfig(operatorId);
+    return res.json({ ok: true, linenQrStyle: cfg.linenQrStyle });
+  } catch (err) {
+    const code = String(err?.code || '');
+    if (code === 'OPERATOR_ACCESS_DENIED' || code === 'MISSING_OPERATOR_OR_EMAIL') {
+      return res.status(403).json({ ok: false, reason: 'OPERATOR_ACCESS_DENIED' });
+    }
+    console.error('[cleanlemon] employee/linens/qr-mode:get', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/employee/linens/qr-request', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const body = req.body || {};
+    const cfg = await clnDobi.getConfig(operatorId);
+    const ttlMs = clnDobi.linenQrTtlMsForStyle(cfg.linenQrStyle);
+    const out = await svc.createLinenQrApprovalRequest({
+      email,
+      operatorId,
+      date: body.date,
+      action: body.action,
+      team: body.team,
+      totals: body.totals,
+      lines: body.lines,
+      missingQty: body.missingQty,
+      remark: body.remark,
+      ttlMs,
+    });
+    return res.json({ ...out, linenQrStyle: cfg.linenQrStyle });
+  } catch (err) {
+    const code = String(err?.code || '');
+    if (code === 'INVALID_PAYLOAD' || code === 'REMARK_REQUIRED' || code === 'INVALID_ITEM_TYPE') {
+      return res.status(400).json({ ok: false, reason: code });
+    }
+    if (code === 'OPERATOR_ACCESS_DENIED' || code === 'MISSING_OPERATOR_OR_EMAIL') {
+      return res.status(403).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] employee/linens/qr-request:post', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.get('/employee/dobi/linen-qr', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.query.operatorId || '').trim();
+    const token = String(req.query.token || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    if (!token) return res.status(400).json({ ok: false, reason: 'MISSING_TOKEN' });
+    const out = await svc.getLinenQrApprovalForDobi({ email, operatorId, token });
+    return res.json(out);
+  } catch (err) {
+    const code = String(err?.code || '');
+    if (code === 'DOBI_ROLE_REQUIRED') return res.status(403).json({ ok: false, reason: code });
+    if (code === 'NOT_FOUND') return res.status(404).json({ ok: false, reason: code });
+    if (code === 'EXPIRED') return res.status(410).json({ ok: false, reason: code });
+    if (code === 'ALREADY_DONE') return res.status(409).json({ ok: false, reason: code });
+    console.error('[cleanlemon] employee/dobi/linen-qr:get', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/employee/dobi/linen-qr-approve', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const token = String(req.body?.token || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    if (!token) return res.status(400).json({ ok: false, reason: 'MISSING_TOKEN' });
+    const out = await svc.approveLinenQrApproval({ email, operatorId, token });
+    return res.json(out);
+  } catch (err) {
+    const code = String(err?.code || '');
+    if (code === 'DOBI_ROLE_REQUIRED') return res.status(403).json({ ok: false, reason: code });
+    if (code === 'NOT_FOUND') return res.status(404).json({ ok: false, reason: code });
+    if (code === 'EXPIRED') return res.status(410).json({ ok: false, reason: code });
+    if (code === 'ALREADY_DONE') return res.status(409).json({ ok: false, reason: code });
+    if (code === 'NO_LINEN_ITEM_TYPE_MATCH') {
+      return res.status(400).json({ ok: false, reason: code, missingKeys: err?.missingKeys });
+    }
+    if (code === 'INVALID_ITEM_TYPE') return res.status(400).json({ ok: false, reason: code });
+    const d = dobiHttpError(res, err);
+    if (d) return d;
+    console.error('[cleanlemon] employee/dobi/linen-qr-approve:post', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.get('/employee/dobi/report', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.query.operatorId || '').trim();
+    const fromDate = String(req.query.fromDate || '').trim().slice(0, 10);
+    const toDate = String(req.query.toDate || '').trim().slice(0, 10);
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const out = await clnDobi.report(operatorId, email, fromDate, toDate);
+    return res.json(out);
+  } catch (err) {
+    const d = dobiHttpError(res, err);
+    if (d) return d;
+    console.error('[cleanlemon] employee/dobi/report:get', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.get('/employee/dobi/summary', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.query.operatorId || '').trim();
+    const fromDate = String(req.query.fromDate || '').trim().slice(0, 10);
+    const toDate = String(req.query.toDate || '').trim().slice(0, 10);
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const out = await clnDobi.summary(operatorId, email, fromDate, toDate);
+    return res.json(out);
+  } catch (err) {
+    const d = dobiHttpError(res, err);
+    if (d) return d;
+    console.error('[cleanlemon] employee/dobi/summary:get', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.get('/employee/dobi/day-events', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.query.operatorId || '').trim();
+    const businessDate = String(req.query.businessDate || '').trim().slice(0, 10);
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    if (!businessDate) return res.status(400).json({ ok: false, reason: 'MISSING_BUSINESS_DATE' });
+    const out = await clnDobi.listWorkflowEventsForDay(operatorId, email, businessDate);
+    return res.json(out);
+  } catch (err) {
+    const code = String(err?.code || '');
+    if (code === 'INVALID_BUSINESS_DATE') return res.status(400).json({ ok: false, reason: code });
+    const d = dobiHttpError(res, err);
+    if (d) return d;
+    console.error('[cleanlemon] employee/dobi/day-events:get', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.get('/operator/dobi/config', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.query.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    await svc.assertClnOperatorStaffEmail(operatorId, email);
+    const cfg = await clnDobi.getConfig(operatorId);
+    const itemTypes = await clnDobi.listItemTypes(operatorId);
+    const machines = await clnDobi.listMachines(operatorId);
+    return res.json({ ok: true, config: cfg, itemTypes, machines });
+  } catch (err) {
+    const d = dobiHttpError(res, err);
+    if (d) return d;
+    console.error('[cleanlemon] operator/dobi/config:get', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.put('/operator/dobi/config', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const cfg = await clnDobi.putConfig(operatorId, email, req.body || {});
+    return res.json({ ok: true, config: cfg });
+  } catch (err) {
+    const d = dobiHttpError(res, err);
+    if (d) return d;
+    console.error('[cleanlemon] operator/dobi/config:put', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.put('/operator/dobi/item-types', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const itemTypes = await clnDobi.replaceItemTypes(operatorId, email, req.body?.items || []);
+    return res.json({ ok: true, itemTypes });
+  } catch (err) {
+    const d = dobiHttpError(res, err);
+    if (d) return d;
+    console.error('[cleanlemon] operator/dobi/item-types:put', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.put('/operator/dobi/machines', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const machines = await clnDobi.replaceMachines(operatorId, email, req.body?.machines || []);
+    return res.json({ ok: true, machines });
+  } catch (err) {
+    const d = dobiHttpError(res, err);
+    if (d) return d;
+    console.error('[cleanlemon] operator/dobi/machines:put', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.get('/operator/dobi/day', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.query.operatorId || '').trim();
+    const businessDate = String(req.query.businessDate || '').trim().slice(0, 10);
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const out = await clnDobi.getDayBundle(operatorId, businessDate, email);
+    return res.json(out);
+  } catch (err) {
+    const d = dobiHttpError(res, err);
+    if (d) return d;
+    console.error('[cleanlemon] operator/dobi/day:get', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
 router.post('/employee/schedule-jobs/group-start', async (req, res) => {
   try {
     const email = employeePortalEmailStrict(req);
@@ -435,6 +1126,24 @@ router.post('/employee/schedule-jobs/group-start', async (req, res) => {
   }
 });
 
+router.get('/employee/job-completion-addons', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.query.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const out = await svc.getEmployeeJobCompletionAddons({ email, operatorId });
+    res.json(out);
+  } catch (err) {
+    const code = err?.code;
+    if (code === 'OPERATOR_ACCESS_DENIED' || code === 'MISSING_OPERATOR_OR_EMAIL') {
+      return res.status(403).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] employee/job-completion-addons:get', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
 router.post('/employee/schedule-jobs/group-end', async (req, res) => {
   try {
     const email = employeePortalEmailStrict(req);
@@ -443,7 +1152,15 @@ router.post('/employee/schedule-jobs/group-end', async (req, res) => {
     const jobIds = Array.isArray(req.body?.jobIds) ? req.body.jobIds : [];
     const photos = Array.isArray(req.body?.photos) ? req.body.photos : [];
     const remark = req.body?.remark;
-    const out = await svc.groupEndEmployeeScheduleJobs({ email, operatorId, jobIds, photos, remark });
+    const completionAddons = Array.isArray(req.body?.completionAddons) ? req.body.completionAddons : [];
+    const out = await svc.groupEndEmployeeScheduleJobs({
+      email,
+      operatorId,
+      jobIds,
+      photos,
+      remark,
+      completionAddons,
+    });
     if (out?.ok && Array.isArray(jobIds) && jobIds.length) {
       clnOpAi.maybeRunProgressRebalanceAfterGroupEnd(operatorId, jobIds);
     }
@@ -535,7 +1252,13 @@ router.post('/employee/task/unlock', async (req, res) => {
     res.json(out);
   } catch (err) {
     const code = err?.code;
-    if (code === 'LOCK_NOT_ALLOWED' || code === 'LOCK_NOT_FOUND' || code === 'LOCK_SCOPE_DENIED') {
+    if (
+      code === 'LOCK_NOT_ALLOWED' ||
+      code === 'LOCK_NOT_FOUND' ||
+      code === 'LOCK_SCOPE_DENIED' ||
+      code === 'OPERATOR_DOOR_USE_PASSWORD' ||
+      code === 'OPERATOR_DOOR_NO_BOOKING_TODAY'
+    ) {
       return res.status(400).json({ ok: false, reason: code });
     }
     if (code === 'OPERATOR_ACCESS_DENIED' || code === 'MISSING_OPERATOR_OR_EMAIL') {
@@ -819,7 +1542,9 @@ router.post('/client/properties/patch', async (req, res) => {
       code === 'AUTHORIZE_PROPERTY_TTLOCK_REQUIRED' ||
       code === 'MISSING_OPERATOR_ID' ||
       code === 'OPERATOR_NOT_FOUND' ||
-      code === 'MISSING_IDS'
+      code === 'MISSING_IDS' ||
+      code === 'INVALID_OPERATOR_DOOR_ACCESS_MODE' ||
+      code === 'OPERATOR_DOOR_GATEWAY_REQUIRED'
     ) {
       return res.status(400).json({ ok: false, reason: code });
     }
@@ -1295,6 +2020,51 @@ router.get('/client/invoices', async (req, res) => {
   }
 });
 
+/** B2B client — Stripe Checkout for one operator’s unpaid invoices (same operator only; Connect destination). */
+router.post('/client/invoices/checkout', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const invoiceIds = req.body?.invoiceIds;
+    const successUrl = String(req.body?.successUrl || '').trim();
+    const cancelUrl = String(req.body?.cancelUrl || '').trim();
+    if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    if (!jwtVerified && !operatorId) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL_OR_OPERATOR' });
+    }
+    if (!Array.isArray(invoiceIds) || !invoiceIds.length) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_INVOICE_IDS' });
+    }
+    if (!successUrl || !cancelUrl) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_RETURN_URL' });
+    }
+    const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
+      ensureClientdetailIfMissing: jwtVerified,
+    });
+    const out = await svc.createClientPortalInvoiceCheckoutSession({
+      clientdetailId,
+      operatorId,
+      invoiceIds,
+      email,
+      successUrl,
+      cancelUrl,
+    });
+    if (!out.ok) {
+      return res.status(400).json({ ok: false, reason: out.code || 'CHECKOUT_FAILED' });
+    }
+    return res.json({ ok: true, url: out.url, sessionId: out.sessionId });
+  } catch (err) {
+    if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
+      return res.status(409).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] client/invoices:checkout', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
 /** B2B client — list schedule jobs (single-operator scope, or whole group when groupId set — mixed property operators). */
 router.get('/client/schedule-jobs', async (req, res) => {
   try {
@@ -1323,8 +2093,13 @@ router.get('/client/schedule-jobs', async (req, res) => {
     if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
       return res.status(409).json({ ok: false, reason: err.code });
     }
-    console.error('[cleanlemon] client/schedule-jobs:get', err);
-    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+    console.error('[cleanlemon] client/schedule-jobs:get', err?.message || err, err?.sqlMessage);
+    return res.status(500).json({
+      ok: false,
+      reason: err?.message || 'SERVER_ERROR',
+      sqlMessage: err?.sqlMessage,
+      errno: err?.errno,
+    });
   }
 });
 
@@ -1882,14 +2657,46 @@ router.get('/operator/dashboard', async (req, res) => {
 router.get('/operator/properties', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
+    const includeArchived =
+      req.query.includeArchived === '1' ||
+      req.query.includeArchived === 'true' ||
+      req.query.includeArchived === 'yes';
     const body = await svc.listOperatorProperties({
       limit: req.query.limit,
       offset: req.query.offset,
       operatorId,
+      includeArchived,
     });
     res.json({ ok: true, items: body });
   } catch (err) {
     console.error('[cleanlemon] operator/properties:get', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+/** Single property — Coliving security credentials for operator edit dialog (matches client portal shape). */
+router.get('/operator/properties/:id', async (req, res) => {
+  try {
+    const operatorId = String(req.query.operatorId || '').trim();
+    const property = await svc.getOperatorPropertyDetail({
+      propertyId: req.params.id,
+      operatorId,
+    });
+    res.json({ ok: true, property });
+  } catch (err) {
+    console.error('[cleanlemon] operator/properties/:id:get', err);
+    if (err && err.code === 'MISSING_IDS') {
+      return res.status(400).json({ ok: false, reason: 'MISSING_IDS' });
+    }
+    if (err && err.code === 'NOT_FOUND') {
+      return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
+    }
+    if (err && err.code === 'OPERATOR_MISMATCH') {
+      return res.status(403).json({ ok: false, reason: 'OPERATOR_MISMATCH' });
+    }
+    if (err && err.code === 'UNSUPPORTED') {
+      return res.status(501).json({ ok: false, reason: 'UNSUPPORTED' });
+    }
     res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
   }
 });
@@ -2006,6 +2813,15 @@ router.put('/operator/properties/:id', async (req, res) => {
     if (err && err.code === 'PROPERTY_DELETE_BLOCKED') {
       return res.status(409).json({ ok: false, reason: 'PROPERTY_DELETE_BLOCKED' });
     }
+    if (err && err.code === 'UNSUPPORTED') {
+      return res.status(501).json({ ok: false, reason: 'UNSUPPORTED' });
+    }
+    if (err && err.code === 'TRANSFER_REQUIRES_BOUND_CLIENT') {
+      return res.status(400).json({ ok: false, reason: 'TRANSFER_REQUIRES_BOUND_CLIENT' });
+    }
+    if (err && err.code === 'ALREADY_CLIENT_OWNED') {
+      return res.status(400).json({ ok: false, reason: 'ALREADY_CLIENT_OWNED' });
+    }
     res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
   }
 });
@@ -2019,6 +2835,12 @@ router.delete('/operator/properties/:id', async (req, res) => {
     console.error('[cleanlemon] operator/properties:delete', err);
     if (err && err.code === 'OPERATOR_MISMATCH') {
       return res.status(403).json({ ok: false, reason: 'OPERATOR_MISMATCH' });
+    }
+    if (err && err.code === 'CLIENT_PORTAL_OWNED') {
+      return res.status(400).json({ ok: false, reason: 'CLIENT_PORTAL_OWNED' });
+    }
+    if (err && err.code === 'PROPERTY_NOT_ARCHIVED') {
+      return res.status(400).json({ ok: false, reason: 'PROPERTY_NOT_ARCHIVED' });
     }
     res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
   }
@@ -2451,7 +3273,10 @@ router.get('/operator/ttlock/credentials', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
-    const data = await clnInt.getTtlockCredentialsClnOperator(operatorId);
+    const slotRaw = req.query?.ttlockSlot ?? req.query?.ttlock_slot;
+    const slot = slotRaw != null && slotRaw !== '' ? Number(slotRaw) : 0;
+    const sl = Number.isFinite(slot) && slot >= 0 ? slot : 0;
+    const data = await clnInt.getTtlockCredentialsClnOperator(operatorId, sl);
     return res.json(data);
   } catch (err) {
     console.error('[cleanlemon] operator/ttlock/credentials', err);
@@ -2464,8 +3289,15 @@ router.post('/operator/ttlock/connect', async (req, res) => {
     const operatorId = String(req.body?.operatorId || '').trim();
     const username = req.body?.username;
     const password = req.body?.password;
+    const accountName = req.body?.accountName;
+    const slotRaw = req.body?.ttlockSlot ?? req.body?.ttlock_slot;
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
-    const result = await clnInt.ttlockConnectClnOperator(operatorId, { username, password });
+    const result = await clnInt.ttlockConnectClnOperator(operatorId, {
+      username,
+      password,
+      accountName,
+      slot: slotRaw != null && slotRaw !== '' ? Number(slotRaw) : undefined
+    });
     return res.json(result);
   } catch (err) {
     const msg = err?.message || 'TTLOCK_CONNECT_FAILED';
@@ -2478,7 +3310,8 @@ router.post('/operator/ttlock/disconnect', async (req, res) => {
   try {
     const operatorId = String(req.body?.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
-    await clnInt.ttlockDisconnectClnOperator(operatorId);
+    const slot = Number(req.body?.ttlockSlot ?? req.body?.ttlock_slot ?? 0) || 0;
+    await clnInt.ttlockDisconnectClnOperator(operatorId, slot);
     return res.json({ ok: true });
   } catch (err) {
     console.error('[cleanlemon] operator/ttlock/disconnect', err);
@@ -2774,10 +3607,237 @@ router.post('/operator/stripe-connect/disconnect', async (req, res) => {
 router.get('/operator/salaries', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
-    const items = await svc.listOperatorSalaries(operatorId);
+    const period = String(req.query.period || '').trim();
+    const items = await svc.listOperatorSalaries(operatorId, period || undefined);
     res.json({ ok: true, items });
   } catch (err) {
     console.error('[cleanlemon] operator/salaries:get', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.get('/operator/salary-settings', async (req, res) => {
+  try {
+    const operatorId = String(req.query.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const settings = await clnSalary.getSalarySettings(operatorId);
+    res.json({ ok: true, settings });
+  } catch (err) {
+    console.error('[cleanlemon] operator/salary-settings:get', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.put('/operator/salary-settings', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const payDays = Array.isArray(req.body?.payDays) ? req.body.payDays : [];
+    const payrollDefaults =
+      req.body?.payrollDefaults !== undefined ? req.body.payrollDefaults : undefined;
+    const settings = await clnSalary.saveSalarySettings(operatorId, payDays, payrollDefaults);
+    res.json({ ok: true, settings });
+  } catch (err) {
+    const code = err?.code;
+    if (code === 'MISSING_OPERATOR_ID' || code === 'SALARY_TABLES_MISSING') {
+      return res.status(400).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] operator/salary-settings:put', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.get('/operator/salary-lines', async (req, res) => {
+  try {
+    const operatorId = String(req.query.operatorId || '').trim();
+    const period = String(req.query.period || '').trim();
+    if (!operatorId || !/^\d{4}-\d{2}$/.test(period)) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_PARAMS' });
+    }
+    const items = await clnSalary.listSalaryLines(operatorId, period);
+    res.json({ ok: true, items });
+  } catch (err) {
+    console.error('[cleanlemon] operator/salary-lines:get', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/operator/salary-lines', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const item = await clnSalary.addSalaryLine(operatorId, req.body || {});
+    res.json({ ok: true, item });
+  } catch (err) {
+    const code = err?.code;
+    if (code === 'RECORD_NOT_FOUND' || code === 'MISSING_OPERATOR_ID' || code === 'SALARY_TABLES_MISSING') {
+      return res.status(400).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] operator/salary-lines:post', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.delete('/operator/salary-lines/:id', async (req, res) => {
+  try {
+    const operatorId = String(req.query.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const ok = await clnSalary.deleteSalaryLine(operatorId, req.params.id);
+    res.json({ ok, deleted: ok });
+  } catch (err) {
+    console.error('[cleanlemon] operator/salary-lines:delete', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.patch('/operator/salary-lines/:id', async (req, res) => {
+  try {
+    const operatorId = String(req.query.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const item = await clnSalary.updateSalaryLine(operatorId, req.params.id, req.body || {});
+    res.json({ ok: true, item });
+  } catch (err) {
+    const code = err?.code;
+    if (code === 'LINE_NOT_FOUND' || code === 'MISSING_PARAMS' || code === 'MISSING_OPERATOR_ID' || code === 'SALARY_TABLES_MISSING') {
+      return res.status(400).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] operator/salary-lines:patch', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/operator/salaries/compute-preview', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const result = await clnSalary.previewFlexiblePayroll(operatorId, req.body || {});
+    res.json({ ok: true, result });
+  } catch (err) {
+    const code = err?.code;
+    if (
+      code === 'MISSING_OPERATOR_ID' ||
+      code === 'RECORD_NOT_FOUND' ||
+      code === 'SALARY_TABLES_MISSING'
+    ) {
+      return res.status(400).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] operator/salaries/compute-preview', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/operator/salaries/sync-from-contacts', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const period = String(req.body?.period || '').trim();
+    if (!operatorId || !/^\d{4}-\d{2}$/.test(period)) {
+      return res.status(400).json({ ok: false, reason: 'INVALID_PARAMS' });
+    }
+    const items = await svc.listOperatorContacts(operatorId);
+    const result = await clnSalary.syncSalaryRecordsFromContacts(operatorId, period, items);
+    res.json(result);
+  } catch (err) {
+    const code = err?.code;
+    if (code === 'INVALID_PARAMS' || code === 'SALARY_TABLES_MISSING') {
+      return res.status(400).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] operator/salaries/sync-from-contacts', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/operator/salaries', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const item = await clnSalary.createSalaryRecord(operatorId, req.body || {});
+    res.json({ ok: true, item });
+  } catch (err) {
+    const code = err?.code;
+    if (code === 'INVALID_PERIOD' || code === 'MISSING_OPERATOR_ID' || code === 'SALARY_TABLES_MISSING') {
+      return res.status(400).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] operator/salaries:post', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.patch('/operator/salaries/:id', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const status = String(req.body?.status || '').trim();
+    if (status === 'void' || status === 'archived') {
+      const item = await clnSalary.patchSalaryRecordStatus(operatorId, req.params.id, status);
+      return res.json({ ok: true, item });
+    }
+    const item = await clnSalary.updateSalaryRecord(operatorId, req.params.id, req.body || {});
+    res.json({ ok: true, item });
+  } catch (err) {
+    const code = err?.code;
+    if (
+      code === 'INVALID_STATUS' ||
+      code === 'MISSING_OPERATOR_ID' ||
+      code === 'SALARY_TABLES_MISSING' ||
+      code === 'RECORD_NOT_FOUND' ||
+      code === 'RECORD_LOCKED' ||
+      code === 'MISSING_PARAMS'
+    ) {
+      return res.status(400).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] operator/salaries:patch', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/operator/salaries/sync-accounting', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const recordIds = Array.isArray(req.body?.recordIds) ? req.body.recordIds : [];
+    const journalDate = String(req.body?.journalDate || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const result = await clnSalary.syncSalaryRecordsToAccounting(
+      operatorId,
+      recordIds,
+      journalDate || undefined
+    );
+    res.json(result);
+  } catch (err) {
+    console.error('[cleanlemon] operator/salaries/sync-accounting', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+/** @deprecated Use POST /operator/salaries/sync-accounting (same behaviour: Bukku or Xero by integration). */
+router.post('/operator/salaries/sync-bukku', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const recordIds = Array.isArray(req.body?.recordIds) ? req.body.recordIds : [];
+    const journalDate = String(req.body?.journalDate || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const result = await clnSalary.syncSalaryRecordsToAccounting(
+      operatorId,
+      recordIds,
+      journalDate || undefined
+    );
+    res.json(result);
+  } catch (err) {
+    console.error('[cleanlemon] operator/salaries/sync-bukku', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/operator/salaries/mark-paid', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const recordIds = Array.isArray(req.body?.recordIds) ? req.body.recordIds : [];
+    const paymentDate = String(req.body?.paymentDate || '').trim();
+    const paymentMethod = String(req.body?.paymentMethod || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const result = await clnSalary.markSalaryRecordsPaid(operatorId, recordIds, paymentDate, paymentMethod);
+    res.json(result);
+  } catch (err) {
+    console.error('[cleanlemon] operator/salaries/mark-paid', err);
     res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
   }
 });
@@ -3538,6 +4598,184 @@ router.post('/admin/saasadmin-ai-chat', async (req, res) => {
     }
     console.error('[cleanlemon] admin/saasadmin-ai-chat:post', err);
     res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+/** Employee (requester) — active route order they placed (not the driver “active trip” endpoint). */
+router.get('/employee/driver-trips/requester-active', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.query.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const out = await svc.getActiveRequesterDriverTripForEmail({ email, operatorId });
+    if (!out.ok && out.reason === 'MIGRATION_REQUIRED') {
+      return res.status(503).json(out);
+    }
+    return res.json(out);
+  } catch (err) {
+    const code = err?.code;
+    if (code === 'OPERATOR_ACCESS_DENIED' || code === 'MISSING_OPERATOR_OR_EMAIL') {
+      return res.status(403).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] employee/driver-trips/requester-active', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+/** Employee (requester) — past route orders (completed / cancelled) for this operator. */
+router.get('/employee/driver-trips/requester-history', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.query.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const out = await svc.listRequesterDriverTripHistoryForEmail({
+      email,
+      operatorId,
+      limit: req.query.limit,
+    });
+    if (!out.ok && out.reason === 'MIGRATION_REQUIRED') {
+      return res.status(503).json(out);
+    }
+    return res.json(out);
+  } catch (err) {
+    const code = err?.code;
+    if (code === 'OPERATOR_ACCESS_DENIED' || code === 'MISSING_OPERATOR_OR_EMAIL') {
+      return res.status(403).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] employee/driver-trips/requester-history', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/employee/driver-trips/requester-cancel', async (req, res) => {
+  try {
+    const email = employeePortalEmailStrict(req);
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const tripId = String(req.body?.tripId || '').trim();
+    const out = await svc.cancelRequesterDriverTrip({ email, operatorId, tripId });
+    return res.json(out);
+  } catch (err) {
+    const code = err?.code;
+    if (code === 'TRIP_NOT_CANCELLABLE' || code === 'BAD_REQUEST') {
+      return res.status(400).json({ ok: false, reason: code });
+    }
+    if (code === 'NOT_FOUND') return res.status(404).json({ ok: false, reason: code });
+    if (code === 'OPERATOR_ACCESS_DENIED' || code === 'MISSING_OPERATOR_OR_EMAIL') {
+      return res.status(403).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] employee/driver-trips/requester-cancel', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+/** Operator — list + Grab booking. */
+router.get('/operator/driver-trips', async (req, res) => {
+  try {
+    const { email } = clientPortalAuthFromRequest(req, req.query?.email);
+    const operatorId = String(req.query.operatorId || '').trim();
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const statusFilter = String(req.query.status || '').trim();
+    const limit = req.query.limit;
+    const businessDate = String(req.query.businessDate || req.query.date || '').trim();
+    const team = String(req.query.team || '').trim();
+    const fulfillment = String(req.query.fulfillment || '').trim();
+    const acceptedDriverEmployeeId = String(req.query.acceptedDriverEmployeeId || '').trim();
+    const out = await svc.listOperatorDriverTrips({
+      email,
+      operatorId,
+      statusFilter,
+      limit,
+      businessDate: businessDate || undefined,
+      team: team || undefined,
+      fulfillment: fulfillment || undefined,
+      acceptedDriverEmployeeId: acceptedDriverEmployeeId || undefined,
+    });
+    if (!out.ok && out.reason === 'MIGRATION_REQUIRED') {
+      return res.status(503).json(out);
+    }
+    return res.json(out);
+  } catch (err) {
+    const code = err?.code;
+    if (code === 'OPERATOR_ACCESS_DENIED' || code === 'MISSING_OPERATOR_OR_EMAIL') {
+      return res.status(403).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] operator/driver-trips:get', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+/** Operator — driver staff rows (for A/B/C filters). */
+router.get('/operator/driver-employees', async (req, res) => {
+  try {
+    const { email } = clientPortalAuthFromRequest(req, req.query?.email);
+    const operatorId = String(req.query.operatorId || '').trim();
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const out = await svc.listOperatorDriverEmployees({ email, operatorId });
+    return res.json(out);
+  } catch (err) {
+    const code = err?.code;
+    if (code === 'OPERATOR_ACCESS_DENIED' || code === 'MISSING_OPERATOR_OR_EMAIL') {
+      return res.status(403).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] operator/driver-employees:get', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+/** Operator — live driver vacancy / waiting / pickup / ongoing. */
+router.get('/operator/driver-fleet-status', async (req, res) => {
+  try {
+    const { email } = clientPortalAuthFromRequest(req, req.query?.email);
+    const operatorId = String(req.query.operatorId || '').trim();
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const out = await svc.listOperatorDriverFleetStatus({ email, operatorId });
+    if (!out.ok && out.reason === 'MIGRATION_REQUIRED') {
+      return res.status(503).json(out);
+    }
+    return res.json(out);
+  } catch (err) {
+    const code = err?.code;
+    if (code === 'OPERATOR_ACCESS_DENIED' || code === 'MISSING_OPERATOR_OR_EMAIL') {
+      return res.status(403).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] operator/driver-fleet-status:get', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/operator/driver-trip/grab', async (req, res) => {
+  try {
+    const { email } = clientPortalAuthFromRequest(req, req.body?.email);
+    const body = req.body || {};
+    const operatorId = String(body.operatorId || '').trim();
+    if (!email) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const out = await svc.bookGrabOperatorDriverTrip({
+      email,
+      operatorId,
+      tripId: body.tripId,
+      grabCarPlate: body.grabCarPlate ?? body.grab_car_plate,
+      grabPhone: body.grabPhone ?? body.grab_phone,
+      grabProofImageUrl: body.grabProofImageUrl ?? body.grab_proof_image_url,
+    });
+    return res.json(out);
+  } catch (err) {
+    const code = err?.code;
+    if (code === 'GRAB_DETAILS_REQUIRED' || code === 'TRIP_NOT_OPEN' || code === 'BAD_REQUEST') {
+      return res.status(400).json({ ok: false, reason: code });
+    }
+    if (code === 'NOT_FOUND') return res.status(404).json({ ok: false, reason: code });
+    if (code === 'OPERATOR_ACCESS_DENIED' || code === 'MISSING_OPERATOR_OR_EMAIL') {
+      return res.status(403).json({ ok: false, reason: code });
+    }
+    console.error('[cleanlemon] operator/driver-trip/grab:post', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
   }
 });
 

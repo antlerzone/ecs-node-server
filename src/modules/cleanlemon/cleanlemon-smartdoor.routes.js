@@ -29,6 +29,9 @@ const {
   syncSmartDoorStatusFromTtlock,
   syncSingleLockStatusFromTtlock,
   syncSingleGatewayStatusFromTtlock,
+  assertOperatorRemoteDoorPolicy,
+  getOperatorDoorPasswordReveal,
+  listLockUnlockLogsForPortalScope,
 } = require('../smartdoorsetting/smartdoorsetting.service');
 
 function clientPortalAuthFromRequest(req, bodyEmail) {
@@ -56,8 +59,12 @@ function stripSmartDoorBody(req) {
 }
 
 /** lockdetail / gatewaydetail scope: Coliving uses plain operatordetail id; Cleanlemons uses dedicated columns. */
-function clnOperatorScope(clnOperatorId) {
-  return { kind: 'cln_operator', clnOperatorId: String(clnOperatorId || '').trim() };
+function clnOperatorScope(clnOperatorId, ttlockSlotOpt) {
+  const base = { kind: 'cln_operator', clnOperatorId: String(clnOperatorId || '').trim() };
+  if (ttlockSlotOpt == null || ttlockSlotOpt === '') return base;
+  const n = Number(ttlockSlotOpt);
+  if (!Number.isFinite(n) || n < 0) return base;
+  return { ...base, ttlockSlot: n };
 }
 /** Optional TTLock account slot (Cleanlemons B2B multi-login). Omitted / invalid → slot 0. */
 function parseTtlockSlotFromRequest(req) {
@@ -217,7 +224,10 @@ router.post('/operator/smartdoorsetting/update-lock', async (req, res, next) => 
       active: req.body?.active,
       childmeter: req.body?.childmeter,
     });
-    if (result.ok === false) return res.status(400).json(result);
+    if (result.ok === false) {
+      const st = result.reason === 'CLIENT_OWNED_READ_ONLY' ? 403 : 400;
+      return res.status(st).json(result);
+    }
     res.json(result);
   } catch (err) {
     next(err);
@@ -232,7 +242,10 @@ router.post('/operator/smartdoorsetting/update-gateway', async (req, res, next) 
     const id = req.body?.id;
     if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
     const result = await updateGateway(sdScope, id, { gatewayName: req.body?.gatewayName });
-    if (result.ok === false) return res.status(400).json(result);
+    if (result.ok === false) {
+      const st = result.reason === 'CLIENT_OWNED_READ_ONLY' ? 403 : 400;
+      return res.status(st).json(result);
+    }
     res.json(result);
   } catch (err) {
     next(err);
@@ -244,18 +257,62 @@ router.post('/operator/smartdoorsetting/unlock', async (req, res, next) => {
     const { email } = clientPortalAuthFromRequest(req, req.body?.email);
     const clientId = await resolveOperatorTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnOperatorScope(clientId);
+    const sdScope = clnOperatorScope(clientId, parseTtlockSlotFromRequest(req));
     const id = req.body?.id;
     if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
+    await assertOperatorRemoteDoorPolicy(sdScope, id);
     await remoteUnlockLock(sdScope, id, {
       actorEmail: email || '',
       portalSource: 'cln_operator_smartdoor',
     });
     res.json({ ok: true });
   } catch (err) {
+    if (err?.code === 'OPERATOR_DOOR_USE_PASSWORD' || err?.code === 'OPERATOR_DOOR_GATEWAY_REQUIRED' || err?.code === 'OPERATOR_DOOR_NO_BOOKING_TODAY') {
+      return res.status(400).json({ ok: false, reason: err.code });
+    }
     if (err.message && err.message.startsWith('TTLOCK_')) {
       return res.status(400).json({ ok: false, reason: err.message });
     }
+    next(err);
+  }
+});
+
+router.post('/operator/smartdoorsetting/view-password', async (req, res, next) => {
+  try {
+    const clientId = await resolveOperatorTtlockClientId(req, res);
+    if (clientId == null) return;
+    const sdScope = clnOperatorScope(clientId, parseTtlockSlotFromRequest(req));
+    const id = req.body?.id;
+    if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
+    const result = await getOperatorDoorPasswordReveal(sdScope, id);
+    if (result.ok === false) {
+      const st = result.reason === 'LOCK_NOT_FOUND' ? 404 : 400;
+      return res.status(st).json(result);
+    }
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/operator/smartdoorsetting/unlock-logs', async (req, res, next) => {
+  try {
+    const clientId = await resolveOperatorTtlockClientId(req, res);
+    if (clientId == null) return;
+    const sdScope = clnOperatorScope(clientId, parseTtlockSlotFromRequest(req));
+    const id = req.body?.id;
+    if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
+    const result = await listLockUnlockLogsForPortalScope(sdScope, id, {
+      date: req.body?.date,
+      from: req.body?.from,
+      to: req.body?.to,
+      page: req.body?.page,
+      pageSize: req.body?.pageSize,
+    });
+    res.json(result);
+  } catch (err) {
+    if (err?.code === 'LOCK_NOT_FOUND') return res.status(404).json({ ok: false, reason: err.code });
+    if (err?.code === 'MISSING_DATE_RANGE') return res.status(400).json({ ok: false, reason: err.code });
     next(err);
   }
 });
@@ -264,7 +321,7 @@ router.post('/operator/smartdoorsetting/preview-selection', async (req, res, nex
   try {
     const clientId = await resolveOperatorTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnOperatorScope(clientId);
+    const sdScope = clnOperatorScope(clientId, parseTtlockSlotFromRequest(req));
     const result = await previewSmartDoorSelection(sdScope);
     res.json(result);
   } catch (err) {
@@ -276,7 +333,7 @@ router.post('/operator/smartdoorsetting/sync-status-from-ttlock', async (req, re
   try {
     const clientId = await resolveOperatorTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnOperatorScope(clientId);
+    const sdScope = clnOperatorScope(clientId, parseTtlockSlotFromRequest(req));
     const result = await syncSmartDoorStatusFromTtlock(sdScope);
     res.json(result);
   } catch (err) {
@@ -288,7 +345,7 @@ router.post('/operator/smartdoorsetting/sync-locks-from-ttlock', async (req, res
   try {
     const clientId = await resolveOperatorTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnOperatorScope(clientId);
+    const sdScope = clnOperatorScope(clientId, parseTtlockSlotFromRequest(req));
     const result = await syncSmartDoorStatusFromTtlock(sdScope);
     res.json(result);
   } catch (err) {
@@ -330,7 +387,7 @@ router.post('/operator/smartdoorsetting/sync-name', async (req, res, next) => {
   try {
     const clientId = await resolveOperatorTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnOperatorScope(clientId);
+    const sdScope = clnOperatorScope(clientId, parseTtlockSlotFromRequest(req));
     const { type, externalId, name } = req.body || {};
     if (!type || !externalId || !name) {
       return res.status(400).json({ ok: false, reason: 'TYPE_EXTERNALID_NAME_REQUIRED' });
@@ -390,7 +447,7 @@ router.post('/operator/smartdoorsetting/insert-smartdoors', async (req, res, nex
   try {
     const clientId = await resolveOperatorTtlockClientId(req, res);
     if (clientId == null) return;
-    const sdScope = clnOperatorScope(clientId);
+    const sdScope = clnOperatorScope(clientId, parseTtlockSlotFromRequest(req));
     const gateways = Array.isArray(req.body?.gateways) ? req.body.gateways : [];
     const locks = Array.isArray(req.body?.locks) ? req.body.locks : [];
     const gatewayMap = new Map();
@@ -559,6 +616,28 @@ router.post('/client/smartdoorsetting/unlock', async (req, res, next) => {
     if (err.message && err.message.startsWith('TTLOCK_')) {
       return res.status(400).json({ ok: false, reason: err.message });
     }
+    next(err);
+  }
+});
+
+router.post('/client/smartdoorsetting/unlock-logs', async (req, res, next) => {
+  try {
+    const clientId = await resolveClientTtlockClientId(req, res);
+    if (clientId == null) return;
+    const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
+    const id = req.body?.id;
+    if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
+    const result = await listLockUnlockLogsForPortalScope(sdScope, id, {
+      date: req.body?.date,
+      from: req.body?.from,
+      to: req.body?.to,
+      page: req.body?.page,
+      pageSize: req.body?.pageSize,
+    });
+    res.json(result);
+  } catch (err) {
+    if (err?.code === 'LOCK_NOT_FOUND') return res.status(404).json({ ok: false, reason: err.code });
+    if (err?.code === 'MISSING_DATE_RANGE') return res.status(400).json({ ok: false, reason: err.code });
     next(err);
   }
 });

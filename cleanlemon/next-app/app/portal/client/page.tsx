@@ -6,7 +6,8 @@ import Link from 'next/link'
 import { useAuth } from '@/lib/auth-context'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
-import { Building2, Calendar, CheckCircle2, Clock, AlertTriangle, ArrowRight } from 'lucide-react'
+import { AlertTriangle, ArrowRight, Sparkles } from 'lucide-react'
+import { useClientBookingNav } from '@/components/portal/client/client-booking-overlay'
 import {
   fetchOperatorInvoices,
   fetchOperatorProperties,
@@ -37,6 +38,7 @@ type Summary = {
 
 export default function ClientDashboardPage() {
   const { user } = useAuth()
+  const { openBooking } = useClientBookingNav()
   const [damageRecent, setDamageRecent] = useState<DamageReportItem[]>([])
   const [loading, setLoading] = useState(true)
   const [summary, setSummary] = useState<Summary>({
@@ -51,11 +53,14 @@ export default function ClientDashboardPage() {
     ;(async () => {
       try {
         const operatorId = String(user?.operatorId || '').trim()
+        const email = String(user?.email || '').trim().toLowerCase()
         const [propRes, schRes, invRes, dmgRes] = await Promise.all([
           fetchOperatorProperties(operatorId || undefined),
           fetchOperatorScheduleJobs({ operatorId: operatorId || undefined, limit: 500 }),
           fetchOperatorInvoices(),
-          fetchClientDamageReports({ operatorId: operatorId || undefined, limit: 5 }),
+          email
+            ? fetchClientDamageReports({ email, operatorId: operatorId || undefined, limit: 5 })
+            : Promise.resolve({ ok: false as const, items: [] as DamageReportItem[] }),
         ])
 
         if (cancelled) return
@@ -65,8 +70,6 @@ export default function ClientDashboardPage() {
         const props = Array.isArray(propRes?.items) ? propRes.items : []
         const schedules = Array.isArray(schRes?.items) ? schRes.items : []
         const invoices = Array.isArray(invRes?.items) ? invRes.items : []
-        const email = String(user?.email || '').trim().toLowerCase()
-
         const upcoming = schedules.filter((x: any) => {
           const st = String(x?.status || '').toLowerCase()
           return !(st.includes('complete') || st.includes('cancel'))
@@ -99,43 +102,57 @@ export default function ClientDashboardPage() {
   }, [user?.operatorId, user?.email])
 
   const cards = useMemo(
-    () => [
-      { label: 'Properties', value: summary.properties, icon: Building2 },
-      { label: 'Upcoming Jobs', value: summary.upcoming, icon: Calendar },
-      { label: 'Completed Jobs', value: summary.completed, icon: CheckCircle2 },
-      { label: 'Pending Invoices', value: summary.pendingInvoices, icon: Clock },
-    ],
+    () =>
+      [
+        { label: 'Properties', shortLabel: 'Props', value: summary.properties },
+        { label: 'Upcoming Jobs', shortLabel: 'Upcoming', value: summary.upcoming },
+        { label: 'Completed Jobs', shortLabel: 'Completed', value: summary.completed },
+        { label: 'Pending Invoices', shortLabel: 'Unpaid', value: summary.pendingInvoices },
+      ] as const,
     [summary]
   )
 
   return (
-    <div className="p-4 md:p-6 space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-foreground">Dashboard</h1>
-        <p className="text-muted-foreground">Overview for your client account</p>
+    <div className="space-y-3 px-4 pb-6 pt-2 md:space-y-6 md:p-6">
+      <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between sm:gap-3">
+        <div>
+          <h1 className="text-2xl font-bold text-foreground">Dashboard</h1>
+          <p className="text-sm text-muted-foreground md:text-base">Overview for your client account</p>
+        </div>
+        <Button
+          type="button"
+          variant="default"
+          size="sm"
+          className="hidden shrink-0 gap-2 md:inline-flex"
+          onClick={() => openBooking()}
+        >
+          <Sparkles className="h-4 w-4" />
+          Booking
+        </Button>
       </div>
       {loading ? (
         <div className="flex items-center justify-center min-h-[200px]">
           <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-primary"></div>
         </div>
       ) : (
-        <div className="space-y-6">
+        <div className="flex flex-col gap-3 md:gap-6">
           <Suspense fallback={null}>
             <ScrollToScheduleWhenTab />
           </Suspense>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          <div className="grid grid-cols-4 gap-2 sm:grid-cols-2 sm:gap-3 lg:grid-cols-4 lg:gap-4">
             {cards.map((card) => (
-              <Card key={card.label}>
-                <CardContent className="p-4">
-                  <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-xl bg-primary/10 flex items-center justify-center">
-                      <card.icon className="h-5 w-5 text-primary" />
-                    </div>
-                    <div>
-                      <p className="text-xl font-bold text-foreground">{card.value}</p>
-                      <p className="text-xs text-muted-foreground">{card.label}</p>
-                    </div>
-                  </div>
+              <Card
+                key={card.label}
+                className="flex w-full min-w-0 flex-col gap-0 overflow-visible rounded-xl border-0 p-0 py-0 shadow-sm"
+              >
+                <CardContent className="flex w-full flex-col items-center justify-center gap-1 px-1.5 py-3 text-center sm:gap-1.5 sm:px-4 sm:py-4 md:py-5">
+                  <p className="text-base font-bold tabular-nums leading-tight text-foreground sm:text-xl">
+                    {card.value}
+                  </p>
+                  <p className="w-full max-w-full text-balance text-[10px] leading-normal text-muted-foreground sm:text-xs">
+                    <span className="sm:hidden">{card.shortLabel}</span>
+                    <span className="hidden sm:inline">{card.label}</span>
+                  </p>
                 </CardContent>
               </Card>
             ))}

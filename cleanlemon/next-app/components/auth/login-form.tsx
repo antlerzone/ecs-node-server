@@ -11,6 +11,7 @@ import { useAuth } from '@/lib/auth-context'
 import {
   shouldUseMockOAuthClient,
   getCleanlemonApiBase,
+  CLEANLEMON_LOCAL_API_BASE,
 } from '@/lib/portal-auth-mock'
 import { Spinner } from '@/components/ui/spinner'
 import {
@@ -41,28 +42,14 @@ function openOAuthPopupWindow(url: string): Window | null {
 }
 
 /**
- * OAuth buttons must never depend on a flaky shared helper alone: same env can tree-shake
- * differently. Prefer inlined NEXT_PUBLIC here, then dev default to local Node.
+ * Same API base as `cleanlemon-api` / `getCleanlemonApiBase` (loopback, live portal host, env).
+ * Dev fallback avoids empty client bundle when NEXT_PUBLIC was missing at build time.
  */
 function resolvePortalApiBaseForOAuth(): string {
-  const fromNextPublic = (process.env.NEXT_PUBLIC_CLEANLEMON_API_URL || '')
-    .trim()
-    .replace(/\/$/, '')
-  if (fromNextPublic) return fromNextPublic
-  if (process.env.NODE_ENV === 'development') {
-    return 'http://localhost:5000'
-  }
-  try {
-    if (typeof window !== 'undefined') {
-      const h = (window.location.hostname || '').toLowerCase().replace(/\.$/, '')
-      if (h === 'localhost' || h === '127.0.0.1' || h === '::1') {
-        return 'http://localhost:5000'
-      }
-    }
-  } catch {
-    /* ignore */
-  }
-  return (getCleanlemonApiBase() || '').trim()
+  const base = getCleanlemonApiBase().trim().replace(/\/$/, '')
+  if (base) return base
+  if (process.env.NODE_ENV === 'development') return CLEANLEMON_LOCAL_API_BASE
+  return ''
 }
 
 export function LoginForm({ initialMode = 'login', redirectTo, oauthUsePopup }: LoginFormProps = {}) {

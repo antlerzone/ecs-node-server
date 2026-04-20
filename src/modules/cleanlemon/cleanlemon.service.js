@@ -19,12 +19,13 @@ const clnOpInvAccounting = require('./cleanlemon-operator-invoice-accounting.ser
 const clnDc = require('./cleanlemon-cln-domain-contacts');
 const saasBukku = require('../billing/saas-bukku.service');
 const { splitAddressWazeGoogleFromText, resolveClnPropertyNavigationUrls } = require('./cln-property-address-split');
-const { malaysiaWallClockToUtcDatetimeForDb } = require('../../utils/dateMalaysia');
+const { malaysiaWallClockToUtcDatetimeForDb, getTodayMalaysiaDate } = require('../../utils/dateMalaysia');
 const {
   validateBookingLeadTimeForConfig,
   validateServiceInSelectedServices,
 } = require('../../utils/cleanlemonBookingEligibility');
 const clnPropGroup = require('./cleanlemon-property-group.service');
+const clnOperatorSalary = require('./cleanlemon-operator-salary.service');
 
 const CLN_ACCOUNT_PROVIDERS = ['bukku', 'xero', 'autocount', 'sql'];
 const CLN_DEFAULT_CURRENCY = (process.env.CLEANLEMON_DEFAULT_CURRENCY || 'MYR').trim().toUpperCase() || 'MYR';
@@ -221,6 +222,7 @@ function sanitizePricingConfigForPublic(cfg) {
     'bookingMode',
     'bookingModeByService',
     'leadTime',
+    'leadTimeByService',
   ];
   const out = {};
   for (const k of keys) {
@@ -1228,6 +1230,18 @@ function mapPortalProfileToUnifiedEmployee(portalResult, normalizedEmail) {
     nricBackUrl: String(p.nricback || '').trim(),
     avatarUrl: String(p.avatar_url || '').trim(),
     approvalPending,
+    aliyunEkycLocked: !!p.aliyun_ekyc_locked,
+    passportExpiryDate:
+      p.passport_expiry_date != null && String(p.passport_expiry_date).trim() !== ''
+        ? String(p.passport_expiry_date).trim().slice(0, 10)
+        : '',
+    profileSelfVerifiedAt:
+      p.profileSelfVerifiedAt != null && String(p.profileSelfVerifiedAt).trim() !== ''
+        ? String(p.profileSelfVerifiedAt).trim()
+        : null,
+    profileIdentityVerified:
+      !!p.aliyun_ekyc_locked ||
+      (p.profileSelfVerifiedAt != null && String(p.profileSelfVerifiedAt).trim() !== ''),
   };
 }
 
@@ -1386,6 +1400,60 @@ async function assertClnOperatorStaffEmail(operatorId, email) {
   }
 }
 
+async function getDriverVehicleByEmail(email) {
+  const em = String(email || '')
+    .trim()
+    .toLowerCase();
+  if (!em) return { ok: false, reason: 'MISSING_EMAIL', vehicle: null };
+  if (!(await clnDc.databaseHasTable(pool, 'cln_employeedetail'))) {
+    return { ok: false, reason: 'MIGRATION_REQUIRED', vehicle: null };
+  }
+  const hasPlate = await databaseHasColumn('cln_employeedetail', 'driver_car_plate');
+  if (!hasPlate) {
+    return { ok: true, vehicle: { carPlate: '', carFrontUrl: '', carBackUrl: '' }, legacy: true };
+  }
+  const [[row]] = await pool.query(
+    'SELECT driver_car_plate, driver_car_front_url, driver_car_back_url FROM cln_employeedetail WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+    [em]
+  );
+  if (!row) return { ok: true, vehicle: { carPlate: '', carFrontUrl: '', carBackUrl: '' } };
+  return {
+    ok: true,
+    vehicle: {
+      carPlate: row.driver_car_plate != null ? String(row.driver_car_plate).trim() : '',
+      carFrontUrl: row.driver_car_front_url != null ? String(row.driver_car_front_url).trim() : '',
+      carBackUrl: row.driver_car_back_url != null ? String(row.driver_car_back_url).trim() : '',
+    },
+  };
+}
+
+async function updateDriverVehicleByEmail(email, patch) {
+  const em = String(email || '')
+    .trim()
+    .toLowerCase();
+  if (!em) {
+    const err = new Error('MISSING_EMAIL');
+    err.code = 'MISSING_EMAIL';
+    throw err;
+  }
+  if (!(await databaseHasColumn('cln_employeedetail', 'driver_car_plate'))) {
+    const err = new Error('MIGRATION_REQUIRED');
+    err.code = 'MIGRATION_REQUIRED';
+    throw err;
+  }
+  const carPlate = patch?.carPlate != null ? String(patch.carPlate).trim().slice(0, 32) : '';
+  const carFrontUrl = patch?.carFrontUrl != null ? String(patch.carFrontUrl).trim().slice(0, 2000) : '';
+  const carBackUrl = patch?.carBackUrl != null ? String(patch.carBackUrl).trim().slice(0, 2000) : '';
+  await pool.query(
+    `UPDATE cln_employeedetail
+     SET driver_car_plate = ?, driver_car_front_url = ?, driver_car_back_url = ?, updated_at = CURRENT_TIMESTAMP(3)
+     WHERE LOWER(TRIM(email)) = ?
+     LIMIT 1`,
+    [carPlate || null, carFrontUrl || null, carBackUrl || null, em]
+  );
+  return getDriverVehicleByEmail(em);
+}
+
 /**
  * Resolves B2B client scope for client-portal APIs.
  * With valid Portal JWT (`ensureClientdetailIfMissing`), creates `cln_clientdetail` for that email if missing — logged-in portal users always have email.
@@ -1493,17 +1561,15 @@ async function upsertEmployeeProfileByEmail(email, payload = {}) {
     throw err;
   }
   const portalPayload = buildPortalPayloadFromUnifiedEmployeePayload(payload);
+  if (payload.selfVerify === true) {
+    portalPayload.selfVerify = true;
+  }
   const result = await updatePortalProfile(normalizedEmail, portalPayload);
   if (!result.ok) {
     const err = new Error(result.reason || 'UPDATE_FAILED');
     err.code = result.reason || 'UPDATE_FAILED';
     throw err;
   }
-  setImmediate(() => {
-    runAgreementAutomationForStaffEmailAcrossOperators(normalizedEmail).catch((e) =>
-      console.error('[cleanlemon] agreement automation after employee profile save', e?.message || e)
-    );
-  });
   return getEmployeeProfileByEmail(normalizedEmail);
 }
 
@@ -1514,6 +1580,19 @@ async function databaseHasColumn(tableName, columnName) {
     [tableName, columnName]
   );
   return Number(row?.n) > 0;
+}
+
+async function databaseHasTable(tableName) {
+  try {
+    const [[row]] = await pool.query(
+      `SELECT COUNT(*) AS n FROM information_schema.TABLES
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`,
+      [String(tableName || '')]
+    );
+    return Number(row?.n) > 0;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -1927,16 +2006,6 @@ async function createOperatorContact(input) {
   }
   await assertContactEmailUniqueForOperator(String(input.email || ''), opId, null);
   const domainId = await clnDc.createOperatorContactDomain(pool, getClnAccountProviderForOperator, input);
-  if (opId && String(input.email || '').trim() && !input.skipAutomationAfterCreate) {
-    const em = String(input.email)
-      .trim()
-      .toLowerCase();
-    setImmediate(() => {
-      tryAgreementAutomationForOperatorStaffEmail(opId, em).catch((e) =>
-        console.error('[cleanlemon] agreement rows after contact create', e?.message || e)
-      );
-    });
-  }
   return domainId;
 }
 
@@ -1954,18 +2023,6 @@ async function updateOperatorContact(id, input) {
     input,
     assertSupervisorEmailAvailable
   );
-  const m = { ...input };
-  const finalOpId = String(m.operatorId || m.operator_id || input.operatorId || input.operator_id || '').trim();
-  const finalEmail = String(m.email || '')
-    .trim()
-    .toLowerCase();
-  if (finalOpId && finalEmail) {
-    setImmediate(() => {
-      tryAgreementAutomationForOperatorStaffEmail(finalOpId, finalEmail).catch((e) =>
-        console.error('[cleanlemon] agreement automation after contact update', e?.message || e)
-      );
-    });
-  }
 }
 
 async function deleteDraftAgreementsForOperatorEmail(operatorId, emailNorm) {
@@ -2275,6 +2332,17 @@ function parseLatLngFromPropertyNavigationUrls(wazeUrl, googleMapsUrl) {
 const DEFAULT_SCHEDULE_JOB_MAP_LAT = 1.492659;
 const DEFAULT_SCHEDULE_JOB_MAP_LNG = 103.741359;
 
+/** mysql2 may still surface BigInt on some types; stringify before mapping to JSON-safe payloads. */
+function rowToJsonSafeFields(row) {
+  if (!row || typeof row !== 'object') return row;
+  const o = { ...row };
+  for (const k of Object.keys(o)) {
+    const v = o[k];
+    if (typeof v === 'bigint') o[k] = v.toString();
+  }
+  return o;
+}
+
 function resolveScheduleJobLatLngFromRow(r) {
   const la = r.propertyLatitude != null && r.propertyLatitude !== '' ? Number(r.propertyLatitude) : NaN;
   const lo = r.propertyLongitude != null && r.propertyLongitude !== '' ? Number(r.propertyLongitude) : NaN;
@@ -2387,6 +2455,28 @@ function mapScheduleRowToJobItem(r, teams) {
     staffRemark: undefined,
     completedPhotos: photos,
     aiAssignmentLocked,
+    mailboxPassword: r.mailboxPasswordRaw != null && String(r.mailboxPasswordRaw).trim()
+      ? String(r.mailboxPasswordRaw).trim()
+      : undefined,
+    doorPin: (() => {
+      const jobPin =
+        r.jobSmartdoorPinRaw != null && String(r.jobSmartdoorPinRaw).trim()
+          ? String(r.jobSmartdoorPinRaw).trim()
+          : '';
+      if (jobPin) return jobPin;
+      return r.smartdoorPasswordRaw != null && String(r.smartdoorPasswordRaw).trim()
+        ? String(r.smartdoorPasswordRaw).trim()
+        : undefined;
+    })(),
+    smartdoorTokenEnabled: Number(r.smartdoorTokenEnabledRaw) === 1,
+    propertySmartdoorId:
+      r.propertySmartdoorIdRaw != null && String(r.propertySmartdoorIdRaw).trim()
+        ? String(r.propertySmartdoorIdRaw).trim()
+        : null,
+    operatorDoorAccessMode:
+      r.operatorDoorAccessModeRaw != null && String(r.operatorDoorAccessModeRaw).trim() !== ''
+        ? String(r.operatorDoorAccessModeRaw).trim()
+        : 'temporary_password_only',
   };
 }
 
@@ -2399,6 +2489,30 @@ async function listOperatorScheduleJobs({ limit = 500, operatorId } = {}) {
   const clientDisp = await buildClnPropertyClientDisplaySql(ct);
   const whereSql = oid ? 'WHERE p.operator_id = ?' : '';
   const params = oid ? [oid, lim] : [lim];
+  const [hasMailboxPwd, hasSmartdoorPwd, hasSmartdoorTok, hasSmartdoorIdCol] = await Promise.all([
+    databaseHasColumn('cln_property', 'mailbox_password'),
+    databaseHasColumn('cln_property', 'smartdoor_password'),
+    databaseHasColumn('cln_property', 'smartdoor_token_enabled'),
+    databaseHasColumn('cln_property', 'smartdoor_id'),
+  ]);
+  const keyAccessSqlParts = [];
+  keyAccessSqlParts.push(
+    hasMailboxPwd
+      ? `NULLIF(TRIM(p.mailbox_password), '') AS mailboxPasswordRaw`
+      : `NULL AS mailboxPasswordRaw`,
+  );
+  keyAccessSqlParts.push(
+    hasSmartdoorPwd
+      ? `NULLIF(TRIM(p.smartdoor_password), '') AS smartdoorPasswordRaw`
+      : `NULL AS smartdoorPasswordRaw`,
+  );
+  keyAccessSqlParts.push(
+    hasSmartdoorTok ? `COALESCE(p.smartdoor_token_enabled, 0) AS smartdoorTokenEnabledRaw` : `0 AS smartdoorTokenEnabledRaw`,
+  );
+  keyAccessSqlParts.push(
+    hasSmartdoorIdCol ? `NULLIF(TRIM(p.smartdoor_id), '') AS propertySmartdoorIdRaw` : `NULL AS propertySmartdoorIdRaw`,
+  );
+  const keyAccessSql = `,\n            ${keyAccessSqlParts.join(',\n            ')}`;
   const hasAiLockCol = await databaseHasColumn('cln_schedule', 'ai_assignment_locked');
   const aiLockSelect = hasAiLockCol ? 's.ai_assignment_locked AS aiAssignmentLockedRaw,' : '0 AS aiAssignmentLockedRaw,';
   const hasColivingCols =
@@ -2410,6 +2524,14 @@ async function listOperatorScheduleJobs({ limit = 500, operatorId } = {}) {
   const pricingAddonsSelect = hasPricingAddonsCol
     ? 's.pricing_addons_json AS pricingAddonsJson,'
     : 'NULL AS pricingAddonsJson,';
+  const hasJobSmartdoorPin = await databaseHasColumn('cln_schedule', 'job_smartdoor_pin');
+  const jobPinSelect = hasJobSmartdoorPin
+    ? `NULLIF(TRIM(s.job_smartdoor_pin), '') AS jobSmartdoorPinRaw`
+    : `NULL AS jobSmartdoorPinRaw`;
+  const hasOperatorDoorMode = await databaseHasColumn('cln_property', 'operator_door_access_mode');
+  const operatorDoorModeSelect = hasOperatorDoorMode
+    ? `NULLIF(TRIM(p.operator_door_access_mode), '') AS operatorDoorAccessModeRaw`
+    : `NULL AS operatorDoorAccessModeRaw`;
   const hasScheduleAuditCols = await databaseHasColumn('cln_schedule', 'created_by_email');
   const auditSelect = hasScheduleAuditCols
     ? `NULLIF(TRIM(s.created_by_email), '') AS createdByEmail,
@@ -2436,7 +2558,10 @@ async function listOperatorScheduleJobs({ limit = 500, operatorId } = {}) {
             COALESCE(p.bed_count, 1) AS bedCount,
             ${clientDisp.nameExpr} AS clientName,
             COALESCE(p.address, '') AS address,
-            ${propNavCols},
+            ${propNavCols}
+            ${keyAccessSql},
+            ${jobPinSelect},
+            ${operatorDoorModeSelect},
             DATE_FORMAT(s.working_day, '%Y-%m-%d') AS jobDate,
             s.status AS rawStatus,
             s.cleaning_type AS cleaningType,
@@ -2656,8 +2781,19 @@ async function createCleaningScheduleJobUnified(input = {}) {
         throw e;
       }
       const isHomestay = pkey === 'homestay';
+      let leadTimeRaw = cfg?.leadTime != null ? String(cfg.leadTime) : 'same_day';
+      if (
+        cfg &&
+        typeof cfg.leadTimeByService === 'object' &&
+        cfg.leadTimeByService != null &&
+        pkey
+      ) {
+        const lts = cfg.leadTimeByService;
+        const per = lts[pkey] != null ? String(lts[pkey]).trim() : '';
+        if (per) leadTimeRaw = per;
+      }
       const lt = validateBookingLeadTimeForConfig({
-        leadTimeRaw: cfg?.leadTime != null ? String(cfg.leadTime) : 'same_day',
+        leadTimeRaw,
         dateYmd: date,
         timeHm: time,
         isHomestay,
@@ -2704,31 +2840,68 @@ async function listClientPortalScheduleJobs({ clientdetailId, operatorId, limit 
   const teams = multiOperatorGroupScope ? [] : await listOperatorTeams(oid);
   const lim = Math.min(Math.max(Number(limit) || 200, 1), 1000);
   const ct = await getClnCompanyTable();
-  const hasPricingAddonsCol = await databaseHasColumn('cln_schedule', 'pricing_addons_json');
+  const [
+    hasPricingAddonsCol,
+    hasAuditCreatedBy,
+    hasAuditReadyBy,
+    hasAuditReadyAt,
+    hasScheduleCreatedAt,
+    hasPropOperatorId,
+    hasPropClientdetailId,
+    hasClientOpJunction,
+  ] = await Promise.all([
+    databaseHasColumn('cln_schedule', 'pricing_addons_json'),
+    databaseHasColumn('cln_schedule', 'created_by_email'),
+    databaseHasColumn('cln_schedule', 'ready_to_clean_by_email'),
+    databaseHasColumn('cln_schedule', 'ready_to_clean_at'),
+    databaseHasColumn('cln_schedule', 'created_at'),
+    databaseHasColumn('cln_property', 'operator_id'),
+    databaseHasColumn('cln_property', 'clientdetail_id'),
+    databaseHasTable('cln_client_operator'),
+  ]);
+  /** Last column in SELECT — no trailing comma (MySQL rejects comma before FROM). */
   const pricingAddonsSelect = hasPricingAddonsCol
-    ? 's.pricing_addons_json AS pricingAddonsJson,'
-    : 'NULL AS pricingAddonsJson,';
-  const hasScheduleAuditCols = await databaseHasColumn('cln_schedule', 'created_by_email');
-  const auditSelect = hasScheduleAuditCols
+    ? 's.pricing_addons_json AS pricingAddonsJson'
+    : 'NULL AS pricingAddonsJson';
+  /** Only select audit columns when all three exist (partial migrations caused ER_BAD_FIELD_ERROR). */
+  const hasFullScheduleAuditCols = hasAuditCreatedBy && hasAuditReadyBy && hasAuditReadyAt;
+  const auditSelect = hasFullScheduleAuditCols
     ? `NULLIF(TRIM(s.created_by_email), '') AS createdByEmail,
             NULLIF(TRIM(s.ready_to_clean_by_email), '') AS readyToCleanByEmail,
             s.ready_to_clean_at AS readyToCleanAt,`
     : `NULL AS createdByEmail,
             NULL AS readyToCleanByEmail,
             NULL AS readyToCleanAt,`;
+  const scheduleOrderBy = hasScheduleCreatedAt
+    ? 's.working_day DESC, s.created_at DESC'
+    : 's.working_day DESC, s.id DESC';
   const propNavColsClient = await sqlPropertyNavigationUrlColumns();
   const clientDisp = await buildClnPropertyClientDisplaySql(ct);
   let groupSql = '';
   const params = [];
   let operatorWhere = '';
   if (!multiOperatorGroupScope) {
-    operatorWhere = 'p.operator_id = ?';
-    params.push(oid);
+    if (hasPropOperatorId) {
+      operatorWhere = 'p.operator_id = ?';
+      params.push(oid);
+    } else if (hasPropClientdetailId && hasClientOpJunction) {
+      operatorWhere = `EXISTS (
+        SELECT 1 FROM cln_client_operator jco
+        WHERE jco.operator_id = ? AND jco.clientdetail_id = p.clientdetail_id
+      )`;
+      params.push(oid);
+    } else {
+      console.warn(
+        '[cleanlemon] listClientPortalScheduleJobs: cannot scope by operator (missing cln_property.operator_id and junction fallback)'
+      );
+      return [];
+    }
   } else {
     operatorWhere = '1=1';
   }
   if (hasGroupTables) {
-    groupSql = ` AND (
+    if (hasPropClientdetailId) {
+      groupSql = ` AND (
       p.clientdetail_id = ?
       OR EXISTS (
         SELECT 1 FROM cln_property_group_property gpp
@@ -2736,10 +2909,23 @@ async function listClientPortalScheduleJobs({ clientdetailId, operatorId, limit 
         WHERE gpp.property_id = p.id AND m.grantee_clientdetail_id = ? AND m.invite_status = 'active'
       )
     )`;
-    params.push(cid, cid);
-  } else {
+      params.push(cid, cid);
+    } else {
+      groupSql = ` AND EXISTS (
+        SELECT 1 FROM cln_property_group_property gpp
+        INNER JOIN cln_property_group_member m ON m.group_id = gpp.group_id
+        WHERE gpp.property_id = p.id AND m.grantee_clientdetail_id = ? AND m.invite_status = 'active'
+      )`;
+      params.push(cid);
+    }
+  } else if (hasPropClientdetailId) {
     groupSql = ' AND p.clientdetail_id = ?';
     params.push(cid);
+  } else {
+    console.warn(
+      '[cleanlemon] listClientPortalScheduleJobs: missing cln_property.clientdetail_id — cannot scope client rows'
+    );
+    return [];
   }
   if (gid && hasGroupTables) {
     groupSql += ` AND EXISTS (
@@ -2780,11 +2966,11 @@ async function listClientPortalScheduleJobs({ clientdetailId, operatorId, limit 
      ${clientDisp.joinSql}
      WHERE ${operatorWhere}
      ${groupSql}
-     ORDER BY s.working_day DESC, s.created_at DESC
+     ORDER BY ${scheduleOrderBy}
      LIMIT ?`,
     params
   );
-  return (rows || []).map((r) => mapScheduleRowToJobItem(r, teams));
+  return (rows || []).map((r) => mapScheduleRowToJobItem(rowToJsonSafeFields(r), teams));
 }
 
 async function createClientPortalScheduleJob({
@@ -3014,6 +3200,57 @@ async function updateClientPortalScheduleJob({
   await updateOperatorScheduleJob(sid, patch);
 }
 
+function safeParseScheduleSubmitByJson(raw) {
+  try {
+    const o = JSON.parse(String(raw || '{}'));
+    return o && typeof o === 'object' && !Array.isArray(o) ? o : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Merges incoming submitByMeta into existing `cln_schedule.submit_by` JSON (does not wipe prior keys).
+ * When completing with `completionAddons`, adds sum(priceMyr) to `cln_schedule.price` if column exists.
+ */
+async function resolveMergedSubmitByAndPrice(scheduleId, incomingMeta, patch, connection) {
+  const q = connection ? connection.query.bind(connection) : pool.query.bind(pool);
+  const [rows] = await q(
+    'SELECT submit_by AS sb, price AS pr FROM cln_schedule WHERE id = ? LIMIT 1',
+    [String(scheduleId)]
+  );
+  const row = rows && rows[0];
+  const prev = safeParseScheduleSubmitByJson(row?.sb);
+  const safeMeta =
+    incomingMeta && typeof incomingMeta === 'object' ? { ...incomingMeta } : { raw: incomingMeta };
+  const merged = { ...prev, ...safeMeta };
+  let newPrice = null;
+  const completing = patch.status !== undefined && normalizeScheduleStatus(patch.status) === 'completed';
+  const addons = Array.isArray(safeMeta.completionAddons) ? safeMeta.completionAddons : [];
+  if (completing && addons.length > 0) {
+    const sum = addons.reduce((a, x) => a + Math.max(0, Number(x?.priceMyr) || 0), 0);
+    if (Number.isFinite(sum) && sum > 0) {
+      const cur = row?.pr != null && row.pr !== '' ? Number(row.pr) : 0;
+      newPrice = Math.round((cur + sum) * 100) / 100;
+    }
+  }
+  return { mergedJson: JSON.stringify(merged), newPrice };
+}
+
+async function getEmployeeJobCompletionAddons({ email, operatorId }) {
+  await assertClnOperatorStaffEmail(operatorId, email);
+  const settings = await getOperatorSettings(operatorId);
+  const raw = Array.isArray(settings.jobCompletionAddons) ? settings.jobCompletionAddons : [];
+  const items = raw
+    .filter((x) => x && String(x.id || '').trim() && String(x.name || '').trim())
+    .map((x) => ({
+      id: String(x.id).trim(),
+      name: String(x.name).trim().slice(0, 200),
+      priceMyr: Math.max(0, Number(x.priceMyr) || 0),
+    }));
+  return { ok: true, items };
+}
+
 async function updateOperatorScheduleJob(id, patch) {
   const sid = String(id);
   const opFromPatch = patch.operatorId != null ? String(patch.operatorId).trim() : '';
@@ -3092,10 +3329,13 @@ async function updateOperatorScheduleJob(id, patch) {
     vals.push(JSON.stringify(photoList));
   }
   if (patch.submitByMeta !== undefined) {
-    const safeMeta =
-      patch.submitByMeta && typeof patch.submitByMeta === 'object' ? patch.submitByMeta : { raw: patch.submitByMeta };
+    const { mergedJson, newPrice } = await resolveMergedSubmitByAndPrice(sid, patch.submitByMeta, patch, null);
     fields.push('submit_by = ?');
-    vals.push(JSON.stringify(safeMeta));
+    vals.push(mergedJson);
+    if (newPrice != null && (await databaseHasColumn('cln_schedule', 'price'))) {
+      fields.push('price = ?');
+      vals.push(newPrice);
+    }
   }
   const hasAiLockCol = await databaseHasColumn('cln_schedule', 'ai_assignment_locked');
   if (hasAiLockCol) {
@@ -3146,10 +3386,18 @@ async function updateOperatorScheduleJobOnConnection(connection, id, patch) {
     vals.push(JSON.stringify(photoList));
   }
   if (patch.submitByMeta !== undefined) {
-    const safeMeta =
-      patch.submitByMeta && typeof patch.submitByMeta === 'object' ? patch.submitByMeta : { raw: patch.submitByMeta };
+    const { mergedJson, newPrice } = await resolveMergedSubmitByAndPrice(
+      String(id),
+      patch.submitByMeta,
+      patch,
+      connection
+    );
     fields.push('submit_by = ?');
-    vals.push(JSON.stringify(safeMeta));
+    vals.push(mergedJson);
+    if (newPrice != null && (await databaseHasColumn('cln_schedule', 'price'))) {
+      fields.push('price = ?');
+      vals.push(newPrice);
+    }
   }
   if (patch.status !== undefined && (await databaseHasColumn('cln_schedule', 'ai_assignment_locked'))) {
     const n = normalizeScheduleStatus(patch.status);
@@ -3294,6 +3542,15 @@ async function groupEndEmployeeScheduleJobs({ email, operatorId, jobIds, photos,
   const groupOperationId = randomUUID();
   const endIso = new Date().toISOString();
   const photoList = Array.isArray(photos) ? photos.filter((x) => typeof x === 'string') : [];
+  const addonList = Array.isArray(completionAddons)
+    ? completionAddons
+        .filter((x) => x && String(x.id || '').trim() && String(x.name || '').trim())
+        .map((x) => ({
+          id: String(x.id).trim(),
+          name: String(x.name).trim().slice(0, 200),
+          priceMyr: Math.max(0, Number(x.priceMyr) || 0),
+        }))
+    : [];
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -3308,6 +3565,7 @@ async function groupEndEmployeeScheduleJobs({ email, operatorId, jobIds, photos,
           remark: remark != null ? String(remark).slice(0, 2000) : '',
           completedAt: endIso,
           sharedPhotos: photoList,
+          ...(addonList.length ? { completionAddons: addonList } : {}),
         },
       });
     }
@@ -3476,6 +3734,30 @@ async function employeeTaskRemoteUnlock({ email, operatorId, jobId, lockDetailId
     throw e;
   }
   const sd = require('../smartdoorsetting/smartdoorsetting.service');
+  const [[propDoor]] = await pool.query(
+    `SELECT COALESCE(NULLIF(TRIM(p.operator_door_access_mode), ''), 'temporary_password_only') AS mode
+     FROM cln_schedule s INNER JOIN cln_property p ON p.id = s.property_id WHERE s.id = ? LIMIT 1`,
+    [String(jobId).trim()]
+  );
+  let dm = String(propDoor?.mode || 'temporary_password_only').toLowerCase();
+  if (dm === 'working_date_only') dm = 'temporary_password_only';
+  if (dm === 'fixed_password') {
+    const e = new Error('OPERATOR_DOOR_USE_PASSWORD');
+    e.code = 'OPERATOR_DOOR_USE_PASSWORD';
+    throw e;
+  }
+  if (dm === 'temporary_password_only') {
+    const ymd = getTodayMalaysiaDate();
+    const [[hit]] = await pool.query(
+      `SELECT 1 AS ok FROM cln_schedule WHERE id = ? AND working_day IS NOT NULL AND DATE(DATE_ADD(working_day, INTERVAL 8 HOUR)) = ? LIMIT 1`,
+      [String(jobId).trim(), ymd]
+    );
+    if (!hit) {
+      const e = new Error('OPERATOR_DOOR_NO_BOOKING_TODAY');
+      e.code = 'OPERATOR_DOOR_NO_BOOKING_TODAY';
+      throw e;
+    }
+  }
   let scopeArg;
   if (scope.kind === 'coliving') scopeArg = scope.clientId;
   else if (scope.kind === 'cln_client') scopeArg = { kind: 'cln_client', clnClientId: scope.clnClientId };
@@ -3608,6 +3890,12 @@ async function createOperatorScheduleJob(input) {
     `INSERT INTO cln_schedule (${colList}) VALUES (${valParts.join(', ')})`,
     insertParams
   );
+  try {
+    const clnSmartPin = require('./cleanlemon-smartdoor-operator-pin.service');
+    await clnSmartPin.syncJobTemporaryPasscodeForSchedule(id);
+  } catch (e) {
+    console.warn('[cleanlemon] syncJobTemporaryPasscodeForSchedule', id, e?.message || e);
+  }
   return id;
 }
 
@@ -3671,7 +3959,7 @@ async function assertClientdetailLinkedToOperator(operatorId, clientdetailId) {
   }
 }
 
-async function listOperatorProperties({ limit = 200, offset = 0, operatorId } = {}) {
+async function listOperatorProperties({ limit = 200, offset = 0, operatorId, includeArchived = false } = {}) {
   const lim = Math.min(Math.max(Number(limit) || 200, 1), 500);
   const off = Math.max(Number(offset) || 0, 0);
   const oid = String(operatorId || '').trim();
@@ -3679,6 +3967,7 @@ async function listOperatorProperties({ limit = 200, offset = 0, operatorId } = 
   const hasClientdetailCol = await databaseHasColumn('cln_property', 'clientdetail_id');
   const hasOpCol = await databaseHasColumn('cln_property', 'operator_id');
   const hasClientIdCol = await databaseHasColumn('cln_property', 'client_id');
+  const hasOpPortalArchived = await databaseHasColumn('cln_property', 'operator_portal_archived');
   const [
     hasPortalOwned,
     hasPremisesType,
@@ -3708,17 +3997,23 @@ async function listOperatorProperties({ limit = 200, offset = 0, operatorId } = 
     databaseHasColumn('cln_property', 'latitude'),
     databaseHasColumn('cln_property', 'longitude'),
   ]);
+  const archivedClause =
+    hasOpPortalArchived && !includeArchived ? ' AND COALESCE(p.operator_portal_archived, 0) = 0 ' : '';
   const scopeWhere = oid
     ? hasOpCol
-      ? ' WHERE p.operator_id = ? '
+      ? ` WHERE p.operator_id = ? ${archivedClause}`
       : hasClientIdCol
-        ? ' WHERE p.client_id = ? '
+        ? ` WHERE p.client_id = ? ${archivedClause}`
         : ' WHERE 1=0 '
-    : '';
+    : archivedClause
+      ? ` WHERE 1=1 ${archivedClause.replace(/^ AND /, ' AND ')}`
+      : '';
   const scopeParams = oid && (hasOpCol || hasClientIdCol) ? [oid] : oid ? [] : [];
   const extraSelect = [];
   if (hasPortalOwned) extraSelect.push('COALESCE(p.client_portal_owned, 0) AS clientPortalOwned');
   else extraSelect.push('0 AS clientPortalOwned');
+  if (hasOpPortalArchived) extraSelect.push('COALESCE(p.operator_portal_archived, 0) AS operatorPortalArchived');
+  else extraSelect.push('0 AS operatorPortalArchived');
   if (hasClientdetailCol) extraSelect.push('NULLIF(TRIM(p.clientdetail_id), \'\') AS clientdetailId');
   if (hasPremisesType) extraSelect.push('p.premises_type AS premisesType');
   if (hasSecuritySystem) extraSelect.push('p.security_system AS securitySystem');
@@ -3792,6 +4087,119 @@ async function listOperatorProperties({ limit = 200, offset = 0, operatorId } = 
     [...scopeParams, lim, off]
   );
   return rows;
+}
+
+/**
+ * Operator portal — Coliving security credentials + link id for edit dialog (GET).
+ * Verifies `cln_property.operator_id` matches `operatorId`.
+ */
+async function getOperatorPropertyDetail({ propertyId, operatorId } = {}) {
+  const pid = String(propertyId || '').trim();
+  const oid = String(operatorId || '').trim();
+  if (!pid || !oid) {
+    const e = new Error('MISSING_IDS');
+    e.code = 'MISSING_IDS';
+    throw e;
+  }
+  const hasOpCol = await databaseHasColumn('cln_property', 'operator_id');
+  if (!hasOpCol) {
+    const e = new Error('UNSUPPORTED');
+    e.code = 'UNSUPPORTED';
+    throw e;
+  }
+  const hasColivingPd = await databaseHasColumn('cln_property', 'coliving_propertydetail_id');
+  const hasClientdetailCol = await databaseHasColumn('cln_property', 'clientdetail_id');
+  const hasSmartdoorId = await databaseHasColumn('cln_property', 'smartdoor_id');
+  const hasMailbox = await databaseHasColumn('cln_property', 'mailbox_password');
+  const hasSdp = await databaseHasColumn('cln_property', 'smartdoor_password');
+  const hasMode = await databaseHasColumn('cln_property', 'operator_door_access_mode');
+  let sel = `SELECT p.id,
+            p.operator_id,
+            COALESCE(p.client_portal_owned, 0) AS client_portal_owned
+            ${hasColivingPd ? ', p.coliving_propertydetail_id AS colivingPropertydetailId' : ', NULL AS colivingPropertydetailId'}`;
+  if (hasClientdetailCol) sel += ', p.clientdetail_id AS clientdetail_id';
+  else sel += ', NULL AS clientdetail_id';
+  if (hasSmartdoorId) sel += ', p.smartdoor_id AS smartdoor_id';
+  else sel += ', NULL AS smartdoor_id';
+  if (hasMailbox) sel += ', p.mailbox_password AS mailbox_password';
+  else sel += ', NULL AS mailbox_password';
+  if (hasSdp) sel += ', p.smartdoor_password AS smartdoor_password';
+  else sel += ', NULL AS smartdoor_password';
+  if (hasMode) sel += ', p.operator_door_access_mode AS operator_door_access_mode';
+  else sel += ', NULL AS operator_door_access_mode';
+  sel += ' FROM cln_property p WHERE p.id = ? LIMIT 1';
+  const [[row]] = await pool.query(sel, [pid]);
+  if (!row) {
+    const e = new Error('NOT_FOUND');
+    e.code = 'NOT_FOUND';
+    throw e;
+  }
+  const curOp = row.operator_id != null ? String(row.operator_id).trim() : '';
+  if (!curOp || curOp !== oid) {
+    const e = new Error('OPERATOR_MISMATCH');
+    e.code = 'OPERATOR_MISMATCH';
+    throw e;
+  }
+  let colivingPdId = '';
+  if (hasColivingPd && row.colivingPropertydetailId != null && String(row.colivingPropertydetailId).trim() !== '') {
+    colivingPdId = String(row.colivingPropertydetailId).trim();
+  }
+  let securitySystemCredentials = null;
+  if (colivingPdId && (await databaseHasColumn('propertydetail', 'security_system_credentials_json'))) {
+    try {
+      const [[credRow]] = await pool.query(
+        'SELECT security_system_credentials_json AS j FROM propertydetail WHERE id = ? LIMIT 1',
+        [colivingPdId]
+      );
+      if (credRow?.j != null && String(credRow.j).trim() !== '') {
+        try {
+          securitySystemCredentials =
+            typeof credRow.j === 'string' ? JSON.parse(credRow.j) : credRow.j;
+        } catch (_) {
+          securitySystemCredentials = null;
+        }
+      }
+    } catch (_) {
+      /* optional */
+    }
+  }
+  let smartdoorGatewayReady = false;
+  try {
+    smartdoorGatewayReady = await clnPropertyHasRemoteGatewayReady(pid);
+  } catch (_) {
+    smartdoorGatewayReady = false;
+  }
+  const ymdToday = getTodayMalaysiaDate();
+  let hasBookingToday = false;
+  try {
+    const [[hb]] = await pool.query(
+      `SELECT 1 AS ok FROM cln_schedule
+       WHERE property_id = ?
+         AND working_day IS NOT NULL
+         AND DATE(DATE_ADD(working_day, INTERVAL 8 HOUR)) = ?
+       LIMIT 1`,
+      [pid, ymdToday]
+    );
+    hasBookingToday = !!hb?.ok;
+  } catch (_) {
+    hasBookingToday = false;
+  }
+
+  return {
+    id: String(row.id),
+    clientPortalOwned: Number(row.client_portal_owned) === 1,
+    colivingPropertydetailId: colivingPdId || '',
+    securitySystemCredentials,
+    smartdoorId: row.smartdoor_id != null ? String(row.smartdoor_id).trim() : '',
+    mailboxPassword: row.mailbox_password != null ? String(row.mailbox_password) : '',
+    smartdoorPassword: row.smartdoor_password != null ? String(row.smartdoor_password) : '',
+    operatorDoorAccessMode:
+      row.operator_door_access_mode != null && String(row.operator_door_access_mode).trim() !== ''
+        ? String(row.operator_door_access_mode).trim()
+        : 'temporary_password_only',
+    smartdoorGatewayReady,
+    hasBookingToday,
+  };
 }
 
 /** Distinct non-empty `property_name` for operator (building / condo names for apartment flow). */
@@ -3958,6 +4366,46 @@ function dedupeAddressPlaceRows(rows) {
   return out;
 }
 
+/**
+ * Fuzzy query variants for Nominatim: OSM often lists "Paragon Suites" while users type "Paragon Suite".
+ * Tries plural/singular and a light locality suffix before giving up.
+ */
+function expandAddressSearchQueryVariants(q) {
+  const base = String(q || '').trim();
+  if (!base) return [];
+  const out = [];
+  const seen = new Set();
+  function push(s) {
+    const t = String(s || '').trim();
+    if (t.length < 2) return;
+    const k = normalizeNominatimQuery(t);
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push(t);
+  }
+  push(base);
+  const b = base;
+  if (/\bSuite\b/i.test(b) && !/\bSuites\b/i.test(b)) {
+    push(b.replace(/\bSuite\b/gi, 'Suites'));
+  }
+  if (/\bSuites\b/i.test(b)) {
+    push(b.replace(/\bSuites\b/gi, 'Suite'));
+  }
+  if (/\bTower\b/i.test(b) && !/\bTowers\b/i.test(b)) {
+    push(b.replace(/\bTower\b/gi, 'Towers'));
+  }
+  if (/\bTowers\b/i.test(b)) {
+    push(b.replace(/\bTowers\b/gi, 'Tower'));
+  }
+  if (
+    base.length <= 48 &&
+    !/malaysia|kuala|johor|penang|selangor|melaka|ipoh|kuching|sabah|sarawak|labuan/i.test(base)
+  ) {
+    push(`${base}, Malaysia`);
+  }
+  return out;
+}
+
 /** OpenStreetMap Nominatim (server-side; Malaysia-biased by default). */
 async function searchAddressPlaces({ q, limit = 8, countrycodes = 'my', propertyName = '' } = {}) {
   const termNorm = normalizeNominatimQuery(q);
@@ -3965,7 +4413,6 @@ async function searchAddressPlaces({ q, limit = 8, countrycodes = 'my', property
   const lim = Math.min(Math.max(Number(limit) || 8, 1), 10);
   const cc = String(countrycodes || '').trim().toLowerCase();
   const pnRaw = String(propertyName || '').trim();
-  const pnNorm = normalizeNominatimQuery(pnRaw);
 
   async function fetchNominatim(queryStr) {
     const qs = normalizeNominatimQuery(queryStr);
@@ -4002,12 +4449,19 @@ async function searchAddressPlaces({ q, limit = 8, countrycodes = 'my', property
     }
   }
 
-  let out = dedupeAddressPlaceRows(await fetchNominatim(q));
-  if (out.length > 0) return out;
-
-  if (pnNorm && pnNorm !== termNorm) {
-    out = dedupeAddressPlaceRows(await fetchNominatim(pnRaw));
+  for (const queryStr of expandAddressSearchQueryVariants(q)) {
+    const out = dedupeAddressPlaceRows(await fetchNominatim(queryStr));
     if (out.length > 0) return out;
+  }
+
+  if (pnRaw) {
+    const pnNorm = normalizeNominatimQuery(pnRaw);
+    if (pnNorm && pnNorm !== termNorm) {
+      for (const queryStr of expandAddressSearchQueryVariants(pnRaw)) {
+        const out = dedupeAddressPlaceRows(await fetchNominatim(queryStr));
+        if (out.length > 0) return out;
+      }
+    }
   }
 
   return [];
@@ -4145,6 +4599,11 @@ async function listClientPortalProperties({ clientdetailId, limit = 500, loginEm
   const lim = Math.min(Math.max(Number(limit) || 500, 1), 500);
   const hasSyncArch = await databaseHasColumn('cln_property', 'coliving_sync_archived');
   const archWhere = hasSyncArch ? ' AND (p.coliving_sync_archived IS NULL OR p.coliving_sync_archived = 0)' : '';
+  const hasOpPortalArchHide = await databaseHasColumn('cln_property', 'operator_portal_archived');
+  /** Operator-archived units: hide from client portal until restored. */
+  const hideOperatorArchivedWhere = hasOpPortalArchHide ? ' AND COALESCE(p.operator_portal_archived, 0) = 0' : '';
+  const hasPortalOwnedList = await databaseHasColumn('cln_property', 'client_portal_owned');
+  const portalOwnedSql = hasPortalOwnedList ? ', COALESCE(p.client_portal_owned, 0) AS clientPortalOwnedRaw' : '';
   const ptSql = hasPremisesType ? ', p.premises_type AS premisesTypeRaw' : '';
   const opSelect =
     hasOpCol && ct
@@ -4176,11 +4635,12 @@ async function listClientPortalProperties({ clientdetailId, limit = 500, loginEm
       p.created_at AS createdAt,
       p.updated_at AS updatedAt
       ${ptSql}
+      ${portalOwnedSql}
       ${opSelect}
       ${plrPendingSql}
      FROM cln_property p
      ${joinSql}
-     WHERE p.clientdetail_id = ?${archWhere}
+     WHERE p.clientdetail_id = ?${archWhere}${hideOperatorArchivedWhere}
      ORDER BY p.updated_at DESC, p.created_at DESC
      LIMIT ?`,
     [cid, lim]
@@ -4201,6 +4661,7 @@ async function listClientPortalProperties({ clientdetailId, limit = 500, loginEm
           p.created_at AS createdAt,
           p.updated_at AS updatedAt
           ${ptSql}
+          ${portalOwnedSql}
           ${opSelect}
           ${plrPendingSql}
          FROM cln_property p
@@ -4210,7 +4671,7 @@ async function listClientPortalProperties({ clientdetailId, limit = 500, loginEm
          INNER JOIN cln_property_group_member m ON m.group_id = gpg.id
            AND m.grantee_clientdetail_id = ?
            AND m.invite_status = 'active'
-         WHERE p.clientdetail_id <> ?${archWhere}
+         WHERE p.clientdetail_id <> ?${archWhere}${hideOperatorArchivedWhere}
          ORDER BY p.updated_at DESC, p.created_at DESC
          LIMIT ?`,
         [cid, cid, remaining]
@@ -4265,6 +4726,9 @@ async function listClientPortalProperties({ clientdetailId, limit = 500, loginEm
     const gList = groupNamesByPropertyId.get(pid) || [];
     const groupNames = [...new Set(gList)].sort((a, b) => a.localeCompare(b));
     const portalAccess = r._portalAccess === 'shared' ? 'shared' : 'owner';
+    const clientPortalOwned =
+      hasPortalOwnedList &&
+      (r.clientPortalOwnedRaw === true || r.clientPortalOwnedRaw === 1 || Number(r.clientPortalOwnedRaw) === 1);
     return {
       id: pid,
       name: String(r.name || ''),
@@ -4277,6 +4741,7 @@ async function listClientPortalProperties({ clientdetailId, limit = 500, loginEm
       clientOperatorLinkPending: pending,
       groupNames,
       portalAccess,
+      clientPortalOwned: hasPortalOwnedList ? !!clientPortalOwned : true,
       createdAt: r.createdAt,
       updatedAt: r.updatedAt,
     };
@@ -4286,6 +4751,7 @@ async function listClientPortalProperties({ clientdetailId, limit = 500, loginEm
 /** Coliving `propertydetail` mirror: only columns that exist in DB are written. */
 const CLIENT_PORTAL_PD_MIRROR_SPECS = [
   { patchKey: 'mailboxPassword', dbCol: 'mailbox_password', kind: 'str' },
+  { patchKey: 'securitySystem', dbCol: 'security_system', kind: 'str' },
   { patchKey: 'securityUsername', dbCol: 'security_username', kind: 'str' },
   { patchKey: 'bedCount', dbCol: 'bed_count', kind: 'int' },
   { patchKey: 'roomCount', dbCol: 'room_count', kind: 'int' },
@@ -4327,6 +4793,26 @@ async function pickExistingColumns(table, colNames) {
   return out;
 }
 
+/** Remote TTLock unlock needs gateway linked in DB: lockdetail.hasgateway + gateway_id for this property's smartdoor. */
+async function clnPropertyHasRemoteGatewayReady(propertyId) {
+  const pid = String(propertyId || '').trim();
+  if (!pid) return false;
+  const hasSd = await databaseHasColumn('cln_property', 'smartdoor_id');
+  if (!hasSd) return false;
+  const [[row]] = await pool.query(
+    `SELECT l.hasgateway AS hg, l.gateway_id AS gwf
+     FROM cln_property p
+     LEFT JOIN lockdetail l ON l.id = p.smartdoor_id
+     WHERE p.id = ?
+     LIMIT 1`,
+    [pid]
+  );
+  if (!row) return false;
+  const gw = row.gwf != null && String(row.gwf).trim() !== '';
+  const hg = Number(row.hg) === 1;
+  return hg && gw;
+}
+
 /**
  * B2B client portal — one property row + Coliving bridge contact (owner-portal pattern) + cleaning prices when present.
  */
@@ -4360,6 +4846,8 @@ async function getClientPortalPropertyDetail({ clientdetailId, propertyId } = {}
     'key_photo_url',
     'smartdoor_password',
     'smartdoor_token_enabled',
+    'operator_door_access_mode',
+    'operator_smartdoor_passcode_name',
     'warmcleaning',
     'deepcleaning',
     'generalcleaning',
@@ -4375,6 +4863,8 @@ async function getClientPortalPropertyDetail({ clientdetailId, propertyId } = {}
   if (hasColivingPd) clnCols.push('coliving_propertydetail_id');
   if (hasColivingRd) clnCols.push('coliving_roomdetail_id');
   if (await databaseHasColumn('cln_property', 'coliving_sync_archived')) clnCols.push('coliving_sync_archived');
+  const hasClientPortalOwnedCol = await databaseHasColumn('cln_property', 'client_portal_owned');
+  if (hasClientPortalOwnedCol) clnCols.push('client_portal_owned');
   for (const c of clnOptional) {
     if (await databaseHasColumn('cln_property', c)) clnCols.push(c);
   }
@@ -4551,11 +5041,41 @@ async function getClientPortalPropertyDetail({ clientdetailId, propertyId } = {}
     }
   }
 
+  let securitySystemCredentials = null;
+  if (colivingPdId && (await databaseHasColumn('propertydetail', 'security_system_credentials_json'))) {
+    try {
+      const [[credRow]] = await pool.query(
+        'SELECT security_system_credentials_json AS j FROM propertydetail WHERE id = ? LIMIT 1',
+        [colivingPdId]
+      );
+      if (credRow?.j != null && String(credRow.j).trim() !== '') {
+        try {
+          securitySystemCredentials =
+            typeof credRow.j === 'string' ? JSON.parse(credRow.j) : credRow.j;
+        } catch (_) {
+          securitySystemCredentials = null;
+        }
+      }
+    } catch (_) {
+      /* optional */
+    }
+  }
+
+  const clientPortalOwned = !hasClientPortalOwnedCol ? true : Number(row.client_portal_owned) === 1;
+
+  let smartdoorGatewayReady = false;
+  try {
+    smartdoorGatewayReady = await clnPropertyHasRemoteGatewayReady(pid);
+  } catch (_) {
+    smartdoorGatewayReady = false;
+  }
+
   return {
     id: String(row.id || ''),
     name: String(row.property_name || '').trim() || 'Property',
     address: String(row.address || '').trim() || '—',
     unitNumber: String(row.unit_name || '').trim(),
+    clientPortalOwned,
     operatorId: hasOpCol && row.operator_id ? String(row.operator_id) : '',
     cleanlemonsOperatorName,
     cleanlemonsOperatorEmail,
@@ -4578,10 +5098,20 @@ async function getClientPortalPropertyDetail({ clientdetailId, propertyId } = {}
     premisesType: row.premises_type != null ? String(row.premises_type) : '',
     securitySystem: row.security_system != null ? String(row.security_system) : '',
     securityUsername: row.security_username != null ? String(row.security_username) : '',
+    securitySystemCredentials,
     afterCleanPhotoUrl: row.after_clean_photo_url != null ? String(row.after_clean_photo_url) : '',
     keyPhotoUrl: row.key_photo_url != null ? String(row.key_photo_url) : '',
     smartdoorPassword: row.smartdoor_password != null ? String(row.smartdoor_password) : '',
     smartdoorTokenEnabled: Number(row.smartdoor_token_enabled) === 1,
+    operatorSmartdoorPasscodeName:
+      row.operator_smartdoor_passcode_name != null && String(row.operator_smartdoor_passcode_name).trim() !== ''
+        ? String(row.operator_smartdoor_passcode_name).trim()
+        : '',
+    smartdoorGatewayReady,
+    operatorDoorAccessMode:
+      row.operator_door_access_mode != null && String(row.operator_door_access_mode).trim() !== ''
+        ? String(row.operator_door_access_mode).trim()
+        : 'temporary_password_only',
     updatedAt: row.updated_at != null ? row.updated_at : null,
     latitude:
       row.latitude != null && String(row.latitude).trim() !== ''
@@ -4638,17 +5168,19 @@ async function patchClientPortalProperty({ clientdetailId, propertyId, body } = 
     throw e;
   }
   await clnPropGroup.assertPropertyActionAllowed(cid, pid, 'property', 'edit');
-  const [hasWNavCol, hasGNavCol, hasLatColPatch, hasLngColPatch] = await Promise.all([
+  const [hasWNavCol, hasGNavCol, hasLatColPatch, hasLngColPatch, hasPortalOwnedPatch] = await Promise.all([
     databaseHasColumn('cln_property', 'waze_url'),
     databaseHasColumn('cln_property', 'google_maps_url'),
     databaseHasColumn('cln_property', 'latitude'),
     databaseHasColumn('cln_property', 'longitude'),
+    databaseHasColumn('cln_property', 'client_portal_owned'),
   ]);
   let selExisting = 'id, clientdetail_id AS propOwnerClientdetailId, coliving_propertydetail_id AS colivingPd, address';
   if (hasWNavCol) selExisting += ', waze_url';
   if (hasGNavCol) selExisting += ', google_maps_url';
   if (hasLatColPatch) selExisting += ', latitude';
   if (hasLngColPatch) selExisting += ', longitude';
+  if (hasPortalOwnedPatch) selExisting += ', COALESCE(client_portal_owned, 0) AS client_portal_owned';
   const [[existing]] = await pool.query(
     `SELECT ${selExisting} FROM cln_property WHERE id = ? LIMIT 1`,
     [pid]
@@ -4660,6 +5192,9 @@ async function patchClientPortalProperty({ clientdetailId, propertyId, body } = 
   }
   const colivingPdId = existing.colivingPd != null ? String(existing.colivingPd) : '';
   const isPropertyOwner = String(existing.propOwnerClientdetailId || '').trim() === cid;
+  /** 1 = created in client portal (full edit); 0 = Coliving-synced / imported (limited fields). */
+  const portalOwnedFullEdit =
+    !hasPortalOwnedPatch || Number(existing.client_portal_owned) === 1;
 
   const b = body && typeof body === 'object' ? body : {};
   const hasOpCol = await databaseHasColumn('cln_property', 'operator_id');
@@ -4684,8 +5219,6 @@ async function patchClientPortalProperty({ clientdetailId, propertyId, body } = 
     }
     const opId = String(b.setCleanlemonsOperator.operatorId || '').trim();
     const auth = !!b.setCleanlemonsOperator.authorizePropertyAndTtlock;
-    const requestApproval =
-      b.setCleanlemonsOperator.requestApproval === true || b.setCleanlemonsOperator.requestApproval === 'true';
     if (!opId) {
       const e = new Error('MISSING_OPERATOR_ID');
       e.code = 'MISSING_OPERATOR_ID';
@@ -4708,23 +5241,12 @@ async function patchClientPortalProperty({ clientdetailId, propertyId, body } = 
       e.code = 'OPERATOR_NOT_FOUND';
       throw e;
     }
-    if (requestApproval) {
+    await pool.query('UPDATE cln_property SET operator_id = ?, updated_at = NOW(3) WHERE id = ?', [opId, pid]);
+    try {
       const plr = require('./cleanlemon-property-link-request.service');
-      let detailSnap = null;
-      try {
-        detailSnap = await getClientPortalPropertyDetail({ clientdetailId: cid, propertyId: pid });
-      } catch (_) {
-        detailSnap = null;
-      }
-      await plr.createPropertyLinkRequest({
-        kind: plr.KIND_CLIENT_OP,
-        propertyId: pid,
-        clientdetailId: cid,
-        operatorId: opId,
-        payloadJson: { propertySnapshot: detailSnap },
-      });
-    } else {
-      await pool.query('UPDATE cln_property SET operator_id = ?, updated_at = NOW(3) WHERE id = ?', [opId, pid]);
+      await plr.assignClnOperatorToPropertySmartDoorRows(pid, cid, opId);
+    } catch (e) {
+      console.warn('[cleanlemon] assignClnOperatorToPropertySmartDoorRows', e?.message || e);
     }
   }
 
@@ -4763,6 +5285,48 @@ async function patchClientPortalProperty({ clientdetailId, propertyId, body } = 
   if (keyPh !== undefined) normalized.keyPhotoUrl = keyPh;
   if (b.smartdoorPassword !== undefined) normalized.smartdoorPassword = String(b.smartdoorPassword ?? '');
   if (b.smartdoorTokenEnabled !== undefined) normalized.smartdoorTokenEnabled = b.smartdoorTokenEnabled;
+  if (b.operatorDoorAccessMode !== undefined) {
+    const raw = String(b.operatorDoorAccessMode ?? '').trim().toLowerCase();
+    const allowed = ['full_access', 'temporary_password_only', 'working_date_only', 'fixed_password'];
+    if (raw && !allowed.includes(raw)) {
+      const e = new Error('INVALID_OPERATOR_DOOR_ACCESS_MODE');
+      e.code = 'INVALID_OPERATOR_DOOR_ACCESS_MODE';
+      throw e;
+    }
+    normalized.operatorDoorAccessMode = raw || 'temporary_password_only';
+  }
+
+  if (hasPortalOwnedPatch && !portalOwnedFullEdit) {
+    const allowedImported = new Set([
+      'afterCleanPhotoUrl',
+      'keyPhotoUrl',
+      'bedCount',
+      'roomCount',
+      'bathroomCount',
+      'operatorDoorAccessMode',
+      'smartdoorPassword',
+      'mailboxPassword',
+    ]);
+    for (const k of Object.keys(normalized)) {
+      if (!allowedImported.has(k)) delete normalized[k];
+    }
+  }
+
+  if (normalized.operatorDoorAccessMode != null) {
+    const m = String(normalized.operatorDoorAccessMode || '').trim().toLowerCase();
+    if (
+      m === 'full_access' ||
+      m === 'working_date_only' ||
+      m === 'temporary_password_only'
+    ) {
+      const okGw = await clnPropertyHasRemoteGatewayReady(pid);
+      if (!okGw) {
+        const e = new Error('OPERATOR_DOOR_GATEWAY_REQUIRED');
+        e.code = 'OPERATOR_DOOR_GATEWAY_REQUIRED';
+        throw e;
+      }
+    }
+  }
 
   const clnSets = [];
   const clnVals = [];
@@ -4777,6 +5341,7 @@ async function patchClientPortalProperty({ clientdetailId, propertyId, body } = 
     ['keyPhotoUrl', 'key_photo_url', 'url'],
     ['smartdoorPassword', 'smartdoor_password', 'str'],
     ['smartdoorTokenEnabled', 'smartdoor_token_enabled', 'bool'],
+    ['operatorDoorAccessMode', 'operator_door_access_mode', 'door_mode'],
     ['mailboxPassword', 'mailbox_password', 'str'],
     ['bedCount', 'bed_count', 'int'],
     ['roomCount', 'room_count', 'int'],
@@ -4795,12 +5360,20 @@ async function patchClientPortalProperty({ clientdetailId, propertyId, body } = 
     if (kind === 'str') v = v == null ? null : String(v);
     if (kind === 'url') v = clnSanitizePersistableUrl(v);
     if (kind === 'bool') v = v === true || v === 1 || v === '1' ? 1 : 0;
+    if (kind === 'door_mode') {
+      v = v == null || v === '' ? 'temporary_password_only' : String(v);
+      if (
+        !['full_access', 'temporary_password_only', 'working_date_only', 'fixed_password'].includes(v)
+      )
+        continue;
+    }
     if (kind === 'lift' && v != null && !['slow', 'medium', 'fast'].includes(String(v))) continue;
     clnSets.push(`\`${col}\` = ?`);
     clnVals.push(v);
   }
 
   if (
+    portalOwnedFullEdit &&
     (hasWNavCol || hasGNavCol) &&
     (normalized.address !== undefined ||
       b.wazeUrl !== undefined ||
@@ -4830,6 +5403,7 @@ async function patchClientPortalProperty({ clientdetailId, propertyId, body } = 
   }
 
   if (
+    portalOwnedFullEdit &&
     (hasLatColPatch || hasLngColPatch) &&
     (b.latitude !== undefined || b.longitude !== undefined || b.lat !== undefined || b.lng !== undefined)
   ) {
@@ -4859,6 +5433,33 @@ async function patchClientPortalProperty({ clientdetailId, propertyId, body } = 
   if (clnSets.length) {
     clnVals.push(pid);
     await pool.query(`UPDATE cln_property SET ${clnSets.join(', ')}, updated_at = NOW(3) WHERE id = ?`, clnVals);
+  }
+
+  try {
+    const bMode = String(b.operatorDoorAccessMode || '').trim().toLowerCase();
+    if (bMode === 'full_access') {
+      const clnSmartPin = require('./cleanlemon-smartdoor-operator-pin.service');
+      await clnSmartPin.syncOperatorPermanentPasscodeForProperty(pid);
+    }
+  } catch (e) {
+    console.warn('[cleanlemon] syncOperatorPermanentPasscodeForProperty', e?.message || e);
+  }
+
+  if (colivingPdId && b.securitySystemCredentials !== undefined && portalOwnedFullEdit) {
+    const credCol = await databaseHasColumn('propertydetail', 'security_system_credentials_json');
+    if (credCol) {
+      const rawCred = b.securitySystemCredentials;
+      const val =
+        rawCred == null || rawCred === ''
+          ? null
+          : typeof rawCred === 'string'
+            ? rawCred
+            : JSON.stringify(rawCred);
+      await pool.query('UPDATE propertydetail SET security_system_credentials_json = ? WHERE id = ?', [
+        val,
+        colivingPdId,
+      ]);
+    }
   }
 
   if (colivingPdId && Object.keys(normalized).length) {
@@ -4938,19 +5539,16 @@ async function bulkRequestClientPortalOperatorBinding({
           continue;
         }
       }
-      let detailSnap = null;
+      await pool.query('UPDATE cln_property SET operator_id = ?, updated_at = NOW(3) WHERE id = ? AND clientdetail_id = ?', [
+        opId,
+        pid,
+        cid,
+      ]);
       try {
-        detailSnap = await getClientPortalPropertyDetail({ clientdetailId: cid, propertyId: pid });
-      } catch (_) {
-        detailSnap = null;
+        await plr.assignClnOperatorToPropertySmartDoorRows(pid, cid, opId);
+      } catch (e) {
+        console.warn('[cleanlemon] bulk bind assignClnOperatorToPropertySmartDoorRows', pid, e?.message || e);
       }
-      await plr.createPropertyLinkRequest({
-        kind: plr.KIND_CLIENT_OP,
-        propertyId: pid,
-        clientdetailId: cid,
-        operatorId: opId,
-        payloadJson: { propertySnapshot: detailSnap },
-      });
       succeeded.push(pid);
     } catch (err) {
       failed.push({
@@ -5398,6 +5996,8 @@ async function updateOperatorProperty(id, input) {
     hasGoogleMapsUrlCol,
     hasLatCol,
     hasLngCol,
+    hasColivingPdCol,
+    hasOpPortalArchivedCol,
   ] = await Promise.all([
     databaseHasColumn('cln_property', 'premises_type'),
     databaseHasColumn('cln_property', 'security_system'),
@@ -5411,6 +6011,8 @@ async function updateOperatorProperty(id, input) {
     databaseHasColumn('cln_property', 'google_maps_url'),
     databaseHasColumn('cln_property', 'latitude'),
     databaseHasColumn('cln_property', 'longitude'),
+    databaseHasColumn('cln_property', 'coliving_propertydetail_id'),
+    databaseHasColumn('cln_property', 'operator_portal_archived'),
   ]);
 
   const sel = ['id', 'address'];
@@ -5421,10 +6023,82 @@ async function updateOperatorProperty(id, input) {
   if (hasClientdetailCol) sel.push('clientdetail_id');
   if (hasPortalOwned) sel.push('client_portal_owned');
   if (hasOpCol) sel.push('operator_id');
+  if (hasColivingPdCol) sel.push('coliving_propertydetail_id');
   const [[cur]] = await pool.query(`SELECT ${sel.join(', ')} FROM cln_property WHERE id = ? LIMIT 1`, [pid]);
   if (!cur) return;
 
   const portalOwned = hasPortalOwned && Number(cur.client_portal_owned) === 1;
+
+  const reqOpNorm = String(input.operatorId || input.operator_id || '').trim();
+  if (hasOpCol && cur.operator_id != null && String(cur.operator_id).trim() !== '') {
+    const curOp = String(cur.operator_id).trim();
+    if (reqOpNorm && curOp && reqOpNorm !== curOp) {
+      const e = new Error('OPERATOR_MISMATCH');
+      e.code = 'OPERATOR_MISMATCH';
+      throw e;
+    }
+  }
+
+  /** Operator-created row with a bound B2B client: hand "ownership" to client portal (client manages core fields). */
+  const wantTransferOwnership =
+    input.transferOwnershipToClient === true ||
+    input.transferOwnershipToClient === 'true' ||
+    input.transferOwnershipToClient === 1;
+  if (wantTransferOwnership) {
+    if (portalOwned) {
+      const e = new Error('ALREADY_CLIENT_OWNED');
+      e.code = 'ALREADY_CLIENT_OWNED';
+      throw e;
+    }
+    if (!hasPortalOwned) {
+      const e = new Error('UNSUPPORTED');
+      e.code = 'UNSUPPORTED';
+      throw e;
+    }
+    const bound =
+      hasClientdetailCol &&
+      cur.clientdetail_id != null &&
+      String(cur.clientdetail_id).trim() !== '';
+    if (!bound) {
+      const e = new Error('TRANSFER_REQUIRES_BOUND_CLIENT');
+      e.code = 'TRANSFER_REQUIRES_BOUND_CLIENT';
+      throw e;
+    }
+    const archFragment = hasOpPortalArchivedCol ? ', operator_portal_archived = 0' : '';
+    await pool.query(
+      `UPDATE cln_property SET client_portal_owned = 1${archFragment}, updated_at = NOW(3) WHERE id = ? LIMIT 1`,
+      [pid]
+    );
+    return;
+  }
+
+  /** Client-created property: operator cannot change fields via this endpoint (portal disables save). */
+  if (portalOwned) {
+    const e = new Error('NOT_CLIENT_PORTAL_OWNED');
+    e.code = 'NOT_CLIENT_PORTAL_OWNED';
+    throw e;
+  }
+
+  const definedInputKeys = Object.keys(input || {}).filter((k) => input[k] !== undefined);
+  const nonOperatorKeys = definedInputKeys.filter((k) => k !== 'operatorId' && k !== 'operator_id');
+  const onlyOperatorPortalArchive =
+    nonOperatorKeys.length > 0 &&
+    nonOperatorKeys.every((k) => k === 'operatorPortalArchived' || k === 'operator_portal_archived');
+  if (onlyOperatorPortalArchive) {
+    if (!hasOpPortalArchivedCol) {
+      const e = new Error('UNSUPPORTED');
+      e.code = 'UNSUPPORTED';
+      throw e;
+    }
+    const raw =
+      input.operatorPortalArchived !== undefined ? input.operatorPortalArchived : input.operator_portal_archived;
+    const en = raw === true || raw === 1 || raw === '1' || raw === 'true';
+    await pool.query(
+      'UPDATE cln_property SET operator_portal_archived = ?, updated_at = NOW(3) WHERE id = ? LIMIT 1',
+      [en ? 1 : 0, pid]
+    );
+    return;
+  }
 
   let nextClientdetail = null;
   if (hasClientdetailCol) {
@@ -5596,8 +6270,39 @@ async function updateOperatorProperty(id, input) {
     }
   }
 
+  if (hasOpPortalArchivedCol && (input.operatorPortalArchived !== undefined || input.operator_portal_archived !== undefined)) {
+    const raw =
+      input.operatorPortalArchived !== undefined ? input.operatorPortalArchived : input.operator_portal_archived;
+    const en = raw === true || raw === 1 || raw === '1' || raw === 'true';
+    sets.push('operator_portal_archived = ?');
+    vals.push(en ? 1 : 0);
+  }
+
   vals.push(pid);
   await pool.query(`UPDATE cln_property SET ${sets.join(', ')}, updated_at = NOW(3) WHERE id = ?`, vals);
+
+  const colivingPdIdForCred =
+    hasColivingPdCol &&
+    cur.coliving_propertydetail_id != null &&
+    String(cur.coliving_propertydetail_id).trim() !== ''
+      ? String(cur.coliving_propertydetail_id).trim()
+      : '';
+  if (colivingPdIdForCred && input.securitySystemCredentials !== undefined) {
+    const credCol = await databaseHasColumn('propertydetail', 'security_system_credentials_json');
+    if (credCol) {
+      const rawCred = input.securitySystemCredentials;
+      const val =
+        rawCred == null || rawCred === ''
+          ? null
+          : typeof rawCred === 'string'
+            ? rawCred
+            : JSON.stringify(rawCred);
+      await pool.query('UPDATE propertydetail SET security_system_credentials_json = ? WHERE id = ?', [
+        val,
+        colivingPdIdForCred,
+      ]);
+    }
+  }
 
   if (pendingClientBind && opIdAssert) {
     const plr = require('./cleanlemon-property-link-request.service');
@@ -5621,10 +6326,32 @@ async function deleteOperatorProperty(id, input = {}) {
 
   const hasOpCol = await databaseHasColumn('cln_property', 'operator_id');
   const hasClientdetailCol = await databaseHasColumn('cln_property', 'clientdetail_id');
+  const hasPortalOwnedDel = await databaseHasColumn('cln_property', 'client_portal_owned');
+  const hasOpPortalArchivedDel = await databaseHasColumn('cln_property', 'operator_portal_archived');
   const sel = ['id'];
   if (hasOpCol) sel.push('operator_id');
   if (hasClientdetailCol) sel.push('clientdetail_id');
+  if (hasPortalOwnedDel) sel.push('client_portal_owned');
+  if (hasOpPortalArchivedDel) sel.push('COALESCE(operator_portal_archived, 0) AS operator_portal_archived');
   const [[row]] = await pool.query(`SELECT ${sel.join(', ')} FROM cln_property WHERE id = ? LIMIT 1`, [pid]);
+
+  if (row && hasPortalOwnedDel && Number(row.client_portal_owned) === 1) {
+    const e = new Error('CLIENT_PORTAL_OWNED');
+    e.code = 'CLIENT_PORTAL_OWNED';
+    throw e;
+  }
+
+  /** Operator-created rows: only allow hard delete after operator portal archive (inactive). */
+  if (
+    row &&
+    hasOpPortalArchivedDel &&
+    !(hasPortalOwnedDel && Number(row.client_portal_owned) === 1) &&
+    Number(row.operator_portal_archived) !== 1
+  ) {
+    const e = new Error('PROPERTY_NOT_ARCHIVED');
+    e.code = 'PROPERTY_NOT_ARCHIVED';
+    throw e;
+  }
 
   if (row && hasOpCol) {
     const curOp = row.operator_id != null ? String(row.operator_id).trim() : '';
@@ -5654,11 +6381,83 @@ async function deleteOperatorProperty(id, input = {}) {
   await pool.query('DELETE FROM cln_property WHERE id = ? LIMIT 1', [pid]);
 }
 
+/**
+ * When `invoicePaymentDuePolicy` is absent from settings_json, default matches legacy 14-day SQL.
+ * When present: mode `none` = no auto-overdue; mode `days` = N calendar days from issue (UTC date).
+ */
+function getInvoicePaymentDuePolicyFromSettings(settings) {
+  const raw = settings && typeof settings === 'object' ? settings.invoicePaymentDuePolicy : undefined;
+  if (raw == null || typeof raw !== 'object') {
+    return { mode: 'days', days: 14 };
+  }
+  const mode = String(raw.mode || '').toLowerCase() === 'none' ? 'none' : 'days';
+  let days = Math.floor(Number(raw.days));
+  if (!Number.isFinite(days) || days < 1) days = 14;
+  if (days > 365) days = 365;
+  return mode === 'none' ? { mode: 'none', days: 14 } : { mode: 'days', days };
+}
+
+function utcYmdAddDays(issueYmd, days) {
+  const s = String(issueYmd || '').slice(0, 10);
+  const [y, mo, d] = s.split('-').map((x) => parseInt(x, 10));
+  if (!Number.isFinite(y) || !Number.isFinite(mo) || !Number.isFinite(d)) return s;
+  const t = Date.UTC(y, mo - 1, d) + Number(days) * 864e5;
+  return new Date(t).toISOString().slice(0, 10);
+}
+
+function utcTodayYmd() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+async function getOperatorSettingsJsonMapForOperatorIds(operatorIds) {
+  const ids = [...new Set((operatorIds || []).map((x) => String(x).trim()).filter(Boolean))];
+  const map = new Map();
+  if (!ids.length) return map;
+  await ensureOperatorSettingsTable();
+  const ph = ids.map(() => '?').join(',');
+  const [rows] = await pool.query(
+    `SELECT operator_id, settings_json FROM cln_operator_settings WHERE operator_id IN (${ph})`,
+    ids
+  );
+  for (const r of rows || []) {
+    let base = {};
+    try {
+      base = JSON.parse(r.settings_json) || {};
+    } catch {
+      base = {};
+    }
+    map.set(String(r.operator_id), base);
+  }
+  return map;
+}
+
+function enrichInvoiceRowStatusAndDue(row, settingsMap) {
+  const issueYmd = String(row.issueDate || '').slice(0, 10);
+  const paid = Number(row.paymentReceived || 0) === 1;
+  const oid = String(row.operatorId || '').trim();
+  const settings = oid && settingsMap.has(oid) ? settingsMap.get(oid) : {};
+  const policy = getInvoicePaymentDuePolicyFromSettings(settings);
+  let dueYmd = null;
+  if (policy.mode === 'days' && issueYmd) {
+    dueYmd = utcYmdAddDays(issueYmd, policy.days);
+  }
+  if (paid) {
+    return { ...row, status: 'paid', dueDate: dueYmd };
+  }
+  if (policy.mode === 'none') {
+    return { ...row, status: 'pending', dueDate: null };
+  }
+  const today = utcTodayYmd();
+  const overdue = dueYmd && dueYmd < today;
+  return { ...row, status: overdue ? 'overdue' : 'pending', dueDate: dueYmd };
+}
+
 async function listOperatorInvoices({ limit = 300 } = {}) {
   const lim = Math.min(Math.max(Number(limit) || 300, 1), 1000);
   const ct = await getClnCompanyTable();
   const hasPaymentReceivedCol = await databaseHasColumn('cln_client_invoice', 'payment_received');
   const hasTransactionIdCol = await databaseHasColumn('cln_client_invoice', 'transaction_id');
+  const hasOpCol = await databaseHasColumn('cln_client_invoice', 'operator_id');
   const [[payTableRow]] = await pool.query(
     `SELECT COUNT(*) AS n FROM information_schema.tables
      WHERE table_schema = DATABASE() AND table_name = 'cln_client_payment'`
@@ -5678,25 +6477,34 @@ async function listOperatorInvoices({ limit = 300 } = {}) {
       GROUP BY invoice_id
     ) p ON p.invoice_id = i.id`
     : '';
+  const hasPdfUrlCol = await databaseHasColumn('cln_client_invoice', 'pdf_url');
+  const pdfUrlExpr = hasPdfUrlCol ? "NULLIF(TRIM(COALESCE(i.pdf_url, '')), '')" : 'NULL';
+  const hasReceiptUrlCol =
+    hasClientPaymentTable && (await databaseHasColumn('cln_client_payment', 'receipt_url'));
+  const receiptUrlExpr = hasReceiptUrlCol
+    ? `(SELECT NULLIF(TRIM(COALESCE(receipt_url, '')), '') FROM cln_client_payment WHERE invoice_id = i.id ORDER BY payment_date DESC LIMIT 1)`
+    : 'NULL';
+  const opSelect = hasOpCol
+    ? `COALESCE(NULLIF(TRIM(i.operator_id), ''), '') AS operatorId`
+    : `'' AS operatorId`;
   const [rows] = await pool.query(
     `SELECT
       i.id,
       COALESCE(i.invoice_number, i.id) AS invoiceNo,
+      i.client_id AS clientId,
       COALESCE(c.name, '') AS client,
       COALESCE(c.email, '') AS clientEmail,
       COALESCE(i.description, '') AS description,
       COALESCE(i.amount, 0) AS amount,
       0 AS tax,
       COALESCE(i.amount, 0) AS total,
-      CASE
-        WHEN ${paymentStatusExpr} = 1 THEN 'paid'
-        WHEN i.created_at IS NOT NULL AND i.created_at < DATE_SUB(NOW(), INTERVAL 14 DAY) THEN 'overdue'
-        ELSE 'overdue'
-      END AS status,
+      CASE WHEN ${paymentStatusExpr} = 1 THEN 1 ELSE 0 END AS paymentReceived,
       DATE_FORMAT(COALESCE(i.created_at, NOW()), '%Y-%m-%d') AS issueDate,
-      DATE_FORMAT(DATE_ADD(COALESCE(i.created_at, NOW()), INTERVAL 14 DAY), '%Y-%m-%d') AS dueDate,
       ${paidDateExpr} AS paidDate,
-      ${accountingInvoiceExpr} AS accountingInvoiceId
+      ${accountingInvoiceExpr} AS accountingInvoiceId,
+      ${pdfUrlExpr} AS pdfUrl,
+      ${receiptUrlExpr} AS receiptUrl,
+      ${opSelect}
      FROM cln_client_invoice i
      LEFT JOIN \`${ct}\` c ON c.id = i.client_id
      ${paymentJoin}
@@ -5704,7 +6512,38 @@ async function listOperatorInvoices({ limit = 300 } = {}) {
      LIMIT ?`,
     [lim]
   );
-  return rows;
+  const raw = rows || [];
+  const opIds = raw.map((r) => String(r.operatorId || '').trim()).filter(Boolean);
+  const settingsMap = await getOperatorSettingsJsonMapForOperatorIds(opIds);
+  return raw.map((r) => {
+    const enriched = enrichInvoiceRowStatusAndDue(
+      {
+        issueDate: r.issueDate,
+        paymentReceived: r.paymentReceived,
+        operatorId: r.operatorId
+      },
+      settingsMap
+    );
+    const { status, dueDate } = enriched;
+    return {
+      id: r.id,
+      invoiceNo: r.invoiceNo,
+      clientId: r.clientId,
+      client: r.client,
+      clientEmail: r.clientEmail,
+      description: r.description,
+      amount: r.amount,
+      tax: r.tax,
+      total: r.total,
+      status,
+      issueDate: r.issueDate,
+      dueDate: dueDate || '',
+      paidDate: r.paidDate,
+      accountingInvoiceId: r.accountingInvoiceId,
+      pdfUrl: r.pdfUrl,
+      receiptUrl: r.receiptUrl
+    };
+  });
 }
 
 /** Operators linked to this B2B client (for portal invoice filter). */
@@ -5784,13 +6623,8 @@ async function listClientPortalInvoices({ clientdetailId, filterOperatorId, limi
       COALESCE(i.amount, 0) AS amount,
       0 AS tax,
       COALESCE(i.amount, 0) AS total,
-      CASE
-        WHEN ${paymentStatusExpr} = 1 THEN 'paid'
-        WHEN DATE(DATE_ADD(COALESCE(i.created_at, NOW()), INTERVAL 14 DAY)) < CURDATE() THEN 'overdue'
-        ELSE 'pending'
-      END AS status,
+      CASE WHEN ${paymentStatusExpr} = 1 THEN 1 ELSE 0 END AS paymentReceived,
       DATE_FORMAT(COALESCE(i.created_at, NOW()), '%Y-%m-%d') AS issueDate,
-      DATE_FORMAT(DATE_ADD(COALESCE(i.created_at, NOW()), INTERVAL 14 DAY), '%Y-%m-%d') AS dueDate,
       ${paidDateExpr} AS paidDate,
       ${accountingInvoiceExpr} AS accountingInvoiceId,
       ${opSelect}
@@ -5803,7 +6637,143 @@ async function listClientPortalInvoices({ clientdetailId, filterOperatorId, limi
      LIMIT ?`,
     params
   );
-  return { items: rows || [], operators };
+  const raw = rows || [];
+  const opIds = raw.map((r) => String(r.operatorId || '').trim()).filter(Boolean);
+  const settingsMap = await getOperatorSettingsJsonMapForOperatorIds(opIds);
+  const items = raw.map((r) => {
+    const enriched = enrichInvoiceRowStatusAndDue(
+      {
+        issueDate: r.issueDate,
+        paymentReceived: r.paymentReceived,
+        operatorId: r.operatorId
+      },
+      settingsMap
+    );
+    return {
+      id: r.id,
+      invoiceNo: r.invoiceNo,
+      description: r.description,
+      amount: r.amount,
+      tax: r.tax,
+      total: r.total,
+      status: enriched.status,
+      issueDate: r.issueDate,
+      dueDate: enriched.dueDate || null,
+      paidDate: r.paidDate,
+      accountingInvoiceId: r.accountingInvoiceId,
+      operatorId: r.operatorId,
+      operatorName: r.operatorName
+    };
+  });
+  return { items, operators };
+}
+
+/**
+ * B2B client portal — Stripe Checkout (payment) for one or more unpaid invoices for the same operator.
+ * Funds go to the operator’s Stripe Connect account when configured.
+ */
+async function createClientPortalInvoiceCheckoutSession({
+  clientdetailId,
+  operatorId,
+  invoiceIds,
+  email,
+  successUrl,
+  cancelUrl
+}) {
+  const cid = String(clientdetailId || '').trim();
+  const oid = String(operatorId || '').trim();
+  const ids = [...new Set((invoiceIds || []).map((x) => String(x).trim()).filter(Boolean))];
+  if (!cid || !oid || !ids.length) {
+    return { ok: false, code: 'INVALID_PARAMS' };
+  }
+  const destination = await clnIntegration.getStripeConnectedAccountIdForOperator(oid);
+  if (!destination) {
+    return { ok: false, code: 'STRIPE_CONNECT_REQUIRED' };
+  }
+
+  const hasPr = await databaseHasColumn('cln_client_invoice', 'payment_received');
+  const hasOpCol = await databaseHasColumn('cln_client_invoice', 'operator_id');
+  const prExpr = hasPr ? 'COALESCE(i.payment_received,0)' : '0';
+  const placeholders = ids.map(() => '?').join(',');
+  let sql = `SELECT i.id,
+    COALESCE(i.amount, 0) AS amount,
+    COALESCE(i.invoice_number, '') AS invoice_number,
+    COALESCE(i.description, '') AS description`;
+  sql += hasOpCol ? `, COALESCE(NULLIF(TRIM(i.operator_id), ''), '') AS operator_id` : `, '' AS operator_id`;
+  sql += `, ${prExpr} AS pr FROM cln_client_invoice i WHERE i.client_id = ? AND i.id IN (${placeholders})`;
+  const [rows] = await pool.query(sql, [cid, ...ids]);
+  if (rows.length !== ids.length) {
+    return { ok: false, code: 'INVOICE_NOT_FOUND' };
+  }
+  for (const r of rows) {
+    if (Number(r.pr) === 1) {
+      return { ok: false, code: 'INVOICE_ALREADY_PAID' };
+    }
+    if (hasOpCol && String(r.operator_id || '') !== oid) {
+      return { ok: false, code: 'OPERATOR_MISMATCH' };
+    }
+  }
+
+  const totalMyr = rows.reduce((s, r) => s + Number(r.amount || 0), 0);
+  if (!(totalMyr > 0)) {
+    return { ok: false, code: 'INVALID_AMOUNT' };
+  }
+  const totalSen = Math.round(totalMyr * 100);
+  if (totalSen < 200) {
+    return { ok: false, code: 'AMOUNT_BELOW_STRIPE_MINIMUM' };
+  }
+
+  const Stripe = require('stripe');
+  const key = String(process.env.CLEANLEMON_STRIPE_SECRET_KEY || process.env.STRIPE_SECRET_KEY || '').trim();
+  if (!key) {
+    return { ok: false, code: 'STRIPE_KEY_MISSING' };
+  }
+  const stripe = new Stripe(key, { apiVersion: '2024-11-20.acacia' });
+
+  const invLabels = rows
+    .map((r) => String(r.invoice_number || r.id || '').trim())
+    .filter(Boolean)
+    .join(', ')
+    .slice(0, 450);
+  const meta = {
+    type: 'cleanlemon_client_invoices',
+    operator_id: oid,
+    clientdetail_id: cid,
+    invoice_ids: ids.join(',').slice(0, 450),
+    customer_email: String(email || '')
+      .trim()
+      .toLowerCase()
+      .slice(0, 200)
+  };
+
+  const session = await stripe.checkout.sessions.create({
+    mode: 'payment',
+    customer_email: String(email || '')
+      .trim()
+      .toLowerCase() || undefined,
+    line_items: [
+      {
+        quantity: 1,
+        price_data: {
+          currency: 'myr',
+          unit_amount: totalSen,
+          product_data: {
+            name: `Cleaning invoices (${rows.length})`,
+            description: invLabels || `Operator ${oid.slice(0, 8)}`
+          }
+        }
+      }
+    ],
+    success_url: successUrl,
+    cancel_url: cancelUrl,
+    metadata: meta,
+    payment_intent_data: {
+      transfer_data: {
+        destination
+      }
+    }
+  });
+  return { ok: true, url: session.url, sessionId: session.id };
 }
 
 async function updateInvoiceStatus(id, status, opts = {}) {
@@ -5938,28 +6908,6 @@ async function ensureAgreementTables() {
   );
 }
 
-function clnContactIsStaffRole(permissions) {
-  const p = Array.isArray(permissions) ? permissions.map((x) => String(x).toLowerCase()) : [];
-  return p.some((x) => ['staff', 'driver', 'dobi', 'supervisor'].includes(x));
-}
-
-function clnNormEmpStatus(s) {
-  return String(s || '')
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, '');
-}
-
-function clnAutomationTriggerMatches(triggerWhen, employmentStatus) {
-  const t = String(triggerWhen || '').trim();
-  const em = clnNormEmpStatus(employmentStatus);
-  const isPart = em.includes('part');
-  if (t === 'new_employee_all') return true;
-  if (t === 'new_employee_parttime_only') return isPart;
-  if (t === 'new_employee_fulltime_only') return !isPart;
-  return false;
-}
-
 function clnPortalProfileCompleteForAutomation(profile) {
   if (!profile || typeof profile !== 'object') return false;
   const name = String(profile.fullname || '')
@@ -5980,187 +6928,12 @@ function clnCompanyProfileCompleteForAutomation(cp) {
   return !!(companyName && ssm && address && contact);
 }
 
-/**
- * Sync automation rows: `pending` until both profiles complete, then `signing` (ready for signatures in any order).
- */
-async function tryAgreementAutomationForOperatorStaffEmail(operatorId, staffEmail) {
-  const oid = String(operatorId || '').trim();
-  const email = String(staffEmail || '')
-    .trim()
-    .toLowerCase();
-  if (!oid || !email) return { ok: false, reason: 'MISSING_IDS' };
-
-  await ensureOperatorSettingsTable();
-  await ensureAgreementTables();
-  await clnDc.ensureClnDomainContactExtras(pool);
-
-  let contact = null;
-  if (await clnDc.clnDomainContactSchemaReady(pool)) {
-    contact = await clnDc.resolveAutomationContactMapRow(pool, oid, email);
-    if (contact) {
-      delete contact.contactSource;
-      delete contact.employeeDetailId;
-      delete contact.clientDetailId;
-    }
-  }
-  if (!contact) return { ok: false, reason: 'CONTACT_NOT_FOUND' };
-  const perms = contact.permissions || [];
-  if (!clnContactIsStaffRole(perms)) return { ok: true, skipped: 'not_staff_contact' };
-
-  const settings = await getOperatorSettings(oid);
-  const rules = Array.isArray(settings?.agreementAutomations) ? settings.agreementAutomations : [];
-  if (!rules.length) return { ok: true, skipped: 'no_rules' };
-
-  const companyOk =
-    clnCompanyProfileCompleteForAutomation(settings.companyProfile || {}) &&
-    clnOperatorPublicSubdomainComplete(settings);
-  const portalRes = await getPortalProfile(email);
-  const empOk = portalRes?.ok && clnPortalProfileCompleteForAutomation(portalRes.profile || {});
-  const profilesComplete = companyOk && empOk;
-  const empType =
-    contact.permissions?.includes('driver') ? 'driver' : contact.permissions?.includes('dobi') ? 'dobi' : 'employee';
-
-  const created = [];
-  const upgraded = [];
-  const hasTplOp = await databaseHasColumn('cln_operator_agreement_template', 'operator_id');
-  for (const rule of rules) {
-    const ruleId = String(rule?.id || '').trim();
-    const templateId = String(rule?.templateId || '').trim();
-    const triggerWhen = String(rule?.triggerWhen || 'new_employee_all').trim();
-    if (!ruleId || !templateId) continue;
-    if (triggerWhen === 'new_customer') continue;
-    if (!clnAutomationTriggerMatches(triggerWhen, contact.employmentStatus)) continue;
-
-    const tplSql = hasTplOp
-      ? 'SELECT id, name, mode FROM cln_operator_agreement_template WHERE id = ? AND operator_id <=> ? LIMIT 1'
-      : 'SELECT id, name, mode FROM cln_operator_agreement_template WHERE id = ? LIMIT 1';
-    const tplParams = hasTplOp ? [templateId, oid] : [templateId];
-    const [tRows] = await pool.query(tplSql, tplParams);
-    const tpl = tRows[0];
-    if (!tpl) continue;
-    const mode = String(tpl.mode || '').trim();
-    if (mode !== 'operator_staff') continue;
-    if (!settings.googleDrive) continue;
-
-    const [existingRows] = await pool.query(
-      `SELECT id, status FROM cln_operator_agreement
-       WHERE operator_id <=> ? AND LOWER(TRIM(recipient_email)) = ? AND automation_rule_id <=> ?
-       LIMIT 1`,
-      [oid, email, ruleId]
-    );
-    const existing = existingRows[0];
-    const startDate = contact.joinedAt || null;
-    const meta = {
-      source: 'automation',
-      automationRuleId: ruleId,
-      templateId,
-      triggerWhen
-    };
-
-    if (existing) {
-      const st = String(existing.status || '').toLowerCase();
-      if (profilesComplete && (st === 'pending' || st === 'draft')) {
-        await pool.query(
-          `UPDATE cln_operator_agreement
-           SET status = 'signing',
-               recipient_name = ?, recipient_type = ?, template_name = ?, salary = ?, start_date = ?,
-               signed_meta_json = ?, template_id = ?, created_at = created_at
-           WHERE id = ? LIMIT 1`,
-          [
-            String(contact.name || ''),
-            empType,
-            String(tpl.name || 'Template'),
-            Number(contact.salaryBasic) || 0,
-            startDate,
-            JSON.stringify(meta),
-            templateId,
-            String(existing.id)
-          ]
-        );
-        upgraded.push(String(existing.id));
-      }
-      continue;
-    }
-
-    const nextStatus = profilesComplete ? 'signing' : 'pending';
-    const agrId = makeId('cln-agr');
-    await pool.query(
-      `INSERT INTO cln_operator_agreement
-        (id, operator_id, recipient_name, recipient_email, recipient_type, template_name, salary, start_date, status, automation_rule_id, signed_meta_json, template_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        agrId,
-        oid,
-        String(contact.name || ''),
-        String(contact.email || ''),
-        empType,
-        String(tpl.name || 'Template'),
-        Number(contact.salaryBasic) || 0,
-        startDate,
-        nextStatus,
-        ruleId,
-        JSON.stringify(meta),
-        templateId
-      ]
-    );
-    created.push(agrId);
-  }
-  return { ok: true, created, upgraded, profilesComplete, companyOk, empOk };
+/** Agreement automation removed — agreements are created only via operator portal (manual). */
+async function tryAgreementAutomationForOperatorStaffEmail() {
+  return { ok: true, skipped: 'automation_disabled' };
 }
-
-async function runAgreementAutomationForStaffEmailAcrossOperators(staffEmail) {
-  const email = String(staffEmail || '')
-    .trim()
-    .toLowerCase();
-  if (!email) return;
-  await clnDc.ensureClnDomainContactExtras(pool);
-  const opIds = new Set();
-  if (await clnDc.clnDomainContactSchemaReady(pool)) {
-    try {
-      const [er] = await pool.query(
-        `SELECT DISTINCT operator_id FROM cln_employee_operator eo
-         INNER JOIN cln_employeedetail d ON d.id = eo.employee_id
-         WHERE LOWER(TRIM(d.email)) = ?`,
-        [email]
-      );
-      for (const r of er) {
-        const opId = r.operator_id != null ? String(r.operator_id) : '';
-        if (opId) opIds.add(opId);
-      }
-    } catch (e) {
-      if (e?.code !== 'ER_NO_SUCH_TABLE') {
-        console.warn('[cleanlemon] runAgreementAutomation domain operators', e?.message || e);
-      }
-    }
-  }
-  for (const opId of opIds) {
-    try {
-      await tryAgreementAutomationForOperatorStaffEmail(opId, email);
-    } catch (e) {
-      console.error('[cleanlemon] agreement automation', opId, email, e?.message || e);
-    }
-  }
-}
-
-async function tryAgreementAutomationForWholeOperator(operatorId) {
-  const oid = String(operatorId || '').trim();
-  if (!oid) return;
-  await clnDc.ensureClnDomainContactExtras(pool);
-  const emails = new Set();
-  if (await clnDc.clnDomainContactSchemaReady(pool)) {
-    const extra = await clnDc.listStaffEmailsForOperatorDomain(pool, oid);
-    for (const em of extra) {
-      if (em) emails.add(em);
-    }
-  }
-  for (const em of emails) {
-    try {
-      await tryAgreementAutomationForOperatorStaffEmail(oid, em);
-    } catch (e) {
-      console.error('[cleanlemon] agreement automation batch', oid, em, e?.message || e);
-    }
-  }
-}
+async function runAgreementAutomationForStaffEmailAcrossOperators() {}
+async function tryAgreementAutomationForWholeOperator() {}
 
 async function listAgreements(operatorId) {
   await ensureAgreementTables();
@@ -7245,61 +8018,10 @@ async function upsertOperatorSettings(operatorId, settings) {
      ON DUPLICATE KEY UPDATE settings_json = VALUES(settings_json), updated_at = CURRENT_TIMESTAMP`,
     [id, String(operatorId), JSON.stringify(merged)]
   );
-  const oidStr = String(operatorId);
-  if (Object.prototype.hasOwnProperty.call(incoming, 'companyProfile')) {
-    setImmediate(() => {
-      tryAgreementAutomationForWholeOperator(oidStr).catch((e) =>
-        console.error('[cleanlemon] agreement automation after company profile save', e?.message || e)
-      );
-    });
-  }
-  if (Object.prototype.hasOwnProperty.call(incoming, 'agreementAutomations')) {
-    setImmediate(() => {
-      tryAgreementAutomationForWholeOperator(oidStr).catch((e) =>
-        console.error('[cleanlemon] agreement automation after rules save', e?.message || e)
-      );
-    });
-  }
 }
 
-async function listOperatorSalaries(operatorId) {
-  const hasOd = await databaseHasColumn('cln_kpi_deduction', 'operatordetail_id');
-  const oid = String(operatorId || '').trim();
-  const where = hasOd && oid ? 'WHERE operatordetail_id <=> ?' : '';
-  const params = hasOd && oid ? [oid] : [];
-  const [rows] = await pool.query(
-    `SELECT
-      CONCAT('sal-', ROW_NUMBER() OVER (ORDER BY COALESCE(staff_email, 'unknown'))) AS id,
-      SUBSTRING_INDEX(COALESCE(staff_email, 'Unknown Staff'), '@', 1) AS name,
-      'Cleaner' AS role,
-      2000 AS baseSalary,
-      GREATEST(0, 1000 - (SUM(CASE WHEN point > 0 THEN point ELSE 0 END) * 10)) AS bonus,
-      GREATEST(0, SUM(CASE WHEN point > 0 THEN point ELSE 0 END) * 5) AS deductions,
-      COUNT(*) AS totalTasks,
-      DATE_FORMAT(CURDATE(), '%Y-%m') AS period
-     FROM cln_kpi_deduction
-     ${where}
-     GROUP BY staff_email
-     ORDER BY totalTasks DESC`,
-    params
-  );
-  return rows.map((r) => {
-    const base = Number(r.baseSalary || 0);
-    const bonus = Number(r.bonus || 0);
-    const deductions = Number(r.deductions || 0);
-    return {
-      id: r.id,
-      name: r.name,
-      role: r.role,
-      baseSalary: base,
-      bonus,
-      deductions,
-      totalTasks: Number(r.totalTasks || 0),
-      total: Math.max(0, base + bonus - deductions),
-      status: 'pending',
-      period: r.period,
-    };
-  });
+async function listOperatorSalaries(operatorId, periodOpt) {
+  return clnOperatorSalary.listOperatorSalaries(operatorId, periodOpt);
 }
 
 async function getClnActiveAccountingSystem(operatorId) {
@@ -10877,6 +11599,942 @@ async function adminDeleteClnPropertyCascade(propertyId) {
   }
 }
 
+// --- Driver route trips (`cln_driver_trip`) — employee order, driver accept, operator Grab ---
+
+function rowToDriverTripPayload(r) {
+  if (!r) return null;
+  const o = {
+    id: String(r.id || '').trim(),
+    operatorId: String(r.operator_id || '').trim(),
+    requesterEmployeeId: String(r.requester_employee_id || '').trim(),
+    requesterEmail: String(r.requester_email || '').trim(),
+    pickupText: String(r.pickup_text || ''),
+    dropoffText: String(r.dropoff_text || ''),
+    scheduleOffset: String(r.schedule_offset || 'now'),
+    orderTimeUtc: r.order_time_utc ? new Date(r.order_time_utc).toISOString() : null,
+    businessTimeZone: String(r.business_time_zone || 'Asia/Kuala_Lumpur'),
+    status: String(r.status || ''),
+    fulfillmentType: String(r.fulfillment_type || 'none'),
+    acceptedDriverEmployeeId: r.accepted_driver_employee_id ? String(r.accepted_driver_employee_id).trim() : null,
+    acceptedAtUtc: r.accepted_at_utc ? new Date(r.accepted_at_utc).toISOString() : null,
+    driverStartedAtUtc: r.driver_started_at_utc ? new Date(r.driver_started_at_utc).toISOString() : null,
+    completedAtUtc: r.completed_at_utc ? new Date(r.completed_at_utc).toISOString() : null,
+    createdAtUtc: r.created_at_utc ? new Date(r.created_at_utc).toISOString() : null,
+    updatedAtUtc: r.updated_at_utc ? new Date(r.updated_at_utc).toISOString() : null,
+  };
+  if (r.requester_full_name != null) o.requesterFullName = String(r.requester_full_name);
+  if (r.accepted_driver_full_name != null) o.acceptedDriverFullName = String(r.accepted_driver_full_name);
+  if (r.accepted_driver_phone != null) o.acceptedDriverPhone = String(r.accepted_driver_phone);
+  if (r.accepted_driver_avatar_url != null) o.acceptedDriverAvatarUrl = String(r.accepted_driver_avatar_url);
+  if (r.accepted_driver_car_plate != null && String(r.accepted_driver_car_plate).trim() !== '') {
+    o.acceptedDriverCarPlate = String(r.accepted_driver_car_plate).trim();
+  }
+  if (r.accepted_driver_car_front_url != null && String(r.accepted_driver_car_front_url).trim() !== '') {
+    o.acceptedDriverCarFrontUrl = String(r.accepted_driver_car_front_url).trim();
+  }
+  if (r.accepted_driver_car_back_url != null && String(r.accepted_driver_car_back_url).trim() !== '') {
+    o.acceptedDriverCarBackUrl = String(r.accepted_driver_car_back_url).trim();
+  }
+  if (r.grab_car_plate != null) o.grabCarPlate = String(r.grab_car_plate);
+  if (r.grab_phone != null) o.grabPhone = String(r.grab_phone);
+  if (r.grab_proof_image_url != null) o.grabProofImageUrl = String(r.grab_proof_image_url);
+  if (r.grab_booked_by_email != null) o.grabBookedByEmail = String(r.grab_booked_by_email);
+  if (r.grab_booked_at_utc) o.grabBookedAtUtc = new Date(r.grab_booked_at_utc).toISOString();
+  if (r.requester_team_name != null && String(r.requester_team_name).trim() !== '') {
+    o.requesterTeamName = String(r.requester_team_name).trim();
+  }
+  o.pickup = o.pickupText;
+  o.dropoff = o.dropoffText;
+  return o;
+}
+
+async function assertEmployeeOperatorJunctionForDriverTrip(email, operatorId) {
+  const em = String(email || '')
+    .trim()
+    .toLowerCase();
+  const oid = String(operatorId || '').trim();
+  if (!em || !oid) {
+    const err = new Error('MISSING_OPERATOR_OR_EMAIL');
+    err.code = 'MISSING_OPERATOR_OR_EMAIL';
+    throw err;
+  }
+  await assertClnOperatorMasterRowExists(oid);
+  if (!(await clnDc.databaseHasTable(pool, 'cln_employeedetail')) || !(await clnDc.databaseHasTable(pool, 'cln_employee_operator'))) {
+    const err = new Error('OPERATOR_ACCESS_DENIED');
+    err.code = 'OPERATOR_ACCESS_DENIED';
+    throw err;
+  }
+  const [rows] = await pool.query(
+    `SELECT eo.staff_role AS staff_role, d.id AS employee_id, LOWER(TRIM(d.email)) AS email
+     FROM cln_employee_operator eo
+     INNER JOIN cln_employeedetail d ON d.id = eo.employee_id
+     WHERE eo.operator_id = ? AND LOWER(TRIM(d.email)) = ?
+     LIMIT 1`,
+    [oid, em]
+  );
+  if (!rows?.length) {
+    const err = new Error('OPERATOR_ACCESS_DENIED');
+    err.code = 'OPERATOR_ACCESS_DENIED';
+    throw err;
+  }
+  return rows[0];
+}
+
+async function assertDriverOperatorJunctionForTrip(email, operatorId) {
+  const row = await assertEmployeeOperatorJunctionForDriverTrip(email, operatorId);
+  if (String(row.staff_role || '').toLowerCase() !== 'driver') {
+    const err = new Error('DRIVER_ROLE_REQUIRED');
+    err.code = 'DRIVER_ROLE_REQUIRED';
+    throw err;
+  }
+  return row;
+}
+
+async function assertDobiOperatorJunctionForLinenQr(email, operatorId) {
+  const row = await assertEmployeeOperatorJunctionForDriverTrip(email, operatorId);
+  if (String(row.staff_role || '').toLowerCase() !== 'dobi') {
+    const err = new Error('DOBI_ROLE_REQUIRED');
+    err.code = 'DOBI_ROLE_REQUIRED';
+    throw err;
+  }
+  return row;
+}
+
+function normalizeLinenTotalsForQr(t) {
+  const o = t && typeof t === 'object' ? t : {};
+  return {
+    bedsheet: Math.max(0, Number(o.bedsheet) || 0),
+    pillowCase: Math.max(0, Number(o.pillowCase ?? o.pillow_case) || 0),
+    bedLinens: Math.max(0, Number(o.bedLinens ?? o.bed_linens) || 0),
+    bathmat: Math.max(0, Number(o.bathmat) || 0),
+    towel: Math.max(0, Number(o.towel) || 0),
+  };
+}
+
+async function normalizeLinenLinesForQr(operatorId, linesRaw) {
+  const arr = Array.isArray(linesRaw) ? linesRaw : [];
+  const clnDobi = require('./cleanlemon-dobi.service');
+  const types = await clnDobi.listItemTypes(operatorId);
+  const byId = new Map(types.map((t) => [String(t.id), t]));
+  const out = [];
+  for (const raw of arr) {
+    const itemTypeId = String(raw?.itemTypeId != null ? raw.itemTypeId : raw?.item_type_id || '').trim();
+    if (!itemTypeId) continue;
+    const qty = Math.max(0, Math.floor(Number(raw?.qty) || 0));
+    if (qty <= 0) continue;
+    const typ = byId.get(itemTypeId);
+    if (!typ) {
+      const err = new Error('INVALID_ITEM_TYPE');
+      err.code = 'INVALID_ITEM_TYPE';
+      throw err;
+    }
+    out.push({
+      itemTypeId,
+      qty,
+      label: String(typ.label || '').trim() || itemTypeId,
+    });
+  }
+  return out;
+}
+
+async function createLinenQrApprovalRequest({
+  email,
+  operatorId,
+  date,
+  action,
+  team,
+  totals,
+  lines: linesRaw,
+  missingQty,
+  remark,
+  ttlMs,
+}) {
+  const em = String(email || '')
+    .trim()
+    .toLowerCase();
+  const oid = String(operatorId || '').trim();
+  await assertClnOperatorStaffEmail(oid, em);
+  const d = String(date || '').trim().slice(0, 10);
+  const act = String(action || '')
+    .trim()
+    .toLowerCase();
+  if (!d || (act !== 'collected' && act !== 'return')) {
+    const err = new Error('INVALID_PAYLOAD');
+    err.code = 'INVALID_PAYLOAD';
+    throw err;
+  }
+  const mq = Math.max(0, Number(missingQty) || 0);
+  const rem = String(remark || '').trim();
+  if (act === 'return' && mq > 0 && !rem) {
+    const err = new Error('REMARK_REQUIRED');
+    err.code = 'REMARK_REQUIRED';
+    throw err;
+  }
+  const normalizedLines = await normalizeLinenLinesForQr(oid, linesRaw);
+  const tot = normalizeLinenTotalsForQr(totals);
+  const sumLegacy = tot.bedsheet + tot.pillowCase + tot.bedLinens + tot.bathmat + tot.towel;
+  const sumLines = normalizedLines.reduce((a, x) => a + x.qty, 0);
+  if (sumLegacy <= 0 && sumLines <= 0) {
+    const err = new Error('INVALID_PAYLOAD');
+    err.code = 'INVALID_PAYLOAD';
+    throw err;
+  }
+  const token = crypto.randomUUID();
+  const now = Date.now();
+  const ttl = Math.max(5000, Math.min(48 * 60 * 60 * 1000, Number(ttlMs) || 60 * 1000));
+  const expiresAtIso = new Date(now + ttl).toISOString();
+  const requestedAtIso = new Date(now).toISOString();
+
+  const settings = await getOperatorSettings(oid);
+  const existing = Array.isArray(settings.linenQrApprovals) ? [...settings.linenQrApprovals] : [];
+  const pruned = existing.filter((x) => {
+    if (!x || typeof x !== 'object') return false;
+    if (String(x.status || 'pending') !== 'pending') return true;
+    const exp = x.expiresAt ? new Date(x.expiresAt).getTime() : 0;
+    return exp > now;
+  });
+  const payload = {
+    date: d,
+    action: act,
+    team: String(team || '').trim() || 'Unassigned',
+    totals: tot,
+    ...(normalizedLines.length ? { lines: normalizedLines } : {}),
+    missingQty: mq,
+    remark: rem,
+  };
+  pruned.unshift({
+    token,
+    status: 'pending',
+    requestedByEmail: em,
+    requestedAt: requestedAtIso,
+    expiresAt: expiresAtIso,
+    payload,
+  });
+  const nextApprovals = pruned.slice(0, 300);
+  await upsertOperatorSettings(oid, { linenQrApprovals: nextApprovals });
+  return { ok: true, token, expiresAt: expiresAtIso };
+}
+
+async function getLinenQrApprovalForDobi({ email, operatorId, token }) {
+  const oid = String(operatorId || '').trim();
+  const t = String(token || '').trim();
+  await assertDobiOperatorJunctionForLinenQr(email, oid);
+  const settings = await getOperatorSettings(oid);
+  const arr = Array.isArray(settings.linenQrApprovals) ? settings.linenQrApprovals : [];
+  const now = Date.now();
+  const row = arr.find((x) => x && x.token === t);
+  if (!row) {
+    const err = new Error('NOT_FOUND');
+    err.code = 'NOT_FOUND';
+    throw err;
+  }
+  if (String(row.status || 'pending') !== 'pending') {
+    const err = new Error('ALREADY_DONE');
+    err.code = 'ALREADY_DONE';
+    throw err;
+  }
+  const exp = row.expiresAt ? new Date(row.expiresAt).getTime() : 0;
+  if (exp <= now) {
+    const err = new Error('EXPIRED');
+    err.code = 'EXPIRED';
+    throw err;
+  }
+  return {
+    ok: true,
+    requestedByEmail: row.requestedByEmail,
+    requestedAt: row.requestedAt,
+    expiresAt: row.expiresAt,
+    payload: row.payload,
+  };
+}
+
+async function approveLinenQrApproval({ email, operatorId, token }) {
+  const oid = String(operatorId || '').trim();
+  const t = String(token || '').trim();
+  const em = String(email || '')
+    .trim()
+    .toLowerCase();
+  await assertDobiOperatorJunctionForLinenQr(em, oid);
+  const settings = await getOperatorSettings(oid);
+  const arr = Array.isArray(settings.linenQrApprovals) ? [...settings.linenQrApprovals] : [];
+  const now = Date.now();
+  const idx = arr.findIndex((x) => x && x.token === t);
+  if (idx < 0) {
+    const err = new Error('NOT_FOUND');
+    err.code = 'NOT_FOUND';
+    throw err;
+  }
+  const row = arr[idx];
+  if (String(row.status || 'pending') !== 'pending') {
+    const err = new Error('ALREADY_DONE');
+    err.code = 'ALREADY_DONE';
+    throw err;
+  }
+  const exp = row.expiresAt ? new Date(row.expiresAt).getTime() : 0;
+  if (exp <= now) {
+    const err = new Error('EXPIRED');
+    err.code = 'EXPIRED';
+    throw err;
+  }
+  const p = row.payload && typeof row.payload === 'object' ? row.payload : {};
+  const location = { lat: null, lng: null };
+  const approvedAt = new Date().toISOString();
+  const entry = {
+    id: `linen-${Date.now()}`,
+    date: String(p.date || '').slice(0, 10),
+    action: String(p.action || 'collected'),
+    team: String(p.team || 'Unassigned'),
+    totals: normalizeLinenTotalsForQr(p.totals),
+    ...(Array.isArray(p.lines) && p.lines.length ? { lines: p.lines } : {}),
+    missingQty: Math.max(0, Number(p.missingQty) || 0),
+    remark: String(p.remark || '').trim(),
+    qrApproved: true,
+    approvedAt,
+    approvedByEmail: em,
+    requestedByEmail: String(row.requestedByEmail || '').trim(),
+    requestedAt: row.requestedAt,
+    submittedAt: row.requestedAt,
+    signature: null,
+    location,
+  };
+  const prevLogs = Array.isArray(settings.linenLogs) ? settings.linenLogs : [];
+  const nextLogs = [entry, ...prevLogs].slice(0, 500);
+  const nextApprovals = arr.filter((_, i) => i !== idx);
+
+  const clnDobi = require('./cleanlemon-dobi.service');
+  await clnDobi.appendIntakeFromLinenQrPayload(oid, em, p);
+
+  await upsertOperatorSettings(oid, { linenLogs: nextLogs, linenQrApprovals: nextApprovals });
+  return { ok: true, entry };
+}
+
+function computeDriverTripOrderTimeUtc(createdAtMs, scheduleOffset) {
+  const so = String(scheduleOffset || 'now').trim();
+  const base = new Date(Number(createdAtMs) || Date.now());
+  if (Number.isNaN(base.getTime())) return new Date();
+  if (so === 'now') return base;
+  const mins = so === '15' ? 15 : so === '30' ? 30 : 0;
+  const d = new Date(base.getTime());
+  d.setMinutes(d.getMinutes() + mins);
+  return d;
+}
+
+async function createEmployeeDriverTrip({ email, operatorId, pickupText, dropoffText, scheduleOffset }) {
+  await assertEmployeeOperatorJunctionForDriverTrip(email, operatorId);
+  if (!(await clnDc.databaseHasTable(pool, 'cln_driver_trip'))) {
+    return { ok: false, reason: 'MIGRATION_REQUIRED' };
+  }
+  const pickup = String(pickupText || '').trim();
+  const dropoff = String(dropoffText || '').trim();
+  if (!pickup || !dropoff || pickup === dropoff) {
+    const err = new Error('BAD_TRIP_ADDRESSES');
+    err.code = 'BAD_TRIP_ADDRESSES';
+    throw err;
+  }
+  const soRaw = String(scheduleOffset || 'now').trim();
+  const so = soRaw === '15' || soRaw === '30' ? soRaw : 'now';
+  const [[emp]] = await pool.query(
+    'SELECT id, email FROM cln_employeedetail WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+    [String(email || '').trim().toLowerCase()]
+  );
+  if (!emp?.id) {
+    const err = new Error('EMPLOYEE_ROW_MISSING');
+    err.code = 'EMPLOYEE_ROW_MISSING';
+    throw err;
+  }
+  const requesterEmployeeId = String(emp.id).trim();
+  const requesterEmail = String(emp.email || email || '').trim();
+  const oid = String(operatorId).trim();
+  const [[dup]] = await pool.query(
+    `SELECT id FROM cln_driver_trip
+     WHERE requester_employee_id = ? AND operator_id = ?
+       AND status IN ('pending','driver_accepted','grab_booked')
+     LIMIT 1`,
+    [requesterEmployeeId, oid]
+  );
+  if (dup?.id) {
+    const err = new Error('ACTIVE_TRIP_EXISTS');
+    err.code = 'ACTIVE_TRIP_EXISTS';
+    throw err;
+  }
+  const id = crypto.randomUUID();
+  const now = Date.now();
+  const orderTime = computeDriverTripOrderTimeUtc(now, so);
+  await pool.query(
+    `INSERT INTO cln_driver_trip (
+      id, operator_id, requester_employee_id, requester_email,
+      pickup_text, dropoff_text, schedule_offset, order_time_utc,
+      business_time_zone, status, fulfillment_type,
+      created_at_utc, updated_at_utc
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Asia/Kuala_Lumpur', 'pending', 'none', CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3))`,
+    [id, oid, requesterEmployeeId, requesterEmail, pickup.slice(0, 2000), dropoff.slice(0, 2000), so, orderTime]
+  );
+  const [[created]] = await pool.query('SELECT * FROM cln_driver_trip WHERE id = ? LIMIT 1', [id]);
+  return { ok: true, trip: rowToDriverTripPayload(created) };
+}
+
+async function listRequesterPendingDriverTrips({ email, operatorId, limit = 20 }) {
+  await assertEmployeeOperatorJunctionForDriverTrip(email, operatorId);
+  if (!(await clnDc.databaseHasTable(pool, 'cln_driver_trip'))) {
+    return { ok: false, reason: 'MIGRATION_REQUIRED', items: [] };
+  }
+  const [[emp]] = await pool.query(
+    'SELECT id FROM cln_employeedetail WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+    [String(email || '').trim().toLowerCase()]
+  );
+  const eid = emp?.id ? String(emp.id).trim() : '';
+  if (!eid) return { ok: true, items: [] };
+  const lim = Math.min(100, Math.max(1, Number(limit) || 20));
+  const [rows] = await pool.query(
+    `SELECT * FROM cln_driver_trip
+     WHERE operator_id = ? AND requester_employee_id = ? AND status = 'pending' AND fulfillment_type = 'none'
+     ORDER BY created_at_utc DESC
+     LIMIT ${lim}`,
+    [String(operatorId).trim(), eid]
+  );
+  return { ok: true, items: (rows || []).map(rowToDriverTripPayload) };
+}
+
+async function listPendingDriverTripsForOperator({ email, operatorId, limit = 50 }) {
+  await assertDriverOperatorJunctionForTrip(email, operatorId);
+  if (!(await clnDc.databaseHasTable(pool, 'cln_driver_trip'))) {
+    return { ok: false, reason: 'MIGRATION_REQUIRED', items: [] };
+  }
+  const lim = Math.min(200, Math.max(1, Number(limit) || 50));
+  const oid = String(operatorId || '').trim();
+  const [rows] = await pool.query(
+    `SELECT * FROM cln_driver_trip
+     WHERE operator_id = ? AND status = 'pending' AND fulfillment_type = 'none'
+     ORDER BY order_time_utc ASC, created_at_utc ASC
+     LIMIT ${lim}`,
+    [oid]
+  );
+  return { ok: true, items: (rows || []).map(rowToDriverTripPayload) };
+}
+
+async function getActiveDriverTripForEmail({ email, operatorId }) {
+  const rowDriver = await assertDriverOperatorJunctionForTrip(email, operatorId);
+  if (!(await clnDc.databaseHasTable(pool, 'cln_driver_trip'))) {
+    return { ok: false, reason: 'MIGRATION_REQUIRED', trip: null };
+  }
+  const driverEmployeeId = String(rowDriver.employee_id || '').trim();
+  const oid = String(operatorId || '').trim();
+  const [[row]] = await pool.query(
+    `SELECT t.*,
+            req.full_name AS requester_full_name,
+            drv.full_name AS accepted_driver_full_name,
+            drv.phone AS accepted_driver_phone,
+            drv.avatar_url AS accepted_driver_avatar_url
+     FROM cln_driver_trip t
+     LEFT JOIN cln_employeedetail req ON req.id = t.requester_employee_id
+     LEFT JOIN cln_employeedetail drv ON drv.id = t.accepted_driver_employee_id
+     WHERE t.operator_id = ? AND t.accepted_driver_employee_id = ? AND t.status = 'driver_accepted'
+     ORDER BY t.accepted_at_utc DESC
+     LIMIT 1`,
+    [oid, driverEmployeeId]
+  );
+  return { ok: true, trip: rowToDriverTripPayload(row) };
+}
+
+async function getActiveRequesterDriverTripForEmail({ email, operatorId }) {
+  await assertEmployeeOperatorJunctionForDriverTrip(email, operatorId);
+  if (!(await clnDc.databaseHasTable(pool, 'cln_driver_trip'))) {
+    return { ok: false, reason: 'MIGRATION_REQUIRED', trip: null };
+  }
+  const [[emp]] = await pool.query(
+    'SELECT id FROM cln_employeedetail WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+    [String(email || '').trim().toLowerCase()]
+  );
+  const eid = emp?.id ? String(emp.id).trim() : '';
+  if (!eid) return { ok: true, trip: null };
+  const oid = String(operatorId || '').trim();
+  const hasDrvVeh = await databaseHasColumn('cln_employeedetail', 'driver_car_plate');
+  const drvVehicleSel = hasDrvVeh
+    ? `, drv.driver_car_plate AS accepted_driver_car_plate,
+            drv.driver_car_front_url AS accepted_driver_car_front_url,
+            drv.driver_car_back_url AS accepted_driver_car_back_url`
+    : '';
+  const [[row]] = await pool.query(
+    `SELECT t.*,
+            req.full_name AS requester_full_name,
+            drv.full_name AS accepted_driver_full_name,
+            drv.phone AS accepted_driver_phone,
+            drv.avatar_url AS accepted_driver_avatar_url
+            ${drvVehicleSel}
+     FROM cln_driver_trip t
+     LEFT JOIN cln_employeedetail req ON req.id = t.requester_employee_id
+     LEFT JOIN cln_employeedetail drv ON drv.id = t.accepted_driver_employee_id
+     WHERE t.operator_id = ? AND t.requester_employee_id = ?
+       AND t.status IN ('pending','driver_accepted','grab_booked')
+     ORDER BY t.created_at_utc DESC
+     LIMIT 1`,
+    [oid, eid]
+  );
+  return { ok: true, trip: rowToDriverTripPayload(row) };
+}
+
+async function listRequesterDriverTripHistoryForEmail({ email, operatorId, limit = 60 }) {
+  await assertEmployeeOperatorJunctionForDriverTrip(email, operatorId);
+  if (!(await clnDc.databaseHasTable(pool, 'cln_driver_trip'))) {
+    return { ok: false, reason: 'MIGRATION_REQUIRED', items: [] };
+  }
+  const [[emp]] = await pool.query(
+    'SELECT id FROM cln_employeedetail WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+    [String(email || '').trim().toLowerCase()]
+  );
+  const eid = emp?.id ? String(emp.id).trim() : '';
+  if (!eid) return { ok: true, items: [] };
+  const oid = String(operatorId || '').trim();
+  const hasDrvVeh = await databaseHasColumn('cln_employeedetail', 'driver_car_plate');
+  const drvVehicleSel = hasDrvVeh
+    ? `, drv.driver_car_plate AS accepted_driver_car_plate,
+            drv.driver_car_front_url AS accepted_driver_car_front_url,
+            drv.driver_car_back_url AS accepted_driver_car_back_url`
+    : '';
+  const lim = Math.min(200, Math.max(1, Number(limit) || 60));
+  const [rows] = await pool.query(
+    `SELECT t.*,
+            req.full_name AS requester_full_name,
+            drv.full_name AS accepted_driver_full_name,
+            drv.phone AS accepted_driver_phone,
+            drv.avatar_url AS accepted_driver_avatar_url
+            ${drvVehicleSel}
+     FROM cln_driver_trip t
+     LEFT JOIN cln_employeedetail req ON req.id = t.requester_employee_id
+     LEFT JOIN cln_employeedetail drv ON drv.id = t.accepted_driver_employee_id
+     WHERE t.operator_id = ? AND t.requester_employee_id = ?
+       AND t.status IN ('completed', 'cancelled')
+     ORDER BY COALESCE(t.completed_at_utc, t.updated_at_utc, t.created_at_utc) DESC
+     LIMIT ${lim}`,
+    [oid, eid]
+  );
+  return { ok: true, items: (rows || []).map(rowToDriverTripPayload) };
+}
+
+async function cancelRequesterDriverTrip({ email, operatorId, tripId }) {
+  await assertEmployeeOperatorJunctionForDriverTrip(email, operatorId);
+  if (!(await clnDc.databaseHasTable(pool, 'cln_driver_trip'))) {
+    return { ok: false, reason: 'MIGRATION_REQUIRED' };
+  }
+  const tid = String(tripId || '').trim();
+  const oid = String(operatorId || '').trim();
+  if (!tid || !oid) {
+    const err = new Error('BAD_REQUEST');
+    err.code = 'BAD_REQUEST';
+    throw err;
+  }
+  const [[emp]] = await pool.query(
+    'SELECT id FROM cln_employeedetail WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+    [String(email || '').trim().toLowerCase()]
+  );
+  const eid = emp?.id ? String(emp.id).trim() : '';
+  if (!eid) {
+    const err = new Error('NOT_FOUND');
+    err.code = 'NOT_FOUND';
+    throw err;
+  }
+  const [[cur]] = await pool.query(
+    'SELECT id, status, requester_employee_id FROM cln_driver_trip WHERE id = ? AND operator_id = ? LIMIT 1',
+    [tid, oid]
+  );
+  if (!cur) {
+    const err = new Error('NOT_FOUND');
+    err.code = 'NOT_FOUND';
+    throw err;
+  }
+  if (String(cur.requester_employee_id) !== eid) {
+    const err = new Error('NOT_FOUND');
+    err.code = 'NOT_FOUND';
+    throw err;
+  }
+  const st = String(cur.status || '');
+  if (!['pending', 'driver_accepted', 'grab_booked'].includes(st)) {
+    const err = new Error('TRIP_NOT_CANCELLABLE');
+    err.code = 'TRIP_NOT_CANCELLABLE';
+    throw err;
+  }
+  await pool.query(
+    `UPDATE cln_driver_trip SET status = 'cancelled', updated_at_utc = CURRENT_TIMESTAMP(3) WHERE id = ? LIMIT 1`,
+    [tid]
+  );
+  return { ok: true };
+}
+
+async function listDriverTripHistoryForEmail({ email, operatorId, limit = 40 }) {
+  await assertDriverOperatorJunctionForTrip(email, operatorId);
+  if (!(await clnDc.databaseHasTable(pool, 'cln_driver_trip'))) {
+    return { ok: false, reason: 'MIGRATION_REQUIRED', items: [] };
+  }
+  const [[junction]] = await pool.query(
+    `SELECT d.id AS employee_id
+     FROM cln_employeedetail d
+     INNER JOIN cln_employee_operator eo ON eo.employee_id = d.id
+     WHERE eo.operator_id = ? AND LOWER(TRIM(d.email)) = ?
+     LIMIT 1`,
+    [String(operatorId || '').trim(), String(email || '').trim().toLowerCase()]
+  );
+  const eid = junction?.employee_id ? String(junction.employee_id).trim() : '';
+  if (!eid) return { ok: true, items: [] };
+  const lim = Math.min(200, Math.max(1, Number(limit) || 40));
+  const [rows] = await pool.query(
+    `SELECT * FROM cln_driver_trip
+     WHERE operator_id = ? AND accepted_driver_employee_id = ? AND status = 'completed'
+     ORDER BY COALESCE(completed_at_utc, updated_at_utc, created_at_utc) DESC
+     LIMIT ${lim}`,
+    [String(operatorId || '').trim(), eid]
+  );
+  return { ok: true, items: (rows || []).map(rowToDriverTripPayload) };
+}
+
+async function acceptDriverTrip({ email, operatorId, tripId }) {
+  const rowDriver = await assertDriverOperatorJunctionForTrip(email, operatorId);
+  const driverEmployeeId = String(rowDriver.employee_id || '').trim();
+  if (!(await clnDc.databaseHasTable(pool, 'cln_driver_trip'))) {
+    const err = new Error('MIGRATION_REQUIRED');
+    err.code = 'MIGRATION_REQUIRED';
+    throw err;
+  }
+  const [[active]] = await pool.query(
+    `SELECT id FROM cln_driver_trip
+     WHERE operator_id = ? AND accepted_driver_employee_id = ? AND status = 'driver_accepted'
+     LIMIT 1`,
+    [String(operatorId || '').trim(), driverEmployeeId]
+  );
+  if (active?.id) {
+    const err = new Error('ACTIVE_TRIP_EXISTS');
+    err.code = 'ACTIVE_TRIP_EXISTS';
+    throw err;
+  }
+  const tid = String(tripId || '').trim();
+  const [upd] = await pool.query(
+    `UPDATE cln_driver_trip
+     SET status = 'driver_accepted',
+         fulfillment_type = 'driver',
+         accepted_driver_employee_id = ?,
+         accepted_at_utc = CURRENT_TIMESTAMP(3),
+         updated_at_utc = CURRENT_TIMESTAMP(3)
+     WHERE id = ? AND operator_id = ? AND status = 'pending' AND fulfillment_type = 'none'`,
+    [driverEmployeeId, tid, String(operatorId || '').trim()]
+  );
+  const affected = Number(upd?.affectedRows ?? 0);
+  if (!affected) {
+    const err = new Error('TRIP_NOT_AVAILABLE');
+    err.code = 'TRIP_NOT_AVAILABLE';
+    throw err;
+  }
+  const [[row]] = await pool.query(
+    `SELECT t.*,
+            req.full_name AS requester_full_name,
+            drv.full_name AS accepted_driver_full_name,
+            drv.phone AS accepted_driver_phone,
+            drv.avatar_url AS accepted_driver_avatar_url
+     FROM cln_driver_trip t
+     LEFT JOIN cln_employeedetail req ON req.id = t.requester_employee_id
+     LEFT JOIN cln_employeedetail drv ON drv.id = t.accepted_driver_employee_id
+     WHERE t.id = ? LIMIT 1`,
+    [tid]
+  );
+  return { ok: true, trip: rowToDriverTripPayload(row) };
+}
+
+async function finishDriverTrip({ email, operatorId, tripId }) {
+  const rowDriver = await assertDriverOperatorJunctionForTrip(email, operatorId);
+  const driverEmployeeId = String(rowDriver.employee_id || '').trim();
+  if (!(await clnDc.databaseHasTable(pool, 'cln_driver_trip'))) {
+    const err = new Error('MIGRATION_REQUIRED');
+    err.code = 'MIGRATION_REQUIRED';
+    throw err;
+  }
+  const tid = String(tripId || '').trim();
+  const hasCompletedCol = await databaseHasColumn('cln_driver_trip', 'completed_at_utc');
+  const setCompleted = hasCompletedCol ? ', completed_at_utc = CURRENT_TIMESTAMP(3)' : '';
+  const [upd] = await pool.query(
+    `UPDATE cln_driver_trip
+     SET status = 'completed', updated_at_utc = CURRENT_TIMESTAMP(3) ${setCompleted}
+     WHERE id = ? AND operator_id = ? AND accepted_driver_employee_id = ?
+       AND status = 'driver_accepted'`,
+    [tid, String(operatorId || '').trim(), driverEmployeeId]
+  );
+  const affected = Number(upd?.affectedRows ?? 0);
+  if (!affected) {
+    const err = new Error('TRIP_FINISH_DENIED');
+    err.code = 'TRIP_FINISH_DENIED';
+    throw err;
+  }
+  const [[row]] = await pool.query('SELECT * FROM cln_driver_trip WHERE id = ? LIMIT 1', [tid]);
+  return { ok: true, trip: rowToDriverTripPayload(row) };
+}
+
+async function listOperatorDriverTrips({
+  email,
+  operatorId,
+  statusFilter,
+  limit = 100,
+  businessDate,
+  team,
+  fulfillment,
+  acceptedDriverEmployeeId,
+}) {
+  await assertClnOperatorStaffEmail(operatorId, email);
+  if (!(await clnDc.databaseHasTable(pool, 'cln_driver_trip'))) {
+    return { ok: false, reason: 'MIGRATION_REQUIRED', items: [] };
+  }
+  const lim = Math.min(500, Math.max(1, Number(limit) || 100));
+  const oid = String(operatorId || '').trim();
+  const sf = String(statusFilter || '').trim().toLowerCase();
+  const hasCrm = await databaseHasColumn('cln_employee_operator', 'crm_json');
+  const hasDrvVeh = await databaseHasColumn('cln_employeedetail', 'driver_car_plate');
+  const teamSel = hasCrm
+    ? `, IF(eo_req.crm_json IS NOT NULL AND JSON_VALID(eo_req.crm_json), NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(eo_req.crm_json, '$.team'))), ''), NULL) AS requester_team_name`
+    : `, NULL AS requester_team_name`;
+  const eoJoin = hasCrm
+    ? `LEFT JOIN cln_employee_operator eo_req ON eo_req.employee_id = t.requester_employee_id AND eo_req.operator_id = t.operator_id`
+    : '';
+  const vehicleSel = hasDrvVeh
+    ? `, drv.driver_car_plate AS accepted_driver_car_plate,
+    drv.driver_car_front_url AS accepted_driver_car_front_url,
+    drv.driver_car_back_url AS accepted_driver_car_back_url`
+    : '';
+
+  let where = 't.operator_id = ?';
+  const params = [oid];
+  if (sf && sf !== 'all') {
+    where += ' AND t.status = ?';
+    params.push(sf);
+  }
+  const bd = String(businessDate || '').trim().slice(0, 10);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(bd)) {
+    where +=
+      ' AND DATE(CONVERT_TZ(COALESCE(t.order_time_utc, t.created_at_utc), "+00:00", "+08:00")) = ?';
+    params.push(bd);
+  }
+  const teamQ = String(team || '').trim();
+  if (teamQ && teamQ !== 'all') {
+    if (hasCrm) {
+      where +=
+        " AND IF(eo_req.crm_json IS NOT NULL AND JSON_VALID(eo_req.crm_json), NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(eo_req.crm_json, '$.team'))), ''), NULL) = ?";
+      params.push(teamQ);
+    }
+  }
+  const ful = String(fulfillment || '').trim().toLowerCase();
+  const accId = String(acceptedDriverEmployeeId || '').trim();
+  if (ful === 'grab') {
+    where += " AND (t.status = 'grab_booked' OR t.fulfillment_type = 'grab')";
+  } else if (ful === 'driver') {
+    where += " AND t.status = 'driver_accepted'";
+    if (accId) {
+      where += ' AND t.accepted_driver_employee_id = ?';
+      params.push(accId);
+    }
+  }
+
+  const [rows] = await pool.query(
+    `SELECT t.*,
+            req.full_name AS requester_full_name,
+            drv.full_name AS accepted_driver_full_name,
+            drv.phone AS accepted_driver_phone,
+            drv.avatar_url AS accepted_driver_avatar_url
+            ${vehicleSel}
+            ${teamSel}
+     FROM cln_driver_trip t
+     LEFT JOIN cln_employeedetail req ON req.id = t.requester_employee_id
+     LEFT JOIN cln_employeedetail drv ON drv.id = t.accepted_driver_employee_id
+     ${eoJoin}
+     WHERE ${where}
+     ORDER BY t.created_at_utc DESC
+     LIMIT ${lim}`,
+    params
+  );
+  return { ok: true, items: (rows || []).map(rowToDriverTripPayload) };
+}
+
+/** Operator portal — staff with `staff_role` driver for slot filters & status board. */
+async function listOperatorDriverEmployees({ email, operatorId }) {
+  await assertClnOperatorStaffEmail(operatorId, email);
+  if (!(await clnDc.databaseHasTable(pool, 'cln_employee_operator'))) {
+    return { ok: true, items: [] };
+  }
+  const oid = String(operatorId || '').trim();
+  const hasPlate = await databaseHasColumn('cln_employeedetail', 'driver_car_plate');
+  const plateSel = hasPlate ? ', d.driver_car_plate' : '';
+  const [rows] = await pool.query(
+    `SELECT d.id, d.full_name, d.email, d.phone${plateSel}
+     FROM cln_employee_operator eo
+     INNER JOIN cln_employeedetail d ON d.id = eo.employee_id
+     WHERE eo.operator_id = ?
+       AND LOWER(TRIM(COALESCE(eo.staff_role, ''))) = 'driver'
+     ORDER BY COALESCE(d.full_name, ''), d.email`,
+    [oid]
+  );
+  return {
+    ok: true,
+    items: (rows || []).map((r, idx) => ({
+      slotLabel: idx < 3 ? `Driver ${String.fromCharCode(65 + idx)}` : `Driver ${idx + 1}`,
+      slotLetter: idx < 3 ? String.fromCharCode(65 + idx) : '',
+      employeeId: String(r.id),
+      fullName: r.full_name != null ? String(r.full_name) : '',
+      email: r.email != null ? String(r.email) : '',
+      phone: r.phone != null ? String(r.phone) : '',
+      carPlate: hasPlate && r.driver_car_plate != null ? String(r.driver_car_plate) : '',
+    })),
+  };
+}
+
+/** `cln_employee_operator.crm_json`: `offDuty: true` or `driverOnDuty: false` → fleet shows Off duty (when no active trip). */
+function driverOffDutyFromEmployeeOperatorCrmJson(raw) {
+  if (raw == null || raw === '') return false;
+  try {
+    const o = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!o || typeof o !== 'object') return false;
+    if (o.offDuty === true) return true;
+    if (o.driverOnDuty === false) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Live fleet status: off_duty (crm) / vacant / waiting (idle, pool has pending) / pickup / ongoing.
+ */
+async function listOperatorDriverFleetStatus({ email, operatorId }) {
+  await assertClnOperatorStaffEmail(operatorId, email);
+  if (!(await clnDc.databaseHasTable(pool, 'cln_driver_trip'))) {
+    return { ok: false, reason: 'MIGRATION_REQUIRED', items: [], pendingPoolCount: 0 };
+  }
+  const oid = String(operatorId || '').trim();
+  const hasStartedCol = await databaseHasColumn('cln_driver_trip', 'driver_started_at_utc');
+  const startedExpr = hasStartedCol ? 't.driver_started_at_utc' : 'NULL';
+  const hasEoCrm = await databaseHasColumn('cln_employee_operator', 'crm_json');
+  const crmSel = hasEoCrm ? ', eo.crm_json AS eo_crm_json' : ', NULL AS eo_crm_json';
+  const [[poolRow]] = await pool.query(
+    `SELECT COUNT(*) AS c FROM cln_driver_trip WHERE operator_id = ? AND status = 'pending'`,
+    [oid]
+  );
+  const pendingPoolCount = Number(poolRow?.c) || 0;
+  if (!(await clnDc.databaseHasTable(pool, 'cln_employee_operator'))) {
+    return { ok: true, items: [], pendingPoolCount };
+  }
+  const [rows] = await pool.query(
+    `SELECT d.id AS employee_id, d.full_name, d.email, d.phone,
+            t.id AS trip_id, t.status AS trip_status, t.pickup_text, t.dropoff_text,
+            t.accepted_at_utc, ${startedExpr} AS driver_started_at_utc, t.order_time_utc, t.created_at_utc
+            ${crmSel}
+     FROM cln_employee_operator eo
+     INNER JOIN cln_employeedetail d ON d.id = eo.employee_id
+     LEFT JOIN cln_driver_trip t
+       ON t.accepted_driver_employee_id = d.id AND t.operator_id = ? AND t.status = 'driver_accepted'
+     WHERE eo.operator_id = ?
+       AND LOWER(TRIM(COALESCE(eo.staff_role, ''))) = 'driver'
+     ORDER BY COALESCE(d.full_name, ''), d.email`,
+    [oid, oid]
+  );
+  const items = (rows || []).map((r) => {
+    const tripId = r.trip_id ? String(r.trip_id) : '';
+    const offDuty = hasEoCrm && driverOffDutyFromEmployeeOperatorCrmJson(r.eo_crm_json);
+    let fleetStatus = 'vacant';
+    if (tripId) {
+      const started = r.driver_started_at_utc != null;
+      fleetStatus = started ? 'ongoing' : 'pickup';
+    } else if (offDuty) {
+      fleetStatus = 'off_duty';
+    } else if (pendingPoolCount > 0) {
+      fleetStatus = 'waiting';
+    }
+    return {
+      employeeId: String(r.employee_id),
+      fullName: r.full_name != null ? String(r.full_name) : '',
+      email: r.email != null ? String(r.email) : '',
+      phone: r.phone != null ? String(r.phone) : '',
+      fleetStatus,
+      activeTrip: tripId
+        ? {
+            id: tripId,
+            pickupText: r.pickup_text != null ? String(r.pickup_text) : '',
+            dropoffText: r.dropoff_text != null ? String(r.dropoff_text) : '',
+            acceptedAtUtc: r.accepted_at_utc ? new Date(r.accepted_at_utc).toISOString() : null,
+            driverStartedAtUtc: r.driver_started_at_utc ? new Date(r.driver_started_at_utc).toISOString() : null,
+            orderTimeUtc: r.order_time_utc ? new Date(r.order_time_utc).toISOString() : null,
+            createdAtUtc: r.created_at_utc ? new Date(r.created_at_utc).toISOString() : null,
+          }
+        : null,
+    };
+  });
+  return { ok: true, items, pendingPoolCount };
+}
+
+async function bookGrabOperatorDriverTrip({ email, operatorId, tripId, grabCarPlate, grabPhone, grabProofImageUrl }) {
+  await assertClnOperatorStaffEmail(operatorId, email);
+  if (!(await clnDc.databaseHasTable(pool, 'cln_driver_trip'))) {
+    return { ok: false, reason: 'MIGRATION_REQUIRED' };
+  }
+  const tid = String(tripId || '').trim();
+  const oid = String(operatorId || '').trim();
+  const plate = grabCarPlate != null ? String(grabCarPlate).trim().slice(0, 64) : '';
+  const phone = grabPhone != null ? String(grabPhone).trim().slice(0, 64) : '';
+  const proof = grabProofImageUrl != null ? String(grabProofImageUrl).trim().slice(0, 2000) : '';
+  if (!plate && !phone && !proof) {
+    const err = new Error('GRAB_DETAILS_REQUIRED');
+    err.code = 'GRAB_DETAILS_REQUIRED';
+    throw err;
+  }
+  const em = String(email || '').trim().toLowerCase();
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[row]] = await conn.query(
+      'SELECT id, status FROM cln_driver_trip WHERE id = ? AND operator_id = ? FOR UPDATE',
+      [tid, oid]
+    );
+    if (!row) {
+      const err = new Error('NOT_FOUND');
+      err.code = 'NOT_FOUND';
+      throw err;
+    }
+    if (String(row.status) !== 'pending') {
+      const err = new Error('TRIP_NOT_OPEN');
+      err.code = 'TRIP_NOT_OPEN';
+      throw err;
+    }
+    await conn.query(
+      `UPDATE cln_driver_trip SET
+        status = 'grab_booked',
+        fulfillment_type = 'grab',
+        grab_car_plate = ?,
+        grab_phone = ?,
+        grab_proof_image_url = ?,
+        grab_booked_by_email = ?,
+        grab_booked_at_utc = CURRENT_TIMESTAMP(3),
+        updated_at_utc = CURRENT_TIMESTAMP(3)
+       WHERE id = ? LIMIT 1`,
+      [plate || null, phone || null, proof || null, em, tid]
+    );
+    await conn.commit();
+  } catch (e) {
+    try {
+      await conn.rollback();
+    } catch (_) {
+      /* ignore */
+    }
+    throw e;
+  } finally {
+    conn.release();
+  }
+  const [[out]] = await pool.query(
+    `SELECT t.*,
+            req.full_name AS requester_full_name,
+            drv.full_name AS accepted_driver_full_name,
+            drv.phone AS accepted_driver_phone,
+            drv.avatar_url AS accepted_driver_avatar_url
+     FROM cln_driver_trip t
+     LEFT JOIN cln_employeedetail req ON req.id = t.requester_employee_id
+     LEFT JOIN cln_employeedetail drv ON drv.id = t.accepted_driver_employee_id
+     WHERE t.id = ? LIMIT 1`,
+    [tid]
+  );
+  return { ok: true, trip: rowToDriverTripPayload(out) };
+}
+
 module.exports = {
   health,
   stats,
@@ -10885,6 +12543,7 @@ module.exports = {
   getPricingConfig,
   upsertPricingConfig,
   listOperatorProperties,
+  getOperatorPropertyDetail,
   listOperatorLinkedClientdetails,
   listClientPortalProperties,
   syncClientPortalPropertiesFromColiving,
@@ -10939,6 +12598,7 @@ module.exports = {
   createClientPortalScheduleJob,
   updateClientPortalScheduleJob,
   listClientPortalInvoices,
+  createClientPortalInvoiceCheckoutSession,
   listOperatorAccountingMappings,
   upsertOperatorAccountingMapping,
   syncOperatorAccountingMappings,
@@ -10992,8 +12652,28 @@ module.exports = {
   resolveClnClientdetailIdForClientPortal,
   listClientPortalLinkedCleanlemonsOperators,
   assertClnOperatorStaffEmail,
+  createLinenQrApprovalRequest,
+  getLinenQrApprovalForDobi,
+  approveLinenQrApproval,
   groupStartEmployeeScheduleJobs,
   groupEndEmployeeScheduleJobs,
+  createEmployeeDriverTrip,
+  listRequesterPendingDriverTrips,
+  listPendingDriverTripsForOperator,
+  getActiveDriverTripForEmail,
+  getActiveRequesterDriverTripForEmail,
+  listRequesterDriverTripHistoryForEmail,
+  cancelRequesterDriverTrip,
+  listDriverTripHistoryForEmail,
+  acceptDriverTrip,
+  finishDriverTrip,
+  listOperatorDriverTrips,
+  listOperatorDriverEmployees,
+  listOperatorDriverFleetStatus,
+  bookGrabOperatorDriverTrip,
+  getDriverVehicleByEmail,
+  updateDriverVehicleByEmail,
+  getEmployeeJobCompletionAddons,
   listEmployeeTaskUnlockTargets,
   employeeTaskRemoteUnlock,
   getPublicMarketingPricingBySubdomain,

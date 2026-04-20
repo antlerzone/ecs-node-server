@@ -19,7 +19,8 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { toast } from "sonner"
-import { Check, MoreHorizontal, Pencil, Search, X } from "lucide-react"
+import { Check, ListFilter, MoreHorizontal, Pencil, Search, X } from "lucide-react"
+import { cn } from "@/lib/utils"
 import { fetchCleanlemonPricingConfig, fetchOperatorScheduleJobs, saveCleanlemonPricingConfig, type CleanlemonPricingConfig, type EmployeeCleanerKpiPersisted } from "@/lib/cleanlemon-api"
 
 type GoalTarget = "team" | "person" | "company"
@@ -71,6 +72,7 @@ export default function KPIPage() {
   const [teamFilter, setTeamFilter] = useState("all")
   const [dateFrom, setDateFrom] = useState("")
   const [dateTo, setDateTo] = useState("")
+  const [ticketFiltersExpanded, setTicketFiltersExpanded] = useState(false)
   const [createOpen, setCreateOpen] = useState(false)
   const [createForm, setCreateForm] = useState({
     actionKind: "deduct" as TicketActionKind,
@@ -211,6 +213,16 @@ export default function KPIPage() {
     })
   }, [tickets, statusFilter, contentKeyword, teamFilter, ticketSearch, dateFrom, dateTo])
 
+  const hasActiveTicketFilters = useMemo(
+    () =>
+      statusFilter !== "all" ||
+      Boolean(contentKeyword.trim()) ||
+      teamFilter !== "all" ||
+      Boolean(dateFrom) ||
+      Boolean(dateTo),
+    [statusFilter, contentKeyword, teamFilter, dateFrom, dateTo],
+  )
+
   const updateTicketStatus = (id: string, status: TicketStatus) => {
     const next = tickets.map((t) => (t.id === id ? { ...t, status } : t))
     setTickets(next)
@@ -345,29 +357,46 @@ export default function KPIPage() {
         </TabsList>
 
         <TabsContent value="dashboard" className="space-y-4 mt-4">
-          <div className="grid gap-4 sm:grid-cols-3">
-            <Card><CardContent className="pt-6"><p className="text-sm text-muted-foreground">Pending</p><p className="text-2xl font-semibold">{pendingCount}</p></CardContent></Card>
-            <Card><CardContent className="pt-6"><p className="text-sm text-muted-foreground">Approved</p><p className="text-2xl font-semibold">{approvedCount}</p></CardContent></Card>
-            <Card><CardContent className="pt-6"><p className="text-sm text-muted-foreground">Void</p><p className="text-2xl font-semibold">{voidCount}</p></CardContent></Card>
+          <div className="grid grid-cols-3 gap-2 md:gap-4">
+            <div className="flex aspect-square flex-col items-center justify-center rounded-xl border bg-card p-2 text-center shadow-sm md:aspect-auto md:min-h-0 md:rounded-lg md:p-6">
+              <span className="text-[10px] font-semibold uppercase leading-tight text-muted-foreground md:text-sm md:normal-case">
+                Pending
+              </span>
+              <span className="mt-0.5 text-xl font-bold tabular-nums md:mt-1 md:text-3xl">{pendingCount}</span>
+            </div>
+            <div className="flex aspect-square flex-col items-center justify-center rounded-xl border bg-card p-2 text-center shadow-sm md:aspect-auto md:min-h-0 md:rounded-lg md:p-6">
+              <span className="text-[10px] font-semibold uppercase leading-tight text-muted-foreground md:text-sm md:normal-case">
+                Approved
+              </span>
+              <span className="mt-0.5 text-xl font-bold tabular-nums md:mt-1 md:text-3xl">{approvedCount}</span>
+            </div>
+            <div className="flex aspect-square flex-col items-center justify-center rounded-xl border bg-card p-2 text-center shadow-sm md:aspect-auto md:min-h-0 md:rounded-lg md:p-6">
+              <span className="text-[10px] font-semibold uppercase leading-tight text-muted-foreground md:text-sm md:normal-case">
+                Void
+              </span>
+              <span className="mt-0.5 text-xl font-bold tabular-nums md:mt-1 md:text-3xl">{voidCount}</span>
+            </div>
           </div>
 
           <Card>
             <CardHeader>
-              <div className="flex items-center justify-between gap-3">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div>
                   <CardTitle>Attendance Deduction Tickets</CardTitle>
                   <CardDescription>
                     Content types: complaint, clean delay, late work in, early work out.
                   </CardDescription>
                 </div>
-                <Button size="sm" onClick={() => setCreateOpen(true)}>Create Ticket</Button>
+                <Button size="sm" className="shrink-0" onClick={() => setCreateOpen(true)}>
+                  Create Ticket
+                </Button>
               </div>
             </CardHeader>
             <CardContent>
               {saving ? <p className="text-xs text-muted-foreground mb-2">Saving...</p> : null}
-              <div className="grid gap-2 mb-4 md:grid-cols-2 lg:grid-cols-6">
-                <div className="relative lg:col-span-2">
-                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+              <div className="mb-4 flex flex-col gap-2">
+                <div className="relative min-w-0">
+                  <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                   <Input
                     className="pl-9"
                     value={ticketSearch}
@@ -375,31 +404,148 @@ export default function KPIPage() {
                     placeholder="Search team/staff/property..."
                   />
                 </div>
-                <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as "all" | TicketStatus)}>
-                  <SelectTrigger><SelectValue placeholder="Status" /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all">All status</SelectItem>
-                    <SelectItem value="pending">Pending</SelectItem>
-                    <SelectItem value="approved">Approved</SelectItem>
-                    <SelectItem value="void">Void</SelectItem>
-                  </SelectContent>
-                </Select>
-                    <Input value={contentKeyword} onChange={(e) => setContentKeyword(e.target.value)} placeholder="Filter content..." />
-                <Select value={teamFilter} onValueChange={setTeamFilter}>
-                  <SelectTrigger><SelectValue placeholder="Team" /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all">All team</SelectItem>
-                    {teamOptions.map((team) => (
-                      <SelectItem key={team} value={team}>{team}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <div className="flex items-center gap-2">
-                  <Input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} />
-                  <Input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} />
-                </div>
+                <Button
+                  type="button"
+                  variant={ticketFiltersExpanded ? "secondary" : "outline"}
+                  className="w-full shrink-0 sm:w-auto"
+                  onClick={() => setTicketFiltersExpanded((v) => !v)}
+                  aria-expanded={ticketFiltersExpanded}
+                >
+                  <ListFilter className="mr-2 h-4 w-4" />
+                  Filter
+                  {hasActiveTicketFilters ? (
+                    <span className="ml-2 inline-flex h-2 w-2 rounded-full bg-primary" aria-hidden />
+                  ) : null}
+                </Button>
+                {ticketFiltersExpanded ? (
+                  <div className="grid w-full min-w-0 gap-3 rounded-lg border bg-muted/30 p-4 sm:grid-cols-2 lg:grid-cols-3">
+                    <div className="space-y-1.5">
+                      <Label className="text-xs text-muted-foreground">Status</Label>
+                      <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as "all" | TicketStatus)}>
+                        <SelectTrigger className="border-input w-full bg-background">
+                          <SelectValue placeholder="Status" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="all">All status</SelectItem>
+                          <SelectItem value="pending">Pending</SelectItem>
+                          <SelectItem value="approved">Approved</SelectItem>
+                          <SelectItem value="void">Void</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-1.5 sm:col-span-2 lg:col-span-1">
+                      <Label className="text-xs text-muted-foreground">Content contains</Label>
+                      <Input
+                        value={contentKeyword}
+                        onChange={(e) => setContentKeyword(e.target.value)}
+                        placeholder="Filter content..."
+                        className="border-input bg-background"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label className="text-xs text-muted-foreground">Team</Label>
+                      <Select value={teamFilter} onValueChange={setTeamFilter}>
+                        <SelectTrigger className="border-input w-full bg-background">
+                          <SelectValue placeholder="Team" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="all">All team</SelectItem>
+                          {teamOptions.map((team) => (
+                            <SelectItem key={team} value={team}>
+                              {team}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-1.5 sm:col-span-2 lg:col-span-2">
+                      <Label className="text-xs text-muted-foreground">Created between</Label>
+                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                        <Input
+                          type="date"
+                          className="border-input bg-background"
+                          value={dateFrom}
+                          onChange={(e) => setDateFrom(e.target.value)}
+                        />
+                        <span className="hidden text-center text-muted-foreground sm:inline sm:shrink-0">–</span>
+                        <Input
+                          type="date"
+                          className="border-input bg-background"
+                          value={dateTo}
+                          onChange={(e) => setDateTo(e.target.value)}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
               </div>
-              <div className="rounded-lg border overflow-hidden">
+
+              <div className="md:hidden space-y-3">
+                {filteredTickets.length === 0 ? (
+                  <div className="rounded-lg border p-6 text-center text-sm text-muted-foreground">No ticket matched filter.</div>
+                ) : (
+                  filteredTickets.map((t) => (
+                    <div
+                      key={t.id}
+                      className="flex gap-3 rounded-lg border bg-card p-3 shadow-sm"
+                    >
+                      <div className="min-w-0 flex-1 space-y-2 text-sm">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <Badge
+                            className={cn(
+                              "shrink-0 text-[10px] uppercase",
+                              t.status === "pending" && "bg-amber-100 text-amber-900 hover:bg-amber-100",
+                              t.status === "approved" && "bg-emerald-100 text-emerald-900 hover:bg-emerald-100",
+                              t.status === "void" && "bg-slate-100 text-slate-700 hover:bg-slate-100",
+                            )}
+                          >
+                            {t.status}
+                          </Badge>
+                          <span className="font-medium">{t.team}</span>
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          {t.staff} · {t.submitBy} · {t.actionKind}
+                        </p>
+                        <p className="break-words text-foreground">{t.content}</p>
+                        <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                          <span>Points: {t.pointDeduct}</span>
+                          <span>{t.actionDate || t.createdAt.slice(0, 10)}</span>
+                        </div>
+                      </div>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button size="icon" variant="outline" className="h-9 w-9 shrink-0" aria-label="Actions">
+                            <MoreHorizontal className="h-4 w-4" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem onClick={() => updateTicketStatus(t.id, "approved")}>
+                            <Check className="mr-2 h-4 w-4" />
+                            Approval
+                          </DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => updateTicketStatus(t.id, "void")}>
+                            <X className="mr-2 h-4 w-4" />
+                            Void
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            onClick={() => {
+                              setEditingTicket(t)
+                              setEditPoints(t.pointDeduct)
+                              setEditContent(t.content)
+                              setEditActionDate(t.actionDate || t.createdAt.slice(0, 10))
+                            }}
+                          >
+                            <Pencil className="mr-2 h-4 w-4" />
+                            Edit
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </div>
+                  ))
+                )}
+              </div>
+
+              <div className="hidden overflow-hidden rounded-lg border md:block">
                 <Table>
                   <TableHeader>
                     <TableRow>
@@ -417,7 +563,9 @@ export default function KPIPage() {
                   <TableBody>
                     {filteredTickets.length === 0 ? (
                       <TableRow>
-                        <TableCell colSpan={9} className="text-center text-muted-foreground">No ticket matched filter.</TableCell>
+                        <TableCell colSpan={9} className="text-center text-muted-foreground">
+                          No ticket matched filter.
+                        </TableCell>
                       </TableRow>
                     ) : (
                       filteredTickets.map((t) => (

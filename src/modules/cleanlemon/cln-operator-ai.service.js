@@ -394,7 +394,18 @@ async function clearScheduleAiFailure(operatorId) {
 
 async function getOperatorAiSettingsForApi(operatorId) {
   const row = await getOperatorAiRow(operatorId);
-  return rowToApiShape(row);
+  const base = rowToApiShape(row);
+  let platformRules = [];
+  try {
+    platformRules = await clnSaasAiMd.listSaasadminAiMd();
+  } catch (e) {
+    const msg = String(e?.message || '');
+    const c = String(e?.code || '');
+    if (c !== 'ER_NO_SUCH_TABLE' && !msg.includes("doesn't exist") && !msg.includes('Unknown table')) {
+      console.warn('[cln-operator-ai] list platform rules for operator UI:', e?.message || e);
+    }
+  }
+  return { ...base, platformRules };
 }
 
 async function saveOperatorAiSettingsFromApi(operatorId, body = {}) {
@@ -519,6 +530,17 @@ function extractJsonObject(text) {
   return JSON.parse(raw.slice(start, end + 1));
 }
 
+/** Only keys that exist on default schedule prefs — blocks arbitrary JSON from the model. */
+function whitelistSchedulePrefsPatch(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  const d = defaultSchedulePrefs();
+  const out = {};
+  for (const k of Object.keys(d)) {
+    if (Object.prototype.hasOwnProperty.call(obj, k)) out[k] = obj[k];
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 /**
  * Operator chat (settings assistant) — stores messages; optional merge of extracted constraints.
  */
@@ -530,7 +552,9 @@ async function runOperatorAiChat({ operatorId, userMessage, mergeExtractedConstr
 
   await appendChatMessage(oid, 'user', userMessage);
 
-  const settings = await getOperatorAiSettingsForApi(oid);
+  const settingsFull = await getOperatorAiSettingsForApi(oid);
+  const { platformRules: _pr, ...settingsRest } = settingsFull;
+  const settings = settingsRest;
   const history = await listChatMessages(oid, 16);
   const histLines = history
     .filter((h) => h.role !== 'system')
@@ -538,22 +562,30 @@ async function runOperatorAiChat({ operatorId, userMessage, mergeExtractedConstr
     .join('\n');
 
   const pr = await safePlatformRulesPrefix();
-  const system = `${pr}You are a scheduling assistant for a cleaning company operator. Be concise.
+  const system = `${pr}You are a scheduling assistant for ONE cleaning company operator only (this tenant). You must follow all platform rules above first. Never suggest reading, modifying, or depending on any other operator's data — only this operator's schedules, teams, and properties.
+Be concise. Help the operator tune automation (schedule preferences), team/property pins, and KPI-related routing hints that live in their saved settings.
 Saved schedule preferences (JSON): ${JSON.stringify(settings.schedulePrefs)}
 Pinned constraints: ${JSON.stringify(settings.pinnedConstraints)}
 Operator extra notes: ${settings.promptExtra || '(none)'}
-If merge mode is on, end your reply with a line exactly: EXTRACT_JSON:{"pinnedConstraints":[...]} where the array lists new property_only_teams rules from the user message (propertyId + teamIds UUIDs). Use empty array if none.`;
+${
+  mergeExtractedConstraints
+    ? `MERGE_MODE is on. End your reply with exactly one line: EXTRACT_JSON:{...} (single JSON object, no markdown fence). The object may include:
+- "pinnedConstraints": array of new property_only_teams entries from the user message (propertyId + teamIds UUIDs). Omit or use [] if none.
+- "schedulePrefs": partial object with only keys you are changing (same field names as in Saved schedule preferences), e.g. aiScheduleCronEnabled, aiSchedulePlanningHorizonDays, aiScheduleCronTimeLocal (HH:mm, Malaysia local), maxJobsPerTeamPerDay, buffer minutes, homestay window, team assignment mode flags, etc. Omit if none.`
+    : 'Do not include EXTRACT_JSON unless the user turns on merge mode.'
+}`;
 
   const user = `Recent conversation:\n${histLines || '(start)'}\n\nReply to the operator's latest message helpfully.`;
 
   const reply = await invokeOperatorLlm({
     provider: creds.provider,
     apiKey: creds.apiKey,
-    system: mergeExtractedConstraints ? `${system}\nMERGE_MODE: on` : system,
+    system,
     user,
   });
 
   let extraPinned = [];
+  let schedulePrefsPatch = null;
   if (mergeExtractedConstraints) {
     const idx = reply.lastIndexOf('EXTRACT_JSON:');
     if (idx !== -1) {
@@ -561,21 +593,38 @@ If merge mode is on, end your reply with a line exactly: EXTRACT_JSON:{"pinnedCo
       try {
         const parsed = JSON.parse(jsonPart);
         if (Array.isArray(parsed.pinnedConstraints)) extraPinned = parsed.pinnedConstraints;
+        const sp = whitelistSchedulePrefsPatch(parsed.schedulePrefs);
+        if (sp) schedulePrefsPatch = sp;
       } catch (_) {
         /* ignore */
       }
     }
   }
 
-  const cleanReply = reply.replace(/EXTRACT_JSON:\s*\{[\s\S]*\}\s*$/m, '').trim();
+  const cleanReply =
+    mergeExtractedConstraints && reply.lastIndexOf('EXTRACT_JSON:') !== -1
+      ? reply.slice(0, reply.lastIndexOf('EXTRACT_JSON:')).trim()
+      : reply.trim();
+
   await appendChatMessage(oid, 'assistant', cleanReply || reply);
 
+  const curPinned = settings.pinnedConstraints || [];
+  const patch = {};
   if (mergeExtractedConstraints && extraPinned.length) {
-    const cur = settings.pinnedConstraints || [];
-    await saveOperatorAiSettingsFromApi(oid, { pinnedConstraints: [...cur, ...extraPinned] });
+    patch.pinnedConstraints = [...curPinned, ...extraPinned];
+  }
+  if (mergeExtractedConstraints && schedulePrefsPatch) {
+    patch.schedulePrefs = normalizePrefs({ ...settings.schedulePrefs, ...schedulePrefsPatch });
+  }
+  if (Object.keys(patch).length) {
+    await saveOperatorAiSettingsFromApi(oid, patch);
   }
 
-  return { reply: cleanReply || reply, pinnedMerged: mergeExtractedConstraints && extraPinned.length > 0 };
+  return {
+    reply: cleanReply || reply,
+    pinnedMerged: mergeExtractedConstraints && extraPinned.length > 0,
+    schedulePrefsMerged: mergeExtractedConstraints && !!schedulePrefsPatch,
+  };
 }
 
 async function loadScheduleContextForAi(operatorId, workingDay) {

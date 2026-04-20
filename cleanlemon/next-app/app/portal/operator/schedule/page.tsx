@@ -43,6 +43,8 @@ import {
   Send,
   RefreshCw,
   HelpCircle,
+  Loader2,
+  ListFilter,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { useAuth } from '@/lib/auth-context'
@@ -64,6 +66,7 @@ import {
   postOperatorScheduleAiSuggest,
   type OperatorScheduleAiPrefs,
   type OperatorRegionGroup,
+  type SaasadminAiMdItem,
 } from '@/lib/cleanlemon-api'
 import {
   PRICING_SERVICES,
@@ -105,6 +108,20 @@ import {
 } from '@/components/ui/command'
 
 const DEFAULT_AREA_COLORS = ['#2563eb', '#dc2626', '#16a34a', '#ca8a04', '#9333ea', '#0891b2', '#ea580c']
+
+function formatPlatformRuleAddedAt(raw: string | undefined): string {
+  if (!raw) return '—'
+  const d = new Date(raw)
+  if (Number.isNaN(d.getTime())) return String(raw)
+  return (
+    new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Kuala_Lumpur',
+      dateStyle: 'medium',
+      timeStyle: 'medium',
+      hour12: false,
+    }).format(d) + ' MYT'
+  )
+}
 
 function normalizeRegionGroupsClient(raw: unknown): OperatorRegionGroup[] {
   if (!Array.isArray(raw)) return []
@@ -435,8 +452,8 @@ export default function SchedulePage() {
 
   const [opAiConnected, setOpAiConnected] = useState(false)
   const [aiSettingsOpen, setAiSettingsOpen] = useState(false)
-  const [aiSettingsTab, setAiSettingsTab] = useState<'settings' | 'chat'>('settings')
   const [aiPrefs, setAiPrefs] = useState<OperatorScheduleAiPrefs>({})
+  const [platformRules, setPlatformRules] = useState<SaasadminAiMdItem[]>([])
   const [aiPromptExtra, setAiPromptExtra] = useState('')
   const [aiPinnedJson, setAiPinnedJson] = useState('[]')
   const [aiChatInput, setAiChatInput] = useState('')
@@ -452,6 +469,7 @@ export default function SchedulePage() {
   const [aiSaveSettingsRunning, setAiSaveSettingsRunning] = useState(false)
   const [aiRebalanceLoading, setAiRebalanceLoading] = useState(false)
   const [activeTab, setActiveTab] = useState<'team' | 'job' | 'map'>('team')
+  const [filtersOpen, setFiltersOpen] = useState(false)
   const [searchTerm, setSearchTerm] = useState('')
   const [statusFilter, setStatusFilter] = useState<string>('all')
   const [selectedClients, setSelectedClients] = useState<string[]>([])
@@ -522,6 +540,7 @@ export default function SchedulePage() {
         setAiPinnedJson(JSON.stringify(st.data.pinnedConstraints || [], null, 2))
         setAiLastCronDayYmd(st.data.lastScheduleAiCronDayYmd ?? null)
         setRegionGroups(normalizeRegionGroupsClient(st.data.regionGroups))
+        setPlatformRules(Array.isArray(st.data.platformRules) ? st.data.platformRules : [])
       } else if (st?.reason === 'CLN_OPERATOR_AI_MIGRATION_REQUIRED') {
         toast.error('Run DB migration 0231_cln_operator_ai.sql, then retry.')
       }
@@ -625,7 +644,12 @@ export default function SchedulePage() {
         toast.error(typeof r.reason === 'string' ? r.reason : 'Chat failed')
         return
       }
-      if (r.pinnedMerged) toast.success('Pinned constraints updated from chat')
+      if (r.pinnedMerged || r.schedulePrefsMerged) {
+        const parts = [r.pinnedMerged && 'team/property pins', r.schedulePrefsMerged && 'automation preferences'].filter(
+          Boolean
+        )
+        toast.success(`Updated from chat: ${parts.join(' & ')}`)
+      }
       await loadAiPanel()
     } finally {
       setAiChatSending(false)
@@ -1646,51 +1670,45 @@ export default function SchedulePage() {
         </div>
         <div className="flex flex-wrap items-center gap-2 justify-end">
           {opAiConnected ? (
-            <>
-              <Button type="button" variant="outline" onClick={() => setAiSettingsOpen(true)}>
-                <Sparkles className="h-4 w-4 mr-2" />
-                AI Setting
-              </Button>
-              <Button
-                type="button"
-                variant="outline"
-                disabled={aiRebalanceLoading}
-                onClick={() => void runAiRebalance()}
-                title={`Rebalance teams for ${scheduleDay} (uses selected working day above)`}
-              >
-                <RefreshCw className={cn('h-4 w-4 mr-2', aiRebalanceLoading && 'animate-spin')} />
-                Rebalance
-              </Button>
-            </>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button type="button" variant="outline" className="gap-1.5">
+                  Action
+                  <ChevronDown className="h-4 w-4 opacity-70" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-56">
+                <DropdownMenuItem
+                  className="gap-2"
+                  onClick={() => setAiSettingsOpen(true)}
+                >
+                  <Sparkles className="h-4 w-4 shrink-0" />
+                  AI Setting
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="gap-2"
+                  disabled={aiRebalanceLoading}
+                  onClick={() => void runAiRebalance()}
+                >
+                  <RefreshCw className={cn('h-4 w-4 shrink-0', aiRebalanceLoading && 'animate-spin')} />
+                  Rebalance
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           ) : (
-            <>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <span className="inline-flex">
-                    <Button type="button" variant="outline" disabled>
-                      <Sparkles className="h-4 w-4 mr-2" />
-                      AI Setting
-                    </Button>
-                  </span>
-                </TooltipTrigger>
-                <TooltipContent side="bottom" className="max-w-xs text-balance">
-                  {aiScheduleDisabledHint}
-                </TooltipContent>
-              </Tooltip>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <span className="inline-flex">
-                    <Button type="button" variant="outline" disabled>
-                      <RefreshCw className="h-4 w-4 mr-2" />
-                      Rebalance
-                    </Button>
-                  </span>
-                </TooltipTrigger>
-                <TooltipContent side="bottom" className="max-w-xs text-balance">
-                  {aiScheduleDisabledHint}
-                </TooltipContent>
-              </Tooltip>
-            </>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="inline-flex">
+                  <Button type="button" variant="outline" disabled className="gap-1.5">
+                    Action
+                    <ChevronDown className="h-4 w-4 opacity-70" />
+                  </Button>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="max-w-xs text-balance">
+                {aiScheduleDisabledHint}
+              </TooltipContent>
+            </Tooltip>
           )}
           <Button onClick={openCreateJobDialog}>
             <Plus className="h-4 w-4 mr-2" />
@@ -1701,35 +1719,54 @@ export default function SchedulePage() {
 
       <Card>
         <CardHeader className="pb-3">
-          <CardTitle className="text-base font-semibold">Filters</CardTitle>
-          <CardDescription>Pick one working day, then narrow the list below.</CardDescription>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div className="min-w-0">
+              <CardTitle className="text-base font-semibold">Filters</CardTitle>
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="shrink-0 gap-1.5"
+              aria-expanded={filtersOpen}
+              onClick={() => setFiltersOpen((o) => !o)}
+            >
+              <ListFilter className="h-4 w-4" />
+              Filter
+              <ChevronDown
+                className={cn('h-4 w-4 opacity-70 transition-transform', filtersOpen && 'rotate-180')}
+              />
+            </Button>
+          </div>
         </CardHeader>
         <CardContent className="space-y-5 pt-0">
-          <div className="flex flex-col gap-4 border-b border-border pb-5 sm:flex-row sm:items-end sm:justify-between">
+          <div className="border-b border-border pb-5">
             <div className="space-y-2 min-w-0">
               <Label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                 Working day
               </Label>
-              <div className="flex flex-wrap items-center gap-2">
-                <Button
-                  type="button"
-                  size="sm"
-                  variant={scheduleDay === localYmdForOffset(0) ? 'default' : 'outline'}
-                  className="shrink-0"
-                  onClick={() => setScheduleDay(localYmdForOffset(0))}
-                >
-                  Today
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant={scheduleDay === localYmdForOffset(1) ? 'default' : 'outline'}
-                  className="shrink-0"
-                  onClick={() => setScheduleDay(localYmdForOffset(1))}
-                >
-                  Tomorrow
-                </Button>
-                <div className="flex items-center gap-2 min-w-0">
+              <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:flex-nowrap sm:items-center sm:gap-2">
+                <div className="grid min-w-0 grid-cols-2 gap-2 sm:flex sm:shrink-0 sm:gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={scheduleDay === localYmdForOffset(0) ? 'default' : 'outline'}
+                    className="w-full px-2.5 sm:w-auto sm:px-3"
+                    onClick={() => setScheduleDay(localYmdForOffset(0))}
+                  >
+                    Today
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={scheduleDay === localYmdForOffset(1) ? 'default' : 'outline'}
+                    className="w-full px-2.5 sm:w-auto sm:px-3"
+                    onClick={() => setScheduleDay(localYmdForOffset(1))}
+                  >
+                    Tomorrow
+                  </Button>
+                </div>
+                <div className="min-w-0 w-full sm:w-[11rem] sm:shrink-0">
                   <Label htmlFor="schedule-day-picker" className="sr-only">
                     Date
                   </Label>
@@ -1741,106 +1778,102 @@ export default function SchedulePage() {
                       const v = e.target.value
                       if (v) setScheduleDay(v)
                     }}
-                    className="h-9 w-[11rem] max-w-full shrink-0"
+                    className="h-9 w-full min-w-0"
                   />
                 </div>
-              </div>
-            </div>
-            <p className="text-sm text-muted-foreground sm:text-right sm:max-w-xs">
-              Showing jobs for{' '}
-              <span className="font-medium text-foreground tabular-nums">{scheduleDay}</span>
-              <span className="hidden sm:inline"> · </span>
-              <span className="block sm:inline">local calendar</span>
-            </p>
-          </div>
-
-          <div className="space-y-3">
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-12 lg:items-end">
-              <div className="sm:col-span-2 lg:col-span-6">
-                <Label htmlFor="schedule-search" className="sr-only">
-                  Search
-                </Label>
-                <div className="relative">
-                  <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground pointer-events-none" />
-                  <Input
-                    id="schedule-search"
-                    className="pl-9 h-9 w-full"
-                    placeholder="Search property, client, address, team…"
-                    value={searchTerm}
-                    onChange={(e) => setSearchTerm(e.target.value)}
-                  />
-                </div>
-              </div>
-              <div className="lg:col-span-3">
-                <ScheduleMultiCheckboxFilter
-                  label="Client"
-                  optionsSorted={clientOptions}
-                  selected={selectedClients}
-                  onSelectedChange={setSelectedClients}
-                  allLabel="All clients"
-                  countNoun="clients"
-                />
-              </div>
-              <div className="lg:col-span-3">
-                <ScheduleMultiCheckboxFilter
-                  label="Property"
-                  optionsSorted={propertyOptions}
-                  selected={selectedProperties}
-                  onSelectedChange={setSelectedProperties}
-                  allLabel="All properties"
-                  countNoun="properties"
-                />
-              </div>
-            </div>
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-12 lg:items-end">
-              <div className="lg:col-span-3">
-                <Label className="text-xs text-muted-foreground mb-1.5 block">Status</Label>
-                <Select value={statusFilter} onValueChange={setStatusFilter}>
-                  <SelectTrigger className="h-9 w-full">
-                    <SelectValue placeholder="Status" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all">All status</SelectItem>
-                    <SelectItem value="pending-checkout">Pending checkout</SelectItem>
-                    <SelectItem value="ready-to-clean">Ready to clean</SelectItem>
-                    <SelectItem value="in-progress">In progress</SelectItem>
-                    <SelectItem value="completed">Completed</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="lg:col-span-3">
-                <Label className="text-xs text-muted-foreground mb-1.5 block">Team</Label>
-                <Select value={teamFilter} onValueChange={setTeamFilter}>
-                  <SelectTrigger className="h-9 w-full">
-                    <SelectValue placeholder="Team" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all">All teams</SelectItem>
-                    <SelectItem value="unassigned">Unassigned</SelectItem>
-                    {teams.map((team) => (
-                      <SelectItem key={team.id} value={team.id}>
-                        {team.name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="sm:col-span-2 lg:col-span-6">
-                <Label className="text-xs text-muted-foreground mb-1.5 block">Sort</Label>
-                <Select value={sortBy} onValueChange={(v: 'priority' | 'kpi-high' | 'kpi-low') => setSortBy(v)}>
-                  <SelectTrigger className="h-9 w-full">
-                    <ArrowUpDown className="h-4 w-4 mr-2 shrink-0 opacity-60" />
-                    <SelectValue placeholder="Sort" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="priority">Priority (unassigned first)</SelectItem>
-                    <SelectItem value="kpi-high">KPI high → low</SelectItem>
-                    <SelectItem value="kpi-low">KPI low → high</SelectItem>
-                  </SelectContent>
-                </Select>
               </div>
             </div>
           </div>
+
+          {filtersOpen ? (
+            <div className="space-y-3">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-12 lg:items-end">
+                <div className="sm:col-span-2 lg:col-span-6">
+                  <Label htmlFor="schedule-search" className="sr-only">
+                    Search
+                  </Label>
+                  <div className="relative">
+                    <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground pointer-events-none" />
+                    <Input
+                      id="schedule-search"
+                      className="pl-9 h-9 w-full"
+                      placeholder="Search property, client, address, team…"
+                      value={searchTerm}
+                      onChange={(e) => setSearchTerm(e.target.value)}
+                    />
+                  </div>
+                </div>
+                <div className="lg:col-span-3">
+                  <ScheduleMultiCheckboxFilter
+                    label="Client"
+                    optionsSorted={clientOptions}
+                    selected={selectedClients}
+                    onSelectedChange={setSelectedClients}
+                    allLabel="All clients"
+                    countNoun="clients"
+                  />
+                </div>
+                <div className="lg:col-span-3">
+                  <ScheduleMultiCheckboxFilter
+                    label="Property"
+                    optionsSorted={propertyOptions}
+                    selected={selectedProperties}
+                    onSelectedChange={setSelectedProperties}
+                    allLabel="All properties"
+                    countNoun="properties"
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-12 lg:items-end">
+                <div className="lg:col-span-3">
+                  <Label className="text-xs text-muted-foreground mb-1.5 block">Status</Label>
+                  <Select value={statusFilter} onValueChange={setStatusFilter}>
+                    <SelectTrigger className="h-9 w-full">
+                      <SelectValue placeholder="Status" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">All status</SelectItem>
+                      <SelectItem value="pending-checkout">Pending checkout</SelectItem>
+                      <SelectItem value="ready-to-clean">Ready to clean</SelectItem>
+                      <SelectItem value="in-progress">In progress</SelectItem>
+                      <SelectItem value="completed">Completed</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="lg:col-span-3">
+                  <Label className="text-xs text-muted-foreground mb-1.5 block">Team</Label>
+                  <Select value={teamFilter} onValueChange={setTeamFilter}>
+                    <SelectTrigger className="h-9 w-full">
+                      <SelectValue placeholder="Team" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">All teams</SelectItem>
+                      <SelectItem value="unassigned">Unassigned</SelectItem>
+                      {teams.map((team) => (
+                        <SelectItem key={team.id} value={team.id}>
+                          {team.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="sm:col-span-2 lg:col-span-6">
+                  <Label className="text-xs text-muted-foreground mb-1.5 block">Sort</Label>
+                  <Select value={sortBy} onValueChange={(v: 'priority' | 'kpi-high' | 'kpi-low') => setSortBy(v)}>
+                    <SelectTrigger className="h-9 w-full">
+                      <ArrowUpDown className="h-4 w-4 mr-2 shrink-0 opacity-60" />
+                      <SelectValue placeholder="Sort" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="priority">Priority (unassigned first)</SelectItem>
+                      <SelectItem value="kpi-high">KPI high → low</SelectItem>
+                      <SelectItem value="kpi-low">KPI low → high</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </CardContent>
       </Card>
 
@@ -1861,37 +1894,80 @@ export default function SchedulePage() {
           <div className="mt-4 space-y-4">
             <Card>
               <CardContent className="p-0">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>Team</TableHead>
-                      <TableHead>Members</TableHead>
-                      <TableHead>Total Job</TableHead>
-                      <TableHead>Estimate KPI</TableHead>
-                      <TableHead className="w-[80px]" />
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {jobsByTeam.map(({ team, teamJobs, avgKpi }) => (
-                      <TableRow key={team.id}>
-                        <TableCell className="py-2 font-medium">
-                          <span className="inline-flex items-center gap-1">
-                            <Users className="h-3.5 w-3.5" />
-                            {team.name}
-                          </span>
-                        </TableCell>
-                        <TableCell className="py-2 text-muted-foreground">{team.members.length}</TableCell>
-                        <TableCell className="py-2">{teamJobs.length}</TableCell>
-                        <TableCell className="py-2">{avgKpi}</TableCell>
-                        <TableCell className="py-2 text-right">
-                          <Button size="sm" variant="ghost" onClick={() => openTeamEditor(team.id)}>
-                            <Pencil className="h-4 w-4" />
-                          </Button>
-                        </TableCell>
+                <div className="hidden md:block">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Team</TableHead>
+                        <TableHead>Members</TableHead>
+                        <TableHead>Total Job</TableHead>
+                        <TableHead>Estimate KPI</TableHead>
+                        <TableHead className="w-[80px]" />
                       </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
+                    </TableHeader>
+                    <TableBody>
+                      {jobsByTeam.map(({ team, teamJobs, avgKpi }) => (
+                        <TableRow key={team.id}>
+                          <TableCell className="py-2 font-medium">
+                            <span className="inline-flex items-center gap-1">
+                              <Users className="h-3.5 w-3.5" />
+                              {team.name}
+                            </span>
+                          </TableCell>
+                          <TableCell className="py-2 text-muted-foreground">{team.members.length}</TableCell>
+                          <TableCell className="py-2">{teamJobs.length}</TableCell>
+                          <TableCell className="py-2">{avgKpi}</TableCell>
+                          <TableCell className="py-2 text-right">
+                            <Button size="sm" variant="ghost" onClick={() => openTeamEditor(team.id)}>
+                              <Pencil className="h-4 w-4" />
+                            </Button>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+                <div className="md:hidden space-y-3 p-3">
+                  {jobsByTeam.map(({ team, teamJobs, avgKpi }) => (
+                    <div key={team.id} className="rounded-lg border border-border bg-background p-4 space-y-3">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <p className="text-xs font-medium text-muted-foreground">Team</p>
+                          <p className="mt-0.5 font-medium leading-snug">
+                            <span className="inline-flex items-center gap-1.5">
+                              <Users className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                              <span className="break-words">{team.name}</span>
+                            </span>
+                          </p>
+                        </div>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          className="shrink-0"
+                          onClick={() => openTeamEditor(team.id)}
+                          aria-label="Edit team"
+                        >
+                          <Pencil className="h-4 w-4" />
+                        </Button>
+                      </div>
+                      <dl className="space-y-2 text-sm">
+                        <div>
+                          <dt className="text-xs text-muted-foreground">Members</dt>
+                          <dd className="mt-0.5">{team.members.length}</dd>
+                        </div>
+                        <div>
+                          <dt className="text-xs text-muted-foreground">Total job</dt>
+                          <dd className="mt-0.5">{teamJobs.length}</dd>
+                        </div>
+                        <div>
+                          <dt className="text-xs text-muted-foreground">Estimate KPI</dt>
+                          <dd className="mt-0.5">{avgKpi}</dd>
+                        </div>
+                      </dl>
+                    </div>
+                  ))}
+                </div>
               </CardContent>
             </Card>
           </div>
@@ -1933,57 +2009,150 @@ export default function SchedulePage() {
             </div>
             <Card>
               <CardContent className="p-0">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead className="w-[36px]">
-                        <Checkbox checked={allSelected} onCheckedChange={(checked) => toggleSelectAllProperties(Boolean(checked))} />
-                      </TableHead>
-                      <TableHead>Property</TableHead>
-                      <TableHead>Client</TableHead>
-                      <TableHead>Price</TableHead>
-                      <TableHead>Team</TableHead>
-                      <TableHead>Status</TableHead>
-                      <TableHead className="w-[80px]" />
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {propertyGroups.map((group) => (
-                      <TableRow key={`${group.property}-${group.unitNumber || ''}-${group.address}`} className={group.unassignedCount > 0 ? 'bg-amber-50/40' : undefined}>
-                        <TableCell className="py-2">
+                <div className="hidden md:block">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead className="w-[36px]">
+                          <Checkbox checked={allSelected} onCheckedChange={(checked) => toggleSelectAllProperties(Boolean(checked))} />
+                        </TableHead>
+                        <TableHead>Property</TableHead>
+                        <TableHead>Client</TableHead>
+                        <TableHead>Price</TableHead>
+                        <TableHead>Team</TableHead>
+                        <TableHead>Status</TableHead>
+                        <TableHead className="w-[80px]" />
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {propertyGroups.map((group) => (
+                        <TableRow key={`${group.property}-${group.unitNumber || ''}-${group.address}`} className={group.unassignedCount > 0 ? 'bg-amber-50/40' : undefined}>
+                          <TableCell className="py-2">
+                            <Checkbox
+                              checked={selectedPropertyKeys.includes(`${group.property}-${group.unitNumber || ''}-${group.address}`)}
+                              onCheckedChange={(checked) => togglePropertySelection(`${group.property}-${group.unitNumber || ''}-${group.address}`, Boolean(checked))}
+                            />
+                          </TableCell>
+                          <TableCell className="py-2">
+                            <div className="font-medium leading-tight">{group.property}</div>
+                            <div className="text-xs text-muted-foreground">
+                              {group.unitNumber ? `Unit No. ${group.unitNumber}` : 'Unit No. -'}
+                            </div>
+                          </TableCell>
+                          <TableCell className="py-2">{group.client}</TableCell>
+                          <TableCell className="py-2">RM {group.totalPrice.toLocaleString('en-MY')}</TableCell>
+                          <TableCell className="py-2 text-sm">
+                            {group.teamNames.length > 0 ? group.teamNames.join(', ') : 'Unassigned'}
+                            {group.unassignedCount > 0 && <Badge className="ml-2 bg-amber-500">+{group.unassignedCount}</Badge>}
+                          </TableCell>
+                          <TableCell className="py-2">
+                            <StatusBadge status={group.jobs[0]?.status || 'ready-to-clean'} size="sm" />
+                          </TableCell>
+                          <TableCell className="py-2 text-right">
+                            <div className="flex justify-end gap-2">
+                              <Button size="sm" variant="outline" onClick={() => openStatusDialog(group.jobs[0])}>
+                                Update Status
+                              </Button>
+                              <DropdownMenu>
+                                <DropdownMenuTrigger asChild>
+                                  <Button size="sm" variant="ghost">
+                                    Action
+                                    <ChevronDown className="ml-1 h-4 w-4" />
+                                  </Button>
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent align="end">
+                                  <DropdownMenuItem onClick={() => openStatusDialog(group.jobs[0])}>
+                                    Update Status
+                                  </DropdownMenuItem>
+                                  {group.jobs.some((job) => job.status === 'completed') && (
+                                    <DropdownMenuItem
+                                      onClick={() =>
+                                        openDetailDialog(group.jobs.find((job) => job.status === 'completed') || group.jobs[0])
+                                      }
+                                    >
+                                      View Detail
+                                    </DropdownMenuItem>
+                                  )}
+                                </DropdownMenuContent>
+                              </DropdownMenu>
+                              {group.jobs.some((job) => job.status === 'completed') && (
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  onClick={() => openDetailDialog(group.jobs.find((job) => job.status === 'completed') || group.jobs[0])}
+                                >
+                                  View Detail
+                                </Button>
+                              )}
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+                <div className="md:hidden space-y-3 p-3">
+                  {propertyGroups.map((group) => {
+                    const rowKey = `${group.property}-${group.unitNumber || ''}-${group.address}`
+                    return (
+                      <div
+                        key={rowKey}
+                        className={cn(
+                          'rounded-lg border border-border bg-background p-4 space-y-3',
+                          group.unassignedCount > 0 && 'bg-amber-50/40'
+                        )}
+                      >
+                        <div className="flex items-start gap-3">
                           <Checkbox
-                            checked={selectedPropertyKeys.includes(`${group.property}-${group.unitNumber || ''}-${group.address}`)}
-                            onCheckedChange={(checked) => togglePropertySelection(`${group.property}-${group.unitNumber || ''}-${group.address}`, Boolean(checked))}
+                            className="mt-1 shrink-0"
+                            checked={selectedPropertyKeys.includes(rowKey)}
+                            onCheckedChange={(checked) => togglePropertySelection(rowKey, Boolean(checked))}
                           />
-                        </TableCell>
-                        <TableCell className="py-2">
-                          <div className="font-medium leading-tight">{group.property}</div>
-                          <div className="text-xs text-muted-foreground">
-                            {group.unitNumber ? `Unit No. ${group.unitNumber}` : 'Unit No. -'}
+                          <div className="min-w-0 flex-1 space-y-3">
+                            <div>
+                              <p className="text-xs font-medium text-muted-foreground">Property</p>
+                              <p className="mt-0.5 font-medium leading-snug break-words">{group.property}</p>
+                              <p className="text-xs text-muted-foreground mt-0.5">
+                                {group.unitNumber ? `Unit No. ${group.unitNumber}` : 'Unit No. -'}
+                              </p>
+                            </div>
+                            <div>
+                              <p className="text-xs font-medium text-muted-foreground">Client</p>
+                              <p className="mt-0.5 break-words">{group.client}</p>
+                            </div>
+                            <div>
+                              <p className="text-xs font-medium text-muted-foreground">Price</p>
+                              <p className="mt-0.5">RM {group.totalPrice.toLocaleString('en-MY')}</p>
+                            </div>
+                            <div>
+                              <p className="text-xs font-medium text-muted-foreground">Team</p>
+                              <p className="mt-0.5 text-sm">
+                                {group.teamNames.length > 0 ? group.teamNames.join(', ') : 'Unassigned'}
+                                {group.unassignedCount > 0 ? (
+                                  <Badge className="ml-2 align-middle bg-amber-500">+{group.unassignedCount}</Badge>
+                                ) : null}
+                              </p>
+                            </div>
+                            <div>
+                              <p className="text-xs font-medium text-muted-foreground">Status</p>
+                              <div className="mt-1">
+                                <StatusBadge status={group.jobs[0]?.status || 'ready-to-clean'} size="sm" />
+                              </div>
+                            </div>
                           </div>
-                        </TableCell>
-                        <TableCell className="py-2">{group.client}</TableCell>
-                        <TableCell className="py-2">RM {group.totalPrice.toLocaleString('en-MY')}</TableCell>
-                        <TableCell className="py-2 text-sm">
-                          {group.teamNames.length > 0 ? group.teamNames.join(', ') : 'Unassigned'}
-                          {group.unassignedCount > 0 && <Badge className="ml-2 bg-amber-500">+{group.unassignedCount}</Badge>}
-                        </TableCell>
-                        <TableCell className="py-2">
-                          <StatusBadge status={group.jobs[0]?.status || 'ready-to-clean'} size="sm" />
-                        </TableCell>
-                        <TableCell className="py-2 text-right">
-                          <div className="flex justify-end gap-2">
-                            <Button size="sm" variant="outline" onClick={() => openStatusDialog(group.jobs[0])}>
-                              Update Status
-                            </Button>
+                        </div>
+                        <div className="flex flex-col gap-2 border-t border-border/60 pt-3">
+                          <Button size="sm" variant="outline" className="w-full" onClick={() => openStatusDialog(group.jobs[0])}>
+                            Update Status
+                          </Button>
                           <DropdownMenu>
                             <DropdownMenuTrigger asChild>
-                              <Button size="sm" variant="ghost">
+                              <Button size="sm" variant="secondary" className="w-full">
                                 Action
                                 <ChevronDown className="ml-1 h-4 w-4" />
                               </Button>
                             </DropdownMenuTrigger>
-                            <DropdownMenuContent align="end">
+                            <DropdownMenuContent align="center" className="w-[min(100vw-2rem,280px)]">
                               <DropdownMenuItem onClick={() => openStatusDialog(group.jobs[0])}>
                                 Update Status
                               </DropdownMenuItem>
@@ -1998,21 +2167,21 @@ export default function SchedulePage() {
                               )}
                             </DropdownMenuContent>
                           </DropdownMenu>
-                            {group.jobs.some((job) => job.status === 'completed') && (
-                              <Button
-                                size="sm"
-                                variant="ghost"
-                                onClick={() => openDetailDialog(group.jobs.find((job) => job.status === 'completed') || group.jobs[0])}
-                              >
-                                View Detail
-                              </Button>
-                            )}
-                          </div>
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
+                          {group.jobs.some((job) => job.status === 'completed') && (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="w-full"
+                              onClick={() => openDetailDialog(group.jobs.find((job) => job.status === 'completed') || group.jobs[0])}
+                            >
+                              View Detail
+                            </Button>
+                          )}
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
               </CardContent>
             </Card>
           </div>
@@ -2039,7 +2208,7 @@ export default function SchedulePage() {
                     style={{ height: '100%', minHeight: 500 }}
                   />
                 </div>
-                <div className="mt-4 grid gap-3 md:grid-cols-2">
+                <div className="mt-4 grid grid-cols-1 gap-3 xl:grid-cols-2">
                   {mapGroups.map((group) => (
                     <div key={`${group.property}-${group.lat}`} className="rounded-md border p-3">
                       <div className="font-medium">{group.property}</div>
@@ -2738,22 +2907,132 @@ export default function SchedulePage() {
       </Dialog>
 
       <Dialog open={aiSettingsOpen} onOpenChange={setAiSettingsOpen}>
-        <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
+        <DialogContent className="max-h-[90vh] w-full max-w-5xl overflow-y-auto p-4 md:p-6">
           <DialogHeader>
-            <DialogTitle>AI schedule</DialogTitle>
+            <DialogTitle>Operator AI — schedule &amp; rules</DialogTitle>
             <DialogDescription className="text-sm">
-              Uses your model API key from <span className="font-medium">Company → Connect AI</span>.
+              Same layout as SaaS Admin → AI rules: <strong>platform rules</strong> apply to every operator first; then
+              your own automation and chat (uses your API key from{' '}
+              <span className="font-medium">Company → Connect AI</span>) only change{' '}
+              <strong>this operator&apos;s</strong> schedules — never another company&apos;s data.
             </DialogDescription>
           </DialogHeader>
           {aiSettingsLoading ? (
             <p className="text-sm text-muted-foreground">Loading…</p>
           ) : (
-            <Tabs value={aiSettingsTab} onValueChange={(v) => setAiSettingsTab(v as 'settings' | 'chat')}>
-              <TabsList className="grid w-full grid-cols-2">
-                <TabsTrigger value="settings">Settings</TabsTrigger>
-                <TabsTrigger value="chat">Chat</TabsTrigger>
-              </TabsList>
-              <TabsContent value="settings" className="space-y-4 mt-4">
+            <div className="space-y-6">
+              <Card>
+                <CardHeader>
+                  <CardTitle>AI chat</CardTitle>
+                  <CardDescription>
+                    Ask for scheduling rules, team pins, or automation (e.g. preferred run time in{' '}
+                    <code className="text-xs">schedulePrefs</code>). Turn on merge below so the assistant can write into
+                    your saved pins and automation fields.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  <label className="flex items-center gap-2 text-sm">
+                    <Checkbox
+                      checked={aiMergeRulesFromChat}
+                      onCheckedChange={(c) => setAiMergeRulesFromChat(Boolean(c))}
+                    />
+                    Apply AI suggestions from chat (team/property pins + automation preferences, experimental)
+                  </label>
+                  <ScrollArea className="h-[320px] rounded-md border p-3">
+                    <div className="space-y-3 pr-3 text-sm">
+                      {aiChatItems.length === 0 && (
+                        <p className="text-muted-foreground">
+                          Example: “Set daily auto-assign horizon to 3 days and prefer same team when possible.” With merge
+                          on, the assistant can end with <code className="text-xs">EXTRACT_JSON:</code> to save pins or
+                          preferences.
+                        </p>
+                      )}
+                      {aiChatItems.map((m) => (
+                        <div
+                          key={m.id}
+                          className={
+                            m.role === 'user' ? 'rounded-md bg-muted/60 p-2' : 'rounded-md border bg-background p-2'
+                          }
+                        >
+                          <div className="text-muted-foreground mb-1 text-xs font-medium uppercase">{m.role}</div>
+                          <div className="whitespace-pre-wrap break-words">{m.content}</div>
+                        </div>
+                      ))}
+                      {aiChatSending && (
+                        <div className="text-muted-foreground flex items-center gap-2 text-xs">
+                          <Loader2 className="h-3 w-3 animate-spin" /> Thinking…
+                        </div>
+                      )}
+                    </div>
+                  </ScrollArea>
+                  <div className="flex gap-2">
+                    <Textarea
+                      placeholder="Message…"
+                      value={aiChatInput}
+                      onChange={(e) => setAiChatInput(e.target.value)}
+                      className="min-h-[80px] flex-1"
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && !e.shiftKey) {
+                          e.preventDefault()
+                          void sendAiChat()
+                        }
+                      }}
+                    />
+                    <Button
+                      type="button"
+                      onClick={() => void sendAiChat()}
+                      disabled={aiChatSending || !aiChatInput.trim()}
+                    >
+                      {aiChatSending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle>Platform rules (read-only)</CardTitle>
+                  <CardDescription>
+                    Managed in Admin → AI rules. The scheduling model always receives these before your operator
+                    settings.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  {platformRules.length === 0 ? (
+                    <p className="text-muted-foreground text-sm">No platform rules yet — SaaS Admin can add them.</p>
+                  ) : (
+                    <ul className="space-y-4">
+                      {platformRules.map((row) => (
+                        <li key={row.id} className="rounded-lg border p-4">
+                          <div className="min-w-0 flex-1 space-y-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <Badge variant="secondary" className="font-mono text-xs">
+                                {row.ruleCode || '—'}
+                              </Badge>
+                              <span className="font-medium">{row.title}</span>
+                            </div>
+                            <div className="text-muted-foreground text-xs">
+                              Added (Malaysia): {formatPlatformRuleAddedAt(row.createdAt)}
+                            </div>
+                            <div className="text-muted-foreground whitespace-pre-wrap text-sm">{row.bodyMd || '—'}</div>
+                            <div className="text-muted-foreground text-xs">order: {row.sortOrder}</div>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle>Your operator automation &amp; model</CardTitle>
+                  <CardDescription>
+                    Manual controls for the same data the chat can adjust. Save runs assign for the working day selected
+                    on the schedule toolbar when AI is connected.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
                 <div className="space-y-2 rounded-md border p-3">
                   <Label className="text-xs text-muted-foreground">Automation</Label>
                   <div className="space-y-3">
@@ -3045,43 +3324,9 @@ export default function SchedulePage() {
                 <Button type="button" disabled={aiSaveSettingsRunning} onClick={() => void saveAiSettings()}>
                   {aiSaveSettingsRunning ? 'Saving…' : 'Save settings'}
                 </Button>
-              </TabsContent>
-              <TabsContent value="chat" className="space-y-3 mt-4">
-                <label className="flex items-center gap-2 text-sm">
-                  <Checkbox
-                    checked={aiMergeRulesFromChat}
-                    onCheckedChange={(c) => setAiMergeRulesFromChat(Boolean(c))}
-                  />
-                  Merge extracted rules into pinned JSON (experimental)
-                </label>
-                <ScrollArea className="h-48 rounded-md border p-2">
-                  <div className="space-y-2 text-sm">
-                    {aiChatItems.length === 0 ? (
-                      <p className="text-muted-foreground text-xs">No messages yet.</p>
-                    ) : (
-                      aiChatItems.map((m) => (
-                        <div key={m.id} className={m.role === 'user' ? 'text-right' : 'text-left'}>
-                          <span className="text-xs text-muted-foreground">{m.role}</span>
-                          <p className="whitespace-pre-wrap break-words">{m.content}</p>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                </ScrollArea>
-                <div className="flex gap-2">
-                  <Textarea
-                    rows={2}
-                    className="flex-1"
-                    placeholder="Ask AI or state a rule…"
-                    value={aiChatInput}
-                    onChange={(e) => setAiChatInput(e.target.value)}
-                  />
-                  <Button type="button" disabled={aiChatSending} onClick={() => void sendAiChat()}>
-                    <Send className="h-4 w-4" />
-                  </Button>
-                </div>
-              </TabsContent>
-            </Tabs>
+                </CardContent>
+              </Card>
+            </div>
           )}
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => setAiSettingsOpen(false)}>

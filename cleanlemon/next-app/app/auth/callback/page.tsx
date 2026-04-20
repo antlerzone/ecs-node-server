@@ -1,7 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useEffect, useRef, useState } from "react";
 import { getCleanlemonApiBase } from "@/lib/portal-auth-mock";
 import { pickFirstClientIdFromMemberRoles, type CleanlemonsJwtContext } from "@/lib/auth-context";
 import {
@@ -37,11 +36,16 @@ function pickInitialOperatorId(data: VerifyResponse): string {
   return "op_demo_001";
 }
 
+const VERIFY_TIMEOUT_MS = 30_000;
+
 export default function CleanlemonsAuthCallbackPage() {
-  const router = useRouter();
   const [error, setError] = useState("");
+  const ranRef = useRef(false);
 
   useEffect(() => {
+    if (ranRef.current) return;
+    ranRef.current = true;
+
     const qs = new URLSearchParams(window.location.search);
     const token = String(qs.get("token") || "").trim();
     if (!token) {
@@ -50,15 +54,24 @@ export default function CleanlemonsAuthCallbackPage() {
     }
     const apiBase = getCleanlemonApiBase();
     if (!apiBase) {
-      setError("OAuth verification failed.");
+      setError("OAuth verification failed (API base URL not set). Check NEXT_PUBLIC_CLEANLEMON_API_URL and restart dev.");
       return;
     }
     const verifyUrl = `${apiBase}/api/portal-auth/verify?token=${encodeURIComponent(token)}`;
-    fetch(verifyUrl)
-      .then((r) => r.json())
+    const ac = new AbortController();
+    const t = window.setTimeout(() => ac.abort(), VERIFY_TIMEOUT_MS);
+    fetch(verifyUrl, { signal: ac.signal })
+      .then(async (r) => {
+        const text = await r.text();
+        try {
+          return JSON.parse(text) as VerifyResponse;
+        } catch {
+          throw new Error("BAD_JSON");
+        }
+      })
       .then((data: VerifyResponse) => {
         if (!data?.ok || !data?.email) {
-          setError("OAuth verification failed.");
+          setError("OAuth verification failed (invalid or expired token). Please try signing in again.");
           return;
         }
         const normalizedEmail = String(data.email).trim().toLowerCase();
@@ -123,13 +136,24 @@ export default function CleanlemonsAuthCallbackPage() {
             window.close();
             return;
           }
-          router.replace(redirectTarget);
+          window.location.replace(redirectTarget);
           return;
         }
-        router.replace(redirectTarget);
+        // Full navigation: client router.replace() after OAuth often fails to leave this page (stuck on "Signing you in…").
+        window.location.replace(redirectTarget);
       })
-      .catch(() => setError("OAuth verification failed."));
-  }, [router]);
+      .catch((e: unknown) => {
+        const aborted = e instanceof Error && e.name === "AbortError";
+        setError(
+          aborted
+            ? `OAuth verification timed out (${VERIFY_TIMEOUT_MS / 1000}s). Is the API running at ${apiBase}?`
+            : "OAuth verification failed (network or server error)."
+        );
+      })
+      .finally(() => {
+        window.clearTimeout(t);
+      });
+  }, []);
 
   if (error) {
     return (

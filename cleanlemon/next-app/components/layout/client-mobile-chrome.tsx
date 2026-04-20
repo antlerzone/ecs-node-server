@@ -16,18 +16,20 @@ interface ClientMobileHeaderProps {
 
 export function ClientMobileHeader({ onOpenMenu }: ClientMobileHeaderProps) {
   return (
-    <header className="fixed top-0 left-0 right-0 z-40 flex h-14 items-center gap-2 border-b border-border bg-background/95 px-3 backdrop-blur supports-[backdrop-filter]:bg-background/80 md:hidden">
+    <header className="fixed left-0 right-0 top-0 z-40 flex h-12 items-center gap-2 border-b border-border bg-background/95 px-3 pt-[max(0.25rem,env(safe-area-inset-top))] backdrop-blur supports-[backdrop-filter]:bg-background/80 md:hidden">
       <Button
         type="button"
         variant="ghost"
         size="icon"
-        className="shrink-0"
+        className="size-9 shrink-0"
         onClick={onOpenMenu}
         aria-label="Open menu"
       >
         <Menu className="h-5 w-5" />
       </Button>
-      <span className="text-sm font-semibold text-foreground">Client Portal</span>
+      <div className="inline-flex min-w-0 flex-1 items-center">
+        <span className="truncate text-sm font-semibold leading-none text-foreground">Client Portal</span>
+      </div>
     </header>
   )
 }

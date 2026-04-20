@@ -1,4 +1,6 @@
-require('dotenv').config();
+// Explicit path + override: machine/User env (e.g. DB_NAME on Windows) must not shadow repo `.env`,
+// or the API pool connects to the wrong DB while migrations use `.env` → MIGRATION_REQUIRED on Dobi, etc.
+require('dotenv').config({ path: require('path').join(__dirname, '.env'), override: true });
 
 // Log once at startup whether SaaS Bukku (manual renew/topup invoice) can run
 const _bukkuKey = process.env.BUKKU_SAAS_API_KEY || process.env.BUKKU_SAAS_BUKKU_API_KEY;

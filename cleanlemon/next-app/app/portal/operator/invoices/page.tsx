@@ -1,6 +1,8 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { jsPDF } from 'jspdf'
+import autoTable from 'jspdf-autotable'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -19,6 +21,7 @@ import {
   updateOperatorInvoiceStatus,
   deleteOperatorInvoice,
   fetchOperatorSettings,
+  saveOperatorSettings,
   createOperatorInvoice,
   updateOperatorInvoice,
   fetchOperatorInvoiceFormOptions,
@@ -30,7 +33,8 @@ import { useAuth } from '@/lib/auth-context'
 import { useEffectiveOperatorId } from '@/lib/cleanlemon-effective-operator-id'
 import {
   Search,
-  Filter,
+  ListFilter,
+  Download,
   Plus,
   Send,
   Eye,
@@ -43,7 +47,7 @@ import {
   AlertCircle,
   ArrowUpDown,
   Trash2,
-  Edit,
+  ExternalLink,
   Mail,
   Settings2,
   Check,
@@ -51,6 +55,7 @@ import {
   Building2,
   Calendar,
   LayoutList,
+  PackagePlus,
 } from 'lucide-react'
 import {
   DropdownMenu,
@@ -73,16 +78,22 @@ import { cn } from '@/lib/utils'
 interface Invoice {
   id: string
   invoiceNo: string
+  /** `cln_client_invoice.client_id` — for filters */
+  clientId: string
   client: string
   clientEmail: string
   property: string
   amount: number
   tax: number
   total: number
-  status: 'paid' | 'overdue' | 'cancelled'
+  status: 'paid' | 'pending' | 'overdue' | 'cancelled'
   issueDate: string
   dueDate: string
   paidDate?: string
+  /** Accounting / portal PDF when set */
+  pdfUrl?: string | null
+  /** Latest payment receipt URL when set */
+  receiptUrl?: string | null
   items: Array<{ description: string; quantity: number; rate: number; amount: number }>
 }
 
@@ -96,6 +107,7 @@ interface PaymentRecord {
   paymentDate: string
   status: 'completed' | 'voided'
   voidedAt?: string
+  receiptUrl?: string | null
 }
 
 type AutomationMode = 'during_booking' | 'after_work' | 'monthly'
@@ -106,6 +118,8 @@ type InvoiceAutomationRow = {
   monthlyMode: MonthlyScheduleMode
   specificDay: string
 }
+
+type JobCompletionAddonRow = { id: string; name: string; priceMyr: number }
 
 function defaultInvoiceAutomationRow(): InvoiceAutomationRow {
   return { mode: 'during_booking', monthlyMode: 'first_day', specificDay: '1' }
@@ -237,6 +251,7 @@ function buildAccountingInvoiceDescription(params: {
 
 const statusConfig = {
   paid: { label: 'Paid', color: 'bg-green-100 text-green-700', icon: CheckCircle2 },
+  pending: { label: 'Pending', color: 'bg-yellow-100 text-yellow-800', icon: Clock },
   overdue: { label: 'Overdue', color: 'bg-red-100 text-red-700', icon: AlertCircle },
   cancelled: { label: 'Cancelled', color: 'bg-gray-100 text-gray-500', icon: XCircle },
 }
@@ -249,16 +264,31 @@ export default function InvoicesPage() {
   const [searchQuery, setSearchQuery] = useState('')
   const [filterMonth, setFilterMonth] = useState('all')
   const [filterYear, setFilterYear] = useState('all')
+  const [filterClientId, setFilterClientId] = useState('all')
+  const [filterExpanded, setFilterExpanded] = useState(false)
   const [selectedInvoices, setSelectedInvoices] = useState<string[]>([])
   const [createInvoiceOpen, setCreateInvoiceOpen] = useState(false)
   const [viewInvoice, setViewInvoice] = useState<Invoice | null>(null)
   const [markAsPaidInvoice, setMarkAsPaidInvoice] = useState<Invoice | null>(null)
+  /** When set, "Mark as paid" dialog applies to all these rows */
+  const [bulkMarkList, setBulkMarkList] = useState<Invoice[] | null>(null)
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false)
   const [paymentMethod, setPaymentMethod] = useState<'cash' | 'bank'>('bank')
   const [paymentDate, setPaymentDate] = useState(new Date().toISOString().split('T')[0])
   const [deleteInvoice, setDeleteInvoice] = useState<Invoice | null>(null)
   const [viewPayment, setViewPayment] = useState<PaymentRecord | null>(null)
   const [editInvoice, setEditInvoice] = useState<Invoice | null>(null)
   const [invoiceAutomationOpen, setInvoiceAutomationOpen] = useState(false)
+  const [paymentDeadlineOpen, setPaymentDeadlineOpen] = useState(false)
+  const [paymentDueMode, setPaymentDueMode] = useState<'none' | 'days'>('days')
+  const [paymentDueDays, setPaymentDueDays] = useState('14')
+  const [paymentDeadlineSaving, setPaymentDeadlineSaving] = useState(false)
+  const [jobAddonsOpen, setJobAddonsOpen] = useState(false)
+  const [jobAddonsRows, setJobAddonsRows] = useState<JobCompletionAddonRow[]>([])
+  const [jobAddonDraftName, setJobAddonDraftName] = useState('')
+  const [jobAddonDraftPrice, setJobAddonDraftPrice] = useState('')
+  const [jobAddonsSaving, setJobAddonsSaving] = useState(false)
+  const [jobAddonsLoading, setJobAddonsLoading] = useState(false)
   /** Product line labels = `cln_account` rows with is_product (same as /operator/accounting). */
   const [accountingProductOptions, setAccountingProductOptions] = useState<string[]>(fallbackAccountingProductLabels)
   const [createLines, setCreateLines] = useState<CreateInvoiceLine[]>(() => [newCreateInvoiceLine()])
@@ -338,6 +368,51 @@ export default function InvoicesPage() {
     setInvoiceAutomationSelectedServices(safe)
   }, [operatorId])
 
+  const refreshPaymentDeadlineSettings = useCallback(async () => {
+    const oid = String(operatorId || '').trim()
+    if (!oid) return
+    try {
+      const r = await fetchOperatorSettings(oid)
+      if (!r || (r as { ok?: boolean }).ok === false) return
+      const raw = (r as { settings?: { invoicePaymentDuePolicy?: { mode?: string; days?: number } } }).settings
+        ?.invoicePaymentDuePolicy
+      const mode = String(raw?.mode || '').toLowerCase() === 'none' ? 'none' : 'days'
+      setPaymentDueMode(mode)
+      const d = Math.floor(Number(raw?.days))
+      setPaymentDueDays(Number.isFinite(d) && d >= 1 && d <= 365 ? String(d) : '14')
+    } catch {
+      setPaymentDueMode('days')
+      setPaymentDueDays('14')
+    }
+  }, [operatorId])
+
+  const refreshJobCompletionAddons = useCallback(async () => {
+    const oid = String(operatorId || '').trim()
+    if (!oid) {
+      setJobAddonsRows([])
+      return
+    }
+    setJobAddonsLoading(true)
+    try {
+      const r = await fetchOperatorSettings(oid)
+      const raw = (r as { settings?: { jobCompletionAddons?: unknown } })?.settings?.jobCompletionAddons
+      const list = Array.isArray(raw) ? raw : []
+      setJobAddonsRows(
+        list
+          .filter((x: any) => x && String(x.id || '').trim() && String(x.name || '').trim())
+          .map((x: any) => ({
+            id: String(x.id).trim(),
+            name: String(x.name).trim(),
+            priceMyr: Math.max(0, Number(x.priceMyr) || 0),
+          }))
+      )
+    } catch {
+      setJobAddonsRows([])
+    } finally {
+      setJobAddonsLoading(false)
+    }
+  }, [operatorId])
+
   const invoiceAutomationServiceRows = useMemo(() => {
     const set = new Set(invoiceAutomationSelectedServices)
     return PRICING_SERVICES.filter((s) => set.has(s.key))
@@ -350,46 +425,56 @@ export default function InvoicesPage() {
     })
   }, [])
 
-  useEffect(() => {
-    let cancelled = false
-    ;(async () => {
-      const r = await fetchOperatorInvoices()
-      if (cancelled || !r?.ok) return
-      const items: Invoice[] = (r.items || []).map((row: any) => ({
+  const loadInvoices = useCallback(async () => {
+    const r = await fetchOperatorInvoices()
+    if (!r?.ok) return
+    const items: Invoice[] = (r.items || []).map((row: any) => {
+      const st = String(row.status || '').toLowerCase()
+      let invStatus: Invoice['status'] = 'pending'
+      if (st === 'paid') invStatus = 'paid'
+      else if (st === 'cancelled') invStatus = 'cancelled'
+      else if (st === 'overdue') invStatus = 'overdue'
+      else invStatus = 'pending'
+      return {
         id: String(row.id),
         invoiceNo: String(row.invoiceNo || row.id),
+        clientId: String(row.clientId ?? row.client_id ?? '').trim(),
         client: String(row.client || ''),
         clientEmail: String(row.clientEmail || ''),
         property: String(row.description || ''),
         amount: Number(row.amount || 0),
         tax: Number(row.tax || 0),
         total: Number(row.total || 0),
-        status: (row.status === 'paid' ? 'paid' : row.status === 'cancelled' ? 'cancelled' : 'overdue'),
+        status: invStatus,
         issueDate: String(row.issueDate || new Date().toISOString().split('T')[0]),
-        dueDate: String(row.dueDate || new Date().toISOString().split('T')[0]),
+        dueDate: String(row.dueDate != null && row.dueDate !== '' ? row.dueDate : ''),
         paidDate: row.paidDate || undefined,
+        pdfUrl: row.pdfUrl != null && String(row.pdfUrl).trim() !== '' ? String(row.pdfUrl).trim() : null,
+        receiptUrl: row.receiptUrl != null && String(row.receiptUrl).trim() !== '' ? String(row.receiptUrl).trim() : null,
         items: [],
-      }))
-      setInvoices(items)
-      setPayments(
-        items
-          .filter((inv) => inv.status === 'paid' && inv.paidDate)
-          .map((inv) => ({
-            id: `PAY-${inv.id}`,
-            invoiceId: inv.id,
-            invoiceNo: inv.invoiceNo,
-            client: inv.client,
-            amount: inv.total,
-            paymentMethod: 'bank',
-            paymentDate: inv.paidDate as string,
-            status: 'completed',
-          }))
-      )
-    })()
-    return () => {
-      cancelled = true
-    }
+      }
+    })
+    setInvoices(items)
+    setPayments(
+      items
+        .filter((inv) => inv.status === 'paid' && inv.paidDate)
+        .map((inv) => ({
+          id: `PAY-${inv.id}`,
+          invoiceId: inv.id,
+          invoiceNo: inv.invoiceNo,
+          client: inv.client,
+          amount: inv.total,
+          paymentMethod: 'bank',
+          paymentDate: inv.paidDate as string,
+          status: 'completed',
+          receiptUrl: inv.receiptUrl,
+        }))
+    )
   }, [])
+
+  useEffect(() => {
+    void loadInvoices()
+  }, [loadInvoices])
 
   useEffect(() => {
     let cancelled = false
@@ -439,18 +524,139 @@ export default function InvoicesPage() {
     )
   }, [createClientId])
 
-  const filteredInvoices = invoices.filter(inv => {
-    const matchesSearch = inv.invoiceNo.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      inv.client.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      inv.property.toLowerCase().includes(searchQuery.toLowerCase())
-    const matchesTab = activeTab === 'all' || inv.status === activeTab
-    const issueDate = new Date(inv.issueDate)
-    const issueMonth = String(issueDate.getMonth() + 1)
-    const issueYear = String(issueDate.getFullYear())
-    const matchesMonth = filterMonth === 'all' || issueMonth === filterMonth
-    const matchesYear = filterYear === 'all' || issueYear === filterYear
-    return matchesSearch && matchesTab && matchesMonth && matchesYear
-  })
+  const filteredInvoices = useMemo(() => {
+    return invoices.filter((inv) => {
+      const matchesSearch =
+        inv.invoiceNo.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        inv.client.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        inv.property.toLowerCase().includes(searchQuery.toLowerCase())
+      const matchesTab = activeTab === 'all' || inv.status === activeTab
+      const issueDate = new Date(inv.issueDate)
+      const issueMonth = String(issueDate.getMonth() + 1)
+      const issueYear = String(issueDate.getFullYear())
+      const matchesMonth = filterMonth === 'all' || issueMonth === filterMonth
+      const matchesYear = filterYear === 'all' || issueYear === filterYear
+      const matchesClient =
+        filterClientId === 'all' ||
+        (String(inv.clientId || '').trim() !== '' && String(inv.clientId).trim() === filterClientId) ||
+        (String(inv.clientId || '').trim() === '' &&
+          invoiceClients.find((c) => c.id === filterClientId)?.name === inv.client)
+      return matchesSearch && matchesTab && matchesMonth && matchesYear && matchesClient
+    })
+  }, [
+    invoices,
+    searchQuery,
+    activeTab,
+    filterMonth,
+    filterYear,
+    filterClientId,
+    invoiceClients,
+  ])
+
+  const hasActiveFilters =
+    filterClientId !== 'all' || filterMonth !== 'all' || filterYear !== 'all'
+
+  const exportFileStem = useMemo(() => {
+    const d = new Date()
+    return `invoices-${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`
+  }, [])
+
+  const escapeCsvCell = (s: string) => {
+    const t = String(s)
+    if (/[",\n\r]/.test(t)) return `"${t.replace(/"/g, '""')}"`
+    return t
+  }
+
+  const invoiceRowExport = useCallback((inv: Invoice) => {
+    return {
+      invoiceNo: inv.invoiceNo,
+      client: inv.client,
+      property: inv.property,
+      status: statusConfig[inv.status].label,
+      total: inv.total.toFixed(2),
+      issueDate: inv.issueDate,
+      dueDate: inv.dueDate,
+      paidDate: inv.paidDate || '',
+    }
+  }, [])
+
+  const exportCsvRows = useCallback(
+    (rows: Invoice[]) => {
+      if (rows.length === 0) {
+        toast.error('No rows to export.')
+        return
+      }
+      const header = ['Invoice', 'Client', 'Description', 'Status', 'Total (RM)', 'Issue', 'Due', 'Paid']
+      const lines = [header.join(',')]
+      for (const inv of rows) {
+        const c = invoiceRowExport(inv)
+        lines.push(
+          [
+            escapeCsvCell(c.invoiceNo),
+            escapeCsvCell(c.client),
+            escapeCsvCell(c.property),
+            escapeCsvCell(c.status),
+            escapeCsvCell(c.total),
+            escapeCsvCell(c.issueDate),
+            escapeCsvCell(c.dueDate),
+            escapeCsvCell(c.paidDate),
+          ].join(',')
+        )
+      }
+      const blob = new Blob(['\uFEFF' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${exportFileStem}.csv`
+      a.click()
+      URL.revokeObjectURL(url)
+      toast.success('CSV downloaded.')
+    },
+    [exportFileStem, invoiceRowExport]
+  )
+
+  const exportPdfRows = useCallback(
+    (rows: Invoice[]) => {
+      if (rows.length === 0) {
+        toast.error('No rows to export.')
+        return
+      }
+      const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' })
+      doc.setFontSize(11)
+      doc.text('Invoices (export)', 8, 10)
+      const body = rows.map((inv) => {
+        const c = invoiceRowExport(inv)
+        return [c.invoiceNo, c.client, c.property.slice(0, 80), c.status, c.total, c.issueDate, c.dueDate, c.paidDate || '—']
+      })
+      autoTable(doc, {
+        startY: 14,
+        head: [['Invoice', 'Client', 'Description', 'Status', 'Total', 'Issue', 'Due', 'Paid']],
+        body,
+        styles: { fontSize: 7, cellPadding: 1.5 },
+        headStyles: { fillColor: [30, 64, 175] },
+        columnStyles: {
+          0: { cellWidth: 28 },
+          1: { cellWidth: 32 },
+          2: { cellWidth: 52 },
+          3: { cellWidth: 22 },
+          4: { cellWidth: 22 },
+          5: { cellWidth: 24 },
+          6: { cellWidth: 24 },
+          7: { cellWidth: 24 },
+        },
+        margin: { left: 8, right: 8 },
+      })
+      doc.save(`${exportFileStem}.pdf`)
+      toast.success('PDF downloaded.')
+    },
+    [exportFileStem, invoiceRowExport]
+  )
+
+  const selectedRows = useMemo(() => {
+    return selectedInvoices
+      .map((id) => filteredInvoices.find((i) => i.id === id))
+      .filter((i): i is Invoice => Boolean(i))
+  }, [selectedInvoices, filteredInvoices])
 
   const handleSelectAll = (checked: boolean) => {
     if (checked) {
@@ -468,52 +674,96 @@ export default function InvoicesPage() {
     }
   }
 
-  const handleSendInvoice = (invoice: Invoice) => {
-    toast.success(`Invoice ${invoice.invoiceNo} sent to ${invoice.clientEmail}`)
+  const handleOpenBulkMarkAsPaid = () => {
+    const list = selectedRows.filter((i) => i.status === 'pending' || i.status === 'overdue')
+    if (list.length === 0) {
+      toast.error('No unpaid invoices in selection.')
+      return
+    }
+    setMarkAsPaidInvoice(null)
+    setBulkMarkList(list)
+    setPaymentMethod('bank')
+    setPaymentDate(new Date().toISOString().split('T')[0])
   }
 
-  const handleBulkAction = (action: string) => {
-    toast.success(`${action} ${selectedInvoices.length} invoices`)
+  const handleOpenBulkDelete = () => {
+    const hasUnpaid = selectedRows.some((i) => i.status !== 'paid')
+    if (!hasUnpaid) {
+      toast.error('Only unpaid invoices can be deleted. Void payment first for paid rows.')
+      return
+    }
+    setBulkDeleteOpen(true)
+  }
+
+  const handleConfirmBulkDelete = async () => {
+    const targets = selectedRows.filter((i) => i.status !== 'paid')
+    if (targets.length === 0) {
+      setBulkDeleteOpen(false)
+      return
+    }
+    for (const inv of targets) {
+      const r = await deleteOperatorInvoice(inv.id, operatorId)
+      if (!r?.ok) {
+        toast.error(r?.reason || inv.invoiceNo)
+        return
+      }
+      setInvoices((prev) => prev.filter((x) => x.id !== inv.id))
+      setPayments((prev) => prev.filter((p) => p.invoiceId !== inv.id))
+      if (viewInvoice?.id === inv.id) setViewInvoice(null)
+    }
+    toast.success(`Deleted ${targets.length} invoice(s).`)
     setSelectedInvoices([])
+    setBulkDeleteOpen(false)
   }
 
   const handleOpenMarkAsPaid = (invoice: Invoice) => {
+    setBulkMarkList(null)
     setMarkAsPaidInvoice(invoice)
     setPaymentMethod('bank')
     setPaymentDate(new Date().toISOString().split('T')[0])
   }
 
   const handleConfirmMarkAsPaid = async () => {
-    if (!markAsPaidInvoice) return
-    const inv = markAsPaidInvoice
-    const r = await updateOperatorInvoiceStatus(inv.id, 'paid', {
-      operatorId,
-      paymentMethod,
-      paymentDate,
-    })
-    if (!r?.ok) {
-      toast.error(r?.reason || 'Failed to record payment in accounting')
-      return
+    const list =
+      bulkMarkList && bulkMarkList.length > 0
+        ? bulkMarkList
+        : markAsPaidInvoice
+          ? [markAsPaidInvoice]
+          : []
+    if (list.length === 0) return
+    for (const inv of list) {
+      if (inv.status === 'paid') continue
+      const r = await updateOperatorInvoiceStatus(inv.id, 'paid', {
+        operatorId,
+        paymentMethod,
+        paymentDate,
+      })
+      if (!r?.ok) {
+        toast.error(r?.reason || `Failed: ${inv.invoiceNo}`)
+        return
+      }
+      setInvoices((prev) =>
+        prev.map((i) => (i.id === inv.id ? { ...i, status: 'paid' as const, paidDate: paymentDate } : i))
+      )
+      const paymentRecord: PaymentRecord = {
+        id: `PAY-${inv.id}-${Date.now()}`,
+        invoiceId: inv.id,
+        invoiceNo: inv.invoiceNo,
+        client: inv.client,
+        amount: inv.total,
+        paymentMethod,
+        paymentDate,
+        status: 'completed',
+        receiptUrl: inv.receiptUrl ?? null,
+      }
+      setPayments((prev) => [paymentRecord, ...prev.filter((p) => p.invoiceId !== inv.id)])
     }
-
-    setInvoices((prev) =>
-      prev.map((i) => (i.id === inv.id ? { ...i, status: 'paid', paidDate: paymentDate } : i))
+    toast.success(
+      list.length > 1 ? `Marked ${list.length} invoices as paid` : `Invoice ${list[0].invoiceNo} marked as paid`
     )
-
-    const paymentRecord: PaymentRecord = {
-      id: `PAY-${inv.id}-${Date.now()}`,
-      invoiceId: inv.id,
-      invoiceNo: inv.invoiceNo,
-      client: inv.client,
-      amount: inv.total,
-      paymentMethod,
-      paymentDate,
-      status: 'completed',
-    }
-    setPayments((prev) => [paymentRecord, ...prev.filter((p) => p.invoiceId !== inv.id)])
-
-    toast.success(`Invoice ${inv.invoiceNo} marked as paid`)
     setMarkAsPaidInvoice(null)
+    setBulkMarkList(null)
+    setSelectedInvoices([])
   }
 
   const handleVoidPayment = async (invoice: Invoice) => {
@@ -560,6 +810,44 @@ export default function InvoicesPage() {
 
   const paymentForInvoice = (invoiceId: string) =>
     payments.find((payment) => payment.invoiceId === invoiceId && payment.status === 'completed')
+
+  const openInvoicePdf = (inv: Invoice) => {
+    const u = String(inv.pdfUrl || '').trim()
+    if (u && /^https?:\/\//i.test(u)) {
+      window.open(u, '_blank', 'noopener,noreferrer')
+      return
+    }
+    toast.message('No invoice PDF link yet', { description: 'Open View detail to review in the app.' })
+    setViewInvoice(inv)
+  }
+
+  const openReceiptForInvoice = (inv: Invoice) => {
+    const pay = paymentForInvoice(inv.id)
+    const url = String(inv.receiptUrl || pay?.receiptUrl || '').trim()
+    if (url && /^https?:\/\//i.test(url)) {
+      window.open(url, '_blank', 'noopener,noreferrer')
+      return
+    }
+    if (pay) {
+      setViewPayment(pay)
+      return
+    }
+    if (inv.status === 'paid') {
+      setViewPayment({
+        id: `PAY-${inv.id}`,
+        invoiceId: inv.id,
+        invoiceNo: inv.invoiceNo,
+        client: inv.client,
+        amount: inv.total,
+        paymentMethod: 'bank',
+        paymentDate: inv.paidDate || inv.issueDate,
+        status: 'completed',
+        receiptUrl: inv.receiptUrl ?? null,
+      })
+      return
+    }
+    toast.error('No receipt for this invoice.')
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -681,15 +969,18 @@ export default function InvoicesPage() {
     const created: Invoice = {
       id: String(r.id || invoiceNo),
       invoiceNo: finalNo,
+      clientId: selectedClient.id,
       client: selectedClient.name,
       clientEmail: selectedClient.email,
       property: description,
       amount,
       tax,
       total,
-      status: 'overdue',
+      status: 'pending',
       issueDate: createInvoiceDate,
       dueDate: createInvoiceDate,
+      pdfUrl: null,
+      receiptUrl: null,
       items: createLines.map((row) => ({
         description: row.product,
         quantity: row.qty,
@@ -704,16 +995,87 @@ export default function InvoicesPage() {
 
   const stats = {
     total: invoices.reduce((sum, inv) => sum + inv.total, 0),
-    paid: invoices.filter(inv => inv.status === 'paid').reduce((sum, inv) => sum + inv.total, 0),
-    pending: invoices.filter(inv => inv.status === 'overdue').reduce((sum, inv) => sum + inv.total, 0),
-    overdue: invoices.filter(inv => inv.status === 'overdue').reduce((sum, inv) => sum + inv.total, 0),
+    paid: invoices.filter((inv) => inv.status === 'paid').reduce((sum, inv) => sum + inv.total, 0),
+    pending: invoices.filter((inv) => inv.status === 'pending').reduce((sum, inv) => sum + inv.total, 0),
+    overdue: invoices.filter((inv) => inv.status === 'overdue').reduce((sum, inv) => sum + inv.total, 0),
+  }
+
+  const handleSavePaymentDeadline = async () => {
+    const oid = String(operatorId || '').trim()
+    if (!oid) return
+    setPaymentDeadlineSaving(true)
+    try {
+      const parsed = Math.min(365, Math.max(1, parseInt(String(paymentDueDays).trim(), 10) || 14))
+      const r = await saveOperatorSettings(oid, {
+        invoicePaymentDuePolicy: {
+          mode: paymentDueMode,
+          days: parsed,
+          businessTimeZone: 'Asia/Kuala_Lumpur',
+        },
+      })
+      if (!r?.ok) {
+        toast.error(String((r as { reason?: string }).reason || 'Failed to save'))
+        return
+      }
+      toast.success('Payment deadline saved')
+      setPaymentDeadlineOpen(false)
+      await loadInvoices()
+    } finally {
+      setPaymentDeadlineSaving(false)
+    }
   }
   const availableYears = Array.from(
     new Set(invoices.map((inv) => String(new Date(inv.issueDate).getFullYear())))
   ).sort((a, b) => Number(b) - Number(a))
 
+  const renderInvoiceActionMenuItems = (invoice: Invoice) => (
+    <>
+      <DropdownMenuItem onClick={() => setViewInvoice(invoice)}>
+        <Eye className="h-4 w-4 mr-2" />
+        View detail
+      </DropdownMenuItem>
+      <DropdownMenuItem
+        disabled={invoice.status === 'paid'}
+        onClick={() => handleOpenMarkAsPaid(invoice)}
+      >
+        <CheckCircle2 className="h-4 w-4 mr-2" />
+        Mark as paid
+      </DropdownMenuItem>
+      <DropdownMenuItem
+        disabled={!String(invoice.pdfUrl || '').trim()}
+        onClick={() => openInvoicePdf(invoice)}
+      >
+        <ExternalLink className="h-4 w-4 mr-2" />
+        View invoice
+      </DropdownMenuItem>
+      <DropdownMenuItem
+        disabled={invoice.status === 'paid'}
+        className="text-destructive focus:text-destructive"
+        onClick={() => setDeleteInvoice(invoice)}
+      >
+        <Trash2 className="h-4 w-4 mr-2" />
+        Delete
+      </DropdownMenuItem>
+      <DropdownMenuItem
+        disabled={invoice.status !== 'paid'}
+        onClick={() => openReceiptForInvoice(invoice)}
+      >
+        <Receipt className="h-4 w-4 mr-2" />
+        View receipt
+      </DropdownMenuItem>
+      <DropdownMenuSeparator />
+      <DropdownMenuItem
+        disabled={invoice.status !== 'paid'}
+        onClick={() => handleVoidPayment(invoice)}
+      >
+        <XCircle className="h-4 w-4 mr-2" />
+        Void payment
+      </DropdownMenuItem>
+    </>
+  )
+
   return (
-    <div className="space-y-6 pb-20 lg:pb-6">
+    <div className="w-full space-y-6 p-4 md:p-6 pb-20 lg:pb-6">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
@@ -818,6 +1180,197 @@ export default function InvoicesPage() {
                   }}
                 >
                   Save
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+
+          <Dialog
+            open={paymentDeadlineOpen}
+            onOpenChange={(open) => {
+              setPaymentDeadlineOpen(open)
+              if (open) void refreshPaymentDeadlineSettings()
+            }}
+          >
+            <DialogTrigger asChild>
+              <Button variant="outline" type="button">
+                <Calendar className="h-4 w-4 mr-2" />
+                Payment deadline
+              </Button>
+            </DialogTrigger>
+            <DialogContent className="max-w-md">
+              <DialogHeader>
+                <DialogTitle>Client portal — payment deadline</DialogTitle>
+                <DialogDescription>
+                  Unpaid invoices become overdue after this many days from the issue date. When overdue, the client
+                  portal can require the client to open Invoices to pay (if you use a day limit). Default before saving
+                  is 14 days (legacy behaviour).
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-4 py-2">
+                <div className="space-y-2">
+                  <Label>Due rule</Label>
+                  <Select
+                    value={paymentDueMode}
+                    onValueChange={(v: 'none' | 'days') => setPaymentDueMode(v)}
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="none">No limit (no auto overdue)</SelectItem>
+                      <SelectItem value="days">Due after N days from issue</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                {paymentDueMode === 'days' ? (
+                  <div className="space-y-2">
+                    <Label>Days</Label>
+                    <Input
+                      type="number"
+                      min={1}
+                      max={365}
+                      value={paymentDueDays}
+                      onChange={(e) => setPaymentDueDays(e.target.value)}
+                    />
+                  </div>
+                ) : null}
+              </div>
+              <DialogFooter>
+                <Button variant="outline" type="button" onClick={() => setPaymentDeadlineOpen(false)}>
+                  Cancel
+                </Button>
+                <Button type="button" disabled={paymentDeadlineSaving} onClick={() => void handleSavePaymentDeadline()}>
+                  {paymentDeadlineSaving ? 'Saving…' : 'Save'}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+
+          <Dialog
+            open={jobAddonsOpen}
+            onOpenChange={(open) => {
+              setJobAddonsOpen(open)
+              if (open) void refreshJobCompletionAddons()
+            }}
+          >
+            <DialogTrigger asChild>
+              <Button variant="outline" type="button">
+                <PackagePlus className="h-4 w-4 mr-2" />
+                Settings
+              </Button>
+            </DialogTrigger>
+            <DialogContent className="max-w-lg">
+              <DialogHeader>
+                <DialogTitle>Job completion add-ons</DialogTitle>
+                <DialogDescription>
+                  Staff can tick these when finishing a clean. Paid amounts add to the schedule fee; use 0 for free
+                  items that still need a record.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-4 py-2">
+                {jobAddonsLoading ? (
+                  <p className="text-sm text-muted-foreground">Loading…</p>
+                ) : (
+                  <div className="space-y-2 max-h-48 overflow-y-auto rounded-md border p-3">
+                    {jobAddonsRows.length === 0 ? (
+                      <p className="text-sm text-muted-foreground">No add-ons yet. Add one below.</p>
+                    ) : (
+                      jobAddonsRows.map((row) => (
+                        <div key={row.id} className="flex items-center justify-between gap-2 text-sm">
+                          <span>
+                            <span className="font-medium">{row.name}</span>
+                            <span className="text-muted-foreground"> — RM {row.priceMyr}</span>
+                          </span>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            className="text-destructive"
+                            onClick={() => setJobAddonsRows((prev) => prev.filter((x) => x.id !== row.id))}
+                          >
+                            Remove
+                          </Button>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                )}
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+                  <div className="flex-1 space-y-2">
+                    <Label>Name</Label>
+                    <Input
+                      value={jobAddonDraftName}
+                      onChange={(e) => setJobAddonDraftName(e.target.value)}
+                      placeholder="e.g. Battery"
+                    />
+                  </div>
+                  <div className="w-full space-y-2 sm:w-28">
+                    <Label>Price (MYR)</Label>
+                    <Input
+                      type="number"
+                      min={0}
+                      step={0.01}
+                      value={jobAddonDraftPrice}
+                      onChange={(e) => setJobAddonDraftPrice(e.target.value)}
+                      placeholder="0"
+                    />
+                  </div>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    className="sm:mb-0.5"
+                    onClick={() => {
+                      const name = jobAddonDraftName.trim()
+                      if (!name) {
+                        toast.error('Enter a name')
+                        return
+                      }
+                      const price = Math.max(0, Number(jobAddonDraftPrice) || 0)
+                      const id =
+                        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+                          ? crypto.randomUUID()
+                          : `addon_${Date.now()}`
+                      setJobAddonsRows((prev) => [
+                        ...prev,
+                        { id, name: name.slice(0, 200), priceMyr: Math.round(price * 100) / 100 },
+                      ])
+                      setJobAddonDraftName('')
+                      setJobAddonDraftPrice('')
+                    }}
+                  >
+                    Add
+                  </Button>
+                </div>
+              </div>
+              <DialogFooter>
+                <Button type="button" variant="outline" onClick={() => setJobAddonsOpen(false)}>
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  disabled={jobAddonsSaving || !String(operatorId || '').trim()}
+                  onClick={async () => {
+                    const oid = String(operatorId || '').trim()
+                    if (!oid) {
+                      toast.error('Missing operator')
+                      return
+                    }
+                    setJobAddonsSaving(true)
+                    try {
+                      const r = await saveOperatorSettings(oid, { jobCompletionAddons: jobAddonsRows })
+                      if (!r?.ok) {
+                        toast.error(String((r as { reason?: string })?.reason || 'Save failed'))
+                        return
+                      }
+                      toast.success('Saved')
+                      setJobAddonsOpen(false)
+                    } finally {
+                      setJobAddonsSaving(false)
+                    }
+                  }}
+                >
+                  {jobAddonsSaving ? 'Saving…' : 'Save'}
                 </Button>
               </DialogFooter>
             </DialogContent>
@@ -1310,211 +1863,321 @@ export default function InvoicesPage() {
       </div>
 
       {/* Filters & Table */}
-      <Card>
-        <CardHeader>
-          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+      <Card className="w-full">
+        <CardHeader className="space-y-4">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
             <Tabs value={activeTab} onValueChange={setActiveTab}>
               <TabsList>
                 <TabsTrigger value="all">All</TabsTrigger>
                 <TabsTrigger value="paid">Paid</TabsTrigger>
+                <TabsTrigger value="pending">Pending</TabsTrigger>
                 <TabsTrigger value="overdue">Overdue</TabsTrigger>
               </TabsList>
             </Tabs>
-            <div className="flex items-center gap-2">
-              <div className="relative flex-1 lg:w-64">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                <Input
-                  placeholder="Search invoices..."
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="pl-9"
-                />
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              <div className="hidden sm:block">
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="outline" size="sm" className="shrink-0">
+                      <Download className="h-4 w-4 mr-2" />
+                      Export
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    <DropdownMenuItem onClick={() => exportPdfRows(filteredInvoices)}>
+                      Export as PDF (filtered)
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => exportCsvRows(filteredInvoices)}>
+                      Export as CSV (filtered)
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
               </div>
-              <Select value={filterMonth} onValueChange={setFilterMonth}>
-                <SelectTrigger className="w-[140px]">
-                  <SelectValue placeholder="Month" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All Months</SelectItem>
-                  <SelectItem value="1">Jan</SelectItem>
-                  <SelectItem value="2">Feb</SelectItem>
-                  <SelectItem value="3">Mar</SelectItem>
-                  <SelectItem value="4">Apr</SelectItem>
-                  <SelectItem value="5">May</SelectItem>
-                  <SelectItem value="6">Jun</SelectItem>
-                  <SelectItem value="7">Jul</SelectItem>
-                  <SelectItem value="8">Aug</SelectItem>
-                  <SelectItem value="9">Sep</SelectItem>
-                  <SelectItem value="10">Oct</SelectItem>
-                  <SelectItem value="11">Nov</SelectItem>
-                  <SelectItem value="12">Dec</SelectItem>
-                </SelectContent>
-              </Select>
-              <Select value={filterYear} onValueChange={setFilterYear}>
-                <SelectTrigger className="w-[120px]">
-                  <SelectValue placeholder="Year" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All Years</SelectItem>
-                  {availableYears.map((year) => (
-                    <SelectItem key={year} value={year}>
-                      {year}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button variant="outline" size="icon">
-                    <Filter className="h-4 w-4" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end">
-                  <DropdownMenuItem onClick={() => setActiveTab('all')}>All</DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => setActiveTab('paid')}>Paid</DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => setActiveTab('overdue')}>Overdue</DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem onClick={() => setFilterMonth('all')}>All Months</DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => setFilterYear('all')}>All Years</DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
+              <div className="hidden sm:block">
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="outline" size="sm" className="shrink-0" disabled={selectedInvoices.length === 0}>
+                      Bulk actions
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-56">
+                    <DropdownMenuItem
+                      disabled={selectedRows.length === 0}
+                      onClick={() => exportCsvRows(selectedRows)}
+                    >
+                      <FileText className="h-4 w-4 mr-2" />
+                      Export selected (CSV)
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      disabled={selectedRows.length === 0}
+                      onClick={() => exportPdfRows(selectedRows)}
+                    >
+                      <FileText className="h-4 w-4 mr-2" />
+                      Export selected (PDF)
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem onClick={handleOpenBulkMarkAsPaid}>
+                      <CheckCircle2 className="h-4 w-4 mr-2" />
+                      Mark selected as paid
+                    </DropdownMenuItem>
+                    <DropdownMenuItem className="text-destructive focus:text-destructive" onClick={handleOpenBulkDelete}>
+                      <Trash2 className="h-4 w-4 mr-2" />
+                      Delete selected
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
             </div>
           </div>
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <div className="relative min-w-0 flex-1">
+              <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                placeholder="Search invoice no., client, description…"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="border-input pl-9"
+              />
+            </div>
+            <Button
+              type="button"
+              variant={filterExpanded ? 'secondary' : 'outline'}
+              className="shrink-0"
+              onClick={() => setFilterExpanded((v) => !v)}
+              aria-expanded={filterExpanded}
+            >
+              <ListFilter className="h-4 w-4 mr-2" />
+              Filter
+              {hasActiveFilters ? (
+                <span className="ml-2 inline-flex h-2 w-2 rounded-full bg-primary" aria-hidden />
+              ) : null}
+            </Button>
+          </div>
+          {filterExpanded ? (
+            <div className="rounded-lg border bg-muted/30 p-4">
+              <div className="flex flex-col gap-3 lg:flex-row lg:flex-wrap lg:items-end">
+                <div className="space-y-1.5 w-full lg:w-[260px]">
+                  <Label className="text-xs text-muted-foreground">Client</Label>
+                  <Select value={filterClientId} onValueChange={setFilterClientId}>
+                    <SelectTrigger className="border-input w-full">
+                      <SelectValue placeholder="Client" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">All clients</SelectItem>
+                      {clientsSortedAZ.map((c) => (
+                        <SelectItem key={c.id} value={c.id}>
+                          {c.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <Select value={filterMonth} onValueChange={setFilterMonth}>
+                  <SelectTrigger className="w-full border-input lg:w-[140px]">
+                    <SelectValue placeholder="Month" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All months</SelectItem>
+                    <SelectItem value="1">Jan</SelectItem>
+                    <SelectItem value="2">Feb</SelectItem>
+                    <SelectItem value="3">Mar</SelectItem>
+                    <SelectItem value="4">Apr</SelectItem>
+                    <SelectItem value="5">May</SelectItem>
+                    <SelectItem value="6">Jun</SelectItem>
+                    <SelectItem value="7">Jul</SelectItem>
+                    <SelectItem value="8">Aug</SelectItem>
+                    <SelectItem value="9">Sep</SelectItem>
+                    <SelectItem value="10">Oct</SelectItem>
+                    <SelectItem value="11">Nov</SelectItem>
+                    <SelectItem value="12">Dec</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Select value={filterYear} onValueChange={setFilterYear}>
+                  <SelectTrigger className="w-full border-input lg:w-[120px]">
+                    <SelectValue placeholder="Year" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All years</SelectItem>
+                    {availableYears.map((year) => (
+                      <SelectItem key={year} value={year}>
+                        {year}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {hasActiveFilters ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      setFilterClientId('all')
+                      setFilterMonth('all')
+                      setFilterYear('all')
+                    }}
+                  >
+                    Clear filters
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
         </CardHeader>
         <CardContent>
-          {selectedInvoices.length > 0 && (
-            <div className="flex items-center gap-2 mb-4 p-3 bg-muted rounded-lg">
+          {selectedInvoices.length > 0 ? (
+            <div className="mb-4 hidden items-center gap-2 rounded-lg bg-muted p-3 md:flex">
               <span className="text-sm font-medium">{selectedInvoices.length} selected</span>
               <div className="flex-1" />
-              <Button variant="outline" size="sm" className="text-destructive" onClick={() => handleBulkAction('Delete')}>
-                <Trash2 className="h-4 w-4 mr-2" />
-                Delete
+              <Button variant="outline" size="sm" onClick={() => setSelectedInvoices([])}>
+                Clear
               </Button>
             </div>
-          )}
+          ) : null}
 
-          <div className="rounded-lg border overflow-hidden">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="w-12">
-                    <Checkbox
-                      checked={selectedInvoices.length === filteredInvoices.length && filteredInvoices.length > 0}
-                      onCheckedChange={handleSelectAll}
-                    />
-                  </TableHead>
-                  <TableHead>
-                    <Button variant="ghost" size="sm" className="h-auto p-0 font-medium">
-                      Invoice
-                      <ArrowUpDown className="h-3 w-3 ml-1" />
-                    </Button>
-                  </TableHead>
-                  <TableHead className="hidden md:table-cell">Client</TableHead>
-                  <TableHead className="hidden lg:table-cell">Property</TableHead>
-                  <TableHead>Amount</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead className="hidden sm:table-cell">Due Date</TableHead>
-                  <TableHead className="w-12"></TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
+          {filteredInvoices.length === 0 ? (
+            <div className="rounded-lg border border-dashed py-12 text-center text-sm text-muted-foreground">
+              No invoices match your filters.
+            </div>
+          ) : (
+            <>
+              <div className="space-y-0 divide-y rounded-lg border md:hidden">
                 {filteredInvoices.map((invoice) => {
                   const StatusIcon = statusConfig[invoice.status].icon
                   return (
-                    <TableRow key={invoice.id}>
-                      <TableCell>
-                        <Checkbox
-                          checked={selectedInvoices.includes(invoice.id)}
-                          onCheckedChange={(checked) => handleSelectInvoice(invoice.id, !!checked)}
-                        />
-                      </TableCell>
-                      <TableCell>
+                    <div key={invoice.id} className="flex items-start gap-3 p-3">
+                      <div className="min-w-0 flex-1 space-y-1.5">
                         <button
                           type="button"
                           onClick={() =>
                             hasAccountingIntegration ? setViewInvoice(invoice) : setEditInvoice(invoice)
                           }
-                          className={
+                          className={cn(
+                            'block text-left text-base font-semibold',
                             hasAccountingIntegration
-                              ? 'font-medium text-primary hover:underline'
-                              : 'font-medium text-foreground hover:underline'
-                          }
+                              ? 'text-primary hover:underline'
+                              : 'text-foreground hover:underline'
+                          )}
                         >
                           {invoice.invoiceNo}
                         </button>
-                      </TableCell>
-                      <TableCell className="hidden md:table-cell">{invoice.client}</TableCell>
-                      <TableCell
-                        className="hidden lg:table-cell max-w-[220px] truncate align-top"
-                        title={invoice.property}
-                      >
-                        {invoice.property}
-                      </TableCell>
-                      <TableCell className="font-medium">RM {invoice.total.toLocaleString()}</TableCell>
-                      <TableCell>
-                        <Badge className={statusConfig[invoice.status].color}>
-                          <StatusIcon className="h-3 w-3 mr-1" />
+                        <p className="truncate text-sm text-muted-foreground">{invoice.client}</p>
+                        <p className="font-medium tabular-nums text-foreground">
+                          RM {invoice.total.toLocaleString()}
+                        </p>
+                        <Badge className={cn('w-fit', statusConfig[invoice.status].color)}>
+                          <StatusIcon className="mr-1 h-3 w-3" />
                           {statusConfig[invoice.status].label}
                         </Badge>
-                      </TableCell>
-                      <TableCell className="hidden sm:table-cell text-muted-foreground">
-                        {new Date(invoice.dueDate).toLocaleDateString()}
-                      </TableCell>
-                      <TableCell>
-                        <DropdownMenu>
-                          <DropdownMenuTrigger asChild>
-                            <Button variant="ghost" size="icon">
-                              <MoreHorizontal className="h-4 w-4" />
-                            </Button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end">
-                            {hasAccountingIntegration && (
-                              <DropdownMenuItem onClick={() => setViewInvoice(invoice)}>
-                                <Eye className="h-4 w-4 mr-2" />
-                                Preview Invoice
-                              </DropdownMenuItem>
-                            )}
-                            {hasAccountingIntegration && paymentForInvoice(invoice.id) && (
-                              <DropdownMenuItem onClick={() => setViewPayment(paymentForInvoice(invoice.id) || null)}>
-                                <Receipt className="h-4 w-4 mr-2" />
-                                Preview Payment
-                              </DropdownMenuItem>
-                            )}
-                            {hasAccountingIntegration && <DropdownMenuSeparator />}
-                            {invoice.status === 'overdue' && (
-                              <DropdownMenuItem onClick={() => handleOpenMarkAsPaid(invoice)}>
-                                <CheckCircle2 className="h-4 w-4 mr-2" />
-                                Mark as Paid
-                              </DropdownMenuItem>
-                            )}
-                            {invoice.status === 'paid' && (
-                              <DropdownMenuItem onClick={() => handleVoidPayment(invoice)}>
-                                <XCircle className="h-4 w-4 mr-2" />
-                                Void Payment
-                              </DropdownMenuItem>
-                            )}
-                            <DropdownMenuItem onClick={() => setEditInvoice(invoice)}>
-                              <Edit className="h-4 w-4 mr-2" />
-                              Edit
-                            </DropdownMenuItem>
-                            {invoice.status !== 'paid' && (
-                              <>
-                                <DropdownMenuSeparator />
-                                <DropdownMenuItem className="text-destructive" onClick={() => setDeleteInvoice(invoice)}>
-                                  <Trash2 className="h-4 w-4 mr-2" />
-                                  Delete
-                                </DropdownMenuItem>
-                              </>
-                            )}
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                      </TableCell>
-                    </TableRow>
+                      </div>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="icon"
+                            className="h-9 w-9 shrink-0"
+                            aria-label="Open actions menu"
+                          >
+                            <MoreHorizontal className="h-4 w-4" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end" className="w-52">
+                          {renderInvoiceActionMenuItems(invoice)}
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </div>
                   )
                 })}
-              </TableBody>
-            </Table>
-          </div>
+              </div>
+
+              <div className="hidden overflow-hidden rounded-lg border md:block">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="w-12">
+                        <Checkbox
+                          checked={selectedInvoices.length === filteredInvoices.length && filteredInvoices.length > 0}
+                          onCheckedChange={handleSelectAll}
+                        />
+                      </TableHead>
+                      <TableHead>
+                        <Button variant="ghost" size="sm" className="h-auto p-0 font-medium">
+                          Invoice
+                          <ArrowUpDown className="h-3 w-3 ml-1" />
+                        </Button>
+                      </TableHead>
+                      <TableHead className="hidden md:table-cell">Client</TableHead>
+                      <TableHead className="hidden lg:table-cell">Property</TableHead>
+                      <TableHead>Amount</TableHead>
+                      <TableHead>Status</TableHead>
+                      <TableHead className="hidden sm:table-cell">Due Date</TableHead>
+                      <TableHead className="w-[100px] text-right">Actions</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {filteredInvoices.map((invoice) => {
+                      const StatusIcon = statusConfig[invoice.status].icon
+                      return (
+                        <TableRow key={invoice.id}>
+                          <TableCell>
+                            <Checkbox
+                              checked={selectedInvoices.includes(invoice.id)}
+                              onCheckedChange={(checked) => handleSelectInvoice(invoice.id, !!checked)}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                hasAccountingIntegration ? setViewInvoice(invoice) : setEditInvoice(invoice)
+                              }
+                              className={
+                                hasAccountingIntegration
+                                  ? 'font-medium text-primary hover:underline'
+                                  : 'font-medium text-foreground hover:underline'
+                              }
+                            >
+                              {invoice.invoiceNo}
+                            </button>
+                          </TableCell>
+                          <TableCell className="hidden md:table-cell">{invoice.client}</TableCell>
+                          <TableCell
+                            className="hidden max-w-[220px] truncate align-top lg:table-cell"
+                            title={invoice.property}
+                          >
+                            {invoice.property}
+                          </TableCell>
+                          <TableCell className="font-medium">RM {invoice.total.toLocaleString()}</TableCell>
+                          <TableCell>
+                            <Badge className={statusConfig[invoice.status].color}>
+                              <StatusIcon className="mr-1 h-3 w-3" />
+                              {statusConfig[invoice.status].label}
+                            </Badge>
+                          </TableCell>
+                          <TableCell className="hidden text-muted-foreground sm:table-cell">
+                            {new Date(invoice.dueDate).toLocaleDateString()}
+                          </TableCell>
+                          <TableCell className="text-right">
+                            <DropdownMenu>
+                              <DropdownMenuTrigger asChild>
+                                <Button variant="outline" size="sm" className="h-8 gap-1 px-2">
+                                  <MoreHorizontal className="h-4 w-4" />
+                                  <span className="sr-only sm:not-sr-only">Actions</span>
+                                </Button>
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent align="end" className="w-52">
+                                {renderInvoiceActionMenuItems(invoice)}
+                              </DropdownMenuContent>
+                            </DropdownMenu>
+                          </TableCell>
+                        </TableRow>
+                      )
+                    })}
+                  </TableBody>
+                </Table>
+              </div>
+            </>
+          )}
         </CardContent>
       </Card>
 
@@ -1610,7 +2273,7 @@ export default function InvoicesPage() {
                   </div>
                 )}
 
-                {viewInvoice.status === 'overdue' && (
+                {(viewInvoice.status === 'pending' || viewInvoice.status === 'overdue') && (
                   <Button className="w-full">
                     <Mail className="h-4 w-4 mr-2" />
                     Send Payment Reminder
@@ -1622,12 +2285,28 @@ export default function InvoicesPage() {
         </SheetContent>
       </Sheet>
 
-      <Dialog open={!!markAsPaidInvoice} onOpenChange={(open) => !open && setMarkAsPaidInvoice(null)}>
+      <Dialog
+        open={Boolean(markAsPaidInvoice) || Boolean(bulkMarkList?.length)}
+        onOpenChange={(open) => {
+          if (!open) {
+            setMarkAsPaidInvoice(null)
+            setBulkMarkList(null)
+          }
+        }}
+      >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Mark as Paid</DialogTitle>
+            <DialogTitle>
+              {bulkMarkList && bulkMarkList.length > 1
+                ? `Mark ${bulkMarkList.length} invoices as paid`
+                : 'Mark as paid'}
+            </DialogTitle>
             <DialogDescription>
-              {markAsPaidInvoice ? `Record payment for ${markAsPaidInvoice.invoiceNo}` : 'Record payment details'}
+              {bulkMarkList && bulkMarkList.length > 0
+                ? `Record the same payment method and date for ${bulkMarkList.length} unpaid invoice(s).`
+                : markAsPaidInvoice
+                  ? `Record payment for ${markAsPaidInvoice.invoiceNo}`
+                  : 'Record payment details'}
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-2">
@@ -1676,6 +2355,25 @@ export default function InvoicesPage() {
         </DialogContent>
       </Dialog>
 
+      <Dialog open={bulkDeleteOpen} onOpenChange={setBulkDeleteOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete selected invoices</DialogTitle>
+            <DialogDescription>
+              This will remove all unpaid invoices in the current selection. Paid rows are skipped.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setBulkDeleteOpen(false)}>
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={() => void handleConfirmBulkDelete()}>
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={!!viewPayment} onOpenChange={(open) => !open && setViewPayment(null)}>
         <DialogContent>
           <DialogHeader>
@@ -1715,6 +2413,17 @@ export default function InvoicesPage() {
               {viewPayment.voidedAt && (
                 <p className="text-sm text-muted-foreground">Voided at {new Date(viewPayment.voidedAt).toLocaleDateString()}</p>
               )}
+              {viewPayment.receiptUrl && /^https?:\/\//i.test(String(viewPayment.receiptUrl)) ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full"
+                  onClick={() => window.open(String(viewPayment.receiptUrl), '_blank', 'noopener,noreferrer')}
+                >
+                  <ExternalLink className="h-4 w-4 mr-2" />
+                  Open receipt URL
+                </Button>
+              ) : null}
             </div>
           )}
         </DialogContent>
@@ -1765,6 +2474,7 @@ export default function InvoicesPage() {
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="paid">Paid</SelectItem>
+                    <SelectItem value="pending">Pending</SelectItem>
                     <SelectItem value="overdue">Overdue</SelectItem>
                     <SelectItem value="cancelled">Cancelled</SelectItem>
                   </SelectContent>

@@ -1,6 +1,7 @@
 "use client"
 
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { useRouter } from 'next/navigation'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Input } from '@/components/ui/input'
@@ -13,9 +14,10 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { User, Mail, Phone, Lock, CreditCard, Camera, Upload, X, Eye, EyeOff } from 'lucide-react'
+import { User, Mail, Phone, Lock, CreditCard, Camera, Upload, X, Eye, EyeOff, ShieldCheck, BadgeCheck } from 'lucide-react'
 import { toast } from 'sonner'
 import { useAuth } from '@/lib/auth-context'
+import { cn } from '@/lib/utils'
 import {
   fetchEmployeeBanks,
   fetchEmployeeProfileByEmail,
@@ -23,20 +25,41 @@ import {
   uploadEmployeeFileToOss,
   requestPortalPasswordResetEmail,
   confirmPortalPasswordReset,
+  startPortalAliyunIdvEkyc,
+  fetchPortalAliyunIdvResult,
+  requestPortalEmailChangeOtp,
+  confirmPortalEmailChange,
 } from '@/lib/cleanlemon-api'
 
 type Props = {
   roleLabel: string
   backendProfile?: boolean
   localStorageKey?: string
+  /** Client/employee: confirm profile (portal self-verify gate). */
+  selfVerifyMode?: boolean
+}
+
+function isPassportRenewalWindow(expiryIso: string): boolean {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(expiryIso || '').trim())
+  if (!m) return false
+  const y = Number(m[1])
+  const mo = Number(m[2])
+  const d = Number(m[3])
+  const exp = new Date(y, mo - 1, d)
+  const now = new Date()
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const daysUntil = Math.floor((exp.getTime() - today.getTime()) / 86400000)
+  return daysUntil <= 30
 }
 
 export default function UnifiedProfilePage({
   roleLabel,
   backendProfile = false,
   localStorageKey,
+  selfVerifyMode = false,
 }: Props) {
-  const { user, updateUser } = useAuth()
+  const router = useRouter()
+  const { user, updateUser, logout } = useAuth()
   const email = String(user?.email || '').trim()
   const clientId = String(user?.operatorId || 'op_demo_001')
   const avatarInputRef = useRef<HTMLInputElement | null>(null)
@@ -53,6 +76,12 @@ export default function UnifiedProfilePage({
   const [bankId, setBankId] = useState('')
   const [bankAccNo, setBankAccNo] = useState('')
   const [bankHolder, setBankHolder] = useState('')
+  const [profileSelfVerifiedAt, setProfileSelfVerifiedAt] = useState('')
+  const [profileIdentityVerified, setProfileIdentityVerified] = useState(false)
+  const [passportExpiryDate, setPassportExpiryDate] = useState('')
+  const [aliyunEkycVerified, setAliyunEkycVerified] = useState(false)
+  const [aliyunEkycStarting, setAliyunEkycStarting] = useState(false)
+  const [govDialogOpen, setGovDialogOpen] = useState(false)
   const [nricFront, setNricFront] = useState<string | null>(null)
   const [nricBack, setNricBack] = useState<string | null>(null)
   const [nricFrontUrl, setNricFrontUrl] = useState<string | null>(null)
@@ -75,15 +104,110 @@ export default function UnifiedProfilePage({
   const [showPwdNew, setShowPwdNew] = useState(false)
   const [showPwdConfirm, setShowPwdConfirm] = useState(false)
 
+  const [emailChangeOpen, setEmailChangeOpen] = useState(false)
+  const [emailNew, setEmailNew] = useState('')
+  const [emailCode, setEmailCode] = useState('')
+  const [emailStep, setEmailStep] = useState<'enter' | 'code'>('enter')
+  const [emailBusy, setEmailBusy] = useState(false)
+
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const saveStateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastSavedPayloadRef = useRef<string>('')
   const didInitSnapshotRef = useRef(false)
+  const prevSelfVerifyVerifiedForUiRef = useRef<boolean | null>(null)
 
   const displayNameForCard = useMemo(
     () => String(nickname || legalName || fullName || 'User').trim() || 'User',
     [nickname, legalName, fullName]
   )
+
+  const idTypeU = useMemo(() => String(idType || '').toUpperCase(), [idType])
+
+  const roleNorm = String(roleLabel || '')
+    .trim()
+    .toLowerCase()
+
+  /** Employee/Client + API profile: always show Verify (covers stale builds where selfVerifyMode was omitted). */
+  const selfVerifyActive = useMemo(
+    () =>
+      !!backendProfile &&
+      (selfVerifyMode || roleNorm === 'employee' || roleNorm === 'client'),
+    [backendProfile, selfVerifyMode, roleNorm]
+  )
+
+  useEffect(() => {
+    if (!selfVerifyActive || typeof window === 'undefined') return
+    const sp = new URLSearchParams(window.location.search)
+    const ekyc = sp.get('ekyc')
+    const cleanPath = window.location.pathname
+    if (ekyc !== '1') return
+    const tid = sessionStorage.getItem('aliyun_ekyc_tid')
+    if (!tid) {
+      router.replace(cleanPath, { scroll: false })
+      return
+    }
+    void (async () => {
+      const r = await fetchPortalAliyunIdvResult(tid)
+      if (r.ok && r.passed) {
+        sessionStorage.removeItem('aliyun_ekyc_tid')
+        setAliyunEkycVerified(true)
+        const pr = await fetchEmployeeProfileByEmail(email, clientId)
+        if (pr?.ok && pr.profile) {
+          const p = pr.profile as Record<string, unknown>
+          setFullName(String(p.fullName || ''))
+          setLegalName(String(p.legalName || ''))
+          setNickname(String(p.nickname || ''))
+          setPhone(String(p.phone || ''))
+          setAddress(String(p.address || ''))
+          setEntityType(String(p.entityType || 'MALAYSIAN_INDIVIDUAL'))
+          setIdType(String(p.idType || 'NRIC'))
+          setIdNumber(String(p.idNumber || ''))
+          setTaxNo(String(p.taxIdNo || ''))
+          setBankId(String(p.bankId || ''))
+          setBankAccNo(String(p.bankAccountNo || ''))
+          setBankHolder(String(p.bankAccountHolder || ''))
+          setPassportExpiryDate(String(p.passportExpiryDate || '').trim())
+          setProfileSelfVerifiedAt(String(p.profileSelfVerifiedAt || '').trim())
+          if (p.avatarUrl) {
+            setAvatarPreview(String(p.avatarUrl))
+            setAvatarUrl(String(p.avatarUrl))
+            updateUser({ avatar: String(p.avatarUrl) })
+          }
+          if (p.nricFrontUrl) {
+            setNricFront(String(p.nricFrontUrl))
+            setNricFrontUrl(String(p.nricFrontUrl))
+          }
+          if (p.nricBackUrl) {
+            setNricBack(String(p.nricBackUrl))
+            setNricBackUrl(String(p.nricBackUrl))
+          }
+          setAliyunEkycVerified(!!p.aliyunEkycLocked)
+          setProfileIdentityVerified(!!(p as { profileIdentityVerified?: boolean }).profileIdentityVerified)
+        }
+        if (r.profileApplied === false && r.profileReason === 'GOV_ID_ALREADY_LINKED') {
+          toast.warning('Verified, but name and ID were not saved — a government login is already linked.')
+        } else if (
+          r.profileApplied === false &&
+          r.profileReason === 'NATIONAL_ID_ALREADY_BOUND' &&
+          r.profileBoundEmail
+        ) {
+          toast.error(
+            `National ID already verified on ${r.profileBoundEmail}. Sign in with that email or contact support.`,
+          )
+        } else if (r.profileApplied === false && r.profileReason === 'EKYC_OCR_INCOMPLETE') {
+          toast.warning('Verified, but name/ID could not be saved automatically. Contact support if needed.')
+        }
+        toast.success('Identity verification completed')
+      } else if (r.ok && r.passed === false) {
+        toast.error(
+          r.subCode ? `Verification did not pass (${r.subCode})` : 'Verification not completed — try again',
+        )
+      } else {
+        toast.error(r.reason || 'Could not load verification result')
+      }
+    })()
+    router.replace(cleanPath, { scroll: false })
+  }, [selfVerifyActive, router, email, clientId, updateUser])
 
   const idLabels = useMemo(() => {
     if (idType === 'PASSPORT') {
@@ -194,6 +318,10 @@ export default function UnifiedProfilePage({
           setNricBack(String(p.nricBackUrl))
           setNricBackUrl(String(p.nricBackUrl))
         }
+        setProfileSelfVerifiedAt(String(p.profileSelfVerifiedAt || '').trim())
+        setAliyunEkycVerified(!!(p as { aliyunEkycLocked?: boolean }).aliyunEkycLocked)
+        setProfileIdentityVerified(!!(p as { profileIdentityVerified?: boolean }).profileIdentityVerified)
+        setPassportExpiryDate(String((p as { passportExpiryDate?: string }).passportExpiryDate || '').trim())
       }
       setIsInitializing(false)
     })()
@@ -392,6 +520,72 @@ export default function UnifiedProfilePage({
     }
   }
 
+  const openEmailChangeDialog = () => {
+    setEmailNew('')
+    setEmailCode('')
+    setEmailStep('enter')
+    setEmailChangeOpen(true)
+  }
+
+  const sendEmailChangeOtp = async () => {
+    const ne = emailNew.trim().toLowerCase()
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(ne)) {
+      toast.error('Enter a valid email address')
+      return
+    }
+    setEmailBusy(true)
+    try {
+      const r = await requestPortalEmailChangeOtp(ne)
+      if (!r.ok) {
+        const msg =
+          r.reason === 'EMAIL_TAKEN'
+            ? 'That email is already registered to another account. Use a new email address.'
+            : r.reason === 'SAME_EMAIL'
+              ? 'New email must differ from your current login'
+              : r.reason === 'MIGRATION_REQUIRED'
+                ? 'Email change is not available yet — contact support'
+                : r.reason || 'Failed to send code'
+        toast.error(msg)
+        return
+      }
+      setEmailStep('code')
+      toast.success('Verification code sent to the new email address')
+    } finally {
+      setEmailBusy(false)
+    }
+  }
+
+  const submitEmailChange = async () => {
+    const ne = emailNew.trim().toLowerCase()
+    const c = emailCode.trim()
+    if (!c) {
+      toast.error('Enter the verification code')
+      return
+    }
+    setEmailBusy(true)
+    try {
+      const r = await confirmPortalEmailChange({ newEmail: ne, code: c })
+      if (!r.ok) {
+        const failMsg =
+          r.reason === 'INVALID_OR_EXPIRED_CODE'
+            ? 'Invalid or expired code'
+            : r.reason === 'EMAIL_TAKEN'
+              ? 'That email is already registered to another account. Use a new email address.'
+              : r.reason || 'Failed'
+        toast.error(failMsg)
+        return
+      }
+      toast.success('Email updated — signing you out')
+      setEmailChangeOpen(false)
+      logout()
+      if (typeof window !== 'undefined') {
+        window.location.href = `${window.location.origin}/login`
+      }
+    } finally {
+      setEmailBusy(false)
+    }
+  }
+
   const openPasswordDialog = () => {
     setPwdDialogOpen(true)
     setPwdCodeSent(false)
@@ -461,6 +655,134 @@ export default function UnifiedProfilePage({
 
   const securityTitle = hasPassword ? 'Change password' : 'Create password'
 
+  async function loadAliyunVerifyScript(): Promise<void> {
+    if (typeof window === 'undefined') return
+    const w = window as unknown as { getMetaInfo?: () => string }
+    if (typeof w.getMetaInfo === 'function') return
+    const src =
+      process.env.NEXT_PUBLIC_ALIYUN_IDV_VERIFY_JS_URL || 'https://hkwebcdn.yuncloudauth.com/cdn/verify.js'
+    await new Promise<void>((resolve, reject) => {
+      const existing = document.querySelector(`script[data-aliyun-verify="1"]`)
+      if (existing) {
+        existing.addEventListener('load', () => resolve(), { once: true })
+        existing.addEventListener('error', () => reject(new Error('verify.js load failed')), { once: true })
+        return
+      }
+      const s = document.createElement('script')
+      s.src = src
+      s.async = true
+      s.dataset.aliyunVerify = '1'
+      s.onload = () => resolve()
+      s.onerror = () => reject(new Error('verify.js load failed'))
+      document.head.appendChild(s)
+    })
+  }
+
+  const passportRenewalEligible =
+    selfVerifyActive &&
+    aliyunEkycVerified &&
+    idTypeU === 'PASSPORT' &&
+    isPassportRenewalWindow(passportExpiryDate)
+
+  const selfVerifyVerifiedForUi =
+    selfVerifyActive &&
+    (profileSelfVerifiedAt.trim() !== '' || aliyunEkycVerified || profileIdentityVerified)
+
+  const selfVerifyAliyunDone = selfVerifyActive && aliyunEkycVerified
+  const disableVerificationDialogMyKad = !backendProfile || aliyunEkycStarting || selfVerifyAliyunDone
+  const disableVerificationDialogPassport =
+    !backendProfile || aliyunEkycStarting || (selfVerifyAliyunDone && !passportRenewalEligible)
+
+  const startAliyunEkycFlow = async (docType: 'MYS01001' | 'GLB03002') => {
+    if (!backendProfile) return
+    setAliyunEkycStarting(true)
+    try {
+      await loadAliyunVerifyScript()
+      const getMetaInfo = (window as unknown as { getMetaInfo?: () => string }).getMetaInfo
+      if (typeof getMetaInfo !== 'function') {
+        toast.error('Verification script not ready — refresh and try again')
+        return
+      }
+      const rawMeta = getMetaInfo()
+      const metaInfo = typeof rawMeta === 'string' ? rawMeta : JSON.stringify(rawMeta)
+      const returnPath =
+        typeof window !== 'undefined'
+          ? (() => {
+              const u = new URL(window.location.href)
+              u.searchParams.set('ekyc', '1')
+              return `${u.pathname}${u.search}`
+            })()
+          : '/portal/client/profile'
+      const out = await startPortalAliyunIdvEkyc({
+        metaInfo,
+        docType,
+        returnPath,
+      })
+      if (!out.ok || !out.transactionUrl || !out.transactionId) {
+        toast.error(
+          out.reason === 'ALIYUN_IDV_NOT_CONFIGURED'
+            ? 'Identity verification isn’t enabled on this API (Alibaba Cloud keys missing in the server .env). Add them and restart the API, or use the live portal.'
+            : out.reason || 'Could not start verification',
+        )
+        return
+      }
+      sessionStorage.setItem('aliyun_ekyc_tid', out.transactionId)
+      setGovDialogOpen(false)
+      window.location.href = out.transactionUrl
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Verification start failed')
+    } finally {
+      setAliyunEkycStarting(false)
+    }
+  }
+
+  const selfVerifyDialogMandatory = selfVerifyActive && !selfVerifyVerifiedForUi
+
+  useEffect(() => {
+    if (isInitializing) return
+    if (!selfVerifyActive) return
+    if (!selfVerifyVerifiedForUi) setGovDialogOpen(true)
+  }, [isInitializing, selfVerifyActive, selfVerifyVerifiedForUi])
+
+  useEffect(() => {
+    if (!selfVerifyActive) {
+      prevSelfVerifyVerifiedForUiRef.current = null
+      return
+    }
+    const wasUnverified = prevSelfVerifyVerifiedForUiRef.current === false
+    if (selfVerifyVerifiedForUi && wasUnverified) {
+      setGovDialogOpen(false)
+    }
+    prevSelfVerifyVerifiedForUiRef.current = selfVerifyVerifiedForUi
+  }, [selfVerifyActive, selfVerifyVerifiedForUi])
+
+  useEffect(() => {
+    if (!selfVerifyActive || typeof window === 'undefined') return
+    const onPageShow = (e: PageTransitionEvent) => {
+      if (!e.persisted) return
+      const em = String(email || '').trim()
+      if (!em) return
+      void (async () => {
+        const result = await fetchEmployeeProfileByEmail(em, clientId)
+        if (!result?.ok || !result.profile) {
+          setGovDialogOpen(true)
+          return
+        }
+        const p = result.profile as Record<string, unknown>
+        const psva = String(p.profileSelfVerifiedAt || '').trim()
+        const ekycLock = !!(p as { aliyunEkycLocked?: boolean }).aliyunEkycLocked
+        const piv = !!(p as { profileIdentityVerified?: boolean }).profileIdentityVerified
+        setProfileSelfVerifiedAt(psva)
+        setAliyunEkycVerified(ekycLock)
+        setProfileIdentityVerified(piv)
+        setPassportExpiryDate(String((p as { passportExpiryDate?: string }).passportExpiryDate || '').trim())
+        if (psva === '' && !ekycLock && !piv) setGovDialogOpen(true)
+      })()
+    }
+    window.addEventListener('pageshow', onPageShow)
+    return () => window.removeEventListener('pageshow', onPageShow)
+  }, [selfVerifyActive, email, clientId])
+
   return (
     <div className="p-4 sm:p-8 max-w-4xl mx-auto">
       <div className="mb-8">
@@ -482,7 +804,18 @@ export default function UnifiedProfilePage({
             )}
           </div>
           <div className="text-center">
-            <div className="font-black text-foreground text-lg">{displayNameForCard}</div>
+            <div className="font-black text-foreground text-lg inline-flex items-center justify-center gap-1.5 flex-wrap">
+              <span>{displayNameForCard}</span>
+              {selfVerifyActive && selfVerifyVerifiedForUi ? (
+                <span
+                  className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-[#1877F2] text-white shadow-sm"
+                  title="Verified"
+                  aria-label="Verified"
+                >
+                  <BadgeCheck className="h-4 w-4" strokeWidth={2.5} />
+                </span>
+              ) : null}
+            </div>
             <div className="text-sm text-muted-foreground">{roleLabel}</div>
           </div>
           <button
@@ -519,10 +852,53 @@ export default function UnifiedProfilePage({
 
         <div className="lg:col-span-2 flex flex-col gap-5">
           <div className="bg-card border border-border rounded-2xl p-6">
-            <div className="flex items-center gap-2 mb-5">
-              <User size={16} style={{ color: 'var(--brand)' }} />
-              <h2 className="font-bold text-foreground">Personal Information</h2>
+            <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between mb-3">
+              <div className="flex items-center gap-2 min-w-0 shrink">
+                <User size={16} style={{ color: 'var(--brand)' }} />
+                <h2 className="font-bold text-foreground">Personal Information</h2>
+              </div>
+              {selfVerifyActive ? (
+                <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto sm:justify-end sm:shrink-0">
+                  {aliyunEkycVerified ? (
+                    <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 text-primary px-2.5 py-1 text-xs font-semibold">
+                      <ShieldCheck className="h-3.5 w-3.5" />
+                      eKYC (MyKad / passport)
+                    </span>
+                  ) : null}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={selfVerifyVerifiedForUi && !passportRenewalEligible}
+                    className={cn(
+                      'w-full sm:w-auto min-w-[14rem] px-8 py-2.5 text-sm font-semibold rounded-xl shrink-0',
+                      selfVerifyVerifiedForUi &&
+                        'border-green-600 bg-green-600 text-white hover:bg-green-600 hover:text-white disabled:opacity-100 disabled:border-green-600 disabled:bg-green-600',
+                    )}
+                    onClick={() => setGovDialogOpen(true)}
+                  >
+                    {passportRenewalEligible
+                      ? 'Re-verify passport'
+                      : selfVerifyVerifiedForUi
+                        ? 'Verified'
+                        : 'Verify'}
+                  </Button>
+                </div>
+              ) : null}
             </div>
+            {selfVerifyActive && !selfVerifyVerifiedForUi ? (
+              <div className="mb-5 flex flex-col gap-3 rounded-xl border border-primary/35 bg-primary/5 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+                <p className="text-sm font-medium text-foreground">
+                  Complete identity verification (MyKad or passport). Required for Employee and Client portal access.
+                </p>
+                <Button
+                  type="button"
+                  className="h-11 w-full min-w-[12rem] shrink-0 px-8 text-base font-semibold sm:w-auto"
+                  onClick={() => setGovDialogOpen(true)}
+                >
+                  Verify identity
+                </Button>
+              </div>
+            ) : null}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <Label className="text-[10px] font-semibold tracking-[0.2em] uppercase text-muted-foreground mb-1.5 block">
@@ -579,6 +955,15 @@ export default function UnifiedProfilePage({
                   Email Address
                 </Label>
                 <input value={email} disabled className={`${inputCls} opacity-80 cursor-not-allowed`} />
+                {backendProfile ? (
+                  <button
+                    type="button"
+                    className="text-xs font-semibold text-primary hover:underline mt-1.5 block text-left"
+                    onClick={openEmailChangeDialog}
+                  >
+                    change email address
+                  </button>
+                ) : null}
               </div>
               <div>
                 <Label className="text-[10px] font-semibold tracking-[0.2em] uppercase text-muted-foreground mb-1.5 block">
@@ -745,6 +1130,134 @@ export default function UnifiedProfilePage({
           </div>
         </div>
       </div>
+
+      <Dialog
+        open={govDialogOpen}
+        onOpenChange={(open) => {
+          if (!open && selfVerifyDialogMandatory) return
+          setGovDialogOpen(open)
+        }}
+      >
+        <DialogContent
+          className="sm:max-w-lg"
+          showCloseButton={!selfVerifyDialogMandatory}
+          onPointerDownOutside={(e) => {
+            if (selfVerifyDialogMandatory) e.preventDefault()
+          }}
+          onInteractOutside={(e) => {
+            if (selfVerifyDialogMandatory) e.preventDefault()
+          }}
+          onEscapeKeyDown={(e) => {
+            if (selfVerifyDialogMandatory) e.preventDefault()
+          }}
+        >
+          <DialogHeader>
+            <DialogTitle>Identity verification</DialogTitle>
+            <DialogDescription className="sr-only">Choose MyKad or passport.</DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-3 py-2">
+            <p className="text-sm text-muted-foreground">
+              Choose Malaysian MyKad (NRIC) or passport. After verification you can finish your profile here.
+            </p>
+            <Button
+              type="button"
+              variant="outline"
+              className="w-full justify-center"
+              disabled={disableVerificationDialogMyKad}
+              onClick={() => void startAliyunEkycFlow('MYS01001')}
+            >
+              {aliyunEkycStarting ? 'Starting…' : 'Verification by Malaysian MyKad (NRIC)'}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              className="w-full justify-center"
+              disabled={disableVerificationDialogPassport}
+              onClick={() => void startAliyunEkycFlow('GLB03002')}
+            >
+              {aliyunEkycStarting ? 'Starting…' : 'Verification by passport'}
+            </Button>
+            {passportRenewalEligible ? (
+              <p className="text-xs text-center text-muted-foreground">
+                Passport expires within one month — you can re-verify with a new document above.
+              </p>
+            ) : null}
+          </div>
+          {!selfVerifyDialogMandatory ? (
+            <DialogFooter>
+              <Button type="button" variant="secondary" onClick={() => setGovDialogOpen(false)}>
+                Close
+              </Button>
+            </DialogFooter>
+          ) : null}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={emailChangeOpen}
+        onOpenChange={(o) => {
+          setEmailChangeOpen(o)
+          if (!o) {
+            setEmailStep('enter')
+            setEmailNew('')
+            setEmailCode('')
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Change email address</DialogTitle>
+            <DialogDescription>
+              {emailStep === 'enter'
+                ? 'Enter your new email. We will send a verification code to that address.'
+                : `Enter the code sent to ${emailNew.trim().toLowerCase()}.`}
+            </DialogDescription>
+          </DialogHeader>
+          {emailStep === 'enter' ? (
+            <div className="space-y-3 py-2">
+              <div>
+                <Label className="text-xs uppercase text-muted-foreground">New email</Label>
+                <Input
+                  className="mt-1"
+                  type="email"
+                  autoComplete="email"
+                  value={emailNew}
+                  onChange={(e) => setEmailNew(e.target.value)}
+                  placeholder="you@example.com"
+                />
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-3 py-2">
+              <div>
+                <Label className="text-xs uppercase text-muted-foreground">Verification code</Label>
+                <Input
+                  className="mt-1"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  placeholder="6-digit code"
+                  value={emailCode}
+                  onChange={(e) => setEmailCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                />
+              </div>
+            </div>
+          )}
+          <DialogFooter className="gap-2 sm:gap-0">
+            <Button type="button" variant="ghost" onClick={() => setEmailChangeOpen(false)}>
+              Cancel
+            </Button>
+            {emailStep === 'enter' ? (
+              <Button type="button" disabled={emailBusy} onClick={() => void sendEmailChangeOtp()}>
+                {emailBusy ? 'Sending...' : 'Send verification code'}
+              </Button>
+            ) : (
+              <Button type="button" disabled={emailBusy} onClick={() => void submitEmailChange()}>
+                {emailBusy ? 'Submitting...' : 'Submit'}
+              </Button>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={pwdDialogOpen} onOpenChange={setPwdDialogOpen}>
         <DialogContent className="sm:max-w-md">

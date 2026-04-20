@@ -1,6 +1,71 @@
 'use client'
 
 import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+
+/** Match Coliving `operator/property` security systems (icare … css). */
+const SECURITY_SYSTEM_IDS = ['icare', 'ecommunity', 'veemios', 'gprop', 'css'] as const
+type SecuritySystemIdOption = (typeof SECURITY_SYSTEM_IDS)[number]
+
+function parseSecuritySystemFromDb(raw: string | undefined | null): SecuritySystemIdOption {
+  const s = String(raw || '')
+    .trim()
+    .toLowerCase()
+  return (SECURITY_SYSTEM_IDS as readonly string[]).includes(s) ? (s as SecuritySystemIdOption) : 'icare'
+}
+
+function isCompleteSecurityCredentials(
+  system: SecuritySystemIdOption,
+  cred: Record<string, unknown> | null | undefined
+): boolean {
+  if (!cred || typeof cred !== 'object') return false
+  switch (system) {
+    case 'icare':
+      return !!(
+        String(cred.phoneNumber || '').trim() &&
+        String(cred.dateOfBirth || '').trim() &&
+        String(cred.password || '')
+      )
+    case 'ecommunity':
+      return !!(
+        String(cred.username || (cred as { user?: string }).user || '').trim() &&
+        String(cred.password || '')
+      )
+    case 'veemios':
+    case 'gprop':
+      return !!(
+        String(cred.userId || (cred as { user_id?: string }).user_id || '').trim() &&
+        String(cred.password || '')
+      )
+    case 'css':
+      return !!(
+        String(cred.loginCode || (cred as { login_code?: string }).login_code || '').trim() &&
+        String(cred.password || '')
+      )
+    default:
+      return false
+  }
+}
+
+function formatSecuritySystemSummary(
+  system: SecuritySystemIdOption,
+  cred: Record<string, unknown> | null
+): string | null {
+  if (!cred || !isCompleteSecurityCredentials(system, cred)) return null
+  const pwPlain = String(cred.password || '').trim()
+  switch (system) {
+    case 'icare':
+      return `Phone: ${String(cred.phoneNumber)} · DOB: ${String(cred.dateOfBirth)} · Password: ${pwPlain}`
+    case 'ecommunity':
+      return `User: ${String(cred.username || (cred as { user?: string }).user || '')} · Password: ${pwPlain}`
+    case 'veemios':
+    case 'gprop':
+      return `User ID: ${String(cred.userId || (cred as { user_id?: string }).user_id || '')} · Password: ${pwPlain}`
+    case 'css':
+      return `Login code: ${String(cred.loginCode || (cred as { login_code?: string }).login_code || '')} · Password: ${pwPlain}`
+    default:
+      return null
+  }
+}
 import { useAuth } from '@/lib/auth-context'
 import {
   createOperatorProperty,
@@ -63,7 +128,6 @@ import { toast } from 'sonner'
 import {
   Building2,
   MapPin,
-  Eye,
   Plus,
   Upload,
   Copy,
@@ -75,6 +139,9 @@ import {
   ChevronDown,
   ChevronRight,
   Users,
+  Pencil,
+  Search,
+  MoreHorizontal,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -175,6 +242,8 @@ type DetailFormState = {
   unitNumber: string
   securityUsername: string
   mailboxPassword: string
+  /** full_access | working_date_only | fixed_password */
+  operatorDoorAccessMode: string
   smartdoorPassword: string
   smartdoorPasswordEnabled: boolean
   smartdoorTokenEnabled: boolean
@@ -194,6 +263,15 @@ type DetailFormState = {
 
 function detailToForm(p: ClientPortalPropertyDetail): DetailFormState {
   const sdp = (p.smartdoorPassword || '').trim()
+  const modeRaw = String(p.operatorDoorAccessMode || '').trim().toLowerCase()
+  const operatorDoorAccessMode = [
+    'full_access',
+    'temporary_password_only',
+    'working_date_only',
+    'fixed_password',
+  ].includes(modeRaw)
+    ? modeRaw
+    : 'temporary_password_only'
   return {
     premisesType: String(p.premisesType || '').trim(),
     propertyName: String(p.name || '').trim(),
@@ -201,6 +279,7 @@ function detailToForm(p: ClientPortalPropertyDetail): DetailFormState {
     unitNumber: String(p.unitNumber || '').trim(),
     securityUsername: String(p.securityUsername || '').trim(),
     mailboxPassword: p.mailboxPassword || '',
+    operatorDoorAccessMode,
     smartdoorPassword: sdp,
     smartdoorPasswordEnabled: sdp.length > 0,
     smartdoorTokenEnabled: !!p.smartdoorTokenEnabled,
@@ -232,6 +311,7 @@ const ClientPropertiesPage = () => {
     unitNumber: '',
     securityUsername: '',
     mailboxPassword: '',
+    operatorDoorAccessMode: 'temporary_password_only',
     smartdoorPassword: '',
     smartdoorPasswordEnabled: false,
     smartdoorTokenEnabled: false,
@@ -248,6 +328,20 @@ const ClientPropertiesPage = () => {
     liftLevel: '',
     specialAreaCount: '',
   })
+  /** Coliving-style security credentials (mirrors `propertydetail.security_system_credentials_json`). */
+  const [persistedSecurityCredentials, setPersistedSecurityCredentials] = useState<Record<
+    string,
+    unknown
+  > | null>(null)
+  const [secCredModalOpen, setSecCredModalOpen] = useState(false)
+  const [secCredModalSaving, setSecCredModalSaving] = useState(false)
+  const [secCredModalSystem, setSecCredModalSystem] = useState<SecuritySystemIdOption>('icare')
+  const [secCredPhone, setSecCredPhone] = useState('')
+  const [secCredDob, setSecCredDob] = useState('')
+  const [secCredUser, setSecCredUser] = useState('')
+  const [secCredUserId, setSecCredUserId] = useState('')
+  const [secCredLoginCode, setSecCredLoginCode] = useState('')
+  const [secCredPassword, setSecCredPassword] = useState('')
   const [dbDistinctPropertyNames, setDbDistinctPropertyNames] = useState<string[]>([])
   const [apartmentPropertyNames, setApartmentPropertyNames] = useState<string[]>([])
   const [apartmentNamesStorageReady, setApartmentNamesStorageReady] = useState(false)
@@ -329,6 +423,10 @@ const ClientPropertiesPage = () => {
   const [inviteBusy, setInviteBusy] = useState(false)
   const [propertiesMainTab, setPropertiesMainTab] = useState<'groups' | 'properties'>('properties')
   const [propertyScopeFilter, setPropertyScopeFilter] = useState<'all' | 'mine' | 'shared'>('all')
+  /** Mobile list filters (desktop uses DataTable internal state). */
+  const [mobilePropSearch, setMobilePropSearch] = useState('')
+  const [mobilePropOperator, setMobilePropOperator] = useState('all')
+  const [mobilePropType, setMobilePropType] = useState('all')
   /** Group view: multi-select for bulk authorise operator. */
   const [selectedGroupIds, setSelectedGroupIds] = useState<Set<string>>(() => new Set())
   /** When set, bulk authorise / overwrite uses these property IDs (e.g. from selected groups). */
@@ -431,6 +529,44 @@ const ClientPropertiesPage = () => {
       .sort((a, b) => a.label.localeCompare(b.label))
   }, [properties])
 
+  const propertyTypeFilterOptions = useMemo(
+    () =>
+      [
+        { label: 'Residential', value: 'Residential' },
+        { label: 'Landed', value: 'Landed' },
+        { label: 'Apartment', value: 'Apartment' },
+        { label: 'Office', value: 'Office' },
+        { label: 'Commercial', value: 'Commercial' },
+        { label: 'Other', value: 'Other' },
+      ] as const,
+    []
+  )
+
+  const mobileFilteredProperties = useMemo(() => {
+    let rows = [...propertiesForTable]
+    const q = mobilePropSearch.trim().toLowerCase()
+    if (q) {
+      rows = rows.filter((row) =>
+        (['name', 'unitNumber', 'groupLabel', 'operator'] as const).some((key) =>
+          String(row[key]).toLowerCase().includes(q)
+        )
+      )
+    }
+    if (mobilePropOperator !== 'all') {
+      rows = rows.filter((row) => row.operatorFilterKey === mobilePropOperator)
+    }
+    if (mobilePropType !== 'all') {
+      rows = rows.filter((row) => row.type === mobilePropType)
+    }
+    rows.sort((a, b) => a.name.localeCompare(b.name))
+    return rows
+  }, [
+    propertiesForTable,
+    mobilePropSearch,
+    mobilePropOperator,
+    mobilePropType,
+  ])
+
   const columns: Column<ClientPropertyRow>[] = useMemo(
     () => [
       {
@@ -485,14 +621,7 @@ const ClientPropertiesPage = () => {
         label: 'Type',
         sortable: true,
         filterable: true,
-        filterOptions: [
-          { label: 'Residential', value: 'Residential' },
-          { label: 'Landed', value: 'Landed' },
-          { label: 'Apartment', value: 'Apartment' },
-          { label: 'Office', value: 'Office' },
-          { label: 'Commercial', value: 'Commercial' },
-          { label: 'Other', value: 'Other' },
-        ],
+        filterOptions: propertyTypeFilterOptions.map((o) => ({ label: o.label, value: o.value })),
         render: (value) => (
           <Badge
             variant="secondary"
@@ -522,14 +651,14 @@ const ClientPropertiesPage = () => {
         sortable: true,
       },
     ],
-    [operatorFilterOptions]
+    [operatorFilterOptions, propertyTypeFilterOptions]
   )
 
   const actions: Action<ClientPropertyRow>[] = useMemo(
     () => [
       {
-        label: 'View Details',
-        icon: <Eye className="h-4 w-4 mr-2" />,
+        label: 'Edit',
+        icon: <Pencil className="h-4 w-4 mr-2" />,
         onClick: (row) => setSelectedProperty(row),
       },
       {
@@ -692,6 +821,10 @@ const ClientPropertiesPage = () => {
         if (res?.ok && res.property) {
           setPropertyDetail(res.property)
           setDetailForm(detailToForm(res.property))
+          const cred = res.property.securitySystemCredentials
+          setPersistedSecurityCredentials(
+            cred && typeof cred === 'object' ? { ...(cred as Record<string, unknown>) } : null
+          )
         } else {
           toast.error(res?.reason || 'Could not load property')
           setPropertyDetail(null)
@@ -858,6 +991,8 @@ const ClientPropertiesPage = () => {
     setConnectPickId('')
     setConnectAckTtlock(false)
     setConnectOverwriteOpen(false)
+    setSecCredModalOpen(false)
+    setPersistedSecurityCredentials(null)
   }, [])
 
   const reloadPropertyList = useCallback(async () => {
@@ -882,6 +1017,139 @@ const ClientPropertiesPage = () => {
     if (!ga) return true
     return !!(ga.perm?.property?.edit ?? false)
   }, [propertyDetail])
+
+  /** Coliving-synced row (`client_portal_owned=0`): only photos + bed/room/bathroom counts. */
+  const isColivingImportedProperty = propertyDetail != null && propertyDetail.clientPortalOwned === false
+  const canEditAllCorePropertyFields = canEditPropertyFields && !isColivingImportedProperty
+  /** Green channel: smart door / operator door mode editable even for Coliving-synced units. */
+  const canEditOperatorDoorBlock = canEditPropertyFields
+
+  const securitySystemSummaryText = useMemo(() => {
+    const sys = parseSecuritySystemFromDb(detailForm.securitySystem)
+    return formatSecuritySystemSummary(sys, persistedSecurityCredentials)
+  }, [detailForm.securitySystem, persistedSecurityCredentials])
+
+  const openSecurityCredentialsModal = useCallback(() => {
+    if (propertyDetail?.clientPortalOwned === false) {
+      toast.error('This property is synced from Coliving. Change security in the operator property page.')
+      return
+    }
+    const sys = parseSecuritySystemFromDb(detailForm.securitySystem)
+    setSecCredModalSystem(sys)
+    const src = persistedSecurityCredentials
+    setSecCredPhone(
+      src && typeof src === 'object' ? String((src as { phoneNumber?: string }).phoneNumber || '') : ''
+    )
+    setSecCredDob(
+      src && typeof src === 'object' ? String((src as { dateOfBirth?: string }).dateOfBirth || '') : ''
+    )
+    setSecCredUser(
+      src && typeof src === 'object'
+        ? String((src as { username?: string }).username || (src as { user?: string }).user || '')
+        : ''
+    )
+    setSecCredUserId(
+      src && typeof src === 'object'
+        ? String((src as { userId?: string }).userId || (src as { user_id?: string }).user_id || '')
+        : ''
+    )
+    setSecCredLoginCode(
+      src && typeof src === 'object'
+        ? String((src as { loginCode?: string }).loginCode || (src as { login_code?: string }).login_code || '')
+        : ''
+    )
+    setSecCredPassword(
+      src && typeof src === 'object' && String((src as { password?: string }).password || '').trim()
+        ? String((src as { password?: string }).password)
+        : ''
+    )
+    setSecCredModalOpen(true)
+  }, [detailForm.securitySystem, persistedSecurityCredentials, propertyDetail?.clientPortalOwned])
+
+  const handleSecurityCredentialsModalSave = useCallback(async () => {
+    if (!selectedProperty?.id || !user?.email) return
+    if (!canEditPropertyFields) {
+      toast.error('You do not have permission to edit this property.')
+      return
+    }
+    if (propertyDetail?.clientPortalOwned === false) {
+      toast.error('Synced properties: edit security in the Coliving operator property page.')
+      return
+    }
+    const colivingPd = String(propertyDetail?.colivingPropertydetailId || '').trim()
+    if (!colivingPd) {
+      toast.error(
+        'Link this unit to a Coliving property first (Sync from Coliving). Security login details are stored on the Coliving property row.'
+      )
+      return
+    }
+    const sys = secCredModalSystem
+    const prevObj = persistedSecurityCredentials
+    const prevPw =
+      prevObj && typeof prevObj === 'object' && String((prevObj as { password?: string }).password || '').trim()
+        ? String((prevObj as { password?: string }).password)
+        : ''
+    const pw = secCredPassword.trim() !== '' ? secCredPassword.trim() : prevPw
+    let body: Record<string, unknown> = {}
+    if (sys === 'icare') {
+      body = { phoneNumber: secCredPhone.trim(), dateOfBirth: secCredDob.trim(), password: pw }
+    } else if (sys === 'ecommunity') {
+      body = { username: secCredUser.trim(), password: pw }
+    } else if (sys === 'veemios' || sys === 'gprop') {
+      body = { userId: secCredUserId.trim(), password: pw }
+    } else {
+      body = { loginCode: secCredLoginCode.trim(), password: pw }
+    }
+    if (!isCompleteSecurityCredentials(sys, body)) {
+      toast.error(
+        'Fill every field for this security system. Leave password empty only when keeping the existing password.'
+      )
+      return
+    }
+    setSecCredModalSaving(true)
+    try {
+      const res = await patchClientPortalProperty(
+        String(user.email).trim().toLowerCase(),
+        String(user.operatorId || '').trim(),
+        selectedProperty.id,
+        {
+          securitySystem: sys,
+          securitySystemCredentials: body,
+        }
+      )
+      if (!res?.ok || !res.property) {
+        toast.error(res?.reason || 'Save failed')
+        return
+      }
+      toast.success('Security system login details were saved.')
+      setPropertyDetail(res.property)
+      setDetailForm(detailToForm(res.property))
+      const c = res.property.securitySystemCredentials
+      setPersistedSecurityCredentials(
+        c && typeof c === 'object' ? { ...(c as Record<string, unknown>) } : null
+      )
+      setSecCredModalOpen(false)
+    } catch {
+      toast.error('Save failed')
+    } finally {
+      setSecCredModalSaving(false)
+    }
+  }, [
+    selectedProperty?.id,
+    user?.email,
+    user?.operatorId,
+    canEditPropertyFields,
+    propertyDetail?.clientPortalOwned,
+    propertyDetail?.colivingPropertydetailId,
+    secCredModalSystem,
+    secCredPhone,
+    secCredDob,
+    secCredUser,
+    secCredUserId,
+    secCredLoginCode,
+    secCredPassword,
+    persistedSecurityCredentials,
+  ])
 
   const addableForGroup = useMemo(() => {
     return properties.filter((row) => !(manageDetail?.properties || []).some((x) => x.id === row.id))
@@ -935,40 +1203,62 @@ const ClientPropertiesPage = () => {
     }
     setDetailSaving(true)
     try {
+      const importedRestricted = propertyDetail?.clientPortalOwned === false
+      const body = importedRestricted
+        ? {
+            afterCleanPhotoUrl: detailForm.afterCleanPhotoUrl,
+            keyPhotoUrl: detailForm.keyPhotoUrl,
+            bedCount: detailForm.bedCount,
+            roomCount: detailForm.roomCount,
+            bathroomCount: detailForm.bathroomCount,
+          }
+        : {
+            premisesType: detailForm.premisesType,
+            name: detailForm.propertyName,
+            address: detailForm.address,
+            unitNumber: detailForm.unitNumber,
+            securitySystem: detailForm.securitySystem,
+            securityUsername: detailForm.securityUsername,
+            mailboxPassword: detailForm.mailboxPassword,
+            operatorDoorAccessMode: detailForm.operatorDoorAccessMode,
+            smartdoorPassword: detailForm.smartdoorPasswordEnabled ? detailForm.smartdoorPassword : '',
+            smartdoorTokenEnabled: detailForm.smartdoorTokenEnabled,
+            afterCleanPhotoUrl: detailForm.afterCleanPhotoUrl,
+            keyPhotoUrl: detailForm.keyPhotoUrl,
+            bedCount: detailForm.bedCount,
+            roomCount: detailForm.roomCount,
+            bathroomCount: detailForm.bathroomCount,
+            kitchen: detailForm.kitchen,
+            livingRoom: detailForm.livingRoom,
+            balcony: detailForm.balcony,
+            staircase: detailForm.staircase,
+            specialAreaCount: detailForm.specialAreaCount,
+            liftLevel: detailForm.liftLevel || '',
+          }
       const res = await patchClientPortalProperty(
         String(user.email).trim().toLowerCase(),
         String(user.operatorId || '').trim(),
         selectedProperty.id,
-        {
-          premisesType: detailForm.premisesType,
-          name: detailForm.propertyName,
-          address: detailForm.address,
-          unitNumber: detailForm.unitNumber,
-          securitySystem: detailForm.securitySystem,
-          securityUsername: detailForm.securityUsername,
-          mailboxPassword: detailForm.mailboxPassword,
-          smartdoorPassword: detailForm.smartdoorPasswordEnabled ? detailForm.smartdoorPassword : '',
-          smartdoorTokenEnabled: detailForm.smartdoorTokenEnabled,
-          afterCleanPhotoUrl: detailForm.afterCleanPhotoUrl,
-          keyPhotoUrl: detailForm.keyPhotoUrl,
-          bedCount: detailForm.bedCount,
-          roomCount: detailForm.roomCount,
-          bathroomCount: detailForm.bathroomCount,
-          kitchen: detailForm.kitchen,
-          livingRoom: detailForm.livingRoom,
-          balcony: detailForm.balcony,
-          staircase: detailForm.staircase,
-          specialAreaCount: detailForm.specialAreaCount,
-          liftLevel: detailForm.liftLevel || '',
-        }
+        body
       )
       if (!res?.ok || !res.property) {
-        toast.error(res?.reason || 'Save failed')
+        const r = String(res?.reason || '')
+        const msg =
+          r === 'OPERATOR_DOOR_GATEWAY_REQUIRED'
+            ? 'Link the property smart door with a gateway first (full access / booking-day modes).'
+            : r === 'INVALID_OPERATOR_DOOR_ACCESS_MODE'
+              ? 'Invalid operator door mode.'
+              : r || 'Save failed'
+        toast.error(msg)
         return
       }
       toast.success('Saved')
       setPropertyDetail(res.property)
       setDetailForm(detailToForm(res.property))
+      const cred = res.property.securitySystemCredentials
+      setPersistedSecurityCredentials(
+        cred && typeof cred === 'object' ? { ...(cred as Record<string, unknown>) } : null
+      )
       await reloadPropertyList()
     } catch {
       toast.error('Save failed')
@@ -1131,7 +1421,7 @@ const ClientPropertiesPage = () => {
           setCleanlemonsOperator: {
             operatorId: connectPickId,
             authorizePropertyAndTtlock: true,
-            requestApproval: true,
+            requestApproval: false,
           },
         }
       )
@@ -1668,28 +1958,179 @@ const ClientPropertiesPage = () => {
                   </Select>
                 </div>
               </CardHeader>
-              <CardContent className="flex min-h-0 flex-1 flex-col px-6 pb-2 pt-0">
-                <DataTable
-                  data={propertiesForTable}
-                  columns={columns}
-                  actions={actions}
-                  onEditClick={(row) => setSelectedProperty(row)}
-                  searchKeys={['name', 'unitNumber', 'groupLabel', 'operator']}
-                  pageSize={10}
-                  fillContainer
-                  noHorizontalScroll
-                  emptyMessage={
-                    propertyScopeFilter === 'shared'
-                      ? 'No shared properties. When someone invites you to a group, their units appear here.'
-                      : propertyScopeFilter === 'mine'
-                        ? 'No properties registered to your account yet.'
-                        : 'No properties found. Add your first property or link Coliving to sync units.'
-                  }
-                  rowSelection={{
-                    selectedIds: selectedPropertyIds,
-                    onSelectionChange: setSelectedPropertyIds,
-                  }}
-                />
+              <CardContent className="flex min-h-0 flex-1 flex-col gap-0 px-4 pb-2 pt-0 sm:px-6">
+                {/* Mobile: schedule-style stacked rows (no table columns) */}
+                <div className="flex flex-col gap-3 md:hidden">
+                  <p className="text-xs text-muted-foreground">
+                    Tap a property to open details. Use the menu for copy ID.
+                  </p>
+                  <div className="relative">
+                    <Search className="pointer-events-none absolute left-3 top-1/2 z-10 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                    <Input
+                      placeholder="Search…"
+                      value={mobilePropSearch}
+                      onChange={(e) => setMobilePropSearch(e.target.value)}
+                      className="h-10 pl-9"
+                      aria-label="Search properties"
+                    />
+                  </div>
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <div className="space-y-1">
+                      <Label className="text-xs text-muted-foreground">Operator</Label>
+                      <Select value={mobilePropOperator} onValueChange={setMobilePropOperator}>
+                        <SelectTrigger className="h-9 w-full">
+                          <SelectValue placeholder="All operators" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="all">All operators</SelectItem>
+                          {operatorFilterOptions.map((o) => (
+                            <SelectItem key={o.value} value={o.value}>
+                              {o.label}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-1">
+                      <Label className="text-xs text-muted-foreground">Type</Label>
+                      <Select value={mobilePropType} onValueChange={setMobilePropType}>
+                        <SelectTrigger className="h-9 w-full">
+                          <SelectValue placeholder="All types" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="all">All types</SelectItem>
+                          {propertyTypeFilterOptions.map((o) => (
+                            <SelectItem key={o.value} value={o.value}>
+                              {o.label}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+                  <div className="rounded-md border border-border bg-card divide-y divide-border">
+                    {mobileFilteredProperties.length === 0 ? (
+                      <div className="px-3 py-10 text-center text-sm text-muted-foreground">
+                        {propertyScopeFilter === 'shared'
+                          ? 'No shared properties. When someone invites you to a group, their units appear here.'
+                          : propertyScopeFilter === 'mine'
+                            ? 'No properties registered to your account yet.'
+                            : 'No properties match your filters.'}
+                      </div>
+                    ) : (
+                      mobileFilteredProperties.map((row) => {
+                        const visibleActions = actions.filter((a) => !a.visible || a.visible(row))
+                        return (
+                          <div key={row.id} className="flex items-center gap-2 px-3 py-4">
+                            <div
+                              className="flex shrink-0 items-center self-center"
+                              onClick={(e) => e.stopPropagation()}
+                              onPointerDown={(e) => e.stopPropagation()}
+                            >
+                              <Checkbox
+                                checked={selectedPropertyIds.has(row.id)}
+                                onCheckedChange={(c) => {
+                                  const next = new Set(selectedPropertyIds)
+                                  if (c === true) next.add(row.id)
+                                  else next.delete(row.id)
+                                  setSelectedPropertyIds(next)
+                                }}
+                                aria-label="Select property"
+                              />
+                            </div>
+                            <button
+                              type="button"
+                              className="min-w-0 flex-1 space-y-1.5 text-left"
+                              onClick={() => setSelectedProperty(row)}
+                            >
+                              <div className="flex flex-wrap items-center gap-2">
+                                <h2 className="text-lg font-bold leading-snug text-foreground">{row.name}</h2>
+                                {row.portalAccess === 'shared' ? (
+                                  <Badge variant="secondary" className="shrink-0 text-[10px] font-normal">
+                                    Shared
+                                  </Badge>
+                                ) : null}
+                              </div>
+                              <p className="text-sm text-muted-foreground">
+                                Unit {row.unitNumber || '—'}
+                                {row.groupLabel && row.groupLabel !== '—' ? (
+                                  <span> · {row.groupLabel}</span>
+                                ) : null}
+                              </p>
+                              <p className="text-sm text-foreground">{row.operator}</p>
+                              <div className="flex flex-wrap items-center gap-2">
+                                <Badge
+                                  variant="secondary"
+                                  className={
+                                    row.type === 'Commercial' || row.type === 'Office'
+                                      ? 'bg-amber-100 text-amber-800'
+                                      : 'bg-green-100 text-green-800'
+                                  }
+                                >
+                                  {row.type}
+                                </Badge>
+                                <Badge variant="secondary" className="bg-green-100 text-green-800">
+                                  {row.status}
+                                </Badge>
+                              </div>
+                              <p className="text-xs text-muted-foreground">Updated {row.lastCleaned}</p>
+                            </button>
+                            {visibleActions.length > 0 ? (
+                              <DropdownMenu>
+                                <DropdownMenuTrigger asChild>
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="icon"
+                                    className="h-9 w-9 shrink-0 self-center"
+                                    aria-label="Property actions"
+                                  >
+                                    <MoreHorizontal className="h-4 w-4" />
+                                  </Button>
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent align="end" className="w-56">
+                                  {visibleActions.map((action, idx) => (
+                                    <DropdownMenuItem
+                                      key={idx}
+                                      onClick={() => action.onClick(row)}
+                                      className={action.variant === 'destructive' ? 'text-destructive' : ''}
+                                    >
+                                      {action.icon}
+                                      {action.label}
+                                    </DropdownMenuItem>
+                                  ))}
+                                </DropdownMenuContent>
+                              </DropdownMenu>
+                            ) : null}
+                          </div>
+                        )
+                      })
+                    )}
+                  </div>
+                </div>
+
+                <div className="hidden min-h-0 flex-1 flex-col md:flex">
+                  <DataTable
+                    data={propertiesForTable}
+                    columns={columns}
+                    actions={actions}
+                    searchKeys={['name', 'unitNumber', 'groupLabel', 'operator']}
+                    pageSize={10}
+                    fillContainer
+                    noHorizontalScroll
+                    emptyMessage={
+                      propertyScopeFilter === 'shared'
+                        ? 'No shared properties. When someone invites you to a group, their units appear here.'
+                        : propertyScopeFilter === 'mine'
+                          ? 'No properties registered to your account yet.'
+                          : 'No properties found. Add your first property or link Coliving to sync units.'
+                    }
+                    rowSelection={{
+                      selectedIds: selectedPropertyIds,
+                      onSelectionChange: setSelectedPropertyIds,
+                    }}
+                  />
+                </div>
               </CardContent>
             </Card>
           )}
@@ -1725,6 +2166,14 @@ const ClientPropertiesPage = () => {
                     </div>
                   </div>
 
+                  {isColivingImportedProperty ? (
+                    <p className="text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
+                      Synced from Coliving: name, address, unit, premises type, security, mailbox and smart door are read-only
+                      here — change them in the Coliving operator property page. You can still update after-clean / key photos
+                      and bed, room, bathroom counts below.
+                    </p>
+                  ) : null}
+
                   <div className="rounded-lg border p-4 space-y-4">
                     <p className="text-sm font-semibold text-foreground">Property & access</p>
                     <p className="text-xs text-muted-foreground">
@@ -1736,6 +2185,7 @@ const ClientPropertiesPage = () => {
                       <Select
                         value={detailForm.premisesType || '__none__'}
                         onValueChange={(v) => setDetailForm((f) => ({ ...f, premisesType: v === '__none__' ? '' : v }))}
+                        disabled={!canEditAllCorePropertyFields}
                       >
                         <SelectTrigger>
                           <SelectValue placeholder="—" />
@@ -1756,6 +2206,7 @@ const ClientPropertiesPage = () => {
                         id="dlg-prop-name"
                         value={detailForm.propertyName}
                         onChange={(e) => setDetailForm((f) => ({ ...f, propertyName: e.target.value }))}
+                        disabled={!canEditAllCorePropertyFields}
                       />
                     </div>
                     <div className="space-y-2">
@@ -1764,6 +2215,7 @@ const ClientPropertiesPage = () => {
                         id="dlg-address"
                         value={detailForm.address}
                         onChange={(e) => setDetailForm((f) => ({ ...f, address: e.target.value }))}
+                        disabled={!canEditAllCorePropertyFields}
                       />
                     </div>
                     <div className="space-y-2 max-w-xs">
@@ -1772,32 +2224,47 @@ const ClientPropertiesPage = () => {
                         id="dlg-unit"
                         value={detailForm.unitNumber}
                         onChange={(e) => setDetailForm((f) => ({ ...f, unitNumber: e.target.value }))}
+                        disabled={!canEditAllCorePropertyFields}
                       />
                     </div>
-                    <div className="space-y-2 max-w-xs">
-                      <Label>Security system</Label>
-                      <Select
-                        value={detailForm.securitySystem || '__none__'}
-                        onValueChange={(v) => setDetailForm((f) => ({ ...f, securitySystem: v === '__none__' ? '' : v }))}
-                      >
-                        <SelectTrigger>
-                          <SelectValue placeholder="—" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="__none__">—</SelectItem>
-                          <SelectItem value="icare">icare</SelectItem>
-                          <SelectItem value="ecommunity">ecommunity</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
                     <div className="space-y-2">
-                      <Label htmlFor="dlg-security-username">Security username</Label>
+                      <Label htmlFor="dlg-security-username" className="text-xs">
+                        Security username
+                      </Label>
                       <Input
                         id="dlg-security-username"
+                        className="mt-1"
                         value={detailForm.securityUsername}
                         onChange={(e) => setDetailForm((f) => ({ ...f, securityUsername: e.target.value }))}
                         placeholder="e.g. icare / gprop username"
+                        disabled={!canEditAllCorePropertyFields}
                       />
+                    </div>
+                    <div>
+                      <Label className="text-xs">Security system</Label>
+                      <div className="flex flex-col sm:flex-row gap-2 mt-1 sm:items-start sm:justify-between">
+                        <div className="flex-1 min-w-0 space-y-1">
+                          <p className="text-sm font-medium text-foreground capitalize">
+                            {parseSecuritySystemFromDb(detailForm.securitySystem)}
+                          </p>
+                          {securitySystemSummaryText ? (
+                            <p className="text-xs text-muted-foreground break-words">{securitySystemSummaryText}</p>
+                          ) : (
+                            <p className="text-xs text-muted-foreground">
+                              Not configured. Use Edit to choose the system and enter login details (saved in MySQL).
+                            </p>
+                          )}
+                        </div>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          className="shrink-0 w-full sm:w-auto"
+                          disabled={!canEditAllCorePropertyFields}
+                          onClick={() => openSecurityCredentialsModal()}
+                        >
+                          Edit
+                        </Button>
+                      </div>
                     </div>
                     <div className="space-y-2">
                       <Label htmlFor="dlg-mailbox2">Mailbox password</Label>
@@ -1807,32 +2274,8 @@ const ClientPropertiesPage = () => {
                         autoComplete="off"
                         value={detailForm.mailboxPassword}
                         onChange={(e) => setDetailForm((f) => ({ ...f, mailboxPassword: e.target.value }))}
+                        disabled={!canEditAllCorePropertyFields}
                       />
-                    </div>
-                    <div className="rounded-md border p-3 space-y-2">
-                      <label className="flex items-center gap-2 text-sm">
-                        <Checkbox
-                          checked={detailForm.smartdoorPasswordEnabled}
-                          onCheckedChange={(c) => setDetailForm((f) => ({ ...f, smartdoorPasswordEnabled: c === true }))}
-                        />
-                        Smart door (password)
-                      </label>
-                      {detailForm.smartdoorPasswordEnabled ? (
-                        <Input
-                          value={detailForm.smartdoorPassword}
-                          onChange={(e) => setDetailForm((f) => ({ ...f, smartdoorPassword: e.target.value }))}
-                          placeholder="Smart door password"
-                        />
-                      ) : null}
-                    </div>
-                    <div className="rounded-md border p-3">
-                      <label className="flex items-center gap-2 text-sm">
-                        <Checkbox
-                          checked={detailForm.smartdoorTokenEnabled}
-                          onCheckedChange={(c) => setDetailForm((f) => ({ ...f, smartdoorTokenEnabled: c === true }))}
-                        />
-                        Smart door (token)
-                      </label>
                     </div>
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                       <div className="space-y-2">
@@ -1840,6 +2283,7 @@ const ClientPropertiesPage = () => {
                         <Input
                           type="file"
                           accept="image/*"
+                          disabled={!canEditPropertyFields}
                           onChange={(e) => {
                             const file = e.target.files?.[0]
                             if (!file) return
@@ -1859,6 +2303,7 @@ const ClientPropertiesPage = () => {
                         <Input
                           type="file"
                           accept="image/*"
+                          disabled={!canEditPropertyFields}
                           onChange={(e) => {
                             const file = e.target.files?.[0]
                             if (!file) return
@@ -1928,6 +2373,49 @@ const ClientPropertiesPage = () => {
                     )}
                   </div>
 
+                  <div className="rounded-lg border p-4 space-y-3">
+                    <p className="text-sm font-semibold text-foreground">Operator door access</p>
+                    <p className="text-xs text-muted-foreground">
+                      How your cleaning operator may open this unit&apos;s smart door. &quot;Full access&quot; and &quot;Booking day only&quot; require the property&apos;s smart door to be linked with a gateway in the database.
+                    </p>
+                    <div className="space-y-2 max-w-md">
+                      <Label className="text-xs">Mode</Label>
+                      <Select
+                        value={detailForm.operatorDoorAccessMode}
+                        onValueChange={(v) => setDetailForm((f) => ({ ...f, operatorDoorAccessMode: v }))}
+                        disabled={!canEditOperatorDoorBlock}
+                      >
+                        <SelectTrigger>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="full_access">Full access — permanent PIN on lock + remote when gateway is ready</SelectItem>
+                          <SelectItem value="temporary_password_only">
+                            Temporary password — PIN per job + remote only on booking days
+                          </SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="rounded-md border p-3 space-y-2">
+                      <label className="flex items-center gap-2 text-sm">
+                        <Checkbox
+                          checked={detailForm.smartdoorPasswordEnabled}
+                          onCheckedChange={(c) => setDetailForm((f) => ({ ...f, smartdoorPasswordEnabled: c === true }))}
+                          disabled={!canEditOperatorDoorBlock}
+                        />
+                        Smart door (password)
+                      </label>
+                      {detailForm.smartdoorPasswordEnabled ? (
+                        <Input
+                          value={detailForm.smartdoorPassword}
+                          onChange={(e) => setDetailForm((f) => ({ ...f, smartdoorPassword: e.target.value }))}
+                          placeholder="Smart door password"
+                          disabled={!canEditOperatorDoorBlock}
+                        />
+                      ) : null}
+                    </div>
+                  </div>
+
                   {/* 2) Contact — same data pattern as Coliving owner portal (operator title + client_profile.contact) */}
                   {(propertyDetail.colivingOperatorTitle || propertyDetail.colivingOperatorContact) && (
                     <div className="rounded-lg border p-4 space-y-2">
@@ -1950,6 +2438,9 @@ const ClientPropertiesPage = () => {
                     <p className="text-xs text-muted-foreground">
                       Counts and mailbox (above) are saved to Cleanlemons and mirrored to Coliving{' '}
                       <code className="text-xs">propertydetail</code> when this unit is linked (same DB as api.colivingjb.com).
+                      {isColivingImportedProperty
+                        ? ' For synced units, only bed / room / bathroom counts are editable here; other area counts and lift level follow Coliving.'
+                        : ''}
                     </p>
                     <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
                       {(
@@ -1970,6 +2461,13 @@ const ClientPropertiesPage = () => {
                             inputMode="numeric"
                             value={detailForm[key]}
                             onChange={(e) => setDetailForm((f) => ({ ...f, [key]: e.target.value }))}
+                            disabled={
+                              !canEditPropertyFields ||
+                              (isColivingImportedProperty &&
+                                key !== 'bedCount' &&
+                                key !== 'roomCount' &&
+                                key !== 'bathroomCount')
+                            }
                           />
                         </div>
                       ))}
@@ -1979,6 +2477,7 @@ const ClientPropertiesPage = () => {
                       <Select
                         value={detailForm.liftLevel || '__none__'}
                         onValueChange={(v) => setDetailForm((f) => ({ ...f, liftLevel: v === '__none__' ? '' : v }))}
+                        disabled={!canEditAllCorePropertyFields}
                       >
                         <SelectTrigger>
                           <SelectValue placeholder="—" />
@@ -2081,6 +2580,125 @@ const ClientPropertiesPage = () => {
               </DialogFooter>
             </>
           )}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={secCredModalOpen} onOpenChange={setSecCredModalOpen}>
+        <DialogContent className="max-w-md max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Security system login</DialogTitle>
+            <DialogDescription>
+              Choose the system here and enter login details. Data is saved to MySQL and shown in plain text on this
+              screen when you reopen the property. Leave password empty only when saving without changing an existing
+              password.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 py-2">
+            <div>
+              <Label className="text-xs">Security system</Label>
+              <Select
+                value={secCredModalSystem}
+                onValueChange={(v) => setSecCredModalSystem(v as SecuritySystemIdOption)}
+              >
+                <SelectTrigger className="mt-1">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="icare">icare</SelectItem>
+                  <SelectItem value="ecommunity">ecommunity</SelectItem>
+                  <SelectItem value="veemios">veemios</SelectItem>
+                  <SelectItem value="gprop">gprop</SelectItem>
+                  <SelectItem value="css">css</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            {secCredModalSystem === 'icare' ? (
+              <>
+                <div>
+                  <Label className="text-xs">Phone number</Label>
+                  <Input
+                    value={secCredPhone}
+                    onChange={(e) => setSecCredPhone(e.target.value)}
+                    className="mt-1"
+                    autoComplete="off"
+                  />
+                </div>
+                <div>
+                  <Label className="text-xs">Date of birth</Label>
+                  <Input
+                    type="date"
+                    value={secCredDob}
+                    onChange={(e) => setSecCredDob(e.target.value)}
+                    className="mt-1"
+                  />
+                </div>
+              </>
+            ) : null}
+            {secCredModalSystem === 'ecommunity' ? (
+              <div>
+                <Label className="text-xs">User</Label>
+                <Input
+                  value={secCredUser}
+                  onChange={(e) => setSecCredUser(e.target.value)}
+                  className="mt-1"
+                  autoComplete="off"
+                />
+              </div>
+            ) : null}
+            {secCredModalSystem === 'veemios' || secCredModalSystem === 'gprop' ? (
+              <div>
+                <Label className="text-xs">User ID</Label>
+                <Input
+                  value={secCredUserId}
+                  onChange={(e) => setSecCredUserId(e.target.value)}
+                  className="mt-1"
+                  autoComplete="off"
+                />
+              </div>
+            ) : null}
+            {secCredModalSystem === 'css' ? (
+              <div>
+                <Label className="text-xs">Login code</Label>
+                <Input
+                  value={secCredLoginCode}
+                  onChange={(e) => setSecCredLoginCode(e.target.value)}
+                  className="mt-1"
+                  autoComplete="off"
+                />
+              </div>
+            ) : null}
+            <div>
+              <Label className="text-xs">Password</Label>
+              <Input
+                type="text"
+                value={secCredPassword}
+                onChange={(e) => setSecCredPassword(e.target.value)}
+                className="mt-1 font-mono text-sm"
+                autoComplete="off"
+                spellCheck={false}
+                placeholder="Required (leave blank to keep existing when editing)"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setSecCredModalOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              disabled={secCredModalSaving}
+              onClick={() => void handleSecurityCredentialsModalSave()}
+            >
+              {secCredModalSaving ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin mr-2 inline" />
+                  Saving…
+                </>
+              ) : (
+                'Save'
+              )}
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 
@@ -2618,17 +3236,6 @@ const ClientPropertiesPage = () => {
                       placeholder="Smart door password"
                     />
                   )}
-                </div>
-                <div className="space-y-2 md:col-span-2 border rounded-md p-3">
-                  <label className="flex items-center gap-2 text-sm">
-                    <Checkbox
-                      checked={form.smartdoorTokenEnabled}
-                      onCheckedChange={(checked) =>
-                        setForm((prev) => ({ ...prev, smartdoorTokenEnabled: !!checked }))
-                      }
-                    />
-                    Smart Door (Token)
-                  </label>
                 </div>
                 <div className="space-y-2">
                   <Label>After Clean Photo</Label>

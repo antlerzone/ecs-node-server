@@ -92,6 +92,8 @@ export type CleanlemonPricingConfig = {
   /** Per pricing service key (`general`, `homestay`, …): `instant` | `request_approve`. Overrides global `bookingMode` when set. */
   bookingModeByService?: Record<string, string>;
   leadTime: string;
+  /** Per service lead-time key (same vocabulary as `leadTime`). Overrides global `leadTime` when set. */
+  leadTimeByService?: Record<string, string>;
   /** Optional — merged by KPI Settings; preserved when Pricing save spreads previous config */
   employeeCleanerKpi?: EmployeeCleanerKpiPersisted;
 };
@@ -444,6 +446,777 @@ export async function saveEmployeeProfile(payload: any): Promise<{ ok: boolean; 
   return r.json();
 }
 
+export async function requestPortalEmailChangeOtp(newEmail: string): Promise<{
+  ok: boolean;
+  reason?: string;
+  newEmail?: string;
+}> {
+  if (!getPortalJwt()) {
+    return { ok: false, reason: 'UNAUTHORIZED' };
+  }
+  const r = await portalUserFetch('/api/portal-auth/email-change/request', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ newEmail: String(newEmail || '').trim() }),
+  });
+  const data = (await r.json().catch(() => ({}))) as { ok?: boolean; reason?: string; newEmail?: string };
+  if (!r.ok) {
+    return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  }
+  return { ok: data.ok !== false, newEmail: data.newEmail };
+}
+
+export async function confirmPortalEmailChange(params: {
+  newEmail: string;
+  code: string;
+}): Promise<{ ok: boolean; reason?: string }> {
+  if (!getPortalJwt()) {
+    return { ok: false, reason: 'UNAUTHORIZED' };
+  }
+  const r = await portalUserFetch('/api/portal-auth/email-change/confirm', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      newEmail: String(params.newEmail || '').trim(),
+      code: String(params.code || '').trim(),
+    }),
+  });
+  const data = (await r.json().catch(() => ({}))) as { ok?: boolean; reason?: string };
+  if (!r.ok) {
+    return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  }
+  return { ok: data.ok !== false };
+}
+
+/** Aliyun eKYC — portal JWT; same backend as Coliving. */
+export async function startPortalAliyunIdvEkyc(params: {
+  metaInfo: string;
+  docType?: 'MYS01001' | 'GLB03002';
+  returnPath?: string;
+}): Promise<{
+  ok: boolean;
+  transactionId?: string;
+  transactionUrl?: string;
+  reason?: string;
+  message?: string;
+}> {
+  if (!getPortalJwt()) {
+    return { ok: false, reason: 'UNAUTHORIZED' };
+  }
+  const r = await portalUserFetch('/api/portal-auth/aliyun-idv/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      metaInfo: String(params.metaInfo || '').trim(),
+      docType: params.docType || 'MYS01001',
+      returnPath: params.returnPath || '/portal/client/profile',
+    }),
+  });
+  const data = (await r.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!r.ok) {
+    return { ok: false, reason: (data.reason as string) || `HTTP_${r.status}` };
+  }
+  return data as {
+    ok: boolean;
+    transactionId?: string;
+    transactionUrl?: string;
+    reason?: string;
+    message?: string;
+  };
+}
+
+export async function fetchPortalAliyunIdvResult(transactionId: string): Promise<{
+  ok: boolean;
+  passed?: boolean;
+  subCode?: string;
+  reason?: string;
+  message?: string;
+  profileApplied?: boolean;
+  profileReason?: string;
+  profileBoundEmail?: string;
+}> {
+  if (!getPortalJwt()) {
+    return { ok: false, reason: 'UNAUTHORIZED' };
+  }
+  const tid = encodeURIComponent(String(transactionId || '').trim());
+  const r = await portalUserFetch(`/api/portal-auth/aliyun-idv/result?transactionId=${tid}`, {
+    cache: 'no-store',
+  });
+  const data = (await r.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!r.ok) {
+    return { ok: false, reason: (data.reason as string) || `HTTP_${r.status}` };
+  }
+  return data as {
+    ok: boolean;
+    passed?: boolean;
+    subCode?: string;
+    reason?: string;
+    message?: string;
+    profileApplied?: boolean;
+    profileReason?: string;
+    profileBoundEmail?: string;
+  };
+}
+
+export type ClnDriverTripPayload = {
+  id: string;
+  operatorId: string;
+  requesterEmployeeId: string;
+  requesterEmail: string;
+  pickup: string;
+  dropoff: string;
+  scheduleOffset: string;
+  orderTimeUtc: string | null;
+  businessTimeZone: string;
+  status: string;
+  fulfillmentType: string;
+  acceptedDriverEmployeeId: string | null;
+  acceptedAtUtc: string | null;
+  completedAtUtc: string | null;
+  createdAtUtc: string | null;
+  updatedAtUtc: string | null;
+  requesterFullName?: string;
+  /** Requester's team label from operator CRM (`crm_json.team`), when present. */
+  requesterTeamName?: string | null;
+  acceptedDriverFullName?: string;
+  acceptedDriverPhone?: string;
+  acceptedDriverAvatarUrl?: string;
+  /** From accepted driver's profile (driver vehicle) — same idea as Grab plate for display on requester order. */
+  acceptedDriverCarPlate?: string | null;
+  acceptedDriverCarFrontUrl?: string | null;
+  acceptedDriverCarBackUrl?: string | null;
+  /** Driver tapped "Start trip" after pickup (required before Finish when migration applied). */
+  driverStartedAtUtc?: string | null;
+  grabCarPlate?: string;
+  grabPhone?: string;
+  grabProofImageUrl?: string;
+  grabBookedByEmail?: string;
+  grabBookedAtUtc?: string | null;
+};
+
+export async function uploadDriverVehiclePhoto(
+  file: File
+): Promise<{ ok: boolean; url?: string; reason?: string }> {
+  const formData = new FormData();
+  formData.append('file', file);
+  const r = await apiFetch({
+    path: '/api/cleanlemon/employee/driver-vehicle-photo',
+    method: 'POST',
+    body: formData,
+  });
+  if (!r.ok) return { ok: false, reason: `HTTP_${r.status}` };
+  return r.json();
+}
+
+export async function fetchDriverVehicle(): Promise<{
+  ok: boolean;
+  vehicle?: { carPlate: string; carFrontUrl: string; carBackUrl: string };
+  legacy?: boolean;
+  reason?: string;
+}> {
+  const r = await apiFetch({ path: '/api/cleanlemon/employee/driver-vehicle', cache: 'no-store' });
+  if (!r.ok) return { ok: false, reason: `HTTP_${r.status}` };
+  return r.json();
+}
+
+export async function saveDriverVehicle(body: {
+  carPlate?: string;
+  carFrontUrl?: string;
+  carBackUrl?: string;
+}): Promise<{ ok: boolean; vehicle?: { carPlate: string; carFrontUrl: string; carBackUrl: string }; reason?: string }> {
+  const r = await apiFetch({
+    path: '/api/cleanlemon/employee/driver-vehicle',
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  if (!r.ok) return { ok: false, reason: `HTTP_${r.status}` };
+  return r.json();
+}
+
+/** Requester — create route order (`POST /employee/driver-trip`). */
+export async function postEmployeeDriverTrip(body: {
+  operatorId: string;
+  pickup: string;
+  dropoff: string;
+  scheduleOffset: 'now' | '15' | '30';
+  orderTimeIso: string;
+}): Promise<{ ok: boolean; trip?: ClnDriverTripPayload; reason?: string }> {
+  const r = await apiFetch({
+    path: '/api/cleanlemon/employee/driver-trip',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = (await r.json().catch(() => ({}))) as { ok?: boolean; trip?: ClnDriverTripPayload; reason?: string };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: !!data.ok, trip: data.trip, reason: data.reason };
+}
+
+export async function fetchPendingDriverTrips(operatorId: string): Promise<{
+  ok: boolean;
+  items?: ClnDriverTripPayload[];
+  reason?: string;
+}> {
+  const qs = new URLSearchParams({ operatorId: String(operatorId || '').trim() });
+  const r = await apiFetch({ path: `/api/cleanlemon/employee/driver-trip/open?${qs}`, cache: 'no-store' });
+  if (!r.ok) return { ok: false, reason: `HTTP_${r.status}` };
+  return r.json();
+}
+
+export async function fetchActiveDriverTrip(operatorId: string): Promise<{
+  ok: boolean;
+  trip?: ClnDriverTripPayload | null;
+  reason?: string;
+}> {
+  const qs = new URLSearchParams({ operatorId: String(operatorId || '').trim() });
+  const r = await apiFetch({ path: `/api/cleanlemon/employee/driver-trip/driver-active?${qs}`, cache: 'no-store' });
+  if (!r.ok) return { ok: false, reason: `HTTP_${r.status}` };
+  return r.json();
+}
+
+export async function fetchDriverTripHistory(
+  operatorId: string,
+  limit = 40
+): Promise<{ ok: boolean; items?: ClnDriverTripPayload[]; reason?: string }> {
+  const qs = new URLSearchParams({
+    operatorId: String(operatorId || '').trim(),
+    limit: String(limit),
+  });
+  const r = await apiFetch({ path: `/api/cleanlemon/employee/driver-trip/driver-history?${qs}`, cache: 'no-store' });
+  if (!r.ok) return { ok: false, reason: `HTTP_${r.status}` };
+  return r.json();
+}
+
+export async function acceptDriverTripRequest(
+  tripId: string,
+  operatorId: string
+): Promise<{ ok: boolean; trip?: ClnDriverTripPayload; reason?: string }> {
+  const r = await apiFetch({
+    path: '/api/cleanlemon/employee/driver-trip/accept',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      operatorId: String(operatorId || '').trim(),
+      tripId: String(tripId || '').trim(),
+    }),
+  });
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean;
+    trip?: ClnDriverTripPayload;
+    reason?: string;
+  };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: !!data.ok, trip: data.trip, reason: data.reason };
+}
+
+export async function postDriverTripStart(
+  tripId: string,
+  operatorId: string
+): Promise<{ ok: boolean; trip?: ClnDriverTripPayload; reason?: string }> {
+  const r = await apiFetch({
+    path: '/api/cleanlemon/employee/driver-trip/start',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      operatorId: String(operatorId || '').trim(),
+      tripId: String(tripId || '').trim(),
+    }),
+  });
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean;
+    trip?: ClnDriverTripPayload;
+    reason?: string;
+  };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: !!data.ok, trip: data.trip, reason: data.reason };
+}
+
+export async function postDriverTripReleaseAccept(
+  tripId: string,
+  operatorId: string
+): Promise<{ ok: boolean; reason?: string }> {
+  const r = await apiFetch({
+    path: '/api/cleanlemon/employee/driver-trip/release-accept',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      operatorId: String(operatorId || '').trim(),
+      tripId: String(tripId || '').trim(),
+    }),
+  });
+  const data = (await r.json().catch(() => ({}))) as { ok?: boolean; reason?: string };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: !!data.ok, reason: data.reason };
+}
+
+export async function finishDriverTripRequest(
+  tripId: string,
+  operatorId: string
+): Promise<{ ok: boolean; trip?: ClnDriverTripPayload; reason?: string }> {
+  const r = await apiFetch({
+    path: '/api/cleanlemon/employee/driver-trip/finish',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      operatorId: String(operatorId || '').trim(),
+      tripId: String(tripId || '').trim(),
+    }),
+  });
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean;
+    trip?: ClnDriverTripPayload;
+    reason?: string;
+  };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: !!data.ok, trip: data.trip, reason: data.reason };
+}
+
+/** Employee (requester) — active route order they placed (pending / driver accepted / Grab). */
+export async function fetchRequesterActiveDriverTrip(operatorId: string): Promise<{
+  ok: boolean;
+  trip?: ClnDriverTripPayload | null;
+  reason?: string;
+}> {
+  const qs = new URLSearchParams({ operatorId: String(operatorId || '').trim() });
+  const r = await apiFetch({
+    path: `/api/cleanlemon/employee/driver-trips/requester-active?${qs}`,
+    cache: 'no-store',
+  });
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean;
+    trip?: ClnDriverTripPayload | null;
+    reason?: string;
+  };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: true, trip: data.trip ?? null };
+}
+
+/** Employee (requester) — past route orders for this operator (completed / cancelled). */
+export async function fetchRequesterDriverTripHistory(
+  operatorId: string,
+  limit = 60
+): Promise<{ ok: boolean; items?: ClnDriverTripPayload[]; reason?: string }> {
+  const qs = new URLSearchParams({
+    operatorId: String(operatorId || '').trim(),
+    limit: String(Math.min(200, Math.max(1, limit))),
+  });
+  const r = await apiFetch({
+    path: `/api/cleanlemon/employee/driver-trips/requester-history?${qs}`,
+    cache: 'no-store',
+  });
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean;
+    items?: ClnDriverTripPayload[];
+    reason?: string;
+  };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: !!data.ok, items: data.items, reason: data.reason };
+}
+
+export async function postRequesterCancelDriverTrip(body: {
+  operatorId: string;
+  tripId: string;
+}): Promise<{ ok: boolean; reason?: string }> {
+  const r = await apiFetch({
+    path: '/api/cleanlemon/employee/driver-trips/requester-cancel',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = (await r.json().catch(() => ({}))) as { ok?: boolean; reason?: string };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: true };
+}
+
+/** Dobi laundry — day bundle, machines, lots (`cln_dobi_*`). */
+export async function fetchDobiDay(operatorId: string, businessDate: string): Promise<any> {
+  const qs = new URLSearchParams({
+    operatorId: String(operatorId || '').trim(),
+    businessDate: String(businessDate || '').trim().slice(0, 10),
+  });
+  return fetchJsonSafe(apiFetch({ path: `/api/cleanlemon/employee/dobi/day?${qs}`, cache: 'no-store' }));
+}
+
+export async function postDobiPreviewSplit(body: {
+  operatorId: string;
+  lines: Array<{ teamName?: string; itemTypeId: string; qty: number }>;
+}): Promise<any> {
+  return fetchJsonSafe(
+    apiFetch({
+      path: '/api/cleanlemon/employee/dobi/preview-split',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  );
+}
+
+export async function postDobiCommitIntake(body: {
+  operatorId: string;
+  businessDate: string;
+  lines: Array<{ teamName?: string; itemTypeId: string; qty: number }>;
+}): Promise<any> {
+  return fetchJsonSafe(
+    apiFetch({
+      path: '/api/cleanlemon/employee/dobi/commit-intake',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  );
+}
+
+export async function postDobiLotAction(body: {
+  operatorId: string;
+  lotId: string;
+  action: string;
+  machineId?: string;
+  handoffRemark?: string;
+  businessDate?: string;
+  /** Partial return from ready: how many pcs taken per `cln_dobi_lot_item` row. */
+  takeouts?: Array<{ itemLineId: string; qty: number }>;
+}): Promise<any> {
+  return fetchJsonSafe(
+    apiFetch({
+      path: '/api/cleanlemon/employee/dobi/lot-action',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  );
+}
+
+/** Dobi staff — damaged linens (stored in `cln_dobi_event` as `damage_linen`). */
+export async function postDobiDamageLinen(body: {
+  operatorId: string;
+  businessDate: string;
+  remark: string;
+  lines: Array<{ itemTypeId: string; qty: number; teamName?: string }>;
+  photoUrls?: string[];
+}): Promise<{ ok?: boolean; id?: string; reason?: string }> {
+  return fetchJsonSafe(
+    apiFetch({
+      path: '/api/cleanlemon/employee/dobi/damage-linen',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  );
+}
+
+/** Cleaner requests QR; dobi scans URL and approves (writes `linenLogs`). */
+export async function fetchEmployeeLinensQrMode(operatorId: string): Promise<{
+  ok?: boolean;
+  linenQrStyle?: 'rotate_1min' | 'permanent';
+  reason?: string;
+}> {
+  const qs = new URLSearchParams({ operatorId: String(operatorId || '').trim() });
+  return fetchJsonSafe(
+    apiFetch({ path: `/api/cleanlemon/employee/linens/qr-mode?${qs}`, cache: 'no-store' })
+  );
+}
+
+export async function postEmployeeLinensQrRequest(body: {
+  operatorId: string;
+  date: string;
+  action: string;
+  team?: string;
+  totals: Record<string, number>;
+  /** When set, intake uses these lines (item types from Dobi settings). */
+  lines?: Array<{ itemTypeId: string; qty: number; label?: string }>;
+  missingQty?: number;
+  remark?: string;
+}): Promise<{
+  ok?: boolean;
+  token?: string;
+  expiresAt?: string;
+  linenQrStyle?: 'rotate_1min' | 'permanent';
+  reason?: string;
+}> {
+  return fetchJsonSafe(
+    apiFetch({
+      path: '/api/cleanlemon/employee/linens/qr-request',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  );
+}
+
+export async function fetchDobiLinenQrPreview(operatorId: string, token: string): Promise<any> {
+  const qs = new URLSearchParams({
+    operatorId: String(operatorId || '').trim(),
+    token: String(token || '').trim(),
+  });
+  return fetchJsonSafe(apiFetch({ path: `/api/cleanlemon/employee/dobi/linen-qr?${qs}`, cache: 'no-store' }));
+}
+
+export async function postDobiLinenQrApprove(body: {
+  operatorId: string;
+  token: string;
+}): Promise<{ ok?: boolean; entry?: unknown; reason?: string; missingKeys?: string[] }> {
+  return fetchJsonSafe(
+    apiFetch({
+      path: '/api/cleanlemon/employee/dobi/linen-qr-approve',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  );
+}
+
+/** Dobi staff: add pending-wash batches manually (no linen QR). */
+export async function postDobiAppendIntake(body: {
+  operatorId: string;
+  businessDate: string;
+  lines: Array<{ teamName: string; itemTypeId: string; qty: number }>;
+  /** `pending_wash` (default) or `ready` — skip machines and place straight in Ready. */
+  targetStage?: 'pending_wash' | 'ready';
+}): Promise<any> {
+  return fetchJsonSafe(
+    apiFetch({
+      path: '/api/cleanlemon/employee/dobi/append-intake',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  );
+}
+
+export async function fetchDobiReport(operatorId: string, fromDate: string, toDate: string): Promise<any> {
+  const qs = new URLSearchParams({
+    operatorId: String(operatorId || '').trim(),
+    fromDate: String(fromDate || '').slice(0, 10),
+    toDate: String(toDate || '').slice(0, 10),
+  });
+  return fetchJsonSafe(apiFetch({ path: `/api/cleanlemon/employee/dobi/report?${qs}`, cache: 'no-store' }));
+}
+
+export async function fetchDobiSummary(operatorId: string, fromDate: string, toDate: string): Promise<any> {
+  const qs = new URLSearchParams({
+    operatorId: String(operatorId || '').trim(),
+    fromDate: String(fromDate || '').slice(0, 10),
+    toDate: String(toDate || '').slice(0, 10),
+  });
+  return fetchJsonSafe(apiFetch({ path: `/api/cleanlemon/employee/dobi/summary?${qs}`, cache: 'no-store' }));
+}
+
+/** Workflow audit for one business day (staff email, name, machine, time). */
+export async function fetchDobiDayEvents(operatorId: string, businessDate: string): Promise<{
+  ok?: boolean;
+  events?: Array<{
+    id: string;
+    eventType: string;
+    createdByEmail: string;
+    staffName: string | null;
+    createdAtUtc: string | null;
+    machineName: string | null;
+    machineKind: string | null;
+  }>;
+  reason?: string;
+}> {
+  const qs = new URLSearchParams({
+    operatorId: String(operatorId || '').trim(),
+    businessDate: String(businessDate || '').slice(0, 10),
+  });
+  return fetchJsonSafe(apiFetch({ path: `/api/cleanlemon/employee/dobi/day-events?${qs}`, cache: 'no-store' }));
+}
+
+export async function fetchOperatorDobiConfig(operatorId: string): Promise<any> {
+  const qs = new URLSearchParams({ operatorId: String(operatorId || '').trim() });
+  return fetchJsonSafe(apiFetch({ path: `/api/cleanlemon/operator/dobi/config?${qs}`, cache: 'no-store' }));
+}
+
+export async function putOperatorDobiConfig(body: {
+  operatorId: string;
+  handoffWashToDryWarningMinutes?: number;
+  linenQrStyle?: 'rotate_1min' | 'permanent';
+}): Promise<any> {
+  return fetchJsonSafe(
+    apiFetch({
+      path: '/api/cleanlemon/operator/dobi/config',
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  );
+}
+
+export async function putOperatorDobiItemTypes(body: {
+  operatorId: string;
+  items: Array<{
+    id?: string;
+    label: string;
+    active?: boolean;
+    /** Max pieces of this type per wash load (batches do not mix types). */
+    washBatchPcs?: number;
+    /** Planned wash duration (minutes) for this type when starting wash. */
+    washRoundMinutes?: number;
+  }>;
+}): Promise<any> {
+  return fetchJsonSafe(
+    apiFetch({
+      path: '/api/cleanlemon/operator/dobi/item-types',
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  );
+}
+
+export async function putOperatorDobiMachines(body: {
+  operatorId: string;
+  machines: Array<{
+    id?: string;
+    kind: 'washer' | 'dryer' | 'iron';
+    name: string;
+    capacityPcs?: number;
+    roundMinutes?: number;
+    active?: boolean;
+  }>;
+}): Promise<any> {
+  return fetchJsonSafe(
+    apiFetch({
+      path: '/api/cleanlemon/operator/dobi/machines',
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  );
+}
+
+export async function fetchOperatorDriverTrips(params: {
+  operatorId: string;
+  status?: string;
+  limit?: number;
+  /** YYYY-MM-DD Malaysia business day on order/created instant */
+  businessDate?: string;
+  team?: string;
+  /** `grab` | `driver` — pair with `acceptedDriverEmployeeId` for Driver A/B/C */
+  fulfillment?: string;
+  acceptedDriverEmployeeId?: string;
+}): Promise<{ ok: boolean; items?: ClnDriverTripPayload[]; reason?: string }> {
+  const oid = String(params.operatorId || '').trim();
+  if (!oid) return { ok: false, reason: 'MISSING_OPERATOR_ID' };
+  const qs = new URLSearchParams({ operatorId: oid });
+  const st = String(params.status || '').trim();
+  if (st) qs.set('status', st);
+  if (params.limit != null) qs.set('limit', String(params.limit));
+  const bd = String(params.businessDate || '').trim();
+  if (bd) qs.set('businessDate', bd);
+  const tm = String(params.team || '').trim();
+  if (tm) qs.set('team', tm);
+  const fu = String(params.fulfillment || '').trim();
+  if (fu) qs.set('fulfillment', fu);
+  const ade = String(params.acceptedDriverEmployeeId || '').trim();
+  if (ade) qs.set('acceptedDriverEmployeeId', ade);
+  const r = await apiFetch({
+    path: `/api/cleanlemon/operator/driver-trips?${qs.toString()}`,
+    cache: 'no-store',
+  });
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean;
+    items?: ClnDriverTripPayload[];
+    reason?: string;
+  };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: true, items: data.items || [] };
+}
+
+export type ClnOperatorDriverEmployeeRow = {
+  slotLabel: string;
+  slotLetter: string;
+  employeeId: string;
+  fullName: string;
+  email: string;
+  phone: string;
+  carPlate: string;
+};
+
+export async function fetchOperatorDriverEmployees(
+  operatorId: string
+): Promise<{ ok: boolean; items?: ClnOperatorDriverEmployeeRow[]; reason?: string }> {
+  const oid = String(operatorId || '').trim();
+  if (!oid) return { ok: false, reason: 'MISSING_OPERATOR_ID' };
+  const qs = new URLSearchParams({ operatorId: oid });
+  const r = await apiFetch({
+    path: `/api/cleanlemon/operator/driver-employees?${qs.toString()}`,
+    cache: 'no-store',
+  });
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean;
+    items?: ClnOperatorDriverEmployeeRow[];
+    reason?: string;
+  };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: true, items: data.items || [] };
+}
+
+export type ClnDriverFleetStatusRow = {
+  employeeId: string;
+  fullName: string;
+  email: string;
+  phone: string;
+  fleetStatus: 'vacant' | 'waiting' | 'pickup' | 'ongoing' | 'off_duty';
+  activeTrip: {
+    id: string;
+    pickupText: string;
+    dropoffText: string;
+    acceptedAtUtc: string | null;
+    driverStartedAtUtc: string | null;
+    orderTimeUtc: string | null;
+    createdAtUtc: string | null;
+  } | null;
+};
+
+export async function fetchOperatorDriverFleetStatus(
+  operatorId: string
+): Promise<{
+  ok: boolean;
+  items?: ClnDriverFleetStatusRow[];
+  pendingPoolCount?: number;
+  reason?: string;
+}> {
+  const oid = String(operatorId || '').trim();
+  if (!oid) return { ok: false, reason: 'MISSING_OPERATOR_ID' };
+  const qs = new URLSearchParams({ operatorId: oid });
+  const r = await apiFetch({
+    path: `/api/cleanlemon/operator/driver-fleet-status?${qs.toString()}`,
+    cache: 'no-store',
+  });
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean;
+    items?: ClnDriverFleetStatusRow[];
+    pendingPoolCount?: number;
+    reason?: string;
+  };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: true, items: data.items || [], pendingPoolCount: data.pendingPoolCount ?? 0 };
+}
+
+export async function postOperatorDriverTripGrab(body: {
+  operatorId: string;
+  tripId: string;
+  grabCarPlate?: string;
+  grabPhone?: string;
+  grabProofImageUrl?: string;
+}): Promise<{ ok: boolean; trip?: ClnDriverTripPayload; reason?: string }> {
+  const r = await apiFetch({
+    path: '/api/cleanlemon/operator/driver-trip/grab',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean;
+    trip?: ClnDriverTripPayload;
+    reason?: string;
+  };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: true, trip: data.trip };
+}
+
 /** Cleanlemons operator companies linked to this B2B client (`cln_client_operator`). */
 export type ClientLinkedOperatorRow = {
   operatorId: string;
@@ -636,6 +1409,8 @@ export type ClientPortalPropertyRow = {
   name: string;
   address: string;
   unitNumber: string;
+  /** True when created in client portal (`client_portal_owned=1`); false when Coliving-synced. */
+  clientPortalOwned?: boolean;
   premisesType?: string;
   /** Cleanlemons operator (`cln_property.operator_id` → company master). */
   operatorId?: string;
@@ -745,6 +1520,8 @@ export type ClientPortalPropertyDetail = {
   name: string;
   address: string;
   unitNumber: string;
+  /** Created in client portal vs Coliving-imported (restricts editable fields). */
+  clientPortalOwned?: boolean;
   operatorId: string;
   cleanlemonsOperatorName: string;
   cleanlemonsOperatorEmail: string;
@@ -768,10 +1545,18 @@ export type ClientPortalPropertyDetail = {
   premisesType?: string;
   securitySystem?: string;
   securityUsername?: string;
+  /** Coliving `propertydetail.security_system_credentials_json` when linked. */
+  securitySystemCredentials?: Record<string, unknown> | null;
   afterCleanPhotoUrl?: string;
   keyPhotoUrl?: string;
   smartdoorPassword?: string;
   smartdoorTokenEnabled?: boolean;
+  /** TTLock keyboardPwdName snapshot for operator permanent PIN (full access). */
+  operatorSmartdoorPasscodeName?: string;
+  /** Lock has gateway linked for remote unlock. */
+  smartdoorGatewayReady?: boolean;
+  /** How the operator may open the door: full_access | temporary_password_only | … */
+  operatorDoorAccessMode?: string;
   smartdoorBindings?: ClientPortalSmartdoorBindings;
   /** WGS84 from `cln_property.latitude` / `longitude` when set. */
   latitude?: number | null;
@@ -1166,11 +1951,22 @@ export async function postClientPortalBulkDisconnect(
   };
 }
 
+/** Operator portal — TTLock accounts (multi-slot; same shape as client rows, source always manual). */
+export type OperatorTtlockAccountRow = {
+  slot: number;
+  accountName: string;
+  username: string;
+  source: 'manual';
+  manageable: boolean;
+  connected: boolean;
+};
+
 /** Operator portal — TTLock (`cln_operator_integration` + `cln_ttlocktoken`). */
 export async function fetchOperatorTtlockOnboardStatus(operatorId: string): Promise<{
   ok?: boolean;
   ttlockConnected?: boolean;
   ttlockCreateEverUsed?: boolean;
+  accounts?: OperatorTtlockAccountRow[];
   reason?: string;
 }> {
   const qs = new URLSearchParams({ operatorId: String(operatorId || '').trim() });
@@ -1182,6 +1978,7 @@ export async function fetchOperatorTtlockOnboardStatus(operatorId: string): Prom
     ok?: boolean;
     ttlockConnected?: boolean;
     ttlockCreateEverUsed?: boolean;
+    accounts?: OperatorTtlockAccountRow[];
     reason?: string;
   };
   if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
@@ -1189,9 +1986,13 @@ export async function fetchOperatorTtlockOnboardStatus(operatorId: string): Prom
 }
 
 export async function fetchOperatorTtlockCredentials(
-  operatorId: string
-): Promise<{ ok?: boolean; username?: string; password?: string; reason?: string }> {
-  const qs = new URLSearchParams({ operatorId: String(operatorId || '').trim() });
+  operatorId: string,
+  ttlockSlot = 0
+): Promise<{ ok?: boolean; username?: string; password?: string; slot?: number; reason?: string }> {
+  const qs = new URLSearchParams({
+    operatorId: String(operatorId || '').trim(),
+    ttlockSlot: String(ttlockSlot),
+  });
   const r = await apiFetch({
     path: `/api/cleanlemon/operator/ttlock/credentials?${qs.toString()}`,
     cache: 'no-store',
@@ -1200,6 +2001,7 @@ export async function fetchOperatorTtlockCredentials(
     ok?: boolean;
     username?: string;
     password?: string;
+    slot?: number;
     reason?: string;
   };
   if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
@@ -1209,8 +2011,17 @@ export async function fetchOperatorTtlockCredentials(
 export async function postOperatorTtlockConnect(
   operatorId: string,
   username: string,
-  password: string
-): Promise<{ ok?: boolean; mode?: string; username?: string; reason?: string }> {
+  password: string,
+  opts?: { accountName?: string }
+): Promise<{
+  ok?: boolean;
+  mode?: string;
+  username?: string;
+  slot?: number;
+  accountName?: string;
+  reason?: string;
+}> {
+  const accountName = opts?.accountName != null ? String(opts.accountName).trim() : '';
   const r = await apiFetch({
     path: '/api/cleanlemon/operator/ttlock/connect',
     method: 'POST',
@@ -1219,24 +2030,33 @@ export async function postOperatorTtlockConnect(
       operatorId: String(operatorId || '').trim(),
       username: String(username || '').trim(),
       password: String(password || ''),
+      accountName: accountName || undefined,
     }),
   });
   const data = (await r.json().catch(() => ({}))) as {
     ok?: boolean;
     mode?: string;
     username?: string;
+    slot?: number;
+    accountName?: string;
     reason?: string;
   };
   if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
   return data;
 }
 
-export async function postOperatorTtlockDisconnect(operatorId: string): Promise<{ ok?: boolean; reason?: string }> {
+export async function postOperatorTtlockDisconnect(
+  operatorId: string,
+  ttlockSlot = 0
+): Promise<{ ok?: boolean; reason?: string }> {
   const r = await apiFetch({
     path: '/api/cleanlemon/operator/ttlock/disconnect',
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ operatorId: String(operatorId || '').trim() }),
+    body: JSON.stringify({
+      operatorId: String(operatorId || '').trim(),
+      ttlockSlot,
+    }),
   });
   const data = (await r.json().catch(() => ({}))) as { ok?: boolean; reason?: string };
   if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
@@ -1341,15 +2161,79 @@ export async function clnUpdateSmartDoorGateway(
   return postCleanlemonSmartDoor<{ ok: boolean; reason?: string }>(scope, 'update-gateway', { email, operatorId, id, ...payload });
 }
 
-export async function clnUnlockSmartDoor(scope: CleanlemonSmartDoorScope, ctx: { operatorId: string; email: string }, lockDetailId: string) {
+export async function clnUnlockSmartDoor(
+  scope: CleanlemonSmartDoorScope,
+  ctx: { operatorId: string; email: string },
+  lockDetailId: string,
+  opts?: { ttlockSlot?: number }
+) {
   const email = String(ctx.email || '').trim().toLowerCase();
   const operatorId = String(ctx.operatorId || '').trim();
-  return postCleanlemonSmartDoor<{ ok: boolean; reason?: string }>(scope, 'unlock', { email, operatorId, id: lockDetailId });
+  const body: Record<string, unknown> = { email, operatorId, id: lockDetailId };
+  if (opts?.ttlockSlot != null && Number.isFinite(Number(opts.ttlockSlot))) {
+    body.ttlockSlot = Number(opts.ttlockSlot);
+  }
+  return postCleanlemonSmartDoor<{ ok: boolean; reason?: string }>(scope, 'unlock', body);
 }
 
-export async function clnPreviewSmartDoorSelection(scope: CleanlemonSmartDoorScope, ctx: { operatorId: string; email: string }) {
+/** Operator: reveal static smart door password when policy allows (property linked + mode). */
+export async function clnViewSmartDoorPassword(
+  ctx: { operatorId: string; email: string },
+  lockDetailId: string,
+  opts?: { ttlockSlot?: number }
+) {
   const email = String(ctx.email || '').trim().toLowerCase();
   const operatorId = String(ctx.operatorId || '').trim();
+  const body: Record<string, unknown> = { email, operatorId, id: lockDetailId };
+  if (opts?.ttlockSlot != null && Number.isFinite(Number(opts.ttlockSlot))) {
+    body.ttlockSlot = Number(opts.ttlockSlot);
+  }
+  return postCleanlemonSmartDoor<{ ok: boolean; password?: string; reason?: string }>('operator', 'view-password', body);
+}
+
+/** Portal remote-unlock audit log for one lock (Malaysia date / range → UTC on server). */
+export async function clnGetSmartDoorUnlockLogs(
+  scope: CleanlemonSmartDoorScope,
+  ctx: { operatorId: string; email: string },
+  lockDetailId: string,
+  query: { date?: string; from?: string; to?: string; page?: number; pageSize?: number; ttlockSlot?: number }
+) {
+  const email = String(ctx.email || '').trim().toLowerCase();
+  const operatorId = String(ctx.operatorId || '').trim();
+  const body: Record<string, unknown> = {
+    email,
+    operatorId,
+    id: lockDetailId,
+    date: query.date,
+    from: query.from,
+    to: query.to,
+    page: query.page,
+    pageSize: query.pageSize,
+  };
+  if (query.ttlockSlot != null && Number.isFinite(Number(query.ttlockSlot))) {
+    body.ttlockSlot = Number(query.ttlockSlot);
+  }
+  return postCleanlemonSmartDoor<{
+    ok?: boolean;
+    items?: Array<Record<string, unknown>>;
+    total?: number;
+    page?: number;
+    pageSize?: number;
+    reason?: string;
+  }>(scope, 'unlock-logs', body);
+}
+
+export async function clnPreviewSmartDoorSelection(
+  scope: CleanlemonSmartDoorScope,
+  ctx: { operatorId: string; email: string },
+  opts?: { ttlockSlot?: number }
+) {
+  const email = String(ctx.email || '').trim().toLowerCase();
+  const operatorId = String(ctx.operatorId || '').trim();
+  const body: Record<string, unknown> = { email, operatorId };
+  if (opts?.ttlockSlot != null && Number.isFinite(Number(opts.ttlockSlot))) {
+    body.ttlockSlot = Number(opts.ttlockSlot);
+  }
   return postCleanlemonSmartDoor<{
     ok?: boolean;
     total?: number;
@@ -1372,7 +2256,7 @@ export async function clnPreviewSmartDoorSelection(scope: CleanlemonSmartDoorSco
       bindingLabels?: string[];
       bindingHint?: string | null;
     }>;
-  }>(scope, 'preview-selection', { email, operatorId });
+  }>(scope, 'preview-selection', body);
 }
 
 export async function clnInsertSmartDoors(
@@ -1399,6 +2283,8 @@ export async function clnInsertSmartDoors(
       gatewayId?: string | null;
       __tmpGatewayExternalId?: number | null;
     }>;
+    /** Cleanlemons operator multi TTLock account (Company → Integration). */
+    ttlockSlot?: number;
   }
 ) {
   const email = String(ctx.email || '').trim().toLowerCase();
@@ -1413,11 +2299,15 @@ export async function clnInsertSmartDoors(
 export async function clnSyncTTLockName(
   scope: CleanlemonSmartDoorScope,
   ctx: { operatorId: string; email: string },
-  payload: { type: string; externalId: string; name: string }
+  payload: { type: string; externalId: string; name: string; ttlockSlot?: number }
 ) {
   const email = String(ctx.email || '').trim().toLowerCase();
   const operatorId = String(ctx.operatorId || '').trim();
-  return postCleanlemonSmartDoor<{ ok: boolean; reason?: string }>(scope, 'sync-name', { email, operatorId, ...payload });
+  const body: Record<string, unknown> = { email, operatorId, type: payload.type, externalId: payload.externalId, name: payload.name };
+  if (payload.ttlockSlot != null && Number.isFinite(Number(payload.ttlockSlot))) {
+    body.ttlockSlot = Number(payload.ttlockSlot);
+  }
+  return postCleanlemonSmartDoor<{ ok: boolean; reason?: string }>(scope, 'sync-name', body);
 }
 
 export async function clnDeleteSmartDoorLock(scope: CleanlemonSmartDoorScope, ctx: { operatorId: string; email: string }, id: string) {
@@ -1432,13 +2322,21 @@ export async function clnDeleteSmartDoorGateway(scope: CleanlemonSmartDoorScope,
   return postCleanlemonSmartDoor<{ ok: boolean; reason?: string }>(scope, 'delete-gateway', { email, operatorId, id });
 }
 
-export async function clnSyncSmartDoorLocksFromTtlock(scope: CleanlemonSmartDoorScope, ctx: { operatorId: string; email: string }) {
+export async function clnSyncSmartDoorLocksFromTtlock(
+  scope: CleanlemonSmartDoorScope,
+  ctx: { operatorId: string; email: string },
+  opts?: { ttlockSlot?: number }
+) {
   const email = String(ctx.email || '').trim().toLowerCase();
   const operatorId = String(ctx.operatorId || '').trim();
+  const body: Record<string, unknown> = { email, operatorId };
+  if (opts?.ttlockSlot != null && Number.isFinite(Number(opts.ttlockSlot))) {
+    body.ttlockSlot = Number(opts.ttlockSlot);
+  }
   return postCleanlemonSmartDoor<{ ok: boolean; lockCount?: number; gatewayCount?: number; reason?: string }>(
     scope,
     'sync-locks-from-ttlock',
-    { email, operatorId }
+    body
   );
 }
 
@@ -1616,15 +2514,60 @@ export async function fetchOperatorDashboard(): Promise<any> {
   return r.json();
 }
 
-export async function fetchOperatorProperties(operatorId?: string): Promise<any> {
+export async function fetchOperatorProperties(
+  operatorId?: string,
+  opts?: { includeArchived?: boolean }
+): Promise<any> {
   const qs = new URLSearchParams({ limit: '500' });
   if (operatorId) qs.set('operatorId', String(operatorId));
+  if (opts?.includeArchived) qs.set('includeArchived', '1');
   const r = await apiFetch({
     path: `/api/cleanlemon/operator/properties?${qs.toString()}`,
     cache: 'no-store',
   });
   if (!r.ok) return { ok: false, reason: `HTTP_${r.status}` };
   return r.json();
+}
+
+/** Operator edit dialog — Coliving-linked security credentials (GET). */
+export async function fetchOperatorPropertyDetail(
+  propertyId: string,
+  operatorId?: string
+): Promise<{
+  ok: boolean;
+  property?: {
+    id: string;
+    clientPortalOwned?: boolean;
+    colivingPropertydetailId?: string;
+    securitySystemCredentials?: Record<string, unknown> | null;
+    smartdoorId?: string;
+    mailboxPassword?: string;
+    smartdoorPassword?: string;
+    operatorDoorAccessMode?: string;
+    smartdoorGatewayReady?: boolean;
+    hasBookingToday?: boolean;
+  };
+  reason?: string;
+}> {
+  const qs = new URLSearchParams();
+  if (operatorId) qs.set('operatorId', String(operatorId));
+  const q = qs.toString();
+  const r = await apiFetch({
+    path: `/api/cleanlemon/operator/properties/${encodeURIComponent(propertyId)}${q ? `?${q}` : ''}`,
+    cache: 'no-store',
+  });
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean;
+    property?: {
+      id: string;
+      clientPortalOwned?: boolean;
+      colivingPropertydetailId?: string;
+      securitySystemCredentials?: Record<string, unknown> | null;
+    };
+    reason?: string;
+  };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return { ok: !!data.ok, property: data.property, reason: data.reason };
 }
 
 /** Distinct `cln_property.property_name` for the operator (building / condo picker). */
@@ -1876,6 +2819,24 @@ export async function fetchClientPortalInvoices(
   );
 }
 
+/** Pay selected unpaid invoices for one operator (Stripe Checkout → operator Connect account). */
+export async function postClientPortalInvoicesCheckout(body: {
+  email: string;
+  operatorId: string;
+  invoiceIds: string[];
+  successUrl: string;
+  cancelUrl: string;
+}): Promise<{ ok: boolean; url?: string; sessionId?: string; reason?: string }> {
+  return fetchJsonSafe(
+    apiFetch({
+      path: '/api/cleanlemon/client/invoices/checkout',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  );
+}
+
 export async function fetchClientScheduleJobs(
   email: string,
   operatorId: string,
@@ -1928,12 +2889,12 @@ export async function createClientScheduleJob(body: {
   );
 }
 
-/** Client portal — extend / reschedule: same schedule row, new working day + in-progress. */
+/** Client portal — extend / reschedule (workingDay) and/or status update. */
 export async function updateClientScheduleJob(body: {
   email: string;
   operatorId: string;
   scheduleId: string;
-  workingDay: string;
+  workingDay?: string;
   status?: string;
   statusSetByEmail?: string;
   groupId?: string;
@@ -2539,14 +3500,174 @@ export async function postSubscriptionCheckoutSession(payload: Record<string, un
   );
 }
 
-export async function fetchOperatorSalaries(operatorId?: string): Promise<any> {
+export async function fetchOperatorSalaries(operatorId?: string, period?: string): Promise<any> {
   const oid = String(operatorId || '').trim()
-  const path = oid
-    ? `/api/cleanlemon/operator/salaries?operatorId=${encodeURIComponent(oid)}`
-    : '/api/cleanlemon/operator/salaries'
+  const qs = new URLSearchParams()
+  if (oid) qs.set('operatorId', oid)
+  if (period && String(period).trim()) qs.set('period', String(period).trim())
+  const path = `/api/cleanlemon/operator/salaries?${qs.toString()}`
   const r = await apiFetch({ path, cache: 'no-store' });
   if (!r.ok) return { ok: false, reason: `HTTP_${r.status}` };
   return r.json();
+}
+
+export async function fetchOperatorSalarySettings(operatorId: string): Promise<any> {
+  const qs = new URLSearchParams({ operatorId: String(operatorId || '').trim() })
+  return fetchJsonSafe(apiFetch({ path: `/api/cleanlemon/operator/salary-settings?${qs}`, cache: 'no-store' }))
+}
+
+export async function saveOperatorSalarySettings(
+  operatorId: string,
+  payDays: number[],
+  payrollDefaults?: import('./malaysia-flex-payroll.types').PayrollDefaultsJson | null
+): Promise<any> {
+  const body: Record<string, unknown> = { operatorId, payDays }
+  if (payrollDefaults !== undefined) body.payrollDefaults = payrollDefaults
+  return fetchJsonSafe(
+    apiFetch({
+      path: '/api/cleanlemon/operator/salary-settings',
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  )
+}
+
+export async function postOperatorSalariesComputePreview(payload: Record<string, unknown>): Promise<{
+  ok?: boolean
+  result?: import('./malaysia-flex-payroll.types').MalaysiaFlexPayrollResult
+  reason?: string
+}> {
+  return fetchJsonSafe(
+    apiFetch({
+      path: '/api/cleanlemon/operator/salaries/compute-preview',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+  )
+}
+
+export async function postOperatorSalariesSyncFromContacts(payload: {
+  operatorId: string
+  period: string
+}): Promise<{ ok?: boolean; created?: number; skipped?: number; eligible?: number; reason?: string }> {
+  return fetchJsonSafe(
+    apiFetch({
+      path: '/api/cleanlemon/operator/salaries/sync-from-contacts',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+  )
+}
+
+export async function fetchOperatorSalaryLines(operatorId: string, period: string): Promise<any> {
+  const qs = new URLSearchParams({ operatorId: String(operatorId || '').trim(), period: String(period || '').trim() })
+  return fetchJsonSafe(apiFetch({ path: `/api/cleanlemon/operator/salary-lines?${qs}`, cache: 'no-store' }))
+}
+
+export async function postOperatorSalaryLine(payload: Record<string, unknown>): Promise<any> {
+  return fetchJsonSafe(
+    apiFetch({
+      path: '/api/cleanlemon/operator/salary-lines',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+  )
+}
+
+export async function deleteOperatorSalaryLine(operatorId: string, lineId: string): Promise<any> {
+  const qs = new URLSearchParams({ operatorId: String(operatorId || '').trim() })
+  const r = await apiFetch({
+    path: `/api/cleanlemon/operator/salary-lines/${encodeURIComponent(lineId)}?${qs}`,
+    method: 'DELETE',
+  })
+  if (!r.ok) return { ok: false, reason: `HTTP_${r.status}` }
+  return r.json()
+}
+
+export async function patchOperatorSalaryLine(
+  operatorId: string,
+  lineId: string,
+  payload: Record<string, unknown>
+): Promise<any> {
+  const qs = new URLSearchParams({ operatorId: String(operatorId || '').trim() })
+  return fetchJsonSafe(
+    apiFetch({
+      path: `/api/cleanlemon/operator/salary-lines/${encodeURIComponent(lineId)}?${qs}`,
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+  )
+}
+
+export async function postOperatorSalaryRecord(payload: Record<string, unknown>): Promise<any> {
+  return fetchJsonSafe(
+    apiFetch({
+      path: '/api/cleanlemon/operator/salaries',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+  )
+}
+
+export async function patchOperatorSalaryRecord(
+  id: string,
+  payload: Record<string, unknown>
+): Promise<any> {
+  return fetchJsonSafe(
+    apiFetch({
+      path: `/api/cleanlemon/operator/salaries/${encodeURIComponent(id)}`,
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+  )
+}
+
+/** Accrual sync: uses operator’s connected accounting (Bukku or Xero). */
+export async function postOperatorSalariesSyncAccounting(
+  operatorId: string,
+  recordIds: string[],
+  journalDate?: string
+): Promise<any> {
+  return fetchJsonSafe(
+    apiFetch({
+      path: '/api/cleanlemon/operator/salaries/sync-accounting',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ operatorId, recordIds, journalDate: journalDate || undefined }),
+    })
+  )
+}
+
+/** @deprecated Use postOperatorSalariesSyncAccounting (same API behaviour). */
+export async function postOperatorSalariesSyncBukku(
+  operatorId: string,
+  recordIds: string[],
+  journalDate?: string
+): Promise<any> {
+  return postOperatorSalariesSyncAccounting(operatorId, recordIds, journalDate)
+}
+
+export async function postOperatorSalariesMarkPaid(payload: {
+  operatorId: string
+  recordIds: string[]
+  paymentDate: string
+  paymentMethod: string
+}): Promise<any> {
+  return fetchJsonSafe(
+    apiFetch({
+      path: '/api/cleanlemon/operator/salaries/mark-paid',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+  )
 }
 
 export async function fetchOperatorContacts(operatorId?: string): Promise<any> {
@@ -2745,6 +3866,18 @@ export type OperatorScheduleAiPrefs = {
   aiScheduleHomestayWindowEndLocal?: string;
 };
 
+/** Platform AI rules (`cln_saasadmin_ai_md`) — also returned read-only on operator schedule AI settings. */
+export type SaasadminAiMdItem = {
+  id: string;
+  /** Stable display id e.g. 0001 (after migration 0270). */
+  ruleCode?: string;
+  title: string;
+  bodyMd: string;
+  sortOrder: number;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
 export async function fetchOperatorScheduleAiSettings(operatorId: string): Promise<{
   ok: boolean;
   data?: {
@@ -2753,6 +3886,8 @@ export async function fetchOperatorScheduleAiSettings(operatorId: string): Promi
     schedulePrefs: OperatorScheduleAiPrefs;
     promptExtra: string;
     chatSummary: string;
+    /** SaaS platform rules (read-only for operator; same source as Admin → AI rules) */
+    platformRules?: SaasadminAiMdItem[];
     /** YYYY-MM-DD (KL) last successful midnight batch anchor */
     lastScheduleAiCronDayYmd?: string | null;
     /** When automatic schedule AI last failed (e.g. API / token) */
@@ -2805,7 +3940,13 @@ export async function postOperatorScheduleAiChat(
   operatorId: string,
   message: string,
   mergeExtractedConstraints?: boolean
-): Promise<{ ok: boolean; reply?: string; pinnedMerged?: boolean; reason?: string }> {
+): Promise<{
+  ok: boolean;
+  reply?: string;
+  pinnedMerged?: boolean;
+  schedulePrefsMerged?: boolean;
+  reason?: string;
+}> {
   return fetchJsonSafe(
     apiFetch({
       path: '/api/cleanlemon/operator/schedule/ai-chat',
@@ -2921,12 +4062,14 @@ export async function fetchOperatorDamageReports(opts?: {
   return data;
 }
 
-export async function fetchClientDamageReports(opts?: {
+export async function fetchClientDamageReports(opts: {
+  email: string
   limit?: number
   operatorId?: string
 }): Promise<{ ok?: boolean; items?: DamageReportItem[]; reason?: string }> {
   const limit = opts?.limit ?? 200;
   const params = new URLSearchParams();
+  params.set('email', String(opts.email || '').trim().toLowerCase());
   params.set('limit', String(limit));
   if (opts?.operatorId) params.set('operatorId', opts.operatorId);
   const r = await apiFetch({
@@ -2940,13 +4083,16 @@ export async function fetchClientDamageReports(opts?: {
 
 export async function acknowledgeClientDamageReport(
   reportId: string,
-  body: { operatorId: string }
+  body: { email: string; operatorId: string }
 ): Promise<{ ok?: boolean; alreadyAcknowledged?: boolean; reason?: string }> {
   const r = await apiFetch({
     path: `/api/cleanlemon/client/damage-reports/${encodeURIComponent(reportId)}/acknowledge`,
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ operatorId: String(body.operatorId || '').trim() }),
+    body: JSON.stringify({
+      email: String(body.email || '').trim().toLowerCase(),
+      operatorId: String(body.operatorId || '').trim(),
+    }),
   });
   const data = (await r.json().catch(() => ({}))) as {
     ok?: boolean
@@ -2982,11 +4128,31 @@ export async function postEmployeeScheduleGroupStart(body: {
   return data;
 }
 
+export type JobCompletionAddonDef = { id: string; name: string; priceMyr: number };
+
+export async function fetchEmployeeJobCompletionAddons(
+  operatorId: string
+): Promise<{ ok?: boolean; items?: JobCompletionAddonDef[]; reason?: string }> {
+  const qs = new URLSearchParams({ operatorId: String(operatorId || '').trim() });
+  const r = await apiFetch({
+    path: `/api/cleanlemon/employee/job-completion-addons?${qs.toString()}`,
+    cache: 'no-store',
+  });
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean;
+    items?: JobCompletionAddonDef[];
+    reason?: string;
+  };
+  if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
+  return data;
+}
+
 export async function postEmployeeScheduleGroupEnd(body: {
   operatorId: string;
   jobIds: string[];
   photos: string[];
   remark?: string;
+  completionAddons?: JobCompletionAddonDef[];
 }): Promise<{ ok?: boolean; reason?: string; groupOperationId?: string; updatedIds?: string[] }> {
   const r = await apiFetch({
     path: '/api/cleanlemon/employee/schedule-jobs/group-end',
@@ -3522,17 +4688,6 @@ export async function postAdminPropertyDelete(propertyId: string): Promise<{
   if (!r.ok) return { ok: false, reason: data.reason || `HTTP_${r.status}` };
   return data;
 }
-
-export type SaasadminAiMdItem = {
-  id: string;
-  /** Stable display id e.g. 0001 (after migration 0270). */
-  ruleCode?: string;
-  title: string;
-  bodyMd: string;
-  sortOrder: number;
-  createdAt?: string;
-  updatedAt?: string;
-};
 
 export async function fetchSaasadminAiMdRules(): Promise<{
   ok: boolean;

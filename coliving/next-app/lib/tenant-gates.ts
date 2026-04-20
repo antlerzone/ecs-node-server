@@ -61,6 +61,10 @@ export interface TenantProfileLite {
   accountholder?: string
   nricFront?: string
   nricback?: string
+  /** ISO from portal_account.profile_self_verified_at — required with field-complete for portal gate */
+  profileSelfVerifiedAt?: string | null
+  /** Server: true when self-attested or Aliyun eKYC locked */
+  profileIdentityVerified?: boolean
   profile?: {
     entity_type?: string
     reg_no_type?: string
@@ -257,7 +261,11 @@ export function getTenantGateLayerFromInitPayload(payload: {
 }): TenantGateLayer {
   const tenant = payload.tenant ?? null
   const tenancies = payload.tenancies ?? []
-  const profileComplete = computeTenantProfileComplete(tenant)
+  const profileFieldsComplete = computeTenantProfileComplete(tenant)
+  const profileSelfVerified =
+    tenant?.profileIdentityVerified === true ||
+    (tenant?.profileSelfVerifiedAt != null && String(tenant.profileSelfVerifiedAt).trim() !== "")
+  const profileComplete = profileFieldsComplete && profileSelfVerified
   const hasPendingOperatorInvite = computeHasPendingOperatorInvite(tenant)
   const hasPendingAgreement = tenantHasPendingAgreementToSign(tenancies)
   const hasOverduePayment = !!payload.hasOverduePayment

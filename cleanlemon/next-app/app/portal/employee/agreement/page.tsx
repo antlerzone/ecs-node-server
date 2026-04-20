@@ -106,23 +106,6 @@ export default function EmployeeAgreementPage() {
     const s = (v: unknown) => normalize(v)
     return items.filter((x) => s(x.status) === "signed" || s(x.status) === "complete")
   }, [items])
-  const waitingClient = useMemo(
-    () => items.filter((x) => normalize(x.status) === "pending_client_sign"),
-    [items]
-  )
-  const waitingOperator = useMemo(
-    () =>
-      items.filter((x) => {
-        const st = normalize(x.status)
-        return st === "pending_operator_sign" || st === "signing"
-      }),
-    [items]
-  )
-  const waitingProfiles = useMemo(() => items.filter((x) => normalize(x.status) === "pending"), [items])
-  const needStaffSign = useMemo(
-    () => items.filter((x) => staffCanSignNow(x.status, x.templateMode, x.signedMeta)),
-    [items]
-  )
 
   const getCanvasPoint = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const canvas = signatureCanvasRef.current
@@ -254,39 +237,6 @@ export default function EmployeeAgreementPage() {
       <div>
         <h1 className="text-2xl font-bold text-foreground">Agreement</h1>
         <p className="text-muted-foreground">Review and sign your employee contract.</p>
-      </div>
-
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
-        <Card>
-          <CardContent className="pt-6">
-            <p className="text-sm text-muted-foreground">Your signature needed</p>
-            <p className="text-2xl font-semibold">{needStaffSign.length}</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <p className="text-sm text-muted-foreground">Awaiting client (customer)</p>
-            <p className="text-2xl font-semibold">{waitingClient.length}</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <p className="text-sm text-muted-foreground">Awaiting operator</p>
-            <p className="text-2xl font-semibold">{waitingOperator.length}</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <p className="text-sm text-muted-foreground">Pending profiles</p>
-            <p className="text-2xl font-semibold">{waitingProfiles.length}</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <p className="text-sm text-muted-foreground">Complete</p>
-            <p className="text-2xl font-semibold">{signed.length}</p>
-          </CardContent>
-        </Card>
       </div>
 
       <Card>

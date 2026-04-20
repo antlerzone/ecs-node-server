@@ -27,7 +27,8 @@
     "scan:api-routes": "node scripts/scan-express-router-paths.js --json",
     "backfill:company-profile-tz": "node scripts/backfill-company-profile-business-timezone.js",
     "verify:rc-bukku": "node scripts/verify-rentalcollection-bukku-fields.js",
-    "bukku:smoke": "node scripts/bukku-api-smoke.js"
+    "bukku:smoke": "node scripts/bukku-api-smoke.js",
+    "test:payroll": "node --test src/utils/__tests__/malaysia-flex-payroll.test.js"
   },
   "keywords": [],
   "author": "",

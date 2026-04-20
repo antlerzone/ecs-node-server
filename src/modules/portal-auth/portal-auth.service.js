@@ -1560,6 +1560,15 @@ function verifyPortalToken(token) {
   }
 }
 
+function profileSelfVerifiedAtFromRow(r) {
+  if (!r || r.profile_self_verified_at == null || r.profile_self_verified_at === '') return null;
+  const v = r.profile_self_verified_at;
+  if (v instanceof Date && !Number.isNaN(v.getTime())) return v.toISOString();
+  const d = new Date(String(v).replace(' ', 'T'));
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
+}
+
 /**
  * 取得會員資料（一個 email 一份，存在 portal_account）。
  * 若 portal_account 尚無該 email 或無 profile 欄位則回傳 null 或空物件。
@@ -1595,7 +1604,8 @@ function mapPortalAccountRowToProfile(r) {
     mydigital_linked: !!(r.mydigital_sub && String(r.mydigital_sub).trim()),
     gov_identity_locked: !!r.gov_identity_locked,
     phone_verified: !!Number(r.phone_verified),
-    aliyun_ekyc_locked: !!Number(r.aliyun_ekyc_locked)
+    aliyun_ekyc_locked: !!Number(r.aliyun_ekyc_locked),
+    profileSelfVerifiedAt: profileSelfVerifiedAtFromRow(r)
   };
 }
 
@@ -1604,18 +1614,22 @@ async function getPortalProfile(email) {
   if (!normalized) {
     return { ok: false, reason: 'NO_EMAIL' };
   }
-  const baseCols = `fullname, first_name, last_name, phone, address, nric, passport_expiry_date, bankname_id, bankaccount, accountholder, avatar_url, nricfront, nricback, entity_type, reg_no_type, id_type, tax_id_no, bank_refund_remark,
+  const baseColsCore = `fullname, first_name, last_name, phone, address, nric, passport_expiry_date, bankname_id, bankaccount, accountholder, avatar_url, nricfront, nricback, entity_type, reg_no_type, id_type, tax_id_no, bank_refund_remark,
        singpass_sub, mydigital_sub, gov_identity_locked`;
   const attempts = [
-    `SELECT ${baseCols},
+    `SELECT ${baseColsCore}, profile_self_verified_at,
        COALESCE(phone_verified, 0) AS phone_verified,
        COALESCE(aliyun_ekyc_locked, 0) AS aliyun_ekyc_locked
        FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1`,
-    `SELECT ${baseCols},
+    `SELECT ${baseColsCore},
+       COALESCE(phone_verified, 0) AS phone_verified,
+       COALESCE(aliyun_ekyc_locked, 0) AS aliyun_ekyc_locked
+       FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1`,
+    `SELECT ${baseColsCore},
        0 AS phone_verified,
        COALESCE(aliyun_ekyc_locked, 0) AS aliyun_ekyc_locked
        FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1`,
-    `SELECT ${baseCols},
+    `SELECT ${baseColsCore},
        0 AS phone_verified,
        0 AS aliyun_ekyc_locked
        FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1`,
@@ -1677,7 +1691,8 @@ async function getPortalProfile(email) {
             mydigital_linked: false,
             gov_identity_locked: false,
             phone_verified: false,
-            aliyun_ekyc_locked: false
+            aliyun_ekyc_locked: false,
+            profileSelfVerifiedAt: null
           }
         };
       } catch (_) {
@@ -1704,6 +1719,11 @@ async function updatePortalProfile(email, payload) {
   }
   if (!payload || typeof payload !== 'object') {
     return { ok: false, reason: 'NO_PAYLOAD' };
+  }
+
+  const selfVerify = payload.selfVerify === true;
+  if (Object.prototype.hasOwnProperty.call(payload, 'selfVerify')) {
+    delete payload.selfVerify;
   }
 
   const bypassIdentityLock = payload._bypassIdentityLock === true;
@@ -1965,6 +1985,21 @@ async function updatePortalProfile(email, payload) {
         console.warn(
           '[portal-auth] passport_expiry_date and/or aliyun_ekyc_locked missing — run migrations 0266/0267 (OCR fields ok, lock/date skipped)'
         );
+      }
+    }
+
+    if (selfVerify) {
+      try {
+        await pool.query(
+          'UPDATE portal_account SET profile_self_verified_at = NOW(), updated_at = NOW() WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+          [normalized]
+        );
+      } catch (svErr) {
+        if (svErr && svErr.code === 'ER_BAD_FIELD_ERROR') {
+          console.warn('[portal-auth] profile_self_verified_at column missing — run migration 0294');
+        } else {
+          throw svErr;
+        }
       }
     }
 

@@ -1,8 +1,8 @@
 "use client"
 
-import { Suspense, useCallback, useEffect, useRef, useState } from 'react'
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardContent, CardDescription, CardHeader } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -41,6 +41,7 @@ import {
   FileSignature,
   BookOpen,
   ChevronsUpDown,
+  Info,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import {
@@ -68,12 +69,13 @@ import {
 } from '@/components/ui/command'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 
 interface Agreement {
   id: string
   recipientName: string
   recipientEmail: string
-  recipientType: 'employee' | 'driver' | 'dobi'
+  recipientType: 'employee' | 'driver' | 'dobi' | 'client'
   templateName: string
   salary: number
   startDate: string
@@ -106,12 +108,6 @@ interface Template {
   lastUpdated: string
 }
 
-interface AgreementAutomationRule {
-  id: string
-  templateId: string
-  triggerWhen: 'new_customer' | 'new_employee_all' | 'new_employee_parttime_only' | 'new_employee_fulltime_only'
-}
-
 const statusConfig = {
   pending: { bg: 'bg-slate-100', text: 'text-slate-800', icon: Clock },
   signing: { bg: 'bg-sky-100', text: 'text-sky-900', icon: FileSignature },
@@ -132,6 +128,8 @@ type StaffPick = {
   email: string
   recipientType: 'employee' | 'driver' | 'dobi'
 }
+
+type LinkedClientPick = { id: string; name: string; email: string }
 
 function permissionToRecipientType(perms: string[]): 'employee' | 'driver' | 'dobi' {
   if (perms.includes('driver')) return 'driver'
@@ -190,9 +188,6 @@ function AgreementPageContent() {
   const [isVariablesDialogOpen, setIsVariablesDialogOpen] = useState(false)
   const [previewAgreement, setPreviewAgreement] = useState<Agreement | null>(null)
   const [signingAgreement, setSigningAgreement] = useState<Agreement | null>(null)
-  const [isAutomationDialogOpen, setIsAutomationDialogOpen] = useState(false)
-  const [automationRules, setAutomationRules] = useState<AgreementAutomationRule[]>([])
-  const [automationSaving, setAutomationSaving] = useState(false)
   const [newTemplate, setNewTemplate] = useState({
     name: '',
     mode: '',
@@ -211,6 +206,10 @@ function AgreementPageContent() {
   const [staffContacts, setStaffContacts] = useState<StaffPick[]>([])
   const [selectedStaffId, setSelectedStaffId] = useState('')
   const [staffComboOpen, setStaffComboOpen] = useState(false)
+  const [createParty, setCreateParty] = useState<'employee' | 'client' | ''>('')
+  const [linkedClients, setLinkedClients] = useState<LinkedClientPick[]>([])
+  const [selectedClientId, setSelectedClientId] = useState('')
+  const [clientComboOpen, setClientComboOpen] = useState(false)
   const [previewingTemplateId, setPreviewingTemplateId] = useState<string | null>(null)
   const opSignCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const opSignWrapRef = useRef<HTMLDivElement | null>(null)
@@ -231,6 +230,24 @@ function AgreementPageContent() {
     }
   }, [operatorId])
 
+  const loadLinkedClients = useCallback(async () => {
+    const r = await fetchOperatorLinkedClientdetails(operatorId)
+    if (r?.ok && Array.isArray(r.items)) {
+      setLinkedClients(
+        r.items.map((c) => ({
+          id: String(c.id),
+          name: String(c.name || ''),
+          email: String(c.email || ''),
+        }))
+      )
+    } else {
+      setLinkedClients([])
+    }
+  }, [operatorId])
+
+  const staffTemplates = useMemo(() => templates.filter((t) => t.mode === 'operator_staff'), [templates])
+  const clientTemplates = useMemo(() => templates.filter((t) => t.mode === 'operator_client'), [templates])
+
   useEffect(() => {
     let cancelled = false
     ;(async () => {
@@ -244,19 +261,6 @@ function AgreementPageContent() {
       if (t?.ok) setTemplates(t.items || [])
       const settings = s?.ok && s.settings && typeof s.settings === 'object' ? s.settings : {}
       setGoogleDriveConnected(!!settings.googleDrive)
-      if (Array.isArray(settings.agreementAutomations)) {
-        setAutomationRules(
-          settings.agreementAutomations
-            .map((x: any, idx: number) => ({
-              id: String(x?.id || `auto-${idx + 1}`),
-              templateId: String(x?.templateId || ''),
-              triggerWhen: (
-                x?.triggerWhen || 'new_employee_all'
-              ) as AgreementAutomationRule['triggerWhen'],
-            }))
-            .filter((x: AgreementAutomationRule) => x.templateId)
-        )
-      }
     })()
     return () => {
       cancelled = true
@@ -264,20 +268,27 @@ function AgreementPageContent() {
   }, [operatorId])
 
   useEffect(() => {
-    if (searchParams.get('createOffer') !== '1') return
+    const openCreate =
+      searchParams.get('createAgreement') === '1' || searchParams.get('createOffer') === '1'
+    if (!openCreate) return
     if (googleDriveConnected === null) return
-    if (!googleDriveConnected) {
-      toast.error('Connect Google Drive under Company → Integration before creating offer letters.')
+    const fromContact = !!searchParams.get('contactId')
+    const legacyOffer = searchParams.get('createOffer') === '1'
+    const needsDrive = fromContact || legacyOffer
+    if (needsDrive && !googleDriveConnected) {
+      toast.error('Connect Google Drive under Company → Integration before creating staff agreements.')
       router.replace('/portal/operator/agreement', { scroll: false })
       return
     }
     setIsCreateDialogOpen(true)
+    if (fromContact || legacyOffer) setCreateParty('employee')
   }, [searchParams, googleDriveConnected, router])
 
   useEffect(() => {
     if (!isCreateDialogOpen) return
     void loadStaffForOffer()
-  }, [isCreateDialogOpen, loadStaffForOffer])
+    void loadLinkedClients()
+  }, [isCreateDialogOpen, loadStaffForOffer, loadLinkedClients])
 
   useEffect(() => {
     if (!signingAgreement) return
@@ -405,7 +416,11 @@ function AgreementPageContent() {
   }, [isCreateDialogOpen, contactIdFromUrl, staffContacts, router])
 
   const resetCreateOfferForm = () => {
+    setCreateParty('')
     setSelectedStaffId('')
+    setSelectedClientId('')
+    setStaffComboOpen(false)
+    setClientComboOpen(false)
     setNewAgreement({
       recipientName: '',
       recipientEmail: '',
@@ -420,7 +435,11 @@ function AgreementPageContent() {
     setIsCreateDialogOpen(open)
     setStaffComboOpen(false)
     if (!open) {
-      if (searchParams.get('createOffer') || searchParams.get('contactId')) {
+      if (
+        searchParams.get('createAgreement') ||
+        searchParams.get('createOffer') ||
+        searchParams.get('contactId')
+      ) {
         router.replace('/portal/operator/agreement', { scroll: false })
       }
       resetCreateOfferForm()
@@ -438,45 +457,15 @@ function AgreementPageContent() {
     setStaffComboOpen(false)
   }
 
-  const addAutomationRule = () => {
-    setAutomationRules((prev) => [
+  const selectClient = (c: LinkedClientPick) => {
+    setSelectedClientId(c.id)
+    setNewAgreement((prev) => ({
       ...prev,
-      {
-        id: `auto-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-        templateId: '',
-        triggerWhen: 'new_employee_all',
-      },
-    ])
-  }
-
-  const updateAutomationRule = (id: string, patch: Partial<AgreementAutomationRule>) => {
-    setAutomationRules((prev) => prev.map((rule) => (rule.id === id ? { ...rule, ...patch } : rule)))
-  }
-
-  const removeAutomationRule = (id: string) => {
-    setAutomationRules((prev) => prev.filter((rule) => rule.id !== id))
-  }
-
-  const handleSaveAutomations = async () => {
-    const invalid = automationRules.some((x) => !x.templateId || !x.triggerWhen)
-    if (invalid) {
-      toast.error('Please select template and trigger for all automation cards')
-      return
-    }
-    setAutomationSaving(true)
-    const settingsR = await fetchOperatorSettings(operatorId)
-    const settings = settingsR?.ok && settingsR.settings && typeof settingsR.settings === 'object' ? settingsR.settings : {}
-    const saveR = await saveOperatorSettings(operatorId, {
-      ...settings,
-      agreementAutomations: automationRules,
-    })
-    setAutomationSaving(false)
-    if (!saveR?.ok) {
-      toast.error(saveR?.reason || 'Failed to save agreement automation')
-      return
-    }
-    toast.success('Agreement automation saved')
-    setIsAutomationDialogOpen(false)
+      recipientName: c.name,
+      recipientEmail: c.email,
+      recipientType: 'client',
+    }))
+    setClientComboOpen(false)
   }
 
   const agreementColumns: Column<Agreement>[] = [
@@ -499,6 +488,7 @@ function AgreementPageContent() {
         { label: 'Employee', value: 'employee' },
         { label: 'Driver', value: 'driver' },
         { label: 'Dobi', value: 'dobi' },
+        { label: 'Client', value: 'client' },
       ],
       render: (value) => (
         <Badge variant="secondary" className="capitalize">{String(value)}</Badge>
@@ -512,7 +502,8 @@ function AgreementPageContent() {
       key: 'salary',
       label: 'Salary',
       sortable: true,
-      render: (value) => `RM ${Number(value).toLocaleString()}/month`,
+      render: (value, row) =>
+        row.recipientType === 'client' ? '—' : `RM ${Number(value).toLocaleString()}/month`,
     },
     {
       key: 'startDate',
@@ -692,40 +683,76 @@ function AgreementPageContent() {
   ]
 
   const handleCreateAgreement = async () => {
-    if (!googleDriveConnected) {
-      toast.error('Connect Google Drive under Company → Integration before creating offer letters.')
-      return
-    }
-    if (!selectedStaffId) {
-      toast.error('Please select a staff recipient from the list')
-      return
-    }
-    if (!newAgreement.recipientEmail.trim() || !newAgreement.recipientType || !newAgreement.template) {
-      toast.error('Please complete email, role type, and template')
-      return
-    }
-    const res = await createOperatorAgreement({
-      operatorId,
-      templateId: newAgreement.template,
-      recipientName: newAgreement.recipientName,
-      recipientEmail: newAgreement.recipientEmail,
-      recipientType: newAgreement.recipientType,
-      templateName: templates.find((t) => t.id === newAgreement.template)?.name || 'Template',
-      salary: Number(newAgreement.salary || 0),
-      startDate: newAgreement.startDate,
-    })
-    if (!res?.ok) {
-      const reason = String(res?.reason || '')
-      if (reason === 'GOOGLE_DRIVE_REQUIRED') {
-        toast.error('Connect Google Drive under Company → Integration before creating offer letters.')
-      } else {
-        toast.error(reason || 'Failed to create offer letter')
+    if (createParty === 'employee') {
+      if (!googleDriveConnected) {
+        toast.error('Connect Google Drive under Company → Integration before creating staff agreements.')
+        return
       }
+      if (!selectedStaffId) {
+        toast.error('Please select a staff recipient from the list')
+        return
+      }
+      if (!newAgreement.recipientEmail.trim() || !newAgreement.recipientType || !newAgreement.template) {
+        toast.error('Please complete email, role type, and template')
+        return
+      }
+      if (!staffTemplates.some((t) => t.id === newAgreement.template)) {
+        toast.error('Choose a staff (operator & staff) template')
+        return
+      }
+      const res = await createOperatorAgreement({
+        operatorId,
+        templateId: newAgreement.template,
+        recipientName: newAgreement.recipientName,
+        recipientEmail: newAgreement.recipientEmail,
+        recipientType: newAgreement.recipientType,
+        templateName: staffTemplates.find((t) => t.id === newAgreement.template)?.name || 'Template',
+        salary: Number(newAgreement.salary || 0),
+        startDate: newAgreement.startDate,
+      })
+      if (!res?.ok) {
+        const reason = String(res?.reason || '')
+        if (reason === 'GOOGLE_DRIVE_REQUIRED') {
+          toast.error('Connect Google Drive under Company → Integration before creating staff agreements.')
+        } else {
+          toast.error(reason || 'Failed to create agreement')
+        }
+        return
+      }
+    } else if (createParty === 'client') {
+      if (!selectedClientId) {
+        toast.error('Please select a client')
+        return
+      }
+      if (!newAgreement.template) {
+        toast.error('Please select a template')
+        return
+      }
+      if (!clientTemplates.some((t) => t.id === newAgreement.template)) {
+        toast.error('Choose an operator & client template')
+        return
+      }
+      const res = await createOperatorAgreement({
+        operatorId,
+        templateId: newAgreement.template,
+        recipientName: newAgreement.recipientName,
+        recipientEmail: newAgreement.recipientEmail,
+        recipientType: 'client',
+        templateName: clientTemplates.find((t) => t.id === newAgreement.template)?.name || 'Template',
+        salary: 0,
+        startDate: '',
+      })
+      if (!res?.ok) {
+        toast.error(String(res?.reason || '') || 'Failed to create agreement')
+        return
+      }
+    } else {
+      toast.error('Choose Employee or Client')
       return
     }
     const r = await fetchOperatorAgreements(operatorId)
     if (r?.ok) setAgreements(r.items || [])
-    toast.success(`Offer letter created for ${newAgreement.recipientName}`)
+    toast.success(`Agreement created for ${newAgreement.recipientName}`)
     onCreateDialogOpenChange(false)
   }
 
@@ -819,172 +846,271 @@ function AgreementPageContent() {
     <div className="space-y-6 pb-20 lg:pb-0">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-        <div>
+        <div className="flex min-w-0 items-center gap-2">
           <h2 className="text-2xl font-bold text-foreground">Agreement Management</h2>
-          <p className="text-muted-foreground">
-            Create and manage agreements. Staff, client, and operator may sign in any order; the agreement completes when all
-            required signatures are collected. A final PDF is generated when complete (Google Drive).
-          </p>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                className="shrink-0 rounded-full text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                aria-label="About agreement management"
+              >
+                <Info className="h-5 w-5" aria-hidden />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" align="start" className="max-w-sm text-left leading-snug">
+              Create and manage agreements. Staff, client, and operator may sign in any order; the agreement completes when all
+              required signatures are collected. A final PDF is generated when complete (Google Drive).
+            </TooltipContent>
+          </Tooltip>
         </div>
         <div className="flex items-center gap-2">
-          <Button variant="outline" onClick={() => setIsAutomationDialogOpen(true)}>
-            Agreement Automation
-          </Button>
-          {googleDriveConnected === true ? (
           <Dialog open={isCreateDialogOpen} onOpenChange={onCreateDialogOpenChange}>
             <DialogTrigger asChild>
               <Button>
                 <Plus className="h-4 w-4 mr-2" />
-                Create Offer Letter
+                Create agreement
               </Button>
             </DialogTrigger>
-          <DialogContent className="max-w-lg">
-            <DialogHeader>
-              <DialogTitle>Create Offer Letter</DialogTitle>
-              <DialogDescription>
-                Generate and send an offer letter to a new hire
-              </DialogDescription>
-            </DialogHeader>
-            <div className="space-y-4 py-4">
-              <div className="grid grid-cols-2 gap-4">
-                <div className="col-span-2 space-y-2">
-                  <Label>Recipient (staff)</Label>
-                  <Popover open={staffComboOpen} onOpenChange={setStaffComboOpen}>
-                    <PopoverTrigger asChild>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        role="combobox"
-                        aria-expanded={staffComboOpen}
-                        className={cn('w-full justify-between font-normal', !selectedStaffId && 'text-muted-foreground')}
+            <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
+              <DialogHeader>
+                <DialogTitle>Create agreement</DialogTitle>
+                <DialogDescription>
+                  Choose whether this agreement is with your staff or a B2B client, then select template and details.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-4 py-2">
+                <div className="space-y-2">
+                  <Label>Agreement with</Label>
+                  <RadioGroup
+                    value={createParty || undefined}
+                    onValueChange={(v) => {
+                      const next = v as 'employee' | 'client'
+                      setCreateParty(next)
+                      setNewAgreement((prev) => ({ ...prev, template: '' }))
+                      if (next === 'employee') {
+                        setSelectedClientId('')
+                      } else {
+                        setSelectedStaffId('')
+                      }
+                    }}
+                    className="flex flex-col gap-2 sm:flex-row sm:gap-6"
+                  >
+                    <label className="flex cursor-pointer items-center gap-2 text-sm font-normal">
+                      <RadioGroupItem value="employee" id="agr-emp" />
+                      <span>Employee (staff)</span>
+                    </label>
+                    <label className="flex cursor-pointer items-center gap-2 text-sm font-normal">
+                      <RadioGroupItem value="client" id="agr-cli" />
+                      <span>Client (B2B customer)</span>
+                    </label>
+                  </RadioGroup>
+                </div>
+
+                {createParty === 'employee' && (
+                  <>
+                    {googleDriveConnected === false && (
+                      <p className="text-sm text-amber-800 dark:text-amber-200 rounded-md border border-amber-200 bg-amber-50 p-2 dark:border-amber-900 dark:bg-amber-950/40">
+                        Connect Google Drive under Company → Integration to create staff agreements.
+                      </p>
+                    )}
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="col-span-2 space-y-2">
+                        <Label>Recipient (staff)</Label>
+                        <Popover open={staffComboOpen} onOpenChange={setStaffComboOpen}>
+                          <PopoverTrigger asChild>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              role="combobox"
+                              aria-expanded={staffComboOpen}
+                              className={cn(
+                                'w-full justify-between font-normal',
+                                !selectedStaffId && 'text-muted-foreground'
+                              )}
+                            >
+                              {selectedStaffId
+                                ? staffContacts.find((s) => s.id === selectedStaffId)?.name ||
+                                  newAgreement.recipientName ||
+                                  'Select staff'
+                                : 'Search and select staff…'}
+                              <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                            </Button>
+                          </PopoverTrigger>
+                          <PopoverContent className="w-[var(--radix-popover-trigger-width)] p-0" align="start">
+                            <Command>
+                              <CommandInput placeholder="Search by name or email…" />
+                              <CommandList>
+                                <CommandEmpty>No matching staff.</CommandEmpty>
+                                <CommandGroup>
+                                  {staffContacts.map((s) => (
+                                    <CommandItem
+                                      key={s.id}
+                                      value={`${s.name} ${s.email}`}
+                                      onSelect={() => selectStaff(s)}
+                                    >
+                                      <span className="truncate">{s.name}</span>
+                                      <span className="ml-2 truncate text-xs text-muted-foreground">{s.email}</span>
+                                    </CommandItem>
+                                  ))}
+                                </CommandGroup>
+                              </CommandList>
+                            </Command>
+                          </PopoverContent>
+                        </Popover>
+                      </div>
+                      <div className="space-y-2">
+                        <Label>Email</Label>
+                        <Input
+                          type="email"
+                          value={newAgreement.recipientEmail}
+                          onChange={(e) => setNewAgreement({ ...newAgreement, recipientEmail: e.target.value })}
+                          placeholder="email@example.com"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label>Role Type</Label>
+                        <Select
+                          value={newAgreement.recipientType}
+                          onValueChange={(value) => setNewAgreement({ ...newAgreement, recipientType: value })}
+                        >
+                          <SelectTrigger>
+                            <SelectValue placeholder="Select type" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="employee">Employee</SelectItem>
+                            <SelectItem value="driver">Driver</SelectItem>
+                            <SelectItem value="dobi">Dobi</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    </div>
+                    <div className="space-y-2">
+                      <Label>Template (operator &amp; staff)</Label>
+                      <Select
+                        value={newAgreement.template}
+                        onValueChange={(value) => setNewAgreement({ ...newAgreement, template: value })}
                       >
-                        {selectedStaffId
-                          ? staffContacts.find((s) => s.id === selectedStaffId)?.name || newAgreement.recipientName || 'Select staff'
-                          : 'Search and select staff…'}
-                        <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
-                      </Button>
-                    </PopoverTrigger>
-                    <PopoverContent className="w-[var(--radix-popover-trigger-width)] p-0" align="start">
-                      <Command>
-                        <CommandInput placeholder="Search by name or email…" />
-                        <CommandList>
-                          <CommandEmpty>No matching staff.</CommandEmpty>
-                          <CommandGroup>
-                            {staffContacts.map((s) => (
-                              <CommandItem
-                                key={s.id}
-                                value={`${s.name} ${s.email}`}
-                                onSelect={() => selectStaff(s)}
-                              >
-                                <span className="truncate">{s.name}</span>
-                                <span className="ml-2 truncate text-xs text-muted-foreground">{s.email}</span>
-                              </CommandItem>
-                            ))}
-                          </CommandGroup>
-                        </CommandList>
-                      </Command>
-                    </PopoverContent>
-                  </Popover>
-                </div>
-                <div className="space-y-2">
-                  <Label>Email</Label>
-                  <Input
-                    type="email"
-                    value={newAgreement.recipientEmail}
-                    onChange={(e) => setNewAgreement({ ...newAgreement, recipientEmail: e.target.value })}
-                    placeholder="email@example.com"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label>Role Type</Label>
-                  <Select
-                    value={newAgreement.recipientType}
-                    onValueChange={(value) => setNewAgreement({ ...newAgreement, recipientType: value })}
-                  >
-                    <SelectTrigger>
-                      <SelectValue placeholder="Select type" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="employee">Employee</SelectItem>
-                      <SelectItem value="driver">Driver</SelectItem>
-                      <SelectItem value="dobi">Dobi</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
+                        <SelectTrigger>
+                          <SelectValue placeholder="Select template" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {staffTemplates.map((t) => (
+                            <SelectItem key={t.id} value={t.id}>
+                              {t.name}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      {staffTemplates.length === 0 && (
+                        <p className="text-xs text-muted-foreground">Add an operator &amp; staff template under Templates first.</p>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <Label>Monthly Salary (RM)</Label>
+                        <Input
+                          type="number"
+                          value={newAgreement.salary}
+                          onChange={(e) => setNewAgreement({ ...newAgreement, salary: e.target.value })}
+                          placeholder="2000"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label>Start Date</Label>
+                        <Input
+                          type="date"
+                          value={newAgreement.startDate}
+                          onChange={(e) => setNewAgreement({ ...newAgreement, startDate: e.target.value })}
+                        />
+                      </div>
+                    </div>
+                  </>
+                )}
+
+                {createParty === 'client' && (
+                  <>
+                    <div className="col-span-2 space-y-2">
+                      <Label>Client (B2B)</Label>
+                      <Popover open={clientComboOpen} onOpenChange={setClientComboOpen}>
+                        <PopoverTrigger asChild>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            role="combobox"
+                            aria-expanded={clientComboOpen}
+                            className={cn(
+                              'w-full justify-between font-normal',
+                              !selectedClientId && 'text-muted-foreground'
+                            )}
+                          >
+                            {selectedClientId
+                              ? linkedClients.find((c) => c.id === selectedClientId)?.name ||
+                                newAgreement.recipientName ||
+                                'Select client'
+                              : 'Search and select client…'}
+                            <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                          </Button>
+                        </PopoverTrigger>
+                        <PopoverContent className="w-[var(--radix-popover-trigger-width)] p-0" align="start">
+                          <Command>
+                            <CommandInput placeholder="Search by name or email…" />
+                            <CommandList>
+                              <CommandEmpty>No linked clients. Link clients under Company or Properties.</CommandEmpty>
+                              <CommandGroup>
+                                {linkedClients.map((c) => (
+                                  <CommandItem
+                                    key={c.id}
+                                    value={`${c.name} ${c.email}`}
+                                    onSelect={() => selectClient(c)}
+                                  >
+                                    <span className="truncate">{c.name}</span>
+                                    <span className="ml-2 truncate text-xs text-muted-foreground">{c.email}</span>
+                                  </CommandItem>
+                                ))}
+                              </CommandGroup>
+                            </CommandList>
+                          </Command>
+                        </PopoverContent>
+                      </Popover>
+                    </div>
+                    <div className="space-y-2">
+                      <Label>Template (operator &amp; client)</Label>
+                      <Select
+                        value={newAgreement.template}
+                        onValueChange={(value) => setNewAgreement({ ...newAgreement, template: value })}
+                      >
+                        <SelectTrigger>
+                          <SelectValue placeholder="Select template" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {clientTemplates.map((t) => (
+                            <SelectItem key={t.id} value={t.id}>
+                              {t.name}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      {clientTemplates.length === 0 && (
+                        <p className="text-xs text-muted-foreground">
+                          Add an operator &amp; client template under Templates first.
+                        </p>
+                      )}
+                    </div>
+                  </>
+                )}
               </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2 col-span-2">
-                  <Label>Template</Label>
-                  <Select
-                    value={newAgreement.template}
-                    onValueChange={(value) => setNewAgreement({ ...newAgreement, template: value })}
-                  >
-                    <SelectTrigger>
-                      <SelectValue placeholder="Select template" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {templates.map((t) => (
-                        <SelectItem key={t.id} value={t.id}>{t.name}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label>Monthly Salary (RM)</Label>
-                  <Input
-                    type="number"
-                    value={newAgreement.salary}
-                    onChange={(e) => setNewAgreement({ ...newAgreement, salary: e.target.value })}
-                    placeholder="2000"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label>Start Date</Label>
-                  <Input
-                    type="date"
-                    value={newAgreement.startDate}
-                    onChange={(e) => setNewAgreement({ ...newAgreement, startDate: e.target.value })}
-                  />
-                </div>
-              </div>
-            </div>
-            <DialogFooter>
-              <Button variant="outline" onClick={() => onCreateDialogOpenChange(false)}>
-                Cancel
-              </Button>
-              <Button variant="outline">
-                Save as Draft
-              </Button>
-              <Button onClick={handleCreateAgreement}>
-                <Send className="h-4 w-4 mr-2" />
-                Create & Send
-              </Button>
-            </DialogFooter>
+              <DialogFooter className="gap-2 sm:gap-0">
+                <Button variant="outline" onClick={() => onCreateDialogOpenChange(false)}>
+                  Cancel
+                </Button>
+                <Button onClick={() => void handleCreateAgreement()}>
+                  <Send className="h-4 w-4 mr-2" />
+                  Create agreement
+                </Button>
+              </DialogFooter>
             </DialogContent>
           </Dialog>
-          ) : googleDriveConnected === false ? (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span className="inline-flex">
-                  <Button type="button" disabled>
-                    <Plus className="h-4 w-4 mr-2" />
-                    Create Offer Letter
-                  </Button>
-                </span>
-              </TooltipTrigger>
-              <TooltipContent side="top" className="max-w-xs">
-                Connect Google Drive under Company → Integration first. Offer letters need Drive to generate and store
-                documents.
-              </TooltipContent>
-            </Tooltip>
-          ) : (
-            <Button type="button" disabled>
-              <Plus className="h-4 w-4 mr-2" />
-              Create Offer Letter
-            </Button>
-          )}
         </div>
       </div>
 
@@ -1048,9 +1174,13 @@ function AgreementPageContent() {
       <Card>
         <CardHeader className="pb-0">
           <Tabs value={activeTab} onValueChange={setActiveTab}>
-            <TabsList>
-              <TabsTrigger value="agreements">Agreements</TabsTrigger>
-              <TabsTrigger value="templates">Templates</TabsTrigger>
+            <TabsList className="grid h-auto min-h-9 w-full grid-cols-2 gap-0.5 p-1 sm:inline-flex sm:h-9 sm:w-fit sm:gap-0">
+              <TabsTrigger className="w-full sm:w-auto" value="agreements">
+                Agreements
+              </TabsTrigger>
+              <TabsTrigger className="w-full sm:w-auto" value="templates">
+                Templates
+              </TabsTrigger>
             </TabsList>
           </Tabs>
         </CardHeader>
@@ -1062,21 +1192,26 @@ function AgreementPageContent() {
               actions={agreementActions}
               searchKeys={['recipientName', 'recipientEmail']}
               pageSize={10}
-              emptyMessage="No agreements found. Create your first offer letter."
+              emptyMessage="No agreements found. Create your first agreement."
+              stackedOnNarrow
             />
           )}
           {activeTab === 'templates' && (
             <>
-              <div className="flex justify-end mb-4">
-                <div className="flex gap-2">
-                  <Button variant="outline" onClick={() => setIsVariablesDialogOpen(true)}>
-                    <BookOpen className="h-4 w-4 mr-2" />
-                    Template Variables
-                  </Button>
+              <div className="mb-4 flex w-full min-w-0 flex-col gap-2 sm:flex-row sm:flex-wrap sm:justify-end">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full justify-center sm:w-auto sm:shrink-0"
+                  onClick={() => setIsVariablesDialogOpen(true)}
+                >
+                  <BookOpen className="h-4 w-4 mr-2 shrink-0" />
+                  Template Variables
+                </Button>
                 <Dialog open={isTemplateDialogOpen} onOpenChange={setIsTemplateDialogOpen}>
                   <DialogTrigger asChild>
-                    <Button variant="outline">
-                      <Plus className="h-4 w-4 mr-2" />
+                    <Button type="button" variant="outline" className="w-full justify-center sm:w-auto sm:shrink-0">
+                      <Plus className="h-4 w-4 mr-2 shrink-0" />
                       New Template
                     </Button>
                   </DialogTrigger>
@@ -1148,7 +1283,6 @@ function AgreementPageContent() {
                     </DialogFooter>
                   </DialogContent>
                 </Dialog>
-                </div>
               </div>
               <DataTable
                 data={templates}
@@ -1157,6 +1291,7 @@ function AgreementPageContent() {
                 searchKeys={['name', 'description']}
                 pageSize={10}
                 emptyMessage="No templates found. Create your first template."
+                stackedOnNarrow
               />
             </>
           )}
@@ -1258,92 +1393,6 @@ function AgreementPageContent() {
             </Button>
             <Button variant="outline" onClick={() => setIsVariablesDialogOpen(false)}>
               Close
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={isAutomationDialogOpen} onOpenChange={setIsAutomationDialogOpen}>
-        <DialogContent className="max-w-2xl">
-          <DialogHeader>
-            <DialogTitle>Agreement Automation</DialogTitle>
-            <DialogDescription>
-              Three roles: <strong>operator</strong>, <strong>client</strong> (your customer), <strong>staff</strong>.
-              Automation uses <strong>Operator &amp; staff</strong> templates: when profiles are ready → status{' '}
-              <strong>signing</strong> → staff and operator may sign in any order → <strong>complete</strong> when both have
-              signed. <strong>Operator &amp; client</strong> templates are not automated here yet; use Create flow and client
-              portal — signatures can complete in any order.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4 py-2 max-h-[60vh] overflow-y-auto pr-1">
-            <Button variant="outline" onClick={addAutomationRule}>
-              <Plus className="h-4 w-4 mr-2" />
-              Add Automation
-            </Button>
-            {automationRules.length === 0 ? (
-              <p className="text-sm text-muted-foreground">No automation yet. Click Add Automation.</p>
-            ) : (
-              automationRules.map((rule, idx) => (
-                <Card key={rule.id}>
-                  <CardHeader className="pb-3">
-                    <CardTitle className="text-base">Automation #{idx + 1}</CardTitle>
-                  </CardHeader>
-                  <CardContent className="space-y-3">
-                    <div className="space-y-2">
-                      <Label>Template</Label>
-                      <Select
-                        value={rule.templateId}
-                        onValueChange={(value) => updateAutomationRule(rule.id, { templateId: value })}
-                      >
-                        <SelectTrigger>
-                          <SelectValue placeholder="Select template" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {templates.map((t) => (
-                            <SelectItem key={t.id} value={t.id}>
-                              {t.name}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                    <div className="space-y-2">
-                      <Label>Trigger when</Label>
-                      <Select
-                        value={rule.triggerWhen}
-                        onValueChange={(value) =>
-                          updateAutomationRule(rule.id, {
-                            triggerWhen: value as AgreementAutomationRule['triggerWhen'],
-                          })
-                        }
-                      >
-                        <SelectTrigger>
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="new_customer">New customer</SelectItem>
-                          <SelectItem value="new_employee_all">New employee all</SelectItem>
-                          <SelectItem value="new_employee_parttime_only">New employee parttime only</SelectItem>
-                          <SelectItem value="new_employee_fulltime_only">New employee full time only</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-                    <div className="flex justify-end">
-                      <Button variant="destructive" size="sm" onClick={() => removeAutomationRule(rule.id)}>
-                        Remove
-                      </Button>
-                    </div>
-                  </CardContent>
-                </Card>
-              ))
-            )}
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setIsAutomationDialogOpen(false)}>
-              Cancel
-            </Button>
-            <Button onClick={handleSaveAutomations} disabled={automationSaving}>
-              {automationSaving ? 'Saving...' : 'Save'}
             </Button>
           </DialogFooter>
         </DialogContent>

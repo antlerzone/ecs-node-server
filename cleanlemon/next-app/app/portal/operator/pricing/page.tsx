@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
@@ -19,15 +19,19 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Badge } from "@/components/ui/badge"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { CircleHelp, Plus, Settings2, Trash2 } from "lucide-react"
+import { AlertTriangle, CircleHelp, Plus, Settings2, Trash2, ChevronRight, ChevronLeft } from "lucide-react"
 import { toast } from "sonner"
 import { useAuth } from "@/lib/auth-context"
 import {
   fetchCleanlemonPricingConfig,
   saveCleanlemonPricingConfig,
+  fetchOperatorPortalSetupStatus,
   type CleanlemonPricingConfig,
+  type OperatorPortalSetupStatus,
 } from "@/lib/cleanlemon-api"
 import { PRICING_SERVICES, type ServiceKey } from "@/lib/cleanlemon-pricing-services"
+import { cn } from "@/lib/utils"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 
 type AddonBasis = "fixed" | "quantity" | "bed" | "room"
 type BookingMode = "instant" | "request_approve"
@@ -45,8 +49,35 @@ type LeadTime =
   | "three_week"
   | "four_week"
   | "one_month"
+
+const LEAD_TIME_SELECT_OPTIONS: { value: LeadTime; label: string }[] = [
+  { value: "twelve_hour", label: "12 hour before" },
+  { value: "same_day", label: "Same day" },
+  { value: "one_day", label: "One day before" },
+  { value: "two_day", label: "Two days before" },
+  { value: "three_day", label: "Three days before" },
+  { value: "four_day", label: "Four days before" },
+  { value: "five_day", label: "Five days before" },
+  { value: "six_day", label: "Six days before" },
+  { value: "one_week", label: "One week before" },
+  { value: "two_week", label: "Two weeks before" },
+  { value: "three_week", label: "Three weeks before" },
+  { value: "four_week", label: "Four weeks before" },
+  { value: "one_month", label: "One month before" },
+]
+
+function isLeadTime(s: string): s is LeadTime {
+  return LEAD_TIME_SELECT_OPTIONS.some((o) => o.value === s)
+}
 type DetailType = "by_hour" | "by_property" | "homestay" | "dobi_kg" | "dobi_pcs" | "dobi_bed"
 type HomestayMode = "fixed_property" | "fixed_property_plus_bed"
+
+/** Short labels for Homestay mode select (value keys unchanged in saved config). */
+const HOMESTAY_MODE_LABEL: Record<HomestayMode, string> = {
+  fixed_property: "Fixed per property",
+  fixed_property_plus_bed: "Property + beds",
+}
+
 type DobiItemRate = { item: string; rate: number }
 
 interface AddonItem {
@@ -235,11 +266,17 @@ export default function OperatorPricingPage() {
   /** Optional override per service key — saved as `bookingModeByService` on operator pricing config. */
   const [bookingModeByService, setBookingModeByService] = useState<Partial<Record<ServiceKey, BookingMode>>>({})
   const [leadTime, setLeadTime] = useState<LeadTime>("same_day")
+  /** Per service — saved as `leadTimeByService`; falls back to global `leadTime`. */
+  const [leadTimeByService, setLeadTimeByService] = useState<Partial<Record<ServiceKey, LeadTime>>>({})
+  const [portalSetupGate, setPortalSetupGate] = useState<OperatorPortalSetupStatus | null>(null)
 
   const [serviceDialogOpen, setServiceDialogOpen] = useState(false)
-  const [bookingDialogOpen, setBookingDialogOpen] = useState(false)
   const [detailDialogOpen, setDetailDialogOpen] = useState(false)
   const [detailType, setDetailType] = useState<DetailType>("by_hour")
+  /** By Hour / By Property detail dialog: must reach Summary before Save commits. */
+  const [detailWizardStep, setDetailWizardStep] = useState<"edit" | "summary">("edit")
+  const detailSessionSnapshotRef = useRef<ServiceConfig | null>(null)
+  const detailSaveCommittedRef = useRef(false)
   const [isSavingRemote, setIsSavingRemote] = useState(false)
   const [isLoadingRemote, setIsLoadingRemote] = useState(true)
 
@@ -287,6 +324,15 @@ export default function OperatorPricingPage() {
         if (typeof config.leadTime === "string") {
           setLeadTime(config.leadTime as LeadTime)
         }
+        if (config.leadTimeByService && typeof config.leadTimeByService === "object") {
+          const o = config.leadTimeByService as Record<string, string>
+          const next: Partial<Record<ServiceKey, LeadTime>> = {}
+          for (const k of SERVICES.map((s) => s.key)) {
+            const v = o[k]
+            if (v && isLeadTime(v)) next[k] = v
+          }
+          setLeadTimeByService(next)
+        }
       }
       setIsLoadingRemote(false)
     })()
@@ -295,6 +341,27 @@ export default function OperatorPricingPage() {
     }
   }, [operatorId])
 
+  useEffect(() => {
+    if (!operatorId || !user?.email) {
+      setPortalSetupGate(null)
+      return
+    }
+    let cancelled = false
+    ;(async () => {
+      const r = await fetchOperatorPortalSetupStatus({
+        operatorId,
+        email: String(user.email).trim().toLowerCase(),
+      })
+      if (!cancelled && r?.ok) setPortalSetupGate(r)
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [operatorId, user?.email])
+
+  const pricingGateHighlight =
+    portalSetupGate?.ok === true && portalSetupGate.firstIncomplete === "pricing"
+
   const activeConfig = serviceConfigs[activeServiceTab]
 
   const updateConfig = (service: ServiceKey, updater: (cfg: ServiceConfig) => ServiceConfig) => {
@@ -302,6 +369,10 @@ export default function OperatorPricingPage() {
   }
 
   const openDetail = (type: DetailType) => {
+    if (type === "by_hour" || type === "by_property") {
+      detailSessionSnapshotRef.current = JSON.parse(JSON.stringify(serviceConfigs[activeServiceTab])) as ServiceConfig
+      setDetailWizardStep("edit")
+    }
     setDetailType(type)
     setDetailDialogOpen(true)
   }
@@ -340,7 +411,7 @@ export default function OperatorPricingPage() {
     }
     if (activeServiceTab === "homestay") {
       const pricedRows = Object.values(activeConfig.homestay.propertyPrices).filter((v) => v > 0).length
-      return `Homestay mode: ${activeConfig.homestay.mode}, priced properties: ${pricedRows}, features: ${activeConfig.homestay.features.length}, add-ons: ${activeConfig.homestay.addons.length}`
+      return `Homestay mode: ${HOMESTAY_MODE_LABEL[activeConfig.homestay.mode]}, priced properties: ${pricedRows}, features: ${activeConfig.homestay.features.length}, add-ons: ${activeConfig.homestay.addons.length}`
     }
     const byHourTotal = activeConfig.byHour.price * activeConfig.byHour.hours * activeConfig.byHour.workers
     const pricedRows = Object.values(activeConfig.byProperty.prices).filter((v) => v > 0).length
@@ -413,10 +484,23 @@ export default function OperatorPricingPage() {
           Object.entries(bookingModeByService).filter(([, v]) => v === "instant" || v === "request_approve")
         ) as CleanlemonPricingConfig["bookingModeByService"],
         leadTime,
+        leadTimeByService: Object.fromEntries(
+          Object.entries(leadTimeByService).filter(([, v]) => typeof v === "string" && isLeadTime(v))
+        ) as CleanlemonPricingConfig["leadTimeByService"],
       }
       const r = await saveCleanlemonPricingConfig(operatorId, payload)
       if (!r.ok) {
         toast.error(`Save failed (${r.reason || "UNKNOWN"})`)
+      } else {
+        try {
+          const setup = await fetchOperatorPortalSetupStatus({
+            operatorId,
+            email: String(user?.email || "").trim().toLowerCase(),
+          })
+          if (setup?.ok) setPortalSetupGate(setup)
+        } catch {
+          /* ignore */
+        }
       }
     } finally {
       setIsSavingRemote(false)
@@ -430,6 +514,8 @@ export default function OperatorPricingPage() {
     bookingMode,
     bookingModeByService,
     leadTime,
+    leadTimeByService,
+    user?.email,
   ])
 
   const handleServiceDialogOpenChange = (open: boolean) => {
@@ -437,14 +523,28 @@ export default function OperatorPricingPage() {
     setServiceDialogOpen(open)
   }
 
-  const handleBookingDialogOpenChange = (open: boolean) => {
-    if (!open) void persistPricingConfig()
-    setBookingDialogOpen(open)
+  const handleDetailDialogOpenChange = (open: boolean) => {
+    if (!open) {
+      const isHourPropertyWizard = detailType === "by_hour" || detailType === "by_property"
+      if (isHourPropertyWizard) {
+        if (!detailSaveCommittedRef.current && detailSessionSnapshotRef.current) {
+          const snap = detailSessionSnapshotRef.current
+          setServiceConfigs((prev) => ({ ...prev, [activeServiceTab]: snap }))
+        }
+        detailSaveCommittedRef.current = false
+        detailSessionSnapshotRef.current = null
+        setDetailWizardStep("edit")
+      } else {
+        void persistPricingConfig()
+      }
+    }
+    setDetailDialogOpen(open)
   }
 
-  const handleDetailDialogOpenChange = (open: boolean) => {
-    if (!open) void persistPricingConfig()
-    setDetailDialogOpen(open)
+  const handleDetailSaveFromSummary = () => {
+    detailSaveCommittedRef.current = true
+    void persistPricingConfig()
+    handleDetailDialogOpenChange(false)
   }
 
   return (
@@ -464,26 +564,80 @@ export default function OperatorPricingPage() {
         </div>
       </div>
 
-      <Card>
+      {pricingGateHighlight ? (
+        <Alert variant="destructive" className="border-destructive/60">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertTitle>Finish pricing setup</AlertTitle>
+          <AlertDescription>
+            Open <strong className="text-foreground">Services Provider</strong> and select at least one service. Each
+            selected service has its own booking mode and lead time. Saving happens when you close the dialog or a detail
+            panel.
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      <Card
+        className={cn(
+          pricingGateHighlight &&
+            "rounded-lg ring-2 ring-destructive ring-offset-2 ring-offset-background"
+        )}
+      >
         <CardHeader>
           <CardTitle>Section 1 - Services & Booking</CardTitle>
-          <CardDescription>Set what services this operator provides, and booking acceptance rules</CardDescription>
+          <CardDescription>
+            Choose services, then set <strong className="text-foreground">booking mode</strong> and{" "}
+            <strong className="text-foreground">lead time</strong> for each service (not one global default).
+          </CardDescription>
         </CardHeader>
-        <CardContent className="flex flex-wrap gap-2">
-          <Button variant="outline" onClick={() => setServiceDialogOpen(true)}>Services Provider</Button>
-          <Button variant="outline" onClick={() => setBookingDialogOpen(true)}>Booking Setting</Button>
-          <Badge variant="secondary">Booking: {bookingMode === "instant" ? "Instant" : "Request & Approve"}</Badge>
-          <Badge variant="secondary">Lead time: {leadTime.replaceAll("_", " ")}</Badge>
+        <CardContent className="flex flex-wrap items-center gap-2">
+          <Button variant="outline" onClick={() => setServiceDialogOpen(true)}>
+            Services Provider
+          </Button>
+          <Badge variant="secondary">{selectedServices.length} service(s) selected</Badge>
         </CardContent>
       </Card>
 
-      <Card>
-        <CardHeader>
+      <Card className="min-w-0">
+        <CardHeader className="min-w-0 space-y-3">
           <CardTitle>Section 2 - Pricing Setting</CardTitle>
-          <CardDescription>Tabs follow selected services from Services Provider</CardDescription>
-          <Tabs value={activeServiceTab} onValueChange={(v) => setActiveServiceTab(v as ServiceKey)}>
-            <div className="w-full overflow-x-auto">
-              <TabsList className="inline-flex w-max flex-nowrap whitespace-nowrap">
+          <CardDescription className="max-w-full">
+            Switch service with the menu below (on larger screens you will see tabs instead).
+          </CardDescription>
+          {/* Mobile: single dropdown — avoids horizontal tab overflow */}
+          <div className="w-full min-w-0 max-w-full md:hidden">
+            <Label htmlFor="pricing-service-mobile" className="mb-1.5 block text-xs text-muted-foreground">
+              Service
+            </Label>
+            <Select
+              value={activeServiceTab}
+              onValueChange={(v) => setActiveServiceTab(v as ServiceKey)}
+            >
+              <SelectTrigger
+                id="pricing-service-mobile"
+                className="h-auto min-h-9 w-full min-w-0 max-w-full whitespace-normal py-2 text-left shadow-xs [&_[data-slot=select-value]]:line-clamp-2 [&_[data-slot=select-value]]:whitespace-normal"
+              >
+                <SelectValue placeholder="Select service" />
+              </SelectTrigger>
+              <SelectContent
+                position="popper"
+                className="max-w-[min(calc(100vw-2rem),var(--radix-select-trigger-width))]"
+              >
+                {selectedServices.map((service) => (
+                  <SelectItem key={service} value={service}>
+                    {SERVICES.find((s) => s.key === service)?.label || service}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          {/* Desktop: horizontal tabs */}
+          <Tabs
+            value={activeServiceTab}
+            onValueChange={(v) => setActiveServiceTab(v as ServiceKey)}
+            className="hidden min-w-0 w-full md:block"
+          >
+            <div className="w-full min-w-0 overflow-x-auto">
+              <TabsList className="inline-flex w-max max-w-full flex-nowrap whitespace-nowrap">
                 {selectedServices.map((service) => (
                   <TabsTrigger key={service} value={service} className="shrink-0">
                     {SERVICES.find((s) => s.key === service)?.label || service}
@@ -493,7 +647,7 @@ export default function OperatorPricingPage() {
             </div>
           </Tabs>
         </CardHeader>
-        <CardContent className="space-y-4">
+        <CardContent className="min-w-0 space-y-4">
           {activeServiceTab !== "homestay" && activeServiceTab !== "dobi" && (
             <>
               <div className="border rounded-lg p-3 space-y-2">
@@ -587,10 +741,10 @@ export default function OperatorPricingPage() {
             </div>
           )}
           {activeServiceTab === "homestay" && (
-            <div className="border rounded-lg p-3 space-y-2">
-              <div className="flex items-center justify-between">
-                <Label>Homestay Mode</Label>
-                <Button variant="outline" size="sm" onClick={() => openDetail("homestay")}>
+            <div className="min-w-0 space-y-2 overflow-hidden rounded-lg border p-3">
+              <div className="flex min-w-0 items-center justify-between gap-2">
+                <Label className="min-w-0 shrink">Homestay Mode</Label>
+                <Button variant="outline" size="sm" className="shrink-0" onClick={() => openDetail("homestay")}>
                   <Settings2 className="h-4 w-4 mr-1" />
                   Detail
                 </Button>
@@ -599,10 +753,25 @@ export default function OperatorPricingPage() {
                 value={activeConfig.homestay.mode}
                 onValueChange={(v: HomestayMode) => updateConfig(activeServiceTab, (cfg) => ({ ...cfg, homestay: { ...cfg.homestay, mode: v } }))}
               >
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="fixed_property">Fix Price According Property (No Calculate Bed)</SelectItem>
-                  <SelectItem value="fixed_property_plus_bed">Fix Price According Property + Calculate Bed</SelectItem>
+                <SelectTrigger className="h-9 w-full min-w-0 max-w-full text-left shadow-xs [&_[data-slot=select-value]]:truncate">
+                  <SelectValue>{HOMESTAY_MODE_LABEL[activeConfig.homestay.mode]}</SelectValue>
+                </SelectTrigger>
+                <SelectContent
+                  position="popper"
+                  className="max-w-[min(calc(100vw-2rem),var(--radix-select-trigger-width))]"
+                >
+                  <SelectItem
+                    value="fixed_property"
+                    title="Price by property type only; bed count does not change the rate."
+                  >
+                    {HOMESTAY_MODE_LABEL.fixed_property}
+                  </SelectItem>
+                  <SelectItem
+                    value="fixed_property_plus_bed"
+                    title="Property base price plus an extra amount calculated from bed quantity."
+                  >
+                    {HOMESTAY_MODE_LABEL.fixed_property_plus_bed}
+                  </SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -619,90 +788,112 @@ export default function OperatorPricingPage() {
       </Card>
 
       <Dialog open={serviceDialogOpen} onOpenChange={handleServiceDialogOpenChange}>
-        <DialogContent className="max-w-[95vw] sm:max-w-[90vw] md:max-w-[85vw]">
+        <DialogContent className="max-h-[88vh] max-w-[95vw] overflow-y-auto sm:max-w-lg md:max-w-2xl">
           <DialogHeader>
             <DialogTitle>Services Provider</DialogTitle>
-            <DialogDescription>Check services this operator provides</DialogDescription>
+            <DialogDescription>
+              Tick each service you offer. For each selected service, set client booking mode and lead time (defaults
+              below use your saved global values when a row has no override yet).
+            </DialogDescription>
           </DialogHeader>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-            {SERVICES.map((service) => (
-              <label key={service.key} className="flex items-center gap-2 border rounded-md px-3 py-2 text-sm">
-                <Checkbox checked={selectedServices.includes(service.key)} onCheckedChange={(v) => toggleService(service.key, !!v)} />
-                {service.label}
-              </label>
-            ))}
-          </div>
-          <DialogFooter>
-            <DialogClose asChild>
-              <Button type="button">Done</Button>
-            </DialogClose>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={bookingDialogOpen} onOpenChange={handleBookingDialogOpenChange}>
-        <DialogContent className="max-w-[95vw] sm:max-w-[90vw] md:max-w-[85vw]">
-          <DialogHeader>
-            <DialogTitle>Booking Setting</DialogTitle>
-            <DialogDescription>Set acceptance mode and lead time rule</DialogDescription>
-          </DialogHeader>
-          <div className="space-y-3">
-            <div className="space-y-2">
-              <Label>Booking Mode</Label>
-              <Select value={bookingMode} onValueChange={(v: BookingMode) => setBookingMode(v)}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="instant">Accept booking instant</SelectItem>
-                  <SelectItem value="request_approve">Request booking & approve</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-2">
-              <Label>Lead Time</Label>
-              <Select value={leadTime} onValueChange={(v: LeadTime) => setLeadTime(v)}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="twelve_hour">12 hour before</SelectItem>
-                  <SelectItem value="same_day">Same day</SelectItem>
-                  <SelectItem value="one_day">one day before</SelectItem>
-                  <SelectItem value="two_day">two day before</SelectItem>
-                  <SelectItem value="three_day">three day before</SelectItem>
-                  <SelectItem value="four_day">four day before</SelectItem>
-                  <SelectItem value="five_day">five day before</SelectItem>
-                  <SelectItem value="six_day">six day before</SelectItem>
-                  <SelectItem value="one_week">one week before</SelectItem>
-                  <SelectItem value="two_week">two week before</SelectItem>
-                  <SelectItem value="three_week">three week before</SelectItem>
-                  <SelectItem value="four_week">four week before</SelectItem>
-                  <SelectItem value="one_month">one month before</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-2">
-              <Label>Per service booking mode (optional)</Label>
-              <p className="text-xs text-muted-foreground">
-                Overrides the global mode above for that service when clients book from Cleanlemons or Coliving.
-              </p>
-              <div className="max-h-48 overflow-y-auto space-y-2 border rounded-md p-2">
-                {selectedServices.map((key) => (
-                  <div key={key} className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="text-sm">{SERVICES.find((s) => s.key === key)?.label || key}</span>
-                    <Select
-                      value={bookingModeByService[key] ?? bookingMode}
-                      onValueChange={(v: BookingMode) =>
-                        setBookingModeByService((prev) => ({ ...prev, [key]: v }))
-                      }
-                    >
-                      <SelectTrigger className="w-[200px]"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="instant">Accept booking instant</SelectItem>
-                        <SelectItem value="request_approve">Request booking & approve</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                ))}
+          <div className="space-y-2 border-b border-border pb-3 text-xs text-muted-foreground">
+            <p>
+              <span className="font-medium text-foreground">Defaults (for new rows):</span> booking{" "}
+              {bookingMode === "instant" ? "Instant" : "Request & approve"} · lead{" "}
+              {LEAD_TIME_SELECT_OPTIONS.find((o) => o.value === leadTime)?.label ?? leadTime}
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <div className="flex min-w-[140px] flex-1 flex-col gap-1">
+                <Label className="text-[11px]">Adjust default booking mode</Label>
+                <Select value={bookingMode} onValueChange={(v: BookingMode) => setBookingMode(v)}>
+                  <SelectTrigger className="h-8 text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="instant">Accept booking instant</SelectItem>
+                    <SelectItem value="request_approve">Request booking & approve</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="flex min-w-[140px] flex-1 flex-col gap-1">
+                <Label className="text-[11px]">Adjust default lead time</Label>
+                <Select value={leadTime} onValueChange={(v: LeadTime) => setLeadTime(v)}>
+                  <SelectTrigger className="h-8 text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {LEAD_TIME_SELECT_OPTIONS.map((o) => (
+                      <SelectItem key={o.value} value={o.value}>
+                        {o.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
             </div>
+          </div>
+          <div className="max-h-[min(50vh,24rem)] space-y-3 overflow-y-auto pr-1">
+            {SERVICES.map((service) => {
+              const on = selectedServices.includes(service.key)
+              return (
+                <div
+                  key={service.key}
+                  className={cn(
+                    "space-y-2 rounded-lg border border-border p-3",
+                    pricingGateHighlight && !on && selectedServices.length === 0 && "border-destructive/60 bg-destructive/[0.04]"
+                  )}
+                >
+                  <label className="flex cursor-pointer items-center gap-2 text-sm font-medium">
+                    <Checkbox
+                      checked={on}
+                      onCheckedChange={(v) => toggleService(service.key, !!v)}
+                    />
+                    {service.label}
+                  </label>
+                  {on ? (
+                    <div className="grid grid-cols-1 gap-3 pl-0 sm:grid-cols-2 sm:pl-6">
+                      <div className="space-y-1.5">
+                        <Label className="text-xs text-muted-foreground">Booking mode</Label>
+                        <Select
+                          value={bookingModeByService[service.key] ?? bookingMode}
+                          onValueChange={(v: BookingMode) =>
+                            setBookingModeByService((prev) => ({ ...prev, [service.key]: v }))
+                          }
+                        >
+                          <SelectTrigger className="h-9">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="instant">Accept booking instant</SelectItem>
+                            <SelectItem value="request_approve">Request booking & approve</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div className="space-y-1.5">
+                        <Label className="text-xs text-muted-foreground">Lead time</Label>
+                        <Select
+                          value={leadTimeByService[service.key] ?? leadTime}
+                          onValueChange={(v: LeadTime) =>
+                            setLeadTimeByService((prev) => ({ ...prev, [service.key]: v }))
+                          }
+                        >
+                          <SelectTrigger className="h-9">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {LEAD_TIME_SELECT_OPTIONS.map((o) => (
+                              <SelectItem key={o.value} value={o.value}>
+                                {o.label}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              )
+            })}
           </div>
           <DialogFooter>
             <DialogClose asChild>
@@ -723,10 +914,146 @@ export default function OperatorPricingPage() {
               {detailType === "dobi_pcs" && "Dobi Services Detail - By PCS"}
               {detailType === "dobi_bed" && "Dobi Services Detail - By Bed"}
             </DialogTitle>
-            <DialogDescription>Configure all fields for this section mode</DialogDescription>
+            <DialogDescription>
+              {detailType === "by_hour" || detailType === "by_property" ? (
+                detailWizardStep === "edit" ? (
+                  <>
+                    Step 1 of 2 — edit details, then go to Summary to save.
+                    <span className="mt-2 flex flex-wrap items-center gap-2">
+                      <Badge variant={detailWizardStep === "edit" ? "default" : "outline"}>1. Details</Badge>
+                      <ChevronRight className="h-3 w-3 text-muted-foreground" aria-hidden />
+                      <Badge variant="outline">2. Summary</Badge>
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    Step 2 of 2 — review and save.
+                    <span className="mt-2 flex flex-wrap items-center gap-2">
+                      <Badge variant="outline">1. Details</Badge>
+                      <ChevronRight className="h-3 w-3 text-muted-foreground" aria-hidden />
+                      <Badge variant="default">2. Summary</Badge>
+                    </span>
+                  </>
+                )
+              ) : (
+                "Configure all fields for this section mode"
+              )}
+            </DialogDescription>
           </DialogHeader>
 
-          {detailType === "by_hour" && (
+          {detailType === "by_hour" && detailWizardStep === "summary" && (
+            <div className="space-y-4">
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-base">Summary — By hour</CardTitle>
+                  <CardDescription>
+                    Service: <span className="font-medium text-foreground">{SERVICES.find((s) => s.key === activeServiceTab)?.label ?? activeServiceTab}</span>
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-3 text-sm">
+                  <div className="grid gap-2 rounded-lg border bg-muted/30 p-3 sm:grid-cols-2">
+                    <div>
+                      <span className="text-muted-foreground">Hours × workers × rate</span>
+                      <p className="font-medium tabular-nums">
+                        {activeConfig.byHour.hours} × {activeConfig.byHour.workers} × RM {activeConfig.byHour.price} → est. RM{" "}
+                        {(activeConfig.byHour.hours * activeConfig.byHour.workers * activeConfig.byHour.price).toLocaleString()}
+                      </p>
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">Minimum selling price</span>
+                      <p className="font-medium tabular-nums">RM {activeConfig.byHour.minSellingPrice.toLocaleString()}</p>
+                    </div>
+                    <div className="sm:col-span-2">
+                      <span className="text-muted-foreground">On-the-spot add-on</span>
+                      <p className="font-medium">{activeConfig.byHour.onSpotAddonPercent}%</p>
+                    </div>
+                  </div>
+                  <div>
+                    <p className="mb-1 font-medium">Features ({activeConfig.byHour.features.filter((x) => String(x).trim()).length})</p>
+                    <ul className="list-inside list-disc text-muted-foreground">
+                      {activeConfig.byHour.features.filter((x) => String(x).trim()).map((f, i) => (
+                        <li key={`sum-f-${i}`}>{f}</li>
+                      ))}
+                      {activeConfig.byHour.features.every((x) => !String(x).trim()) ? (
+                        <li className="list-none text-xs">No feature lines yet</li>
+                      ) : null}
+                    </ul>
+                  </div>
+                  <div>
+                    <p className="mb-1 font-medium">Add-ons ({activeConfig.byHour.addons.length})</p>
+                    {activeConfig.byHour.addons.length === 0 ? (
+                      <p className="text-xs text-muted-foreground">None</p>
+                    ) : (
+                      <ul className="space-y-1 text-muted-foreground">
+                        {activeConfig.byHour.addons.map((a) => (
+                          <li key={a.id} className="text-xs">
+                            {a.name || "(unnamed)"} — {a.basis} — RM {a.price}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+          )}
+
+          {detailType === "by_property" && detailWizardStep === "summary" && (
+            <div className="space-y-4">
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-base">Summary — By property type</CardTitle>
+                  <CardDescription>
+                    Service: <span className="font-medium text-foreground">{SERVICES.find((s) => s.key === activeServiceTab)?.label ?? activeServiceTab}</span>
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-3 text-sm">
+                  <div>
+                    <p className="mb-2 font-medium">Property prices</p>
+                    <div className="max-h-48 space-y-1 overflow-y-auto rounded-lg border bg-muted/20 p-2">
+                      {PROPERTY_ROWS.filter((row) => (activeConfig.byProperty.prices[row] || 0) > 0).length === 0 ? (
+                        <p className="text-xs text-muted-foreground">No property rows with a price above 0</p>
+                      ) : (
+                        PROPERTY_ROWS.filter((row) => (activeConfig.byProperty.prices[row] || 0) > 0).map((row) => (
+                          <div key={row} className="flex justify-between gap-2 text-xs">
+                            <span>{row}</span>
+                            <span className="tabular-nums font-medium">RM {(activeConfig.byProperty.prices[row] || 0).toLocaleString()}</span>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                  <div>
+                    <p className="mb-1 font-medium">Features ({activeConfig.byProperty.features.filter((x) => String(x).trim()).length})</p>
+                    <ul className="list-inside list-disc text-muted-foreground">
+                      {activeConfig.byProperty.features.filter((x) => String(x).trim()).map((f, i) => (
+                        <li key={`sum-pf-${i}`}>{f}</li>
+                      ))}
+                      {activeConfig.byProperty.features.every((x) => !String(x).trim()) ? (
+                        <li className="list-none text-xs">No feature lines yet</li>
+                      ) : null}
+                    </ul>
+                  </div>
+                  <div>
+                    <p className="mb-1 font-medium">Add-ons ({activeConfig.byProperty.addons.length})</p>
+                    {activeConfig.byProperty.addons.length === 0 ? (
+                      <p className="text-xs text-muted-foreground">None</p>
+                    ) : (
+                      <ul className="space-y-1 text-muted-foreground">
+                        {activeConfig.byProperty.addons.map((a) => (
+                          <li key={a.id} className="text-xs">
+                            {a.name || "(unnamed)"} — {a.basis} — RM {a.price}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+          )}
+
+          {detailType === "by_hour" && detailWizardStep === "edit" && (
             <div className="space-y-4">
               <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
                 <div className="space-y-2">
@@ -888,7 +1215,7 @@ export default function OperatorPricingPage() {
             </div>
           )}
 
-          {detailType === "by_property" && (
+          {detailType === "by_property" && detailWizardStep === "edit" && (
             <div className="space-y-4">
               <Card>
                 <CardHeader><CardTitle className="text-base">Property Price Matrix</CardTitle></CardHeader>
@@ -1138,7 +1465,6 @@ export default function OperatorPricingPage() {
 
           {detailType === "homestay" && (
             <div className="space-y-4">
-                <>
               <Card>
                 <CardHeader><CardTitle className="text-base">Section 1 - Setup property fix price</CardTitle></CardHeader>
                 <CardContent className="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -1225,19 +1551,44 @@ export default function OperatorPricingPage() {
                   <Button variant="outline" onClick={() => addAddon("homestay")}><Plus className="h-4 w-4 mr-1" />Add Add-on</Button>
                 </CardContent>
               </Card>
-                </>
             </div>
           )}
 
           <DialogFooter>
-            <DialogClose asChild>
-              <Button type="button" variant="outline">
-                Close
-              </Button>
-            </DialogClose>
-            <DialogClose asChild>
-              <Button type="button">Save</Button>
-            </DialogClose>
+            {detailType === "by_hour" || detailType === "by_property" ? (
+              detailWizardStep === "edit" ? (
+                <>
+                  <Button type="button" variant="outline" onClick={() => handleDetailDialogOpenChange(false)}>
+                    Close
+                  </Button>
+                  <Button type="button" onClick={() => setDetailWizardStep("summary")}>
+                    Next
+                    <ChevronRight className="ml-1 h-4 w-4" />
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <Button type="button" variant="outline" onClick={() => setDetailWizardStep("edit")}>
+                    <ChevronLeft className="mr-1 h-4 w-4" />
+                    Back
+                  </Button>
+                  <Button type="button" onClick={handleDetailSaveFromSummary}>
+                    Save
+                  </Button>
+                </>
+              )
+            ) : (
+              <>
+                <DialogClose asChild>
+                  <Button type="button" variant="outline">
+                    Close
+                  </Button>
+                </DialogClose>
+                <DialogClose asChild>
+                  <Button type="button">Save</Button>
+                </DialogClose>
+              </>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>

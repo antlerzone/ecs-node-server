@@ -97,6 +97,8 @@ async function getTenantByEmail(email) {
   let bankName = r.bankname_id;
   let bankAccount = r.bankaccount;
   let accountholder = r.accountholder;
+  let profileSelfVerifiedAt = null;
+  let portalAliyunEkycLocked = false;
   try {
     const portalRes = await getPortalProfile(norm);
     if (portalRes.ok && portalRes.profile) {
@@ -108,8 +110,15 @@ async function getTenantByEmail(email) {
       if (p.bankname_id != null) bankName = p.bankname_id;
       if (p.bankaccount != null) bankAccount = p.bankaccount;
       if (p.accountholder != null) accountholder = p.accountholder;
+      if (p.profileSelfVerifiedAt != null && String(p.profileSelfVerifiedAt).trim() !== '') {
+        profileSelfVerifiedAt = p.profileSelfVerifiedAt;
+      }
+      portalAliyunEkycLocked = !!p.aliyun_ekyc_locked;
     }
   } catch (_) { /* portal_account profile columns may not exist yet */ }
+
+  const profileIdentityVerified =
+    (profileSelfVerifiedAt != null && String(profileSelfVerifiedAt).trim() !== '') || portalAliyunEkycLocked;
 
   return {
     _id: r.id,
@@ -126,7 +135,9 @@ async function getTenantByEmail(email) {
     nricback: r.nricback,
     approvalRequest: parseJson(r.approval_request_json),
     profile,
-    account
+    account,
+    profileSelfVerifiedAt,
+    profileIdentityVerified
   };
 }
 

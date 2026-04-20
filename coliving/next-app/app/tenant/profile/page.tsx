@@ -16,6 +16,7 @@ export default function TenantProfilePage() {
       onBackendSaveSuccess={() => tenantState?.refetch?.()}
       showViewMyProfileButton
       publicProfileTenantId={publicProfileTenantId}
+      selfVerifyMode
     />
   )
 }

@@ -1,6 +1,14 @@
 "use client"
 
-import { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react'
+import {
+  createContext,
+  useContext,
+  useState,
+  useEffect,
+  useLayoutEffect,
+  useCallback,
+  ReactNode,
+} from 'react'
 import type { UserRole, PricingPlan } from './types'
 import { getCleanlemonApiBase } from './portal-auth-mock'
 
@@ -106,7 +114,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
-  useEffect(() => {
+  /** Before paint: avoids /portal stuck on "Loading..." when useEffect runs late after OAuth redirect or client navigation. */
+  useLayoutEffect(() => {
     syncSessionFromStorage()
     setIsLoading(false)
   }, [syncSessionFromStorage])

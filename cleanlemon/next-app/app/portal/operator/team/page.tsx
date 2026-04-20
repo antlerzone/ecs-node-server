@@ -380,6 +380,10 @@ export default function TeamPage() {
     return teams.filter((t) => t.restDays.includes(day))
   }
 
+  /** Same rest logic as calendar cells, keyed by full weekday name (matches `weekDays`). */
+  const teamsRestingOnWeekday = (dayName: string) =>
+    teams.filter((t) => t.restDays.includes(dayName))
+
   const teamBadgeClass = (teamId: string) => {
     const index = teams.findIndex((t) => t.id === teamId)
     if (index < 0) return teamBadgeColorClasses[0]
@@ -507,6 +511,14 @@ export default function TeamPage() {
     await refreshAll()
   }
 
+  const teamAuthoriseLabel = (t: TeamRecord) =>
+    t.authorizeMode === 'full'
+      ? 'full authorise'
+      : `selected: ${[...new Set(t.selectedPropertyIds.map(propertyLabelById))].join(', ') || '-'}`
+
+  const membersLabel = (t: TeamRecord) =>
+    t.memberIds.map((id) => contacts.find((c) => c.id === id)?.name ?? id).join(', ') || '—'
+
   const deleteTeam = async (team: TeamRecord) => {
     const res = await deleteOperatorTeam(team.id, operatorId)
     if (!res.ok) {
@@ -526,16 +538,24 @@ export default function TeamPage() {
       {pageLoading && (
         <p className="text-sm text-muted-foreground">Loading teams and directory…</p>
       )}
-      <div className="flex items-center justify-between gap-3">
-        <div>
+      <div className="flex min-w-0 flex-col gap-4">
+        <div className="min-w-0">
           <h2 className="text-2xl font-bold text-foreground">Team Management</h2>
-          <p className="text-muted-foreground">Create, edit and delete team at operator level.</p>
+          <p className="text-muted-foreground text-sm sm:text-base">Create, edit and delete team at operator level.</p>
         </div>
-        <div className="flex items-center gap-2">
-          <Tabs value={viewTab} onValueChange={(v) => setViewTab(v as 'list' | 'calendar')}>
-            <TabsList>
-              <TabsTrigger value="list">Team List</TabsTrigger>
-              <TabsTrigger value="calendar">Calendar</TabsTrigger>
+        <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
+          <Tabs
+            value={viewTab}
+            onValueChange={(v) => setViewTab(v as 'list' | 'calendar')}
+            className="w-full min-w-0 sm:w-auto"
+          >
+            <TabsList className="grid h-auto w-full grid-cols-2 gap-1 p-1 sm:inline-flex sm:w-auto">
+              <TabsTrigger value="list" className="flex-1 sm:flex-initial">
+                Team List
+              </TabsTrigger>
+              <TabsTrigger value="calendar" className="flex-1 sm:flex-initial">
+                Calendar
+              </TabsTrigger>
             </TabsList>
           </Tabs>
 
@@ -547,8 +567,8 @@ export default function TeamPage() {
             }}
           >
             <DialogTrigger asChild>
-              <Button onClick={openCreateDialog}>
-                <Plus className="h-4 w-4 mr-2" />
+              <Button onClick={openCreateDialog} className="w-full shrink-0 sm:w-auto" size="default">
+                <Plus className="h-4 w-4 sm:mr-2" />
                 Create Team
               </Button>
             </DialogTrigger>
@@ -779,13 +799,14 @@ export default function TeamPage() {
       </div>
 
       {viewTab === 'list' ? (
-        <Card>
+        <Card className="min-w-0 overflow-hidden">
           <CardHeader>
             <CardTitle>Team List</CardTitle>
           </CardHeader>
-          <CardContent>
-            <div className="rounded-md border overflow-hidden">
-              <table className="w-full text-sm">
+          <CardContent className="min-w-0 space-y-0 px-4 sm:px-6">
+            {/* Desktop: wide table scrolls inside viewport */}
+            <div className="hidden md:block overflow-x-auto rounded-md border">
+              <table className="w-full min-w-[900px] text-sm">
                 <thead className="bg-muted/50">
                   <tr>
                     <th className="text-left p-3">Team</th>
@@ -798,28 +819,32 @@ export default function TeamPage() {
                 </thead>
                 <tbody>
                   {teams.length === 0 ? (
-                    <tr><td colSpan={6} className="p-4 text-muted-foreground">No teams created.</td></tr>
+                    <tr>
+                      <td colSpan={6} className="p-4 text-muted-foreground">
+                        No teams created.
+                      </td>
+                    </tr>
                   ) : (
                     teams.map((t) => (
                       <tr key={t.id} className="border-t">
                         <td className="p-3 font-medium">{t.name}</td>
-                        <td className="p-3">{t.memberIds.map((id) => contacts.find((c) => c.id === id)?.name ?? id).join(', ') || '-'}</td>
-                        <td className="p-3">{new Date(t.createdAt).toLocaleDateString('en-MY')}</td>
-                        <td className="p-3 capitalize">
-                          {t.authorizeMode === 'full'
-                            ? 'full authorise'
-                            : `selected: ${[...new Set(t.selectedPropertyIds.map(propertyLabelById))].join(', ') || '-'}`}
+                        <td className="p-3 max-w-[220px] whitespace-normal break-words">{membersLabel(t)}</td>
+                        <td className="p-3 whitespace-nowrap">{new Date(t.createdAt).toLocaleDateString('en-MY')}</td>
+                        <td className="p-3 max-w-[280px] whitespace-normal break-words capitalize">
+                          {teamAuthoriseLabel(t)}
                         </td>
-                        <td className="p-3">
+                        <td className="p-3 max-w-[200px] whitespace-normal break-words">
                           {t.restDays.length > 0 ? t.restDays.join(', ') : '-'}
                         </td>
                         <td className="p-3">
-                          <div className="flex gap-2">
+                          <div className="flex flex-wrap gap-2">
                             <Button size="sm" variant="outline" onClick={() => openEditTeam(t)}>
-                              <Pencil className="h-4 w-4 mr-1" />Edit Team
+                              <Pencil className="h-4 w-4 mr-1" />
+                              Edit Team
                             </Button>
-                            <Button size="sm" variant="destructive" onClick={() => deleteTeam(t)}>
-                              <Trash2 className="h-4 w-4 mr-1" />Delete Team
+                            <Button size="sm" variant="destructive" onClick={() => void deleteTeam(t)}>
+                              <Trash2 className="h-4 w-4 mr-1" />
+                              Delete Team
                             </Button>
                           </div>
                         </td>
@@ -829,45 +854,133 @@ export default function TeamPage() {
                 </tbody>
               </table>
             </div>
+
+            {/* Mobile: stacked rows — no horizontal table scroll */}
+            <div className="md:hidden rounded-md border border-border bg-card divide-y divide-border">
+              {teams.length === 0 ? (
+                <div className="px-3 py-10 text-center text-sm text-muted-foreground">No teams created.</div>
+              ) : (
+                teams.map((t) => (
+                  <div key={t.id} className="px-3 py-4 space-y-3">
+                    <div className="space-y-2 min-w-0">
+                      <h3 className="text-lg font-bold leading-snug text-foreground">{t.name}</h3>
+                      <div className="space-y-1 text-sm">
+                        <p>
+                          <span className="text-muted-foreground">Members · </span>
+                          <span className="text-foreground break-words">{membersLabel(t)}</span>
+                        </p>
+                        <p>
+                          <span className="text-muted-foreground">Created · </span>
+                          {new Date(t.createdAt).toLocaleDateString('en-MY')}
+                        </p>
+                        <p className="break-words capitalize">
+                          <span className="text-muted-foreground">Authorise · </span>
+                          {teamAuthoriseLabel(t)}
+                        </p>
+                        <p className="break-words">
+                          <span className="text-muted-foreground">Rest days · </span>
+                          {t.restDays.length > 0 ? t.restDays.join(', ') : '—'}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Button size="sm" variant="outline" className="flex-1 min-w-[120px]" onClick={() => openEditTeam(t)}>
+                        <Pencil className="h-4 w-4 mr-1" />
+                        Edit
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="destructive"
+                        className="flex-1 min-w-[120px]"
+                        onClick={() => void deleteTeam(t)}
+                      >
+                        <Trash2 className="h-4 w-4 mr-1" />
+                        Delete
+                      </Button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
           </CardContent>
         </Card>
       ) : (
-        <Card>
+        <Card className="min-w-0 overflow-hidden">
           <CardHeader>
             <CardTitle>Calendar</CardTitle>
-            <CardDescription>Rest-day badge by team ({calendarCells.monthLabel})</CardDescription>
+            <CardDescription className="hidden md:block">
+              Rest-day badge by team ({calendarCells.monthLabel})
+            </CardDescription>
+            <CardDescription className="md:hidden">Which teams are off each weekday</CardDescription>
           </CardHeader>
-          <CardContent>
-            <div className="grid grid-cols-7 gap-2 text-xs font-medium text-muted-foreground mb-2">
-              {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d) => (
-                <div key={d} className="text-center py-1">{d}</div>
-              ))}
+          <CardContent className="min-w-0 px-4 pb-4 pt-0 sm:px-6">
+            {/* Mobile: one block per weekday — no cramped month grid */}
+            <div className="md:hidden divide-y divide-border overflow-hidden rounded-lg border border-border bg-card">
+              {weekDays.map((day) => {
+                const off = teamsRestingOnWeekday(day)
+                return (
+                  <div key={day} className="px-3 py-3">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{day}</p>
+                    {off.length === 0 ? (
+                      <p className="mt-1 text-sm text-muted-foreground">—</p>
+                    ) : (
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        {off.map((t) => (
+                          <Badge
+                            key={t.id}
+                            variant="secondary"
+                            className={`text-xs font-normal ${teamBadgeClass(t.id)}`}
+                          >
+                            {t.name}
+                          </Badge>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
             </div>
-            <div className="grid grid-cols-7 gap-2">
-              {calendarCells.cells.map((cell, idx) => (
-                <div key={idx} className="min-h-[130px] border rounded-md p-2 bg-background">
-                  {cell ? (
-                    <>
-                      <p className="text-sm font-semibold mb-2">{cell.day}</p>
-                      <div className="space-y-1">
+
+            {/* Desktop: month grid */}
+            <div className="hidden w-full max-w-full md:block">
+              <div className="mb-2 grid grid-cols-7 gap-1 text-[10px] font-medium text-muted-foreground sm:gap-2 sm:text-xs">
+                {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d) => (
+                  <div key={d} className="truncate py-0.5 text-center">
+                    {d}
+                  </div>
+                ))}
+              </div>
+              <div className="grid grid-cols-7 auto-rows-min items-start gap-1 sm:gap-2">
+                {calendarCells.cells.map((cell, idx) =>
+                  cell ? (
+                    <div
+                      key={idx}
+                      className="flex min-h-0 flex-col gap-1 rounded-md border border-border bg-background p-1 sm:p-1.5"
+                    >
+                      <span className="text-[11px] font-semibold tabular-nums leading-none text-foreground sm:text-sm">
+                        {cell.day}
+                      </span>
+                      <div className="flex min-h-0 flex-col gap-0.5">
                         {teamsRestingOn(cell.date).length === 0 ? (
-                          <p className="text-[11px] text-muted-foreground">-</p>
+                          <span className="text-[9px] text-muted-foreground/70 sm:text-[11px]">·</span>
                         ) : (
                           teamsRestingOn(cell.date).map((t) => (
                             <Badge
                               key={`${t.id}-${cell.day}`}
                               variant="secondary"
-                              className={`mr-1 mb-1 ${teamBadgeClass(t.id)}`}
+                              className={`w-full justify-center whitespace-normal break-words px-1 py-0.5 text-center text-[9px] leading-tight sm:text-xs ${teamBadgeClass(t.id)}`}
                             >
-                              {t.name} rest
+                              {t.name}
                             </Badge>
                           ))
                         )}
                       </div>
-                    </>
-                  ) : null}
-                </div>
-              ))}
+                    </div>
+                  ) : (
+                    <div key={idx} className="min-h-0" aria-hidden />
+                  )
+                )}
+              </div>
             </div>
           </CardContent>
         </Card>

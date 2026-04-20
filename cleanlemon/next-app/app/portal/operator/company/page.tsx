@@ -8,6 +8,7 @@ import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Separator } from '@/components/ui/separator'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
@@ -16,6 +17,7 @@ import {
   BookOpen,
   Bot,
   CheckCircle,
+  CheckCircle2,
   DollarSign,
   HardDrive,
   Shield,
@@ -26,9 +28,11 @@ import {
   XCircle,
   Zap,
   Upload,
+  AlertTriangle,
   X,
   ExternalLink,
   Lock,
+  ChevronDown,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import {
@@ -64,12 +68,17 @@ import {
   fetchEmployeeBanks,
   uploadEmployeeFileToOss,
   fetchOperatorTtlockCredentials,
+  fetchOperatorTtlockOnboardStatus,
   postOperatorTtlockConnect,
   postOperatorTtlockDisconnect,
+  type OperatorTtlockAccountRow,
+  fetchOperatorPortalSetupStatus,
   type ClmAddonCatalogItem,
+  type OperatorPortalSetupStatus,
 } from '@/lib/cleanlemon-api'
 import { canonicalOperatorPlanCode, planAllowsAccounting } from '@/lib/cleanlemon-subscription-plan'
 import { cn } from '@/lib/utils'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 
 function uiPlanToApiPlan(p: PricingPlan): string {
   if (p === 'basic') return 'starter'
@@ -290,6 +299,33 @@ function computeSurchargeApplySegments(
   return mergeIntervals(raw)
 }
 
+/** Mirrors `clnCompanyProfileCompleteForAutomation` + public subdomain rules in `cleanlemon.service.js` (setup gate). */
+const COMPANY_GATE_FIELD_KEYS = ['companyName', 'ssmNumber', 'address', 'contact', 'subdomain'] as const
+type CompanyGateFieldKey = (typeof COMPANY_GATE_FIELD_KEYS)[number]
+
+function companySetupMissingFieldKeys(ci: {
+  companyName: string
+  ssmNumber: string
+  address: string
+  contact: string
+  subdomain: string
+}): CompanyGateFieldKey[] {
+  const keys: CompanyGateFieldKey[] = []
+  if (!String(ci.companyName || '').trim()) keys.push('companyName')
+  if (!String(ci.ssmNumber || '').trim()) keys.push('ssmNumber')
+  if (!String(ci.address || '').trim()) keys.push('address')
+  if (!String(ci.contact || '').trim()) keys.push('contact')
+  const sub = String(ci.subdomain || '').trim().toLowerCase()
+  if (!sub) keys.push('subdomain')
+  else if (sub.length > 64) keys.push('subdomain')
+  else if (!/^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$/.test(sub)) keys.push('subdomain')
+  return keys
+}
+
+function companyGateFieldClass(missing: CompanyGateFieldKey[], key: CompanyGateFieldKey): string {
+  return missing.includes(key) ? 'rounded-md p-1 ring-2 ring-destructive ring-offset-2 ring-offset-background' : ''
+}
+
 function QuarterHourTimeSelect({
   id,
   label,
@@ -391,6 +427,9 @@ export default function CompanyPage() {
   const [ttlockFormPass, setTtlockFormPass] = useState('')
   const [ttlockViewCreds, setTtlockViewCreds] = useState<{ username: string; password: string } | null>(null)
   const [ttlockBusy, setTtlockBusy] = useState(false)
+  const [ttlockAccounts, setTtlockAccounts] = useState<OperatorTtlockAccountRow[]>([])
+  const [manageSlot, setManageSlot] = useState<number | null>(null)
+  const [ttlockAccountName, setTtlockAccountName] = useState('')
   const [selectedPaymentProvider, setSelectedPaymentProvider] = useState<'stripe' | 'xendit'>('stripe')
   const [selectedAccountingProvider, setSelectedAccountingProvider] = useState<'bukku' | 'xero'>('bukku')
   const [selectedAiProvider, setSelectedAiProvider] = useState<'openai' | 'deepseek' | 'gemini'>('openai')
@@ -401,6 +440,7 @@ export default function CompanyPage() {
   const [saasBillingLoading, setSaasBillingLoading] = useState(false)
   const [subscriptionItem, setSubscriptionItem] = useState<any>(null)
   const [subscriptionLoading, setSubscriptionLoading] = useState(false)
+  const [portalSetupGate, setPortalSetupGate] = useState<OperatorPortalSetupStatus | null>(null)
   const [checkoutBusyKey, setCheckoutBusyKey] = useState<string | null>(null)
   const [clnPlanAmounts, setClnPlanAmounts] = useState<Record<
     string,
@@ -499,6 +539,31 @@ export default function CompanyPage() {
     companyInfo.outOfWorkingHourMarkupValue,
   ])
 
+  const companyGateHighlight =
+    portalSetupGate?.ok === true && portalSetupGate.firstIncomplete === 'company'
+  const companyGateMissing = useMemo(
+    () => (companyGateHighlight ? companySetupMissingFieldKeys(companyInfo) : []),
+    [companyGateHighlight, companyInfo]
+  )
+
+  useEffect(() => {
+    if (!operatorId || !user?.email) {
+      setPortalSetupGate(null)
+      return
+    }
+    let cancelled = false
+    ;(async () => {
+      const r = await fetchOperatorPortalSetupStatus({
+        operatorId,
+        email: String(user.email).trim().toLowerCase(),
+      })
+      if (!cancelled && r?.ok) setPortalSetupGate(r)
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [operatorId, user?.email])
+
   useEffect(() => {
     skipInitialIntegrationSave.current = true
     oauthReturnHandledRef.current = false
@@ -587,8 +652,14 @@ export default function CompanyPage() {
     if (!operatorId) return
     let cancelled = false
     ;(async () => {
-      const r = await fetchOperatorSettings(operatorId)
+      const [r, ttSt] = await Promise.all([
+        fetchOperatorSettings(operatorId),
+        fetchOperatorTtlockOnboardStatus(operatorId),
+      ])
       if (cancelled || !r?.ok) return
+      if (!cancelled && ttSt?.ok && Array.isArray(ttSt.accounts)) {
+        setTtlockAccounts(ttSt.accounts)
+      }
       const parsed = r.settings || {}
       setIntegrationState((prev) => ({
         ...prev,
@@ -804,13 +875,13 @@ export default function CompanyPage() {
   ])
 
   useEffect(() => {
-    const manage = showTtlockDialog && ttlockStep === 'manage' && !!operatorId
+    const manage = showTtlockDialog && ttlockStep === 'manage' && manageSlot != null && !!operatorId
     if (!manage) {
       setTtlockViewCreds(null)
       return
     }
     let cancelled = false
-    void fetchOperatorTtlockCredentials(operatorId).then((res) => {
+    void fetchOperatorTtlockCredentials(operatorId, manageSlot!).then((res) => {
       if (cancelled) return
       if (res?.ok) {
         setTtlockViewCreds({ username: res.username ?? '', password: res.password ?? '' })
@@ -821,7 +892,7 @@ export default function CompanyPage() {
     return () => {
       cancelled = true
     }
-  }, [showTtlockDialog, ttlockStep, operatorId])
+  }, [showTtlockDialog, ttlockStep, manageSlot, operatorId])
 
   useEffect(() => {
     if (!subscriptionItem?.billingCycle) return
@@ -944,6 +1015,15 @@ export default function CompanyPage() {
         return
       }
       toast.success('Company information updated successfully')
+      try {
+        const rs = await fetchOperatorPortalSetupStatus({
+          operatorId,
+          email: String(user?.email || '').trim().toLowerCase(),
+        })
+        if (rs?.ok) setPortalSetupGate(rs)
+      } catch {
+        /* ignore */
+      }
     } catch {
       toast.error('Save failed')
     }
@@ -1299,13 +1379,16 @@ export default function CompanyPage() {
   }
 
   const openTtlockConnectDialog = () => {
+    setManageSlot(null)
     setTtlockStep('choose')
     setTtlockFormUser('')
     setTtlockFormPass('')
+    setTtlockAccountName('')
     setShowTtlockDialog(true)
   }
 
-  const openTtlockManageDialog = () => {
+  const openTtlockManageForSlot = (slot: number) => {
+    setManageSlot(slot)
     setTtlockStep('manage')
     setShowTtlockDialog(true)
   }
@@ -1315,9 +1398,14 @@ export default function CompanyPage() {
       toast.error('Missing operator profile')
       return
     }
+    const name = ttlockAccountName.trim()
+    if (!name) {
+      toast.error('Enter a name for this TTLock account')
+      return
+    }
     setTtlockBusy(true)
     try {
-      const r = await postOperatorTtlockConnect(operatorId, ttlockFormUser, ttlockFormPass)
+      const r = await postOperatorTtlockConnect(operatorId, ttlockFormUser, ttlockFormPass, { accountName: name })
       if (!r?.ok) {
         const reason = r?.reason || 'TTLOCK_CONNECT_FAILED'
         toast.error(
@@ -1332,9 +1420,16 @@ export default function CompanyPage() {
       toast.success('TTLock connected')
       setShowTtlockDialog(false)
       setTtlockFormPass('')
-      const s = await fetchOperatorSettings(operatorId)
+      setTtlockAccountName('')
+      const [s, ttSt] = await Promise.all([
+        fetchOperatorSettings(operatorId),
+        fetchOperatorTtlockOnboardStatus(operatorId),
+      ])
       if (s?.ok && s.settings) {
         setIntegrationState((prev) => ({ ...prev, ttlock: !!s.settings.ttlock }))
+      }
+      if (ttSt?.ok && Array.isArray(ttSt.accounts)) {
+        setTtlockAccounts(ttSt.accounts)
       }
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'TTLock connect failed')
@@ -1343,20 +1438,27 @@ export default function CompanyPage() {
     }
   }
 
-  const disconnectTtlock = async () => {
+  const disconnectTtlockAtSlot = async (slot: number) => {
     if (!operatorId) return
     setTtlockBusy(true)
     try {
-      const r = await postOperatorTtlockDisconnect(operatorId)
+      const r = await postOperatorTtlockDisconnect(operatorId, slot)
       if (!r?.ok) {
         toast.error(r?.reason || 'Disconnect failed')
         return
       }
       toast.success('TTLock disconnected')
       setShowTtlockDialog(false)
-      const s = await fetchOperatorSettings(operatorId)
+      setManageSlot(null)
+      const [s, ttSt] = await Promise.all([
+        fetchOperatorSettings(operatorId),
+        fetchOperatorTtlockOnboardStatus(operatorId),
+      ])
       if (s?.ok && s.settings) {
         setIntegrationState((prev) => ({ ...prev, ttlock: !!s.settings.ttlock }))
+      }
+      if (ttSt?.ok && Array.isArray(ttSt.accounts)) {
+        setTtlockAccounts(ttSt.accounts)
       }
     } catch {
       toast.error('Disconnect failed')
@@ -1364,6 +1466,11 @@ export default function CompanyPage() {
       setTtlockBusy(false)
     }
   }
+
+  const connectedTtlockRows = useMemo(
+    () => ttlockAccounts.filter((a) => a.connected),
+    [ttlockAccounts]
+  )
 
   const getPlanIcon = (plan: string) => {
     switch (plan) {
@@ -1401,6 +1508,15 @@ export default function CompanyPage() {
         </TabsList>
 
         <TabsContent value="profile" className="mt-6 space-y-6">
+          {companyGateHighlight ? (
+            <Alert variant="destructive" className="border-destructive/60">
+              <AlertTriangle className="h-4 w-4" />
+              <AlertTitle>Complete required company details</AlertTitle>
+              <AlertDescription>
+                Items outlined in red are still required before you can use the rest of the operator portal.
+              </AlertDescription>
+            </Alert>
+          ) : null}
           {/* Company Profile */}
           <Card>
             <CardHeader>
@@ -1420,7 +1536,12 @@ export default function CompanyPage() {
                     disabled
                   />
                 </div>
-                <div className="space-y-2">
+                <div
+                  className={cn(
+                    'space-y-2',
+                    companyGateFieldClass(companyGateMissing, 'companyName')
+                  )}
+                >
                   <Label htmlFor="company-name">Company Name</Label>
                   <Input
                     id="company-name"
@@ -1430,7 +1551,12 @@ export default function CompanyPage() {
                 </div>
               </div>
               <div className="grid sm:grid-cols-2 gap-4">
-                <div className="space-y-2">
+                <div
+                  className={cn(
+                    'space-y-2',
+                    companyGateFieldClass(companyGateMissing, 'ssmNumber')
+                  )}
+                >
                   <Label htmlFor="registration">SSM Number</Label>
                   <Input
                     id="registration"
@@ -1438,7 +1564,12 @@ export default function CompanyPage() {
                     onChange={(e) => setCompanyInfo({ ...companyInfo, ssmNumber: e.target.value })}
                   />
                 </div>
-                <div className="space-y-2 sm:col-span-2">
+                <div
+                  className={cn(
+                    'space-y-2 sm:col-span-2',
+                    companyGateFieldClass(companyGateMissing, 'subdomain')
+                  )}
+                >
                   <Label htmlFor="subdomain">
                     Subdomain <span className="text-destructive">*</span>
                   </Label>
@@ -1477,7 +1608,12 @@ export default function CompanyPage() {
                     onChange={(e) => setCompanyInfo({ ...companyInfo, tin: e.target.value })}
                   />
                 </div>
-                <div className="space-y-2">
+                <div
+                  className={cn(
+                    'space-y-2',
+                    companyGateFieldClass(companyGateMissing, 'contact')
+                  )}
+                >
                   <Label htmlFor="contact">Contact</Label>
                   <Input
                     id="contact"
@@ -1486,7 +1622,12 @@ export default function CompanyPage() {
                   />
                 </div>
               </div>
-              <div className="space-y-2">
+              <div
+                className={cn(
+                  'space-y-2',
+                  companyGateFieldClass(companyGateMissing, 'address')
+                )}
+              >
                 <Label htmlFor="address">Address</Label>
                 <Input
                   id="address"
@@ -1935,41 +2076,74 @@ export default function CompanyPage() {
 
               <div className="space-y-3">
                 <p className="text-sm font-medium">Smart door</p>
-                <div className="p-4 border border-border rounded-xl flex items-start justify-between gap-3">
-                  <div className="flex items-start gap-3 min-w-0">
-                    <div className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0" style={{ background: 'var(--brand-light)' }}>
-                      <Lock size={18} style={{ color: 'var(--brand)' }} />
-                    </div>
-                    <div className="min-w-0">
-                      <p className="font-semibold text-foreground text-sm">TTLock</p>
-                      <p className="text-xs text-muted-foreground leading-relaxed">
-                        TTLock Open Platform account — same flow as Coliving company settings; token stored for API access.
-                      </p>
-                      <div className="flex items-center gap-1 mt-1.5">
-                        {integrationState.ttlock ? (
-                          <>
-                            <CheckCircle size={12} className="text-green-600" />
-                            <span className="text-xs text-green-600 font-medium">Connected</span>
-                          </>
-                        ) : (
-                          <>
-                            <XCircle size={12} className="text-muted-foreground" />
-                            <span className="text-xs text-muted-foreground">Not connected</span>
-                          </>
-                        )}
+                <div className="p-4 border border-border rounded-xl space-y-3">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                    <div className="flex items-start gap-3 min-w-0">
+                      <div className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0" style={{ background: 'var(--brand-light)' }}>
+                        <Lock size={18} style={{ color: 'var(--brand)' }} />
+                      </div>
+                      <div className="min-w-0">
+                        <p className="font-semibold text-foreground text-sm">TTLock</p>
+                        <p className="text-xs text-muted-foreground leading-relaxed">
+                          Connect one or more TTLock Open Platform accounts (same idea as client Integration). Each login gets a label; token stored per account.
+                        </p>
+                        <div className="flex items-center gap-1 mt-1.5">
+                          {integrationState.ttlock ? (
+                            <>
+                              <CheckCircle size={12} className="text-green-600" />
+                              <span className="text-xs text-green-600 font-medium">At least one account connected</span>
+                            </>
+                          ) : (
+                            <>
+                              <XCircle size={12} className="text-muted-foreground" />
+                              <span className="text-xs text-muted-foreground">No accounts connected</span>
+                            </>
+                          )}
+                        </div>
                       </div>
                     </div>
-                  </div>
-                  {integrationState.ttlock ? (
-                    <div className="flex gap-2">
-                      <Button size="sm" variant="outline" onClick={openTtlockManageDialog}>
-                        Manage
-                      </Button>
-                    </div>
-                  ) : (
-                    <Button size="sm" onClick={openTtlockConnectDialog}>
-                      Connect
+                    <Button size="sm" className="shrink-0 self-end sm:self-auto" onClick={openTtlockConnectDialog}>
+                      Connect TTLock
                     </Button>
+                  </div>
+                  {connectedTtlockRows.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">No TTLock accounts yet. Use Connect TTLock to add one.</p>
+                  ) : (
+                    <ul className="space-y-2">
+                      {connectedTtlockRows.map((a) => (
+                        <li
+                          key={`op-ttlock-${a.slot}`}
+                          className="flex flex-col gap-2 rounded-lg border border-border bg-muted/20 p-3 sm:flex-row sm:items-center sm:justify-between"
+                        >
+                          <div className="min-w-0 space-y-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="font-medium text-foreground text-sm">
+                                {a.accountName?.trim() || 'TTLock account'}
+                              </span>
+                              <Badge variant="outline" className="text-xs">
+                                Manual
+                              </Badge>
+                              <span className="inline-flex items-center gap-1 text-xs text-green-700">
+                                <CheckCircle2 className="h-3.5 w-3.5" />
+                                Connected
+                              </span>
+                            </div>
+                            {a.username?.trim() ? (
+                              <p className="truncate font-mono text-xs text-muted-foreground">{a.username}</p>
+                            ) : null}
+                          </div>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            className="shrink-0 self-end sm:self-auto"
+                            onClick={() => openTtlockManageForSlot(a.slot)}
+                          >
+                            Manage
+                          </Button>
+                        </li>
+                      ))}
+                    </ul>
                   )}
                 </div>
               </div>
@@ -1980,70 +2154,80 @@ export default function CompanyPage() {
         <TabsContent value="subscription" className="mt-6 space-y-6">
           {/* Current Plan */}
           <Card className="border-primary">
-            <CardHeader>
-              <div className="flex items-center justify-between">
-                <div>
+            <CardHeader className="space-y-3 pb-2 sm:pb-4">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div className="min-w-0">
                   <CardTitle className="text-lg">Current Plan</CardTitle>
-                    <CardDescription>
-                      {subscriptionLoading
-                        ? 'Loading subscription from backend...'
-                        : `You are on the ${apiPlanCodeToDisplayName(subscriptionItem?.planCode ?? uiPlanToApiPlan(currentUiPlan))} plan`}
-                    </CardDescription>
+                  <CardDescription className="mt-1">
+                    {subscriptionLoading
+                      ? 'Loading subscription from backend...'
+                      : `You are on the ${apiPlanCodeToDisplayName(subscriptionItem?.planCode ?? uiPlanToApiPlan(currentUiPlan))} plan`}
+                  </CardDescription>
                 </div>
-                <Badge className="bg-accent text-accent-foreground text-lg px-3 py-1 font-semibold tracking-wide">
+                <Badge className="w-fit shrink-0 bg-accent px-3 py-1 text-base font-semibold tracking-wide text-accent-foreground sm:text-lg">
                   {apiPlanCodeToDisplayName(subscriptionItem?.planCode ?? uiPlanToApiPlan(currentUiPlan))}
                 </Badge>
               </div>
             </CardHeader>
-            <CardContent>
-              <div className="flex items-center justify-between">
-                <div>
+            <CardContent className="space-y-4">
+              <div className="flex flex-col gap-4 border-t border-border/60 pt-4 sm:flex-row sm:items-start sm:justify-between sm:border-t-0 sm:pt-0">
+                <div className="min-w-0">
                   {String(subscriptionItem?.billingCycle || 'monthly').toLowerCase() === 'yearly' ? (
                     <>
-                      <p className="text-3xl sm:text-4xl font-bold text-foreground tracking-tight">
+                      <p className="text-3xl font-bold tracking-tight text-foreground sm:text-4xl">
                         RM {Number(subscriptionItem?.monthlyPrice || 0).toLocaleString()}
-                        <span className="text-base sm:text-lg font-semibold text-muted-foreground">/mo</span>
+                        <span className="text-base font-semibold text-muted-foreground sm:text-lg">/mo</span>
                       </p>
-                      <p className="text-sm text-muted-foreground mt-1">
+                      <p className="mt-1 text-sm text-muted-foreground">
                         RM {Math.round(Number(subscriptionItem?.monthlyPrice || 0) * 12).toLocaleString()}
                         /year · yearly billing
                       </p>
                     </>
                   ) : String(subscriptionItem?.billingCycle || '').toLowerCase() === 'quarterly' ? (
                     <>
-                      <p className="text-3xl sm:text-4xl font-bold text-foreground tracking-tight">
+                      <p className="text-3xl font-bold tracking-tight text-foreground sm:text-4xl">
                         RM {Number(subscriptionItem?.monthlyPrice || 0).toLocaleString()}
-                        <span className="text-base sm:text-lg font-semibold text-muted-foreground">/mo</span>
+                        <span className="text-base font-semibold text-muted-foreground sm:text-lg">/mo</span>
                       </p>
-                      <p className="text-sm text-muted-foreground mt-1">
+                      <p className="mt-1 text-sm text-muted-foreground">
                         RM {Math.round(Number(subscriptionItem?.monthlyPrice || 0) * 3).toLocaleString()}
                         /quarter · quarterly billing
                       </p>
                     </>
                   ) : (
                     <>
-                      <p className="text-3xl sm:text-4xl font-bold text-foreground tracking-tight">
+                      <p className="text-3xl font-bold tracking-tight text-foreground sm:text-4xl">
                         RM {Number(subscriptionItem?.monthlyPrice || 0).toLocaleString()}
-                        <span className="text-base sm:text-lg font-semibold text-muted-foreground">/mo</span>
+                        <span className="text-base font-semibold text-muted-foreground sm:text-lg">/mo</span>
                       </p>
-                      <p className="text-sm text-muted-foreground mt-1">Billed monthly</p>
+                      <p className="mt-1 text-sm text-muted-foreground">Billed monthly</p>
                     </>
                   )}
                 </div>
-                <div className="text-right">
-                  <p className="text-sm text-muted-foreground">Subscription status</p>
-                  <p className="font-medium">{subscriptionItem?.status || 'pending'}</p>
-                  <p className="text-xs text-muted-foreground mt-1">
-                    Renewal / expiry date: {subscriptionItem?.expiryDate || '-'}
-                  </p>
+                <div className="rounded-lg border border-border/80 bg-muted/30 px-3 py-2.5 sm:border-0 sm:bg-transparent sm:p-0 sm:text-right">
+                  <p className="text-xs text-muted-foreground">Status</p>
+                  <p className="font-medium capitalize">{subscriptionItem?.status || 'pending'}</p>
+                  <p className="mt-2 text-xs text-muted-foreground">Renews / expires</p>
+                  <p className="font-medium tabular-nums">{subscriptionItem?.expiryDate || '—'}</p>
                 </div>
               </div>
-              <p className="text-xs text-muted-foreground mt-3">
+              <p className="hidden text-xs text-muted-foreground sm:block">
                 <span className="font-medium text-foreground">Renew</span> extends from expiry by the billing period you choose (monthly / quarterly / yearly).{' '}
                 <span className="font-medium text-foreground">Upgrade</span> applies a higher plan from today.
               </p>
-              <div className="mt-4">
+              <Collapsible className="group sm:hidden">
+                <CollapsibleTrigger className="flex w-full items-center justify-between gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2 text-left text-xs font-medium text-foreground">
+                  Renew &amp; upgrade — how it works
+                  <ChevronDown className="h-4 w-4 shrink-0 transition-transform duration-200 group-data-[state=open]:rotate-180" />
+                </CollapsibleTrigger>
+                <CollapsibleContent className="mt-2 text-xs text-muted-foreground">
+                  <span className="font-medium text-foreground">Renew</span> extends from expiry by the period you pick.{' '}
+                  <span className="font-medium text-foreground">Upgrade</span> starts the higher plan from today.
+                </CollapsibleContent>
+              </Collapsible>
+              <div>
                 <Button
+                  className="w-full sm:w-auto"
                   onClick={() => startSubscriptionCheckout(currentUiPlan, hasActiveSubscriptionPeriod ? 'renew' : 'subscribe')}
                   disabled={
                     subscriptionLoading ||
@@ -2054,7 +2238,7 @@ export default function CompanyPage() {
                   {checkoutBusyKey === `${currentUiPlan}-renew` || checkoutBusyKey === `${currentUiPlan}-subscribe`
                     ? 'Redirecting to Stripe...'
                     : hasActiveSubscriptionPeriod
-                      ? 'Renew current plan on Stripe'
+                      ? 'Renew on Stripe'
                       : 'Subscribe on Stripe'}
                 </Button>
               </div>
@@ -2062,8 +2246,11 @@ export default function CompanyPage() {
           </Card>
 
           <div className="flex flex-col items-center gap-3 py-4">
-            <p className="text-sm text-muted-foreground text-center">
+            <p className="hidden px-1 text-center text-sm text-muted-foreground sm:block">
               Pay monthly, quarterly, or yearly. Tab defaults to yearly; we sync to your current cycle when your subscription loads.
+            </p>
+            <p className="px-2 text-center text-xs text-muted-foreground sm:hidden">
+              Pick a billing cycle for the prices below. We match your current cycle when data loads.
             </p>
             <Tabs
               value={billingPeriod}
@@ -2090,26 +2277,48 @@ export default function CompanyPage() {
           <Card className="border-dashed bg-muted/30">
             <CardHeader className="pb-2">
               <CardTitle className="text-base">What each tier includes</CardTitle>
-              <CardDescription className="text-xs sm:text-sm leading-relaxed">
-                Same core product on every plan: one operator account with one login email, staff punch card, and the full operational feature set below — except where noted.
+              <CardDescription className="text-xs leading-snug sm:text-sm sm:leading-relaxed">
+                <span className="sm:hidden">Same app on every tier; Starter → Growth → Enterprise adds accounting, then KPI / Dobi / branding &amp; more.</span>
+                <span className="hidden sm:inline">
+                  Same core product on every plan: one operator account with one login email, staff punch card, and the full operational feature set below — except where noted.
+                </span>
               </CardDescription>
             </CardHeader>
-            <CardContent className="text-sm text-muted-foreground space-y-3 pt-0">
-              <p>
-                <span className="font-semibold text-foreground">Starter</span> — Everything listed on the Starter card.
-                No accounting integration (no Bukku / Xero link).
-              </p>
-              <p>
-                <span className="font-semibold text-foreground">Growth</span> — Everything in Starter, plus{' '}
-                <span className="text-foreground font-medium">accounting integration (Bukku &amp; Xero)</span>.
-              </p>
-              <p>
-                <span className="font-semibold text-foreground">Enterprise</span> — Everything in Growth, plus{' '}
-                <span className="text-foreground font-medium">
-                  KPI Settings, Dobi &amp; Driver management, customization (branding, fields &amp; workflows)
-                </span>
-                , priority support, and custom reports.
-              </p>
+            <CardContent className="space-y-0 pt-0 text-muted-foreground">
+              <div className="hidden space-y-3 text-sm sm:block">
+                <p>
+                  <span className="font-semibold text-foreground">Starter</span> — Everything listed on the Starter card.
+                  No accounting integration (no Bukku / Xero link).
+                </p>
+                <p>
+                  <span className="font-semibold text-foreground">Growth</span> — Everything in Starter, plus{' '}
+                  <span className="font-medium text-foreground">accounting integration (Bukku &amp; Xero)</span>.
+                </p>
+                <p>
+                  <span className="font-semibold text-foreground">Enterprise</span> — Everything in Growth, plus{' '}
+                  <span className="font-medium text-foreground">
+                    KPI Settings, Dobi &amp; Driver management, customization (branding, fields &amp; workflows)
+                  </span>
+                  , priority support, and custom reports.
+                </p>
+              </div>
+              <Collapsible className="group sm:hidden">
+                <CollapsibleTrigger className="flex w-full items-center justify-between gap-2 rounded-lg border border-dashed border-border bg-background/80 px-3 py-2.5 text-left text-xs font-medium text-foreground">
+                  View Starter vs Growth vs Enterprise
+                  <ChevronDown className="h-4 w-4 shrink-0 transition-transform duration-200 group-data-[state=open]:rotate-180" />
+                </CollapsibleTrigger>
+                <CollapsibleContent className="mt-3 space-y-2.5 text-xs leading-snug">
+                  <p>
+                    <span className="font-semibold text-foreground">Starter</span> — Full ops; no Bukku / Xero.
+                  </p>
+                  <p>
+                    <span className="font-semibold text-foreground">Growth</span> — + accounting (Bukku &amp; Xero).
+                  </p>
+                  <p>
+                    <span className="font-semibold text-foreground">Enterprise</span> — + KPI, Dobi/Driver, branding &amp; workflows, priority support, custom reports.
+                  </p>
+                </CollapsibleContent>
+              </Collapsible>
             </CardContent>
           </Card>
 
@@ -2231,23 +2440,31 @@ export default function CompanyPage() {
 
           {/* Addons */}
           <Card>
-            <CardHeader>
-              <CardTitle className="text-lg flex items-center gap-2">
-                <Sparkles className="h-5 w-5" />
+            <CardHeader className="space-y-2">
+              <CardTitle className="flex items-center gap-2 text-lg">
+                <Sparkles className="h-5 w-5 shrink-0" />
                 Add-ons
               </CardTitle>
-              <CardDescription>
-                Add-ons use yearly list prices in MySQL and prorate to your renewal date.{' '}
-                <strong className="text-foreground">Only available if your main subscription is on yearly billing.</strong>
+              <CardDescription className="text-sm leading-snug">
+                <span className="font-medium text-foreground">Yearly main plan only.</span>{' '}
+                <span className="text-muted-foreground">Prices prorate to your renewal date.</span>
               </CardDescription>
             </CardHeader>
-            <CardContent>
-              <p className="text-xs text-muted-foreground mb-4">
-                Charge = yearly list price × (days until subscription expiry ÷ 365). Monthly or quarterly main plans
-                cannot purchase add-ons until they move to yearly. Checkout uses Stripe (dynamic line items, no add-on
-                Price IDs).
-              </p>
-              <div className="grid sm:grid-cols-2 gap-4">
+            <CardContent className="space-y-4">
+              <Collapsible className="group rounded-lg border border-border/60 bg-muted/20">
+                <CollapsibleTrigger className="flex w-full items-center justify-between gap-2 px-3 py-2.5 text-left text-xs font-medium text-foreground sm:py-2">
+                  <span>Technical details (proration &amp; Stripe)</span>
+                  <ChevronDown className="h-4 w-4 shrink-0 transition-transform duration-200 group-data-[state=open]:rotate-180" />
+                </CollapsibleTrigger>
+                <CollapsibleContent className="border-t border-border/60 px-3 pb-3 pt-2">
+                  <p className="text-[11px] leading-relaxed text-muted-foreground sm:text-xs">
+                    List prices are yearly; the charge is prorated by days left until your main subscription expiry.
+                    Monthly or quarterly main plans must switch to yearly before add-ons. Checkout is on Stripe (dynamic
+                    line items).
+                  </p>
+                </CollapsibleContent>
+              </Collapsible>
+              <div className="grid gap-3 sm:grid-cols-2 sm:gap-4">
                 {addonCatalog.map((addon) => {
                   const isActive = currentAddonCodes.includes(addon.addonCode.toLowerCase())
                   const q = addonQuotes[addon.addonCode]
@@ -2260,52 +2477,64 @@ export default function CompanyPage() {
                   return (
                     <div
                       key={addon.id}
-                      className={`p-4 rounded-lg border-2 ${
+                      className={`rounded-lg border-2 p-3 sm:p-4 ${
                         isActive ? 'border-primary bg-primary/5' : 'border-border'
                       }`}
                     >
-                      <div className="flex items-center justify-between mb-2">
-                        <h4 className="font-medium">{addon.title}</h4>
-                        {isActive && <Badge className="bg-primary">Active</Badge>}
+                      <div className="mb-2 flex items-start justify-between gap-2">
+                        <h4 className="font-medium leading-tight">{addon.title}</h4>
+                        {isActive ? <Badge className="shrink-0 bg-primary">Active</Badge> : null}
                       </div>
                       {addon.description ? (
-                        <p className="text-xs text-muted-foreground mb-2">{addon.description}</p>
+                        <p className="mb-2 line-clamp-2 text-xs text-muted-foreground sm:line-clamp-none">{addon.description}</p>
                       ) : null}
-                      <p className="text-sm font-medium text-foreground mb-1">
-                        List: RM {addon.amountMyr.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 })}{' '}
-                        / year
-                      </p>
-                      <p className="text-xs text-muted-foreground mb-3">
-                        {addonQuotesLoading && !q ? (
-                          'Calculating proration…'
-                        ) : q?.reason ? (
-                          <span className="text-amber-700 dark:text-amber-400">
-                            {q.reason === 'ADDON_ALREADY_ACTIVE'
-                              ? 'Already active.'
-                              : q.reason === 'ADDON_REQUIRES_YEARLY_SUBSCRIPTION'
-                                ? 'Only available when your main subscription is billed yearly. Renew or switch to yearly first.'
-                              : q.reason === 'PRORATION_BELOW_STRIPE_MINIMUM'
-                                ? 'Prorated amount is below the minimum charge — renew the main subscription first.'
-                                : q.reason}
-                          </span>
-                        ) : q?.amountDueMyr != null ? (
-                          <>
-                            Due now (prorated):{' '}
-                            <span className="text-foreground font-medium">
-                              RM{' '}
-                              {q.amountDueMyr.toLocaleString(undefined, {
-                                minimumFractionDigits: 2,
-                                maximumFractionDigits: 2,
-                              })}
+                      <dl className="mb-3 space-y-1.5 text-xs sm:text-sm">
+                        <div className="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-0.5">
+                          <dt className="text-muted-foreground">List / year</dt>
+                          <dd className="font-medium tabular-nums text-foreground">
+                            RM{' '}
+                            {addon.amountMyr.toLocaleString(undefined, {
+                              minimumFractionDigits: 0,
+                              maximumFractionDigits: 2,
+                            })}
+                          </dd>
+                        </div>
+                        <div className="text-muted-foreground">
+                          {addonQuotesLoading && !q ? (
+                            <span>Calculating…</span>
+                          ) : q?.reason ? (
+                            <span className="text-amber-700 dark:text-amber-400">
+                              {q.reason === 'ADDON_ALREADY_ACTIVE'
+                                ? 'Already active.'
+                                : q.reason === 'ADDON_REQUIRES_YEARLY_SUBSCRIPTION'
+                                  ? 'Switch main plan to yearly first.'
+                                  : q.reason === 'PRORATION_BELOW_STRIPE_MINIMUM'
+                                    ? 'Amount below minimum — renew main plan first.'
+                                    : q.reason}
                             </span>
-                            {q.daysRemaining != null ? (
-                              <span> · {q.daysRemaining} days left until renewal</span>
-                            ) : null}
-                          </>
-                        ) : (
-                          '—'
-                        )}
-                      </p>
+                          ) : q?.amountDueMyr != null ? (
+                            <div className="flex flex-col gap-0.5 sm:flex-row sm:flex-wrap sm:items-baseline sm:gap-x-2">
+                              <span>
+                                <span className="text-muted-foreground">Due now</span>{' '}
+                                <span className="font-semibold text-foreground">
+                                  RM{' '}
+                                  {q.amountDueMyr.toLocaleString(undefined, {
+                                    minimumFractionDigits: 2,
+                                    maximumFractionDigits: 2,
+                                  })}
+                                </span>
+                              </span>
+                              {q.daysRemaining != null ? (
+                                <span className="text-[11px] text-muted-foreground sm:text-xs">
+                                  · {q.daysRemaining}d to renewal
+                                </span>
+                              ) : null}
+                            </div>
+                          ) : (
+                            '—'
+                          )}
+                        </div>
+                      </dl>
                       <Button
                         size="sm"
                         variant={isActive ? 'outline' : 'default'}
@@ -2581,6 +2810,8 @@ export default function CompanyPage() {
           if (!open) {
             setTtlockStep('choose')
             setTtlockFormPass('')
+            setTtlockAccountName('')
+            setManageSlot(null)
             setTtlockViewCreds(null)
           }
         }}
@@ -2590,13 +2821,13 @@ export default function CompanyPage() {
             <DialogTitle>TTLock</DialogTitle>
             <DialogDescription>
               {ttlockStep === 'manage'
-                ? 'This company uses its own TTLock Open Platform account.'
+                ? `Manage “${ttlockAccounts.find((x) => x.slot === manageSlot)?.accountName?.trim() || 'this account'}”.`
                 : ttlockStep === 'choose'
                   ? 'Register on TTLock first if needed, then log in with your existing account.'
-                  : 'Enter your TTLock username and password. We verify and store the API token.'}
+                  : 'Enter a display name and your TTLock username and password. We verify and store the API token.'}
             </DialogDescription>
           </DialogHeader>
-          {ttlockStep === 'manage' ? (
+          {ttlockStep === 'manage' && manageSlot != null ? (
             <div className="space-y-3">
               <div>
                 <Label className="text-xs font-semibold">TTLock username</Label>
@@ -2610,7 +2841,11 @@ export default function CompanyPage() {
                 <Button variant="outline" onClick={() => setShowTtlockDialog(false)} disabled={ttlockBusy}>
                   Close
                 </Button>
-                <Button variant="destructive" disabled={ttlockBusy} onClick={() => void disconnectTtlock()}>
+                <Button
+                  variant="destructive"
+                  disabled={ttlockBusy}
+                  onClick={() => void disconnectTtlockAtSlot(manageSlot)}
+                >
                   {ttlockBusy ? 'Disconnecting…' : 'Disconnect'}
                 </Button>
               </DialogFooter>
@@ -2639,6 +2874,19 @@ export default function CompanyPage() {
             </div>
           ) : (
             <div className="space-y-3">
+              <div>
+                <Label htmlFor="cln-ttlock-account-name" className="text-xs font-semibold">
+                  Account name
+                </Label>
+                <Input
+                  id="cln-ttlock-account-name"
+                  autoComplete="off"
+                  placeholder="e.g. Main office, Warehouse"
+                  value={ttlockAccountName}
+                  onChange={(e) => setTtlockAccountName(e.target.value)}
+                  className="mt-1"
+                />
+              </div>
               <div>
                 <Label htmlFor="cln-ttlock-user" className="text-xs font-semibold">
                   TTLock username
@@ -2672,7 +2920,12 @@ export default function CompanyPage() {
                 </Button>
                 <Button
                   type="button"
-                  disabled={ttlockBusy || !ttlockFormUser.trim() || !ttlockFormPass.trim()}
+                  disabled={
+                    ttlockBusy ||
+                    !ttlockAccountName.trim() ||
+                    !ttlockFormUser.trim() ||
+                    !ttlockFormPass.trim()
+                  }
                   onClick={() => void submitTtlockConnect()}
                 >
                   {ttlockBusy ? 'Connecting…' : 'Connect TTLock'}

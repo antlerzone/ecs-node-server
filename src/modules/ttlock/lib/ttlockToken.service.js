@@ -67,9 +67,9 @@ async function getTTLockAccountByClient(clientId, ttlockSlotOpt) {
   try {
     const [clnRows] = await pool.query(
       `SELECT values_json FROM cln_operator_integration
-       WHERE operator_id = ? AND \`key\` = 'smartDoor' AND provider = 'ttlock' AND enabled = 1
+       WHERE operator_id = ? AND \`key\` = 'smartDoor' AND provider = 'ttlock' AND enabled = 1 AND COALESCE(slot, 0) = ?
        LIMIT 1`,
-      [String(clientId)]
+      [String(clientId), ttlockSlot]
     );
     if (clnRows.length) {
       const creds = parseTtlockValuesJson(clnRows[0].values_json);
@@ -135,6 +135,57 @@ function isMissingTableError(e) {
   return /doesn't exist/i.test(msg) || /Unknown table/i.test(msg);
 }
 
+/** Idempotent: multi-slot operator tokens (migration 0280). Safe to call repeatedly. */
+let clnTtlocktokenOperatorSlotEnsured = false;
+async function ensureClnTtlocktokenOperatorSlotUnique() {
+  if (clnTtlocktokenOperatorSlotEnsured) return;
+  try {
+    const [[row]] = await pool.query(
+      `SELECT COUNT(*) AS c FROM information_schema.TABLES
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cln_ttlocktoken'`
+    );
+    if (!row || Number(row.c) === 0) return;
+  } catch {
+    return;
+  }
+  try {
+    const [[col]] = await pool.query(
+      `SELECT COUNT(*) AS c FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cln_ttlocktoken' AND COLUMN_NAME = 'slot'`
+    );
+    if (!col || Number(col.c) === 0) {
+      await pool.query('ALTER TABLE cln_ttlocktoken ADD COLUMN slot INT NOT NULL DEFAULT 0 AFTER operator_id');
+    }
+  } catch (e) {
+    console.warn('[ttlockToken] ensure operator slot column', e?.message || e);
+  }
+  try {
+    const [[uq]] = await pool.query(
+      `SELECT COUNT(*) AS c FROM information_schema.STATISTICS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cln_ttlocktoken' AND INDEX_NAME = 'uq_cln_ttlocktoken_operator'`
+    );
+    if (uq && Number(uq.c) > 0) {
+      await pool.query('ALTER TABLE cln_ttlocktoken DROP INDEX uq_cln_ttlocktoken_operator');
+    }
+  } catch (e) {
+    console.warn('[ttlockToken] drop uq_cln_ttlocktoken_operator', e?.message || e);
+  }
+  try {
+    const [[uq2]] = await pool.query(
+      `SELECT COUNT(*) AS c FROM information_schema.STATISTICS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cln_ttlocktoken' AND INDEX_NAME = 'uq_cln_ttlocktoken_operator_slot'`
+    );
+    if (!uq2 || Number(uq2.c) === 0) {
+      await pool.query(
+        'ALTER TABLE cln_ttlocktoken ADD UNIQUE KEY uq_cln_ttlocktoken_operator_slot (operator_id, slot)'
+      );
+    }
+  } catch (e) {
+    console.warn('[ttlockToken] add uq_cln_ttlocktoken_operator_slot', e?.message || e);
+  }
+  clnTtlocktokenOperatorSlotEnsured = true;
+}
+
 /**
  * Where to persist TTLock tokens: Coliving operatordetail uses `ttlocktoken`; Cleanlemons uses `cln_ttlocktoken`.
  */
@@ -191,6 +242,9 @@ async function saveTokenClnScoped(clientId, scope, data, ttlockSlot = 0) {
   const clientdetailId = scope === 'cln_clientdetail' ? clientId : null;
   const operatorId = scope === 'cln_operatordetail' ? clientId : null;
   const slot = Number(ttlockSlot) || 0;
+  if (scope === 'cln_operatordetail') {
+    await ensureClnTtlocktokenOperatorSlotUnique();
+  }
 
   let existing;
   try {
@@ -202,8 +256,8 @@ async function saveTokenClnScoped(clientId, scope, data, ttlockSlot = 0) {
       existing = rows;
     } else {
       const [rows] = await pool.query(
-        'SELECT id FROM cln_ttlocktoken WHERE operator_id = ? LIMIT 1',
-        [clientId]
+        'SELECT id FROM cln_ttlocktoken WHERE operator_id = ? AND slot = ? LIMIT 1',
+        [clientId, slot]
       );
       existing = rows;
     }
@@ -228,13 +282,13 @@ async function saveTokenClnScoped(clientId, scope, data, ttlockSlot = 0) {
   await pool.query(
     `INSERT INTO cln_ttlocktoken (id, clientdetail_id, operator_id, slot, accesstoken, refreshtoken, expiresin, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, NOW(3), NOW(3))`,
-    [id, clientdetailId, operatorId, clientdetailId ? slot : 0, accessToken, refreshTokenVal, expiresIn]
+    [id, clientdetailId, operatorId, slot, accessToken, refreshTokenVal, expiresIn]
   );
 }
 
 /**
  * Save or update token. Routes to `ttlocktoken` (Coliving operatordetail) or `cln_ttlocktoken` (Cleanlemons).
- * @param {object} [opts] - `{ slot }` for cln_clientdetail multi-account (default slot 0).
+ * @param {object} [opts] - `{ slot }` for Cleanlemons multi-account (default slot 0).
  */
 async function saveToken(clientId, data, opts = {}) {
   const cid = String(clientId || '').trim();
@@ -244,7 +298,7 @@ async function saveToken(clientId, data, opts = {}) {
     return;
   }
   if (scope === 'cln_clientdetail' || scope === 'cln_operatordetail') {
-    const slot = scope === 'cln_clientdetail' ? Number(opts?.slot) || 0 : 0;
+    const slot = Number(opts?.slot) || 0;
     await saveTokenClnScoped(cid, scope, data, slot);
     return;
   }
@@ -291,9 +345,10 @@ async function readStoredTtlockTokenRow(clientId, ttlockSlotOpt) {
   }
   if (scope === 'cln_operatordetail') {
     try {
+      await ensureClnTtlocktokenOperatorSlotUnique();
       const [rows] = await pool.query(
-        'SELECT accesstoken, refreshtoken, expiresin, updated_at FROM cln_ttlocktoken WHERE operator_id = ? LIMIT 1',
-        [cid]
+        'SELECT accesstoken, refreshtoken, expiresin, updated_at FROM cln_ttlocktoken WHERE operator_id = ? AND slot = ? LIMIT 1',
+        [cid, slot]
       );
       return { scope, row: rows[0] || null };
     } catch (e) {

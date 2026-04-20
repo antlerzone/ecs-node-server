@@ -1,8 +1,7 @@
 "use client"
 
 import { useEffect, useMemo, useState } from "react"
-import Link from "next/link"
-import { ArrowLeft, ChevronLeft, ChevronRight } from "lucide-react"
+import { ChevronLeft, ChevronRight } from "lucide-react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -11,6 +10,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Checkbox } from "@/components/ui/checkbox"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { toast } from "sonner"
 import { useAuth } from "@/lib/auth-context"
 import {
@@ -123,6 +123,7 @@ export default function OperatorCalenderPage() {
   const [selectedProductIds, setSelectedProductIds] = useState<string[]>([])
   const [selectedPropertyIds, setSelectedPropertyIds] = useState<string[]>([])
   const [selectedClientIds, setSelectedClientIds] = useState<string[]>([])
+  const [calendarPageTab, setCalendarPageTab] = useState<"calendar" | "list">("calendar")
 
   useEffect(() => {
     let cancelled = false
@@ -339,149 +340,170 @@ export default function OperatorCalenderPage() {
 
   return (
     <div className="space-y-6 pb-20 lg:pb-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold">Calendar Pricing Adjustment</h1>
-          <p className="text-muted-foreground">Large calendar view for pricing markup/deduction</p>
-        </div>
-        <Button variant="outline" asChild>
-          <Link href="/operator/pricing">
-            <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to Pricing
-          </Link>
-        </Button>
+      <div>
+        <h1 className="text-2xl font-bold">Calendar Pricing Adjustment</h1>
+        <p className="text-muted-foreground">Large calendar view for pricing markup/deduction</p>
       </div>
 
-      <Card>
-        <CardHeader>
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <CardTitle>Calendar</CardTitle>
-            <div className="flex items-center gap-2">
-              <Button onClick={openCreate}>Pricing Adjustment</Button>
-              <Button variant="outline" size="icon" onClick={goPrevMonth}>
-                <ChevronLeft className="h-4 w-4" />
-              </Button>
-              <Badge variant="secondary">{monthLabel}</Badge>
-              <Button variant="outline" size="icon" onClick={goNextMonth}>
-                <ChevronRight className="h-4 w-4" />
-              </Button>
-            </div>
-          </div>
-          <CardDescription>Select date range by clicking dates, then click Pricing Adjustment</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div className="grid grid-cols-7 gap-2">
-            {weekDays.map((d) => (
-              <div key={d} className="text-xs font-medium text-muted-foreground px-2">
-                {d}
-              </div>
-            ))}
-          </div>
+      <Tabs value={calendarPageTab} onValueChange={(v) => setCalendarPageTab(v as "calendar" | "list")} className="w-full min-w-0">
+        <TabsList className="grid h-auto w-full min-w-0 grid-cols-2 gap-1 p-1 sm:inline-flex sm:h-9 sm:w-auto">
+          <TabsTrigger value="calendar" className="w-full sm:w-auto">
+            Calendar view
+          </TabsTrigger>
+          <TabsTrigger value="list" className="w-full sm:w-auto">
+            Adjustment list
+          </TabsTrigger>
+        </TabsList>
 
-          <div className="grid grid-cols-7 gap-2">
-            {cells.map((day) => {
-              const dayKey = ymd(day)
-              const sameMonth = day.getMonth() === viewMonth
-              const selected = activeStart && activeEnd && inRange(dayKey, activeStart, activeEnd)
-              const adjs = dayAdjustments(dayKey)
-              const price = dayPrice(dayKey)
-
-              return (
-                <button
-                  key={dayKey}
-                  type="button"
-                  onClick={() => onClickDay(day)}
-                  className={`h-40 md:h-44 border rounded-lg p-2 text-left align-top transition ${
-                    selected ? "ring-2 ring-primary/40" : ""
-                  } ${!sameMonth ? "opacity-50" : ""}`}
-                >
-                  <div className="flex items-start justify-between">
-                    <span className="text-sm font-medium">{day.getDate()}</span>
-                    <span className="text-sm font-medium">{`${day.getDate()} RM${price}`}</span>
+        <TabsContent value="calendar" className="mt-4 space-y-4 outline-none">
+          <Card className="overflow-hidden">
+            <CardHeader className="space-y-3">
+              <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
+                <CardTitle className="text-lg">Calendar</CardTitle>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button className="shrink-0" onClick={openCreate}>
+                    Pricing Adjustment
+                  </Button>
+                  <div className="flex flex-1 items-center justify-center gap-1 sm:flex-initial sm:justify-end">
+                    <Button variant="outline" size="icon" onClick={goPrevMonth} aria-label="Previous month">
+                      <ChevronLeft className="h-4 w-4" />
+                    </Button>
+                    <Badge variant="secondary" className="max-w-[min(100%,14rem)] shrink truncate px-2 py-1 text-xs sm:text-sm">
+                      {monthLabel}
+                    </Badge>
+                    <Button variant="outline" size="icon" onClick={goNextMonth} aria-label="Next month">
+                      <ChevronRight className="h-4 w-4" />
+                    </Button>
                   </div>
-                  <div className="mt-2 min-h-[72px] space-y-1">
-                    {adjs.map((adj) => (
-                      <button
-                        key={adj.id}
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          openEdit(adj)
-                        }}
-                        className="w-full text-left cursor-pointer"
-                        title={`Edit ${adj.name}`}
-                      >
-                        <Badge
-                          className={`w-full justify-start truncate border-0 transition-colors ${promotionColorClass(adj.id)}`}
-                        >
-                          {adj.name} {adj.adjustmentType === "markup" ? "+" : "-"}
-                          {adj.value}
-                          {adj.valueType === "percentage" ? "%" : " RM"}
-                        </Badge>
-                      </button>
+                </div>
+              </div>
+              <CardDescription>Select date range by tapping dates, then tap Pricing Adjustment</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <div className="overflow-x-auto pb-1 -mx-1 px-1 md:mx-0 md:overflow-visible md:px-0">
+                <div className="min-w-[560px] md:min-w-0">
+                  <div className="grid grid-cols-7 gap-1 md:gap-2">
+                    {weekDays.map((d) => (
+                      <div key={d} className="px-0.5 text-center text-[10px] font-medium text-muted-foreground sm:text-xs md:px-2">
+                        {d}
+                      </div>
                     ))}
                   </div>
-                </button>
-              )
-            })}
-          </div>
 
-          <div className="flex items-center gap-2 pt-2">
-            <Badge variant="secondary">
-              {activeStart ? `Selected: ${activeStart} to ${activeEnd || activeStart}` : "No date selected"}
-            </Badge>
-          </div>
-        </CardContent>
-      </Card>
+                  <div className="mt-1 grid grid-cols-7 gap-1 md:gap-2">
+                    {cells.map((day) => {
+                      const dayKey = ymd(day)
+                      const sameMonth = day.getMonth() === viewMonth
+                      const selected = activeStart && activeEnd && inRange(dayKey, activeStart, activeEnd)
+                      const adjs = dayAdjustments(dayKey)
+                      const price = dayPrice(dayKey)
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Adjustment List</CardTitle>
-          <CardDescription>Search and filter adjustment records</CardDescription>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-            <Input placeholder="Search name / remark / value" value={search} onChange={(e) => setSearch(e.target.value)} />
-            <Input type="date" value={filterFrom} onChange={(e) => setFilterFrom(e.target.value)} />
-            <Input type="date" value={filterTo} onChange={(e) => setFilterTo(e.target.value)} />
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-2">
-          {filteredAdjustments.length === 0 ? (
-            <div className="text-sm text-muted-foreground border rounded-lg p-4">No adjustment found</div>
-          ) : (
-            filteredAdjustments.map((adj) => (
-              <button
-                key={adj.id}
-                type="button"
-                onClick={() => openEdit(adj)}
-                className="w-full text-left border rounded-lg p-3 hover:bg-muted/40 transition"
-              >
-                <div className="flex items-center gap-2">
-                  <span className="font-medium text-sm">{adj.name}</span>
-                  <Badge
-                    className={`${
-                      adj.adjustmentType === "markup"
-                        ? adj.valueType === "percentage"
-                          ? "bg-cyan-100 text-cyan-800 border-0"
-                          : "bg-violet-100 text-violet-800 border-0"
-                        : adj.valueType === "percentage"
-                        ? "bg-rose-100 text-rose-800 border-0"
-                        : "bg-amber-100 text-amber-800 border-0"
-                    }`}
+                      return (
+                        <button
+                          key={dayKey}
+                          type="button"
+                          onClick={() => onClickDay(day)}
+                          className={`min-h-[5.5rem] rounded-lg border p-1.5 text-left align-top transition sm:min-h-[6.5rem] md:h-44 md:min-h-0 md:p-2 ${
+                            selected ? "ring-2 ring-primary/40" : ""
+                          } ${!sameMonth ? "opacity-50" : ""}`}
+                        >
+                          <div className="flex flex-col gap-0.5">
+                            <span className="text-xs font-semibold leading-none sm:text-sm">{day.getDate()}</span>
+                            <span className="text-[10px] font-medium tabular-nums text-muted-foreground sm:text-xs md:text-sm">
+                              RM{price}
+                            </span>
+                          </div>
+                          <div className="mt-1 space-y-0.5 md:mt-2 md:min-h-[72px] md:space-y-1">
+                            {adjs.map((adj) => (
+                              <button
+                                key={adj.id}
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  openEdit(adj)
+                                }}
+                                className="w-full cursor-pointer text-left"
+                                title={`Edit ${adj.name}`}
+                              >
+                                <Badge
+                                  className={`w-full justify-start truncate border-0 px-1 py-0 text-[9px] leading-tight transition-colors sm:text-xs ${promotionColorClass(adj.id)}`}
+                                >
+                                  <span className="truncate">
+                                    {adj.name} {adj.adjustmentType === "markup" ? "+" : "-"}
+                                    {adj.value}
+                                    {adj.valueType === "percentage" ? "%" : " RM"}
+                                  </span>
+                                </Badge>
+                              </button>
+                            ))}
+                          </div>
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <Badge variant="secondary" className="max-w-full whitespace-normal text-left text-xs leading-snug">
+                  {activeStart ? `Selected: ${activeStart} to ${activeEnd || activeStart}` : "No date selected"}
+                </Badge>
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="list" className="mt-4 outline-none">
+          <Card>
+            <CardHeader>
+              <CardTitle>Adjustment List</CardTitle>
+              <CardDescription>Search and filter adjustment records</CardDescription>
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 md:grid-cols-3">
+                <Input placeholder="Search name / remark / value" value={search} onChange={(e) => setSearch(e.target.value)} />
+                <Input type="date" value={filterFrom} onChange={(e) => setFilterFrom(e.target.value)} />
+                <Input type="date" value={filterTo} onChange={(e) => setFilterTo(e.target.value)} />
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              {filteredAdjustments.length === 0 ? (
+                <div className="rounded-lg border p-4 text-sm text-muted-foreground">No adjustment found</div>
+              ) : (
+                filteredAdjustments.map((adj) => (
+                  <button
+                    key={adj.id}
+                    type="button"
+                    onClick={() => openEdit(adj)}
+                    className="w-full rounded-lg border p-3 text-left transition hover:bg-muted/40"
                   >
-                    {adj.adjustmentType === "markup" ? "+" : "-"}
-                    {adj.value}
-                    {adj.valueType === "percentage" ? "%" : " RM"}
-                  </Badge>
-                </div>
-                <div className="text-xs text-muted-foreground mt-1">
-                  {adj.startDate} to {adj.endDate}
-                  {adj.remark ? ` · ${adj.remark}` : ""}
-                </div>
-              </button>
-            ))
-          )}
-        </CardContent>
-      </Card>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-sm font-medium">{adj.name}</span>
+                      <Badge
+                        className={`${
+                          adj.adjustmentType === "markup"
+                            ? adj.valueType === "percentage"
+                              ? "bg-cyan-100 text-cyan-800 border-0"
+                              : "bg-violet-100 text-violet-800 border-0"
+                            : adj.valueType === "percentage"
+                              ? "bg-rose-100 text-rose-800 border-0"
+                              : "bg-amber-100 text-amber-800 border-0"
+                        }`}
+                      >
+                        {adj.adjustmentType === "markup" ? "+" : "-"}
+                        {adj.value}
+                        {adj.valueType === "percentage" ? "%" : " RM"}
+                      </Badge>
+                    </div>
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      {adj.startDate} to {adj.endDate}
+                      {adj.remark ? ` · ${adj.remark}` : ""}
+                    </div>
+                  </button>
+                ))
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
         <DialogContent className="max-w-3xl">

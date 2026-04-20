@@ -105,6 +105,17 @@ function crmStatusFromJson(crm) {
   return st || 'active';
 }
 
+/** Malaysia payroll statutory flags default for new employee CRM (EPF/SOCSO/EIS on; MTD off until configured). */
+function normalizeSalaryStatutoryDefaults(raw) {
+  const d = raw && typeof raw === 'object' ? raw : {};
+  return {
+    epfApplies: d.epfApplies !== false,
+    socsoApplies: d.socsoApplies !== false,
+    eisApplies: d.eisApplies !== false,
+    mtdApplies: d.mtdApplies === true,
+  };
+}
+
 function buildCrmFromInput(input) {
   const empFromPortal = Array.isArray(input.portalRoles)
     ? input.portalRoles
@@ -117,6 +128,13 @@ function buildCrmFromInput(input) {
     empFromPortal.length > 0
       ? [...new Set(empFromPortal.map((x) => String(x).toLowerCase()))]
       : undefined;
+
+  const isEmployeeCrm =
+    (portalRoles && portalRoles.length > 0) ||
+    (Array.isArray(input.permissions) &&
+      input.permissions.some((x) =>
+        ['staff', 'driver', 'dobi', 'supervisor'].includes(String(x).toLowerCase())
+      ));
 
   const base = {
     status: String(input.status || 'active'),
@@ -134,6 +152,9 @@ function buildCrmFromInput(input) {
     remarkHistory: Array.isArray(input.remarkHistory) ? input.remarkHistory : [],
   };
   if (portalRoles && portalRoles.length) base.portalRoles = portalRoles;
+  if (isEmployeeCrm) {
+    base.salaryStatutoryDefaults = normalizeSalaryStatutoryDefaults(input.salaryStatutoryDefaults);
+  }
   return base;
 }
 
@@ -172,6 +193,7 @@ function mapEmployeeJunctionToContact(eo, d, crm) {
     workingWithUsCount: c.workingWithUsCount != null ? Number(c.workingWithUsCount) : undefined,
     trainings: Array.isArray(c.trainings) ? c.trainings : [],
     remarkHistory: Array.isArray(c.remarkHistory) ? c.remarkHistory : [],
+    salaryStatutoryDefaults: normalizeSalaryStatutoryDefaults(c.salaryStatutoryDefaults),
     contactSource: 'employee',
   };
 }

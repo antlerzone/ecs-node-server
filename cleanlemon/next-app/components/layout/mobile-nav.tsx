@@ -1,10 +1,11 @@
 "use client"
 
-import { Suspense, useMemo } from 'react'
+import { Suspense, useContext, useMemo } from 'react'
 import { usePathname, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import { cn } from '@/lib/utils'
 import { LucideIcon } from 'lucide-react'
+import { ClientBookingNavContext } from '@/components/portal/client/client-booking-overlay'
 
 export interface NavItem {
   href: string
@@ -12,6 +13,8 @@ export interface NavItem {
   label: string
   activeMatch?: 'exact' | 'prefix'
   prominent?: boolean
+  /** Opens client booking overlay (Cleanlemons client portal) instead of navigating. */
+  clientBookingOpener?: boolean
   clientTab?: "home" | "schedule"
 }
 
@@ -50,15 +53,45 @@ function itemIsActive(
 
 function MobileNavInner({ items, basePath, tab }: MobileNavProps & { tab: string | null }) {
   const pathname = usePathname()
+  const clientBookingCtx = useContext(ClientBookingNavContext)
 
   return (
     <nav className="fixed bottom-0 left-0 right-0 z-50 border-t border-border bg-card md:hidden">
       <div className="flex items-end justify-between gap-1 px-2 pb-1 pt-2 safe-area-pb">
         {items.map((item) => {
-          const isActive = itemIsActive(pathname, basePath, tab, item)
+          const isActive = item.clientBookingOpener
+            ? !!clientBookingCtx?.bookingOpen
+            : itemIsActive(pathname, basePath, tab, item)
           const linkHref = `${basePath}${item.href}`
 
           if (item.prominent) {
+            if (item.clientBookingOpener && clientBookingCtx) {
+              return (
+                <div key={`${basePath}:booking-opener`} className="flex flex-1 flex-col items-center">
+                  <button
+                    type="button"
+                    onClick={() => clientBookingCtx.openBooking()}
+                    className={cn(
+                      'relative z-10 -mt-4 flex h-14 w-14 shrink-0 flex-col items-center justify-center rounded-full shadow-lg ring-4 ring-card transition-transform active:scale-95',
+                      isActive
+                        ? 'bg-primary text-primary-foreground ring-primary/25'
+                        : 'bg-primary text-primary-foreground hover:brightness-110',
+                    )}
+                    aria-pressed={isActive}
+                  >
+                    <item.icon className="h-6 w-6" strokeWidth={2} />
+                  </button>
+                  <span
+                    className={cn(
+                      'mt-1 max-w-[4.5rem] truncate text-center text-[10px] font-semibold leading-tight',
+                      isActive ? 'text-primary' : 'text-muted-foreground',
+                    )}
+                  >
+                    {item.label}
+                  </span>
+                </div>
+              )
+            }
             return (
               <div key={`${basePath}:${item.href || "prominent"}`} className="flex flex-1 flex-col items-center">
                 <Link

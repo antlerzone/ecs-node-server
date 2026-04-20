@@ -667,6 +667,86 @@ function isClnTableMissingErr(err) {
   return /doesn't exist/i.test(msg) || /Unknown table/i.test(msg);
 }
 
+let clnEoCrmJsonColumnCache;
+async function clnEmployeeOperatorHasCrmJsonColumn() {
+  if (clnEoCrmJsonColumnCache !== undefined) return clnEoCrmJsonColumnCache;
+  try {
+    const [rows] = await pool.query(
+      `SELECT 1 AS ok FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cln_employee_operator' AND COLUMN_NAME = 'crm_json'
+       LIMIT 1`
+    );
+    clnEoCrmJsonColumnCache = rows.length > 0;
+  } catch {
+    clnEoCrmJsonColumnCache = false;
+  }
+  return clnEoCrmJsonColumnCache;
+}
+
+function safeParseCrmJsonForAccess(raw) {
+  if (raw == null || raw === '') return {};
+  // mysql2 may return LONGTEXT as Buffer; treating it as "parsed object" skips JSON.parse and drops portalRoles.
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(raw)) raw = raw.toString('utf8');
+  if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) return raw;
+  try {
+    const o = JSON.parse(String(raw));
+    return o && typeof o === 'object' && !Array.isArray(o) ? o : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Operator Contacts UI reads `crm_json.portalRoles` (multi-select). JWT used to only mirror `staff_role` (single),
+ * so Driver/Dobi disappeared when primary was supervisor/cleaner. Expand one junction into one JWT row per portal role.
+ */
+function expandJunctionRowsToEmployeeOperatorJwtRows(rows) {
+  const out = [];
+  const allowed = new Set(['staff', 'driver', 'dobi', 'supervisor']);
+  for (const row of rows || []) {
+    const j = String(row.junctionId);
+    const opId = String(row.operatorId);
+    const opName = String(row.operatorName || '').trim() || '(operator)';
+    const crm = safeParseCrmJsonForAccess(row.crm_json);
+    let roles = [];
+    if (Array.isArray(crm.portalRoles) && crm.portalRoles.length) {
+      roles = [
+        ...new Set(
+          crm.portalRoles.map((x) => String(x).toLowerCase()).filter((x) => allowed.has(x))
+        )
+      ];
+    }
+    if (!roles.length) {
+      const sr = String(row.staffRole != null ? row.staffRole : row.staff_role || 'cleaner').toLowerCase();
+      if (sr === 'driver') roles = ['driver'];
+      else if (sr === 'dobi') roles = ['dobi'];
+      else if (sr === 'supervisor') roles = ['supervisor'];
+      else roles = ['staff'];
+    }
+    const toJwtStaffRole = (portalRole) => {
+      const x = String(portalRole || '').toLowerCase();
+      if (x === 'driver') return 'driver';
+      if (x === 'dobi') return 'dobi';
+      if (x === 'supervisor') return 'supervisor';
+      return 'cleaner';
+    };
+    const seen = new Set();
+    for (const pr of roles) {
+      const staffRole = toJwtStaffRole(pr);
+      const dedupeKey = `${opId}|${staffRole}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      out.push({
+        junctionId: j,
+        operatorId: opId,
+        operatorName: opName,
+        staffRole
+      });
+    }
+  }
+  return out;
+}
+
 /**
  * Cleanlemons: one portal email → supervisor scope via `cln_employeedetail` + `cln_employee_operator` (staff_role supervisor)
  * + other junctions. Used for operator dropdown (supervisor + field staff).
@@ -746,24 +826,20 @@ async function getCleanlemonsPortalContext(email) {
       };
     }
 
-    const employeeOperators = [];
+    let employeeOperators = [];
     if (employee?.id) {
       try {
+        const hasCrmJson = await clnEmployeeOperatorHasCrmJsonColumn();
+        const crmSel = hasCrmJson ? ', eo.crm_json AS crm_json' : ', NULL AS crm_json';
         const [eoRows] = await pool.query(
           `SELECT eo.id AS junctionId, eo.operator_id AS operatorId, eo.staff_role AS staffRole, o.name AS operatorName
+           ${crmSel}
            FROM cln_employee_operator eo
            INNER JOIN \`${clnMaster}\` o ON o.id = eo.operator_id
            WHERE eo.employee_id = ?`,
           [employee.id]
         );
-        for (const row of eoRows || []) {
-          employeeOperators.push({
-            junctionId: String(row.junctionId),
-            operatorId: String(row.operatorId),
-            operatorName: String(row.operatorName || '').trim() || '(operator)',
-            staffRole: String(row.staff_role || 'cleaner')
-          });
-        }
+        employeeOperators = expandJunctionRowsToEmployeeOperatorJwtRows(eoRows || []);
       } catch (e) {
         if (!isClnTableMissingErr(e)) throw e;
       }

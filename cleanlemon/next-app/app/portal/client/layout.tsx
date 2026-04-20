@@ -7,7 +7,7 @@ import { MobileNav } from '@/components/layout/mobile-nav'
 import { ClientMobileDrawer, ClientMobileHeader } from '@/components/layout/client-mobile-chrome'
 import type { ClientNavItem } from '@/components/layout/client-mobile-chrome'
 import { useAuth } from '@/lib/auth-context'
-import { fetchEmployeeProfileByEmail, fetchOperatorInvoices } from '@/lib/cleanlemon-api'
+import { fetchEmployeeProfileByEmail, fetchClientPortalInvoices } from '@/lib/cleanlemon-api'
 import {
   Home,
   Calendar,
@@ -22,26 +22,26 @@ import {
   Sparkles,
 } from 'lucide-react'
 import { Toaster } from 'sonner'
+import { ClientBookingNavProvider } from '@/components/portal/client/client-booking-overlay'
 
-/** Desktop sidebar: full list (order preserved). */
+/** Desktop sidebar: full list (order preserved). Booking opens from Dashboard (desktop) or bottom bar (mobile). */
 const clientPortalNavItemsFull: ClientNavItem[] = [
   { href: '', icon: Home, label: 'Dashboard' },
   { href: '/profile', icon: User, label: 'Profile' },
   { href: '/agreement', icon: FileSignature, label: 'Agreement' },
   { href: '/invoices', icon: FileText, label: 'Invoices' },
   { href: '/approval', icon: CheckSquare, label: 'Approval' },
-  { href: '/booking', icon: Calendar, label: 'Booking', activeMatch: 'prefix' },
   { href: '/damage', icon: AlertTriangle, label: 'Damage' },
   { href: '/properties', icon: Building2, label: 'Properties' },
   { href: '/integration', icon: Plug, label: 'Integration' },
   { href: '/smart-door', icon: Lock, label: 'Smart Door' },
 ]
 
-/** Mobile bottom bar (5): Dashboard → Schedule (dashboard tab) → Booking page → Invoice → Profile */
+/** Mobile bottom bar (5): Dashboard → Schedule (dashboard tab) → Booking sheet → Invoice → Profile */
 const mobileBottomNavItems: ClientNavItem[] = [
   { href: '', icon: Home, label: 'Dashboard', clientTab: 'home' },
   { href: '?tab=schedule', icon: Calendar, label: 'Schedule', clientTab: 'schedule' },
-  { href: '/booking', icon: Sparkles, label: 'Booking', prominent: true },
+  { href: '', icon: Sparkles, label: 'Booking', prominent: true, clientBookingOpener: true },
   { href: '/invoices', icon: FileText, label: 'Invoice' },
   { href: '/profile', icon: User, label: 'Profile' },
 ]
@@ -67,6 +67,13 @@ function isProfileComplete(profile: Record<string, unknown> | null | undefined):
     'address',
   ]
   return required.every((key) => String(profile[key] || '').trim() !== '')
+}
+
+function isProfileSelfVerified(profile: Record<string, unknown> | null | undefined): boolean {
+  if (!profile) return false
+  if (profile.profileIdentityVerified === true) return true
+  const v = profile.profileSelfVerifiedAt
+  return v != null && String(v).trim() !== ''
 }
 
 export default function ClientLayout({
@@ -108,6 +115,10 @@ export default function ClientLayout({
     const p = String(pathname || '')
     return p.includes('/client/smart-door')
   }, [pathname])
+  const isDamageRoute = useMemo(() => {
+    const p = String(pathname || '')
+    return p.includes('/client/damage')
+  }, [pathname])
 
   useEffect(() => {
     let cancelled = false
@@ -122,7 +133,8 @@ export default function ClientLayout({
         const res = await fetchEmployeeProfileByEmail(email)
         const profile = (res?.profile || {}) as Record<string, unknown>
         const complete = !!(res?.ok && isProfileComplete(profile))
-        if (!complete && !isProfileRoute) {
+        const selfVerified = !!(res?.ok && isProfileSelfVerified(profile))
+        if ((!complete || !selfVerified) && !isProfileRoute) {
           router.replace('/client/profile?gate=required')
           return
         }
@@ -138,18 +150,13 @@ export default function ClientLayout({
           return
         }
 
-        const inv = await fetchOperatorInvoices()
-        const allInvoices = Array.isArray(inv?.items) ? inv.items : []
-        const myInvoices = allInvoices.filter((x: any) => {
-          const em = String(x?.clientEmail || x?.email || '').trim().toLowerCase()
-          if (!em) return true
-          return em === email.toLowerCase()
-        })
-        const hasUnpaidInvoice = myInvoices.some((x: any) => {
+        const inv = await fetchClientPortalInvoices(email, String(user?.operatorId || '').trim(), { limit: 500 })
+        const myInvoices = Array.isArray(inv?.items) ? inv.items : []
+        const hasOverdueInvoice = myInvoices.some((x: any) => {
           const st = String(x?.status || '').trim().toLowerCase()
-          return st === 'pending' || st === 'overdue' || st === 'unpaid'
+          return st === 'overdue'
         })
-        if (hasUnpaidInvoice && !isInvoicesRoute && !isIntegrationRoute && !isColivingLinkRoute && !isSmartDoorRoute) {
+        if (hasOverdueInvoice && !isInvoicesRoute && !isIntegrationRoute && !isColivingLinkRoute && !isSmartDoorRoute) {
           router.replace('/client/invoices?gate=required')
           return
         }
@@ -161,7 +168,7 @@ export default function ClientLayout({
     return () => {
       cancelled = true
     }
-  }, [user?.email, isProfileRoute, isApprovalRoute, isInvoicesRoute, isIntegrationRoute, isColivingLinkRoute, isSmartDoorRoute, router])
+  }, [user?.email, user?.operatorId, isProfileRoute, isApprovalRoute, isInvoicesRoute, isIntegrationRoute, isColivingLinkRoute, isSmartDoorRoute, router])
 
   if (
     checkingGate &&
@@ -171,7 +178,8 @@ export default function ClientLayout({
     !isInvoicesRoute &&
     !isIntegrationRoute &&
     !isColivingLinkRoute &&
-    !isSmartDoorRoute
+    !isSmartDoorRoute &&
+    !isDamageRoute
   ) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-background">
@@ -191,20 +199,22 @@ export default function ClientLayout({
   }
 
   return (
-    <div className="flex min-h-screen bg-background md:h-screen md:max-h-screen">
-      <AppSidebar items={clientPortalNavItemsFull} basePath="/client" title="Client Portal" />
-      <ClientMobileHeader onOpenMenu={() => setMobileMenuOpen(true)} />
-      <ClientMobileDrawer
-        open={mobileMenuOpen}
-        onOpenChange={setMobileMenuOpen}
-        items={mobileDrawerNavItems}
-        basePath="/client"
-      />
-      <main className="flex min-h-0 flex-1 flex-col overflow-y-auto pt-14 pb-20 md:pt-0 md:pb-0">
-        {children}
-      </main>
-      <MobileNav items={mobileBottomNavItems} basePath="/client" />
-      <Toaster richColors position="top-center" />
-    </div>
+    <ClientBookingNavProvider>
+      <div className="flex min-h-screen bg-background md:h-screen md:max-h-screen">
+        <AppSidebar items={clientPortalNavItemsFull} basePath="/client" title="Client Portal" />
+        <ClientMobileHeader onOpenMenu={() => setMobileMenuOpen(true)} />
+        <ClientMobileDrawer
+          open={mobileMenuOpen}
+          onOpenChange={setMobileMenuOpen}
+          items={mobileDrawerNavItems}
+          basePath="/client"
+        />
+        <main className="flex min-h-0 flex-1 flex-col overflow-y-auto pt-12 pb-20 md:pt-0 md:pb-0">
+          {children}
+        </main>
+        <MobileNav items={mobileBottomNavItems} basePath="/client" />
+        <Toaster richColors position="top-center" />
+      </div>
+    </ClientBookingNavProvider>
   )
 }

@@ -35,6 +35,10 @@ export interface OwnerProfile {
   client?: string[]
   /** Operators linked to this owner (junction + legacy + properties); contact for WhatsApp */
   linkedOperators?: Array<{ clientId: string; title: string; contact: string }>
+  /** ISO from portal_account — gate requires this + complete fields */
+  profileSelfVerifiedAt?: string | null
+  /** Server: self-attest or Aliyun eKYC */
+  profileIdentityVerified?: boolean
 }
 
 function ownerAddressLine(o: OwnerProfile): string {
@@ -120,7 +124,7 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
     fetchOwner()
   }, [fetchOwner])
 
-  const profileComplete = useMemo(() => {
+  const profileFieldsComplete = useMemo(() => {
     if (!owner) return false
     const prof = owner.profile || {}
     const legalName = String(owner.ownerName || "").trim()
@@ -148,6 +152,15 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
         (exempt || (nric && nf && (!requiresBackImage || nb)))
     )
   }, [owner])
+
+  const profileSelfVerified = useMemo(
+    () =>
+      owner?.profileIdentityVerified === true ||
+      (owner?.profileSelfVerifiedAt != null && String(owner.profileSelfVerifiedAt).trim() !== ""),
+    [owner]
+  )
+
+  const profileComplete = profileFieldsComplete && profileSelfVerified
 
   const value = useMemo<OwnerState>(
     () => ({

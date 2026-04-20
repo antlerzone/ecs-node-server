@@ -10,7 +10,7 @@ const pool = require('../../config/db');
 const { ACCOUNTING_PLAN_IDS } = require('../access/access.service');
 const contactSync = require('../contact/contact-sync.service');
 const { malaysiaDateRangeToUtcForQuery } = require('../../utils/dateMalaysia');
-const { updatePortalProfile } = require('../portal-auth/portal-auth.service');
+const { updatePortalProfile, getPortalProfile } = require('../portal-auth/portal-auth.service');
 const lockWrapper = require('../ttlock/wrappers/lock.wrapper');
 const lockdetailLog = require('../smartdoorsetting/lockdetail-log.service');
 const { signatureValueToPublicUrl } = require('../upload/signature-image-to-oss-url');
@@ -142,6 +142,23 @@ async function getOwnerByEmail(email) {
     }
   }
   const linkedOperators = await getLinkedOperatorsForClientIds(clientIds);
+  let profileSelfVerifiedAt = null;
+  let portalAliyunEkycLocked = false;
+  try {
+    const portalRes = await getPortalProfile(String(email).trim().toLowerCase());
+    if (portalRes.ok && portalRes.profile) {
+      const p = portalRes.profile;
+      if (p.profileSelfVerifiedAt != null) {
+        const v = p.profileSelfVerifiedAt;
+        if (String(v).trim() !== '') profileSelfVerifiedAt = v;
+      }
+      portalAliyunEkycLocked = !!p.aliyun_ekyc_locked;
+    }
+  } catch (_) {
+    /* ignore */
+  }
+  const profileIdentityVerified =
+    (profileSelfVerifiedAt != null && String(profileSelfVerifiedAt).trim() !== '') || portalAliyunEkycLocked;
   let approvalpending = parseJson(r.approvalpending);
   if (Array.isArray(approvalpending) && approvalpending.length > 0) {
     approvalpending = await enrichApprovalPending(approvalpending);
@@ -166,7 +183,9 @@ async function getOwnerByEmail(email) {
     account: parseJson(r.account),
     property: propertyIds,
     client: clientIds,
-    linkedOperators
+    linkedOperators,
+    profileSelfVerifiedAt,
+    profileIdentityVerified
   };
 }
 

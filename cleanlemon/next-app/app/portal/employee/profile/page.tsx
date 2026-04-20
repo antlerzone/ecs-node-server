@@ -3,5 +3,7 @@
 import UnifiedProfilePage from '@/components/shared/unified-profile-page'
 
 export default function EmployeeProfilePage() {
-  return <UnifiedProfilePage roleLabel="Employee" backendProfile />
+  return (
+    <UnifiedProfilePage roleLabel="Employee" backendProfile={true} selfVerifyMode={true} />
+  )
 }

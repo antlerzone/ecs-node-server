@@ -15,6 +15,7 @@ const pool = require('../../config/db');
 const lockWrapper = require('../ttlock/wrappers/lock.wrapper');
 const gatewayWrapper = require('../ttlock/wrappers/gateway.wrapper');
 const lockdetailLog = require('./lockdetail-log.service');
+const { getTodayMalaysiaDate, malaysiaDateRangeToUtcForQuery } = require('../../utils/dateMalaysia');
 
 /**
  * Smart door row ownership (lockdetail / gatewaydetail).
@@ -36,7 +37,10 @@ function normalizeSmartDoorScope(scopeOrColivingClientId) {
       return { kind: 'cln_client', clnClientId: String(s.clnClientId || '').trim(), ttlockSlot };
     }
     if (s.kind === 'cln_operator') {
-      return { kind: 'cln_operator', clnOperatorId: String(s.clnOperatorId || '').trim() };
+      const rawOpSlot = s.ttlockSlot;
+      const opSlotNum = rawOpSlot == null || rawOpSlot === '' ? 0 : Number(rawOpSlot);
+      const ttlockSlot = Number.isFinite(opSlotNum) && opSlotNum >= 0 ? opSlotNum : 0;
+      return { kind: 'cln_operator', clnOperatorId: String(s.clnOperatorId || '').trim(), ttlockSlot };
     }
   }
   return { kind: 'coliving', clientId: String(scopeOrColivingClientId || '').trim() };
@@ -54,22 +58,25 @@ function ttLockIntegrationKey(scopeOrColivingClientId) {
 function ttLockApiOptions(scopeOrColivingClientId) {
   const s = normalizeSmartDoorScope(scopeOrColivingClientId);
   if (s.kind === 'cln_client') return { slot: s.ttlockSlot ?? 0 };
+  if (s.kind === 'cln_operator') return { slot: s.ttlockSlot ?? 0 };
   return {};
 }
 
 /** Merge slot from a lockdetail/gatewaydetail row into scope for TTLock calls. */
 function scopeWithTtlockSlotFromRow(scopeOrColivingClientId, slotFromRow) {
   const s = normalizeSmartDoorScope(scopeOrColivingClientId);
-  if (s.kind !== 'cln_client') return scopeOrColivingClientId;
   const n = slotFromRow == null ? 0 : Number(slotFromRow);
   const ttlockSlot = Number.isFinite(n) && n >= 0 ? n : 0;
-  return { kind: 'cln_client', clnClientId: s.clnClientId, ttlockSlot };
+  if (s.kind === 'cln_client') return { kind: 'cln_client', clnClientId: s.clnClientId, ttlockSlot };
+  if (s.kind === 'cln_operator') return { kind: 'cln_operator', clnOperatorId: s.clnOperatorId, ttlockSlot };
+  return scopeOrColivingClientId;
 }
 
 /** DB value for lockdetail.cln_ttlock_slot / gatewaydetail.cln_ttlock_slot on insert/update. */
 function clnTtlockSlotColumnValue(scopeOrColivingClientId) {
   const s = normalizeSmartDoorScope(scopeOrColivingClientId);
   if (s.kind === 'cln_client') return s.ttlockSlot ?? 0;
+  if (s.kind === 'cln_operator') return s.ttlockSlot ?? 0;
   return 0;
 }
 
@@ -255,6 +262,252 @@ async function remoteUnlockLock(scopeOrColivingClientId, lockDetailId, logContex
   return { ok: true };
 }
 
+/**
+ * Operator list: attach `cln_property` door mode + whether there is a schedule on today's MY calendar.
+ */
+async function enrichOperatorSmartDoorLockItems(lockItems, operatorId) {
+  const oid = String(operatorId || '').trim();
+  const ids = lockItems.map((l) => l._id).filter(Boolean);
+  if (!oid || !ids.length) return;
+  const ph = ids.map(() => '?').join(',');
+  let rows;
+  try {
+    [rows] = await pool.query(
+      `SELECT id AS propertyId, smartdoor_id AS smartdoorId,
+              COALESCE(NULLIF(TRIM(operator_door_access_mode), ''), 'fixed_password') AS mode
+       FROM cln_property
+       WHERE operator_id = ? AND smartdoor_id IN (${ph})`,
+      [oid, ...ids]
+    );
+  } catch (e) {
+    console.warn('[smartdoorsetting] enrichOperatorSmartDoorLockItems:', e?.message || e);
+    return;
+  }
+  const byLock = new Map((rows || []).map((r) => [String(r.smartdoorId), r]));
+  const todayMy = getTodayMalaysiaDate();
+  const propertyIds = [...new Set((rows || []).map((r) => String(r.propertyId)))];
+  let bookingSet = new Set();
+  if (propertyIds.length) {
+    const pph = propertyIds.map(() => '?').join(',');
+    try {
+      const [br] = await pool.query(
+        `SELECT DISTINCT property_id AS pid FROM cln_schedule
+         WHERE property_id IN (${pph})
+           AND working_day IS NOT NULL
+           AND DATE(DATE_ADD(working_day, INTERVAL 8 HOUR)) = ?`,
+        [...propertyIds, todayMy]
+      );
+      bookingSet = new Set((br || []).map((x) => String(x.pid)));
+    } catch (e) {
+      console.warn('[smartdoorsetting] enrichOperatorSmartDoorLockItems booking:', e?.message || e);
+    }
+  }
+  for (const l of lockItems) {
+    const pr = byLock.get(String(l._id));
+    if (!pr) continue;
+    l.clnPropertyId = String(pr.propertyId);
+    l.operatorDoorAccessMode = pr.mode;
+    l.hasBookingToday = bookingSet.has(String(pr.propertyId));
+  }
+}
+
+async function mapEmailsToClnDisplayNames(emails) {
+  const list = [...new Set(emails.map((e) => String(e || '').trim().toLowerCase()).filter(Boolean))];
+  const m = new Map();
+  if (!list.length) return m;
+  const ph = list.map(() => '?').join(',');
+  try {
+    const [cRows] = await pool.query(
+      `SELECT LOWER(TRIM(email)) AS em, NULLIF(TRIM(fullname), '') AS nm FROM cln_clientdetail WHERE LOWER(TRIM(email)) IN (${ph})`,
+      list
+    );
+    for (const r of cRows || []) {
+      if (r.nm) m.set(String(r.em), String(r.nm));
+    }
+  } catch (_) {
+    /* optional */
+  }
+  for (const t of ['cln_operatordetail', 'cln_operator']) {
+    try {
+      const [oRows] = await pool.query(
+        `SELECT LOWER(TRIM(email)) AS em, NULLIF(TRIM(name), '') AS nm FROM \`${t}\` WHERE LOWER(TRIM(email)) IN (${ph})`,
+        list
+      );
+      for (const r of oRows || []) {
+        const em = String(r.em || '');
+        if (em && r.nm && !m.has(em)) m.set(em, String(r.nm));
+      }
+    } catch (_) {
+      /* table may not exist in some envs */
+    }
+  }
+  return m;
+}
+
+/**
+ * Operator remote unlock: enforce `cln_property.operator_door_access_mode` + gateway + booking (MY today).
+ */
+async function assertOperatorRemoteDoorPolicy(scopeOrColivingClientId, lockDetailId) {
+  const scope = normalizeSmartDoorScope(scopeOrColivingClientId);
+  if (scope.kind !== 'cln_operator') return;
+  const oid = scope.clnOperatorId;
+  const lid = String(lockDetailId || '').trim();
+  const lock = await getLock(scopeOrColivingClientId, lid);
+  if (!lock) {
+    const e = new Error('LOCK_NOT_FOUND');
+    e.code = 'LOCK_NOT_FOUND';
+    throw e;
+  }
+  const gwOk = !!lock.hasGateway && !!lock.gateway && !lock.needsGatewayDbLink;
+  let prop = null;
+  try {
+    const [[row]] = await pool.query(
+      `SELECT id AS propertyId,
+              COALESCE(NULLIF(TRIM(operator_door_access_mode), ''), 'temporary_password_only') AS mode
+       FROM cln_property
+       WHERE operator_id = ? AND smartdoor_id = ?
+       LIMIT 1`,
+      [oid, lid]
+    );
+    prop = row || null;
+  } catch (err) {
+    console.warn('[smartdoorsetting] assertOperatorRemoteDoorPolicy:', err?.message || err);
+  }
+  if (!prop) return;
+  let mode = String(prop.mode || 'temporary_password_only').trim().toLowerCase();
+  if (mode === 'fixed_password') {
+    const e = new Error('OPERATOR_DOOR_USE_PASSWORD');
+    e.code = 'OPERATOR_DOOR_USE_PASSWORD';
+    throw e;
+  }
+  if (mode === 'working_date_only') mode = 'temporary_password_only';
+  if (mode === 'full_access') {
+    if (!gwOk) {
+      const e = new Error('OPERATOR_DOOR_GATEWAY_REQUIRED');
+      e.code = 'OPERATOR_DOOR_GATEWAY_REQUIRED';
+      throw e;
+    }
+    return;
+  }
+  if (mode === 'temporary_password_only') {
+    if (!gwOk) {
+      const e = new Error('OPERATOR_DOOR_GATEWAY_REQUIRED');
+      e.code = 'OPERATOR_DOOR_GATEWAY_REQUIRED';
+      throw e;
+    }
+    const ymd = getTodayMalaysiaDate();
+    const [[b]] = await pool.query(
+      `SELECT 1 AS ok FROM cln_schedule
+       WHERE property_id = ?
+         AND working_day IS NOT NULL
+         AND DATE(DATE_ADD(working_day, INTERVAL 8 HOUR)) = ?
+       LIMIT 1`,
+      [prop.propertyId, ymd]
+    );
+    if (!b) {
+      const e = new Error('OPERATOR_DOOR_NO_BOOKING_TODAY');
+      e.code = 'OPERATOR_DOOR_NO_BOOKING_TODAY';
+      throw e;
+    }
+    return;
+  }
+  if (!gwOk) {
+    const e = new Error('OPERATOR_DOOR_GATEWAY_REQUIRED');
+    e.code = 'OPERATOR_DOOR_GATEWAY_REQUIRED';
+    throw e;
+  }
+}
+
+/**
+ * Operator: reveal `cln_property.smartdoor_password` when policy allows.
+ */
+async function getOperatorDoorPasswordReveal(scopeOrColivingClientId, lockDetailId) {
+  const scope = normalizeSmartDoorScope(scopeOrColivingClientId);
+  if (scope.kind !== 'cln_operator') {
+    return { ok: false, reason: 'NOT_OPERATOR_SCOPE' };
+  }
+  const oid = scope.clnOperatorId;
+  const lid = String(lockDetailId || '').trim();
+  const lock = await getLock(scopeOrColivingClientId, lid);
+  if (!lock) return { ok: false, reason: 'LOCK_NOT_FOUND' };
+  const gwOk = !!lock.hasGateway && !!lock.gateway && !lock.needsGatewayDbLink;
+  let row;
+  try {
+    const [[r]] = await pool.query(
+      `SELECT id AS propertyId, COALESCE(smartdoor_password, '') AS pwd,
+              COALESCE(NULLIF(TRIM(operator_door_access_mode), ''), 'fixed_password') AS mode
+       FROM cln_property
+       WHERE operator_id = ? AND smartdoor_id = ?
+       LIMIT 1`,
+      [oid, lid]
+    );
+    row = r;
+  } catch (e) {
+    return { ok: false, reason: 'QUERY_FAILED' };
+  }
+  if (!row) return { ok: false, reason: 'NO_PROPERTY_LINK' };
+  const mode = String(row.mode || 'fixed_password').trim().toLowerCase();
+  const pwd = String(row.pwd || '');
+  if (mode === 'fixed_password') {
+    return { ok: true, password: pwd };
+  }
+  if (!gwOk) return { ok: false, reason: 'OPERATOR_DOOR_GATEWAY_REQUIRED' };
+  if (mode === 'full_access') {
+    return { ok: true, password: pwd };
+  }
+  if (mode === 'working_date_only') {
+    const ymd = getTodayMalaysiaDate();
+    const [[b]] = await pool.query(
+      `SELECT 1 AS ok FROM cln_schedule
+       WHERE property_id = ?
+         AND working_day IS NOT NULL
+         AND DATE(DATE_ADD(working_day, INTERVAL 8 HOUR)) = ?
+       LIMIT 1`,
+      [row.propertyId, ymd]
+    );
+    if (!b) return { ok: false, reason: 'OPERATOR_DOOR_NO_BOOKING_TODAY' };
+    return { ok: true, password: pwd };
+  }
+  return { ok: true, password: pwd };
+}
+
+/**
+ * Portal: unlock logs for a lock (scope must own lockdetail row). `date` or `from`+`to` = Malaysia YYYY-MM-DD.
+ */
+async function listLockUnlockLogsForPortalScope(scopeOrColivingClientId, lockDetailId, { date, from, to, page, pageSize } = {}) {
+  const lid = String(lockDetailId || '').trim();
+  const lock = await getLock(scopeOrColivingClientId, lid);
+  if (!lock) {
+    const e = new Error('LOCK_NOT_FOUND');
+    e.code = 'LOCK_NOT_FOUND';
+    throw e;
+  }
+  const fromY = from || date;
+  const toY = to || date;
+  if (!fromY || !toY) {
+    const e = new Error('MISSING_DATE_RANGE');
+    e.code = 'MISSING_DATE_RANGE';
+    throw e;
+  }
+  const a = String(fromY).slice(0, 10);
+  const b = String(toY).slice(0, 10);
+  const { fromUtc, toUtc } = malaysiaDateRangeToUtcForQuery(a, b);
+  const raw = await lockdetailLog.listLockdetailLogsForPortal({
+    lockdetailId: lid,
+    utcFrom: fromUtc,
+    utcTo: toUtc,
+    page,
+    pageSize,
+  });
+  const emails = [...new Set((raw.items || []).map((i) => String(i.actorEmail || '').trim().toLowerCase()).filter(Boolean))];
+  const nameMap = await mapEmailsToClnDisplayNames(emails);
+  const items = (raw.items || []).map((i) => ({
+    ...i,
+    actorDisplayName: nameMap.get(String(i.actorEmail || '').trim().toLowerCase()) || '',
+  }));
+  return { ok: true, items, total: raw.total, page: raw.page, pageSize: raw.pageSize };
+}
+
 const DEFAULT_PAGE_SIZE = 20;
 const MAX_PAGE_SIZE = 100;
 const CACHE_LIMIT_MAX = 2000;
@@ -339,6 +592,9 @@ async function getSmartDoorList(scopeOrColivingClientId, opts = {}) {
       const parent = lockItems.find(o => o._id !== l._id && (o.childmeter || []).includes(l._id));
       l.parentLockAlias = parent ? parent.lockAlias : null;
     });
+    if (scope.kind === 'cln_operator' && lockItems.length) {
+      await enrichOperatorSmartDoorLockItems(lockItems, scope.clnOperatorId);
+    }
   }
 
   if (filter !== 'LOCK') {
@@ -565,9 +821,17 @@ async function getGateway(scopeOrColivingClientId, id) {
  * Update lock: lockAlias, active, childmeter (array of lockdetail ids).
  */
 async function updateLock(scopeOrColivingClientId, id, data) {
+  const scope = normalizeSmartDoorScope(scopeOrColivingClientId);
   const { sql, params } = scopeRowOwnerWhere(scopeOrColivingClientId);
-  const [rows] = await pool.query(`SELECT id FROM lockdetail WHERE id = ? AND ${sql}`, [id, ...params]);
+  const [rows] = await pool.query(
+    `SELECT id, cln_clientid FROM lockdetail WHERE id = ? AND ${sql}`,
+    [id, ...params]
+  );
   if (!rows || rows.length === 0) return { ok: false, reason: 'LOCK_NOT_FOUND' };
+  const cc = rows[0].cln_clientid;
+  if (scope.kind === 'cln_operator' && cc != null && String(cc).trim() !== '') {
+    return { ok: false, reason: 'CLIENT_OWNED_READ_ONLY' };
+  }
 
   const updates = [];
   const updParams = [];
@@ -593,9 +857,17 @@ async function updateLock(scopeOrColivingClientId, id, data) {
  * Update gateway: gatewayName.
  */
 async function updateGateway(scopeOrColivingClientId, id, data) {
+  const scope = normalizeSmartDoorScope(scopeOrColivingClientId);
   const { sql, params } = scopeRowOwnerWhere(scopeOrColivingClientId);
-  const [rows] = await pool.query(`SELECT id FROM gatewaydetail WHERE id = ? AND ${sql}`, [id, ...params]);
+  const [rows] = await pool.query(
+    `SELECT id, cln_clientid FROM gatewaydetail WHERE id = ? AND ${sql}`,
+    [id, ...params]
+  );
   if (!rows || rows.length === 0) return { ok: false, reason: 'GATEWAY_NOT_FOUND' };
+  const cc = rows[0].cln_clientid;
+  if (scope.kind === 'cln_operator' && cc != null && String(cc).trim() !== '') {
+    return { ok: false, reason: 'CLIENT_OWNED_READ_ONLY' };
+  }
   if (data.gatewayName === undefined) return { ok: true };
   await pool.query('UPDATE gatewaydetail SET gatewayname = ? WHERE id = ?', [String(data.gatewayName), id]);
   return { ok: true };
@@ -711,7 +983,9 @@ async function mergeOneLockFromTtlockListItem(scopeOrColivingClientId, l, getSin
  * @returns {Promise<Array>} lock list from TTLock (empty on failure).
  */
 async function fetchTtlockLockListAndMergeToDb(scopeOrColivingClientId) {
-  const lockRes = await lockWrapper.listAllLocks(ttLockIntegrationKey(scopeOrColivingClientId));
+  const ttKey = ttLockIntegrationKey(scopeOrColivingClientId);
+  const ttOpt = ttLockApiOptions(scopeOrColivingClientId);
+  const lockRes = await lockWrapper.listAllLocks(ttKey, ttOpt);
   const lockList = lockRes?.list || [];
   /** Lazy: one query per sync when list/detail omit gateway id but account has exactly one gateway row. */
   let singleGatewayFallbackPromise;
@@ -1319,6 +1593,9 @@ module.exports = {
   updateLock,
   updateGateway,
   remoteUnlockLock,
+  assertOperatorRemoteDoorPolicy,
+  getOperatorDoorPasswordReveal,
+  listLockUnlockLogsForPortalScope,
   previewSmartDoorSelection,
   syncTTLockName,
   getSmartDoorIdsByProperty,

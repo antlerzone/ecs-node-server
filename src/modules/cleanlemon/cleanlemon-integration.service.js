@@ -32,6 +32,33 @@ function getCleanlemonXeroClientSecret() {
   return (process.env.CLEANLEMON_XERO_CLIENT_SECRET || process.env.XERO_CLIENT_SECRET || '').trim();
 }
 
+async function migrateClnOperatorIntegrationSlotUnique() {
+  try {
+    const [[row]] = await pool.query(
+      `SELECT COUNT(*) AS c FROM information_schema.STATISTICS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cln_operator_integration' AND INDEX_NAME = 'uniq_cln_operator_integration'`
+    );
+    if (row && Number(row.c) > 0) {
+      await pool.query('ALTER TABLE cln_operator_integration DROP INDEX uniq_cln_operator_integration');
+    }
+  } catch (e) {
+    console.warn('[cleanlemon-integration] migrate operator integration unique (drop old)', e?.message || e);
+  }
+  try {
+    const [[row2]] = await pool.query(
+      `SELECT COUNT(*) AS c FROM information_schema.STATISTICS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cln_operator_integration' AND INDEX_NAME = 'uniq_cln_operator_integration_slot'`
+    );
+    if (!row2 || Number(row2.c) === 0) {
+      await pool.query(
+        'ALTER TABLE cln_operator_integration ADD UNIQUE KEY uniq_cln_operator_integration_slot (operator_id, `key`, provider, slot)'
+      );
+    }
+  } catch (e) {
+    console.warn('[cleanlemon-integration] migrate operator integration unique (add slot)', e?.message || e);
+  }
+}
+
 async function ensureClnOperatorIntegrationTable() {
   await pool.query(
     `CREATE TABLE IF NOT EXISTS cln_operator_integration (
@@ -46,9 +73,10 @@ async function ensureClnOperatorIntegrationTable() {
       einvoice TINYINT(1) NULL DEFAULT NULL,
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      UNIQUE KEY uniq_cln_operator_integration (operator_id, \`key\`, provider)
+      UNIQUE KEY uniq_cln_operator_integration_slot (operator_id, \`key\`, provider, slot)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
   );
+  await migrateClnOperatorIntegrationSlotUnique();
 }
 
 async function ensureClnClientIntegrationTable() {
@@ -315,9 +343,11 @@ function verifyDriveState(s) {
 
 async function upsertClnOperatorIntegration(operatorId, key, slot, provider, valuesMerge, enabled = true, einvoice = null) {
   await ensureClnOperatorIntegrationTable();
+  const slotNum = Number(slot) || 0;
   const [rows] = await pool.query(
-    `SELECT id, values_json FROM cln_operator_integration WHERE operator_id = ? AND \`key\` = ? AND provider = ? LIMIT 1`,
-    [String(operatorId), key, provider]
+    `SELECT id, values_json FROM cln_operator_integration
+     WHERE operator_id = ? AND \`key\` = ? AND provider = ? AND COALESCE(slot, 0) = ? LIMIT 1`,
+    [String(operatorId), key, provider, slotNum]
   );
   const existing = rows[0];
   const prev = existing?.values_json
@@ -340,7 +370,7 @@ async function upsertClnOperatorIntegration(operatorId, key, slot, provider, val
   await pool.query(
     `INSERT INTO cln_operator_integration (id, operator_id, \`key\`, version, slot, enabled, provider, values_json, einvoice, created_at, updated_at)
      VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)`,
-    [id, String(operatorId), key, slot, enabled ? 1 : 0, provider, valuesStr, en, now, now]
+    [id, String(operatorId), key, slotNum, enabled ? 1 : 0, provider, valuesStr, en, now, now]
   );
 }
 
@@ -856,12 +886,13 @@ async function getOAuth2ClientForOperator(operatorId) {
   return oauth2Client;
 }
 
-async function getClnTtlockRow(operatorId) {
+async function getClnTtlockRowForOperator(operatorId, slot = 0) {
   await ensureClnOperatorIntegrationTable();
+  const sl = Number(slot) || 0;
   const [rows] = await pool.query(
-    `SELECT id, enabled, values_json FROM cln_operator_integration
-     WHERE operator_id = ? AND \`key\` = ? AND provider = ? LIMIT 1`,
-    [String(operatorId), KEY_SMART_DOOR, PROVIDER_TTLOCK]
+    `SELECT id, enabled, values_json, slot FROM cln_operator_integration
+     WHERE operator_id = ? AND \`key\` = ? AND provider = ? AND COALESCE(slot, 0) = ? LIMIT 1`,
+    [String(operatorId), KEY_SMART_DOOR, PROVIDER_TTLOCK, sl]
   );
   if (!rows.length) return null;
   const row = rows[0];
@@ -873,7 +904,27 @@ async function getClnTtlockRow(operatorId) {
       v = {};
     }
   } else v = v || {};
-  return { id: row.id, enabled: Number(row.enabled) === 1, values: v };
+  return { id: row.id, slot: Number(row.slot) || 0, enabled: Number(row.enabled) === 1, values: v };
+}
+
+async function listClnOperatorTtlockIntegrationRows(operatorId) {
+  await ensureClnOperatorIntegrationTable();
+  const [rows] = await pool.query(
+    `SELECT id, slot, enabled, values_json FROM cln_operator_integration
+     WHERE operator_id = ? AND \`key\` = ? AND provider = ? ORDER BY slot ASC`,
+    [String(operatorId).trim(), KEY_SMART_DOOR, PROVIDER_TTLOCK]
+  );
+  return rows || [];
+}
+
+async function nextAvailableTtlockSlotOperator(operatorId) {
+  await ensureClnOperatorIntegrationTable();
+  const [rows] = await pool.query(
+    `SELECT COALESCE(MAX(COALESCE(slot, 0)), -1) + 1 AS n FROM cln_operator_integration
+     WHERE operator_id = ? AND \`key\` = ? AND provider = ?`,
+    [String(operatorId).trim(), KEY_SMART_DOOR, PROVIDER_TTLOCK]
+  );
+  return Number(rows[0]?.n) || 0;
 }
 
 function parseClientTtlockValuesJson(raw) {
@@ -955,15 +1006,25 @@ async function getClnClientTtlockSlot0Connected(clientdetailId) {
 }
 
 /**
- * Cleanlemons TTLock: operator connects their TTLock Open Platform user (same idea as Coliving company setting).
- * Token persisted in `cln_ttlocktoken.operator_id` (not `ttlocktoken`, which FKs Coliving operatordetail only).
+ * Cleanlemons TTLock: operator connects TTLock Open Platform users (multi `slot`; token in `cln_ttlocktoken`).
+ * @param {{ username: string, password: string, accountName?: string, slot?: number }} opts
  */
-async function ttlockConnectClnOperator(operatorId, { username, password } = {}) {
+async function ttlockConnectClnOperator(operatorId, opts = {}) {
+  const { username, password, accountName, slot: slotOpt } = opts;
   const oid = String(operatorId || '').trim();
   const usernameTrim = String(username || '').trim();
   const passwordTrim = String(password || '').trim();
   if (!oid) throw new Error('MISSING_OPERATOR_ID');
   if (!usernameTrim || !passwordTrim) throw new Error('TTLOCK_USERNAME_PASSWORD_REQUIRED');
+  const nameTrim = String(accountName || '').trim();
+  let slot;
+  if (slotOpt != null && slotOpt !== '') {
+    slot = Number(slotOpt);
+    if (!Number.isFinite(slot) || slot < 0) throw new Error('INVALID_TTLOCK_SLOT');
+  } else {
+    slot = await nextAvailableTtlockSlotOperator(oid);
+  }
+  const displayName = nameTrim || `TTLock (${slot})`;
   const freshToken = await requestNewToken({
     username: usernameTrim,
     password: passwordTrim
@@ -971,18 +1032,20 @@ async function ttlockConnectClnOperator(operatorId, { username, password } = {})
   await upsertClnOperatorIntegration(
     oid,
     KEY_SMART_DOOR,
-    0,
+    slot,
     PROVIDER_TTLOCK,
     {
       ttlock_username: usernameTrim,
       ttlock_password: passwordTrim,
-      ttlock_mode: 'existing'
+      ttlock_mode: 'existing',
+      ttlock_source: 'manual',
+      account_display_name: displayName
     },
     true,
     null
   );
-  await saveToken(oid, freshToken);
-  return { ok: true, mode: 'existing', username: usernameTrim };
+  await saveToken(oid, freshToken, { slot });
+  return { ok: true, mode: 'existing', username: usernameTrim, slot, accountName: displayName };
 }
 
 /** Server-side bridge key: Cleanlemons calls Coliving with this (stored plaintext in cln_operator_integration; hash on Coliving in client_integration). */
@@ -1134,35 +1197,62 @@ async function disconnectColivingBridgeClnClientdetail(clientdetailId) {
   return { ok: true };
 }
 
-async function ttlockDisconnectClnOperator(operatorId) {
+async function ttlockDisconnectClnOperator(operatorId, slot = 0) {
   const oid = String(operatorId || '').trim();
+  const sl = Number(slot) || 0;
   if (!oid) throw new Error('MISSING_OPERATOR_ID');
   await ensureClnOperatorIntegrationTable();
   const [rows] = await pool.query(
-    `SELECT id FROM cln_operator_integration WHERE operator_id = ? AND \`key\` = ? AND provider = ? LIMIT 1`,
-    [oid, KEY_SMART_DOOR, PROVIDER_TTLOCK]
+    `SELECT id FROM cln_operator_integration
+     WHERE operator_id = ? AND \`key\` = ? AND provider = ? AND COALESCE(slot, 0) = ? LIMIT 1`,
+    [oid, KEY_SMART_DOOR, PROVIDER_TTLOCK, sl]
   );
   if (rows.length) {
     await pool.query('UPDATE cln_operator_integration SET enabled = 0, updated_at = NOW() WHERE id = ?', [rows[0].id]);
   }
+  try {
+    await pool.query('DELETE FROM cln_ttlocktoken WHERE operator_id = ? AND slot = ?', [oid, sl]);
+  } catch (e) {
+    const msg = String(e?.sqlMessage || e?.message || '');
+    if (!/Unknown column/i.test(msg) && !/doesn't exist/i.test(msg)) throw e;
+  }
   return { ok: true };
 }
 
-async function getTtlockCredentialsClnOperator(operatorId) {
-  const row = await getClnTtlockRow(operatorId);
-  if (!row || !row.enabled) return { ok: true, username: '', password: '' };
+async function getTtlockCredentialsClnOperator(operatorId, slot = 0) {
+  const row = await getClnTtlockRowForOperator(operatorId, slot);
+  if (!row || !row.enabled) return { ok: true, username: '', password: '', slot: Number(slot) || 0 };
   const u = row.values.ttlock_username != null ? String(row.values.ttlock_username) : '';
   const p = row.values.ttlock_password != null ? String(row.values.ttlock_password) : '';
-  return { ok: true, username: u, password: p };
+  return { ok: true, username: u, password: p, slot: row.slot };
 }
 
 async function getTtlockOnboardStatusClnOperator(operatorId) {
-  const row = await getClnTtlockRow(operatorId);
-  const v = row?.values || {};
-  const enabled = !!(row && row.enabled);
+  const list = await listClnOperatorTtlockIntegrationRows(operatorId);
+  let ttlockCreateEverUsed = false;
+  let ttlockConnected = false;
+  const accounts = [];
+  for (const r of list) {
+    const v = parseClientTtlockValuesJson(r.values_json);
+    if (v.ttlock_subuser_ever_created) ttlockCreateEverUsed = true;
+    const en = Number(r.enabled) === 1;
+    const hasCreds = !!(v.ttlock_username && v.ttlock_password);
+    const connected = en && hasCreds;
+    if (connected) ttlockConnected = true;
+    const nm = v.account_display_name != null ? String(v.account_display_name).trim() : '';
+    accounts.push({
+      slot: Number(r.slot) || 0,
+      accountName: nm || '',
+      username: v.ttlock_username != null ? String(v.ttlock_username) : '',
+      source: 'manual',
+      manageable: true,
+      connected
+    });
+  }
   return {
-    ttlockConnected: enabled && !!(v.ttlock_username && v.ttlock_password),
-    ttlockCreateEverUsed: !!v.ttlock_subuser_ever_created
+    ttlockConnected,
+    ttlockCreateEverUsed,
+    accounts
   };
 }
 
@@ -1401,6 +1491,33 @@ async function rotateThirdPartyIntegrationApiKeyClnClientdetail(clientdetailId) 
   return { ok: true, apiKey, clientId: cid };
 }
 
+/** Stripe Connect connected account id for operator (cln_operator_integration stripeConnect + oauth). */
+async function getStripeConnectedAccountIdForOperator(operatorId) {
+  const oid = String(operatorId || '').trim();
+  if (!oid) return null;
+  try {
+    await ensureClnOperatorIntegrationTable();
+  } catch {
+    return null;
+  }
+  const [rows] = await pool.query(
+    `SELECT enabled, values_json FROM cln_operator_integration WHERE operator_id = ? AND \`key\` = ? AND provider = ? LIMIT 1`,
+    [oid, KEY_STRIPE_CONNECT, PROVIDER_STRIPE_OAUTH]
+  );
+  const r = rows && rows[0];
+  if (!r || Number(r.enabled) !== 1) return null;
+  let v = r.values_json;
+  if (typeof v === 'string') {
+    try {
+      v = JSON.parse(v || '{}');
+    } catch {
+      v = {};
+    }
+  } else v = v || {};
+  const acct = v.stripe_connected_account_id && String(v.stripe_connected_account_id).trim();
+  return acct || null;
+}
+
 module.exports = {
   ensureClnOperatorIntegrationTable,
   ensureClnClientIntegrationTable,
@@ -1424,6 +1541,7 @@ module.exports = {
   getStripeConnectOAuthAuthUrl,
   completeOperatorStripeConnectOAuth,
   disconnectStripeConnect,
+  getStripeConnectedAccountIdForOperator,
   ttlockConnectClnOperator,
   ttlockDisconnectClnOperator,
   getTtlockCredentialsClnOperator,
