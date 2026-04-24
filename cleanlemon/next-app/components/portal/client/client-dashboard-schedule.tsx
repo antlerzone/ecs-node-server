@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useAuth } from '@/lib/auth-context'
 import {
   fetchClientPortalProperties,
@@ -8,6 +8,7 @@ import {
   fetchClientPropertyGroupDetail,
   fetchClientScheduleJobs,
   updateClientScheduleJob,
+  deleteClientScheduleJob,
 } from '@/lib/cleanlemon-api'
 import { toast } from 'sonner'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -24,10 +25,21 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
-import { ArrowDown, ArrowUp, ArrowUpDown, Clock } from 'lucide-react'
+import { ArrowDown, ArrowUp, ArrowUpDown, ChevronDown, Clock, Download, Eye, Loader2, MessageSquare, X } from 'lucide-react'
+import { GiveReviewDialog } from '@/components/cleanlemons/give-review-dialog'
 import { addDaysToMalaysiaYmd, getMalaysiaCalendarYmd } from '@/lib/cleanlemon-booking-eligibility'
+import { StatusBadge } from '@/components/shared/status-badge'
+import { normalizeDamageAttachmentUrl } from '@/lib/media-url-kind'
+import type { TaskStatus } from '@/lib/types'
 
 type ScheduleItem = {
   id: string
@@ -37,59 +49,146 @@ type ScheduleItem = {
   unit: string
   cleaningType: string
   time: string
-  scheduleStatus: string
+  /** Same as operator schedule API (`normalizeScheduleStatus`). */
+  normalizedStatus: TaskStatus
+  /** Raw `cln_schedule.status` — distinguish Customer Missing vs pending-checkout. */
+  statusRaw?: string
   date: string
   team?: string
+  /** Completion photo URLs (same as operator schedule). */
+  completedPhotos?: string[]
+  /** Same-day checkout + check-in — operator priority flag */
+  btob?: boolean
 }
 
 type DayMode = 'today' | 'tomorrow' | 'custom'
 
 type SortKey = 'date' | 'property' | 'unit' | 'service' | 'time' | 'status'
 
-function clientScheduleBadgeLabel(status: string): string {
-  const s = String(status || '').toLowerCase()
-  if (s === 'pending-checkout') return 'Pending approval'
-  if (s === 'ready-to-clean') return 'Confirmed'
-  if (s.includes('progress')) return 'In progress'
-  if (s.includes('complete') || s === 'done') return 'Completed'
-  if (s.includes('cancel')) return 'Cancelled'
-  return 'Scheduled'
-}
-
 /** Align with backend `normalizeScheduleStatus` for dropdown value + API. */
 function canonicalClientScheduleStatus(s: string) {
-  const x = String(s || '')
-    .toLowerCase()
-    .replace(/\s+/g, '-')
+  const raw = String(s ?? '').trim()
+  if (raw === '') return 'pending-checkout'
+  const x = raw.toLowerCase().replace(/\s+/g, '-')
   if (x.includes('complete') || x === 'done') return 'completed'
   if (x.includes('progress')) return 'in-progress'
   if (x.includes('cancel')) return 'cancelled'
-  if (x.includes('checkout') || x === 'pending-checkout') return 'pending-checkout'
-  return 'ready-to-clean'
+  if (
+    x.includes('checkout') ||
+    x.includes('check-out') ||
+    x === 'pending-checkout' ||
+    x === 'pending-check-out'
+  ) {
+    return 'pending-checkout'
+  }
+  if (x.includes('customer') && x.includes('missing')) return 'pending-checkout'
+  if (x.includes('ready') && x.includes('clean')) return 'ready-to-clean'
+  return 'pending-checkout'
 }
 
-const CLIENT_SCHEDULE_STATUS_OPTIONS: { value: string; label: string }[] = [
-  { value: 'pending-checkout', label: 'Pending approval' },
-  { value: 'ready-to-clean', label: 'Ready to clean' },
-  { value: 'in-progress', label: 'In progress' },
-  { value: 'completed', label: 'Completed' },
-  { value: 'cancelled', label: 'Cancelled' },
-]
-
-const getStatusColor = (status: string) => {
-  switch (status) {
-    case 'completed':
-      return 'bg-green-100 text-green-800'
-    case 'cancelled':
-      return 'bg-red-100 text-red-800'
-    case 'pending-checkout':
-      return 'bg-amber-100 text-amber-900'
-    case 'ready-to-clean':
-    case 'in-progress':
-      return 'bg-blue-100 text-blue-800'
-    default:
-      return 'bg-muted text-muted-foreground'
+/** Match operator `jobRowStatusSelectValue` — Customer Missing vs pending-checkout. */
+function clientJobRowStatusSelectValue(job: ScheduleItem | undefined): string {
+  if (!job) return 'pending-checkout'
+  const raw = String(job.statusRaw || '')
+    .toLowerCase()
+    .replace(/\s+/g, '-')
+  if (job.normalizedStatus === 'pending-checkout') {
+    if (raw.includes('customer') && raw.includes('missing')) return 'customer-missing'
+    return 'pending-checkout'
   }
+  return job.normalizedStatus
+}
+
+function mapClientStatusKeyToApi(key: string): string {
+  if (key === 'customer-missing') return 'Customer Missing'
+  return key
+}
+
+/** Values allowed in the quick `<select>` (must match `<option value>`). */
+const CLIENT_SCHEDULE_SELECT_VALUES = new Set([
+  'pending-checkout',
+  'ready-to-clean',
+  'in-progress',
+  'customer-missing',
+  'completed',
+])
+
+function safeClientScheduleStatusSelectValue(job: ScheduleItem): string {
+  const v = clientJobRowStatusSelectValue(job)
+  return CLIENT_SCHEDULE_SELECT_VALUES.has(v) ? v : 'pending-checkout'
+}
+
+/** Action = View detail (completed) / Reschedule (other active). Hidden for pending checkout & ready to clean. */
+function clientScheduleShowActionMenu(item: ScheduleItem): boolean {
+  if (item.normalizedStatus === 'completed' || item.normalizedStatus === 'cancelled') return true
+  const sel = safeClientScheduleStatusSelectValue(item)
+  if (sel === 'pending-checkout' || sel === 'ready-to-clean') return false
+  return true
+}
+
+function isClientScheduleStatusDropdownLocked(item: ScheduleItem): boolean {
+  if (item.normalizedStatus === 'cancelled') return true
+  if (item.normalizedStatus === 'completed') return true
+  return safeClientScheduleStatusSelectValue(item) === 'completed'
+}
+
+/** Plain HTML select (same options as operator `ScheduleJobQuickStatusSelect`). */
+function ClientScheduleJobQuickStatusSelect({
+  value,
+  disabled,
+  className,
+  onCommit,
+}: {
+  value: string
+  disabled?: boolean
+  className?: string
+  onCommit: (next: string) => void
+}) {
+  return (
+    <select
+      className={cn(
+        'rounded-md border border-input bg-background px-2 py-1.5 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50',
+        className,
+      )}
+      value={value}
+      disabled={disabled}
+      onChange={(e) => {
+        const v = e.target.value
+        if (v === value) return
+        onCommit(v)
+      }}
+    >
+      <option value="pending-checkout">Pending check out</option>
+      <option value="ready-to-clean">Ready to clean</option>
+      <option value="in-progress">Customer extend</option>
+      <option value="customer-missing" style={{ color: 'rgb(220 38 38)' }}>
+        Customer missing
+      </option>
+      <option value="completed">Completed</option>
+    </select>
+  )
+}
+
+function clientStatusBadge(task: ScheduleItem) {
+  const sel = clientJobRowStatusSelectValue(task)
+  if (sel === 'customer-missing') {
+    return (
+      <Badge variant="outline" className="border-red-300 bg-red-50 text-xs font-medium text-red-700">
+        Customer missing
+      </Badge>
+    )
+  }
+  const st = task.normalizedStatus
+  if (
+    st === 'pending-checkout' ||
+    st === 'ready-to-clean' ||
+    st === 'in-progress' ||
+    st === 'completed' ||
+    st === 'cancelled'
+  ) {
+    return <StatusBadge status={st} size="sm" />
+  }
+  return <StatusBadge status="pending-checkout" size="sm" />
 }
 
 function formatDisplayDate(dateString: string) {
@@ -103,6 +202,28 @@ function formatDisplayDate(dateString: string) {
 function ymdInRange(ymd: string, from: string, to: string): boolean {
   const d = String(ymd || '').slice(0, 10)
   return d >= from && d <= to
+}
+
+function fileExtForCompletionPhoto(url: string, contentType: string | null): string {
+  try {
+    const u = new URL(url)
+    const path = u.pathname
+    const m = /\.([a-zA-Z0-9]{1,8})$/.exec(path)
+    if (m && !/^(html?|php|asp|jsp)$/i.test(m[1])) {
+      return `.${m[1].toLowerCase()}`
+    }
+  } catch {
+    /* relative URL */
+    const m = /\.([a-zA-Z0-9]{1,8})(?:\?|$)/.exec(url)
+    if (m && !/^(html?|php)$/i.test(m[1])) return `.${m[1].toLowerCase()}`
+  }
+  const ct = String(contentType || '').toLowerCase()
+  if (ct.includes('jpeg') || ct.includes('jpg')) return '.jpg'
+  if (ct.includes('png')) return '.png'
+  if (ct.includes('webp')) return '.webp'
+  if (ct.includes('gif')) return '.gif'
+  if (ct.includes('heic')) return '.heic'
+  return '.jpg'
 }
 
 export function ClientDashboardSchedule() {
@@ -128,10 +249,30 @@ export function ClientDashboardSchedule() {
   const [rescheduleTarget, setRescheduleTarget] = useState<ScheduleItem | null>(null)
   const [rescheduleYmd, setRescheduleYmd] = useState('')
   const [rescheduleSubmitting, setRescheduleSubmitting] = useState(false)
+  const [extendDeleteOpen, setExtendDeleteOpen] = useState(false)
+  const [extendDeleteTarget, setExtendDeleteTarget] = useState<ScheduleItem | null>(null)
+  const [extendDeleteSubmitting, setExtendDeleteSubmitting] = useState(false)
   const [statusUpdatingId, setStatusUpdatingId] = useState<string | null>(null)
+  const [btobUpdatingId, setBtobUpdatingId] = useState<string | null>(null)
+  const [jobDetailOpen, setJobDetailOpen] = useState(false)
+  const [jobDetailItem, setJobDetailItem] = useState<ScheduleItem | null>(null)
+  const [jobDetailPhotoUrls, setJobDetailPhotoUrls] = useState<string[]>([])
+  const [completionZipDownloading, setCompletionZipDownloading] = useState(false)
+  const [completionPhotoLightboxUrl, setCompletionPhotoLightboxUrl] = useState<string | null>(null)
+  const [reviewOpen, setReviewOpen] = useState(false)
+  const [reviewTarget, setReviewTarget] = useState<ScheduleItem | null>(null)
 
   const todayYmd = useMemo(() => getMalaysiaCalendarYmd(), [])
   const tomorrowYmd = useMemo(() => addDaysToMalaysiaYmd(todayYmd, 1), [todayYmd])
+
+  useEffect(() => {
+    if (!completionPhotoLightboxUrl) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setCompletionPhotoLightboxUrl(null)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [completionPhotoLightboxUrl])
 
   const displayProperties = useMemo(() => {
     if (!selectedGroupId) return properties
@@ -169,7 +310,14 @@ export function ClientDashboardSchedule() {
       )
       const jobs = Array.isArray(jobRes?.items) ? jobRes.items : []
       const mapped: ScheduleItem[] = jobs.map((j: Record<string, unknown>) => {
-        const st = String(j.status || '').toLowerCase()
+        const rawStatus = String(j.status ?? '').trim()
+        const normalizedStatus = canonicalClientScheduleStatus(rawStatus) as TaskStatus
+        const photos = Array.isArray(j.completedPhotos)
+          ? (j.completedPhotos as unknown[])
+              .map((u) => String(u || '').trim())
+              .filter(Boolean)
+          : []
+        const sr = j.statusRaw
         return {
           id: String(j.id || ''),
           propertyId: String(j.propertyId || ''),
@@ -178,9 +326,12 @@ export function ClientDashboardSchedule() {
           unit: String(j.unit || j.unitNumber || ''),
           cleaningType: String(j.cleaningType || 'General Cleaning'),
           time: String(j.time || ''),
-          scheduleStatus: st,
+          normalizedStatus,
+          statusRaw: sr != null && String(sr).trim() !== '' ? String(sr).trim() : undefined,
+          completedPhotos: photos,
           date: String(j.date || j.workingDay || new Date().toISOString()).slice(0, 10),
           team: String(j.team || j.teamName || ''),
+          btob: Boolean(j.btob),
         }
       })
       setSchedules(mapped)
@@ -250,7 +401,7 @@ export function ClientDashboardSchedule() {
         case 'time':
           return cmp(a.time || '', b.time || '') * dir
         case 'status':
-          return cmp(a.scheduleStatus, b.scheduleStatus) * dir
+          return cmp(a.normalizedStatus, b.normalizedStatus) * dir
         default:
           return 0
       }
@@ -303,6 +454,81 @@ export function ClientDashboardSchedule() {
     setCustomizeOpen(true)
   }
 
+  async function applyScheduleBtob(item: ScheduleItem, nextBtob: boolean) {
+    const email = String(user?.email || '').trim().toLowerCase()
+    const op = String(item.operatorId || user?.operatorId || '').trim()
+    if (!email || !op) {
+      toast.error('Sign in required')
+      return
+    }
+    setBtobUpdatingId(item.id)
+    try {
+      const r = await updateClientScheduleJob({
+        email,
+        operatorId: op,
+        scheduleId: item.id,
+        btob: nextBtob,
+        ...(selectedGroupId ? { groupId: selectedGroupId } : {}),
+      })
+      if (!r.ok) {
+        toast.error(typeof r.reason === 'string' ? r.reason : 'Update failed')
+        return
+      }
+      toast.success(nextBtob ? 'Marked as same-day turnover' : 'BTOB cleared')
+      setScheduleRefreshTick((t) => t + 1)
+    } finally {
+      setBtobUpdatingId(null)
+    }
+  }
+
+  function openCompletedJobDetail(item: ScheduleItem) {
+    setJobDetailItem(item)
+    setJobDetailPhotoUrls(
+      (item.completedPhotos ?? []).map((u) => normalizeDamageAttachmentUrl(String(u))).filter(Boolean)
+    )
+    setJobDetailOpen(true)
+  }
+
+  const downloadCompletionPhotosZip = useCallback(async () => {
+    if (jobDetailPhotoUrls.length === 0) return
+    setCompletionZipDownloading(true)
+    try {
+      const { default: JSZip } = await import('jszip')
+      const zip = new JSZip()
+      for (let i = 0; i < jobDetailPhotoUrls.length; i++) {
+        const url = jobDetailPhotoUrls[i]
+        const res = await fetch(url, { mode: 'cors', credentials: 'omit' })
+        if (!res.ok) {
+          throw new Error(`Photo ${i + 1} could not be loaded (${res.status})`)
+        }
+        const blob = await res.blob()
+        const ext = fileExtForCompletionPhoto(url, res.headers.get('content-type'))
+        zip.file(`photo-${String(i + 1).padStart(3, '0')}${ext}`, blob)
+      }
+      const out = await zip.generateAsync({ type: 'blob' })
+      const idPart = jobDetailItem?.id ? String(jobDetailItem.id).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 12) : 'job'
+      const datePart = jobDetailItem?.date ? String(jobDetailItem.date).slice(0, 10) : 'photos'
+      const name = `completion-photos-${idPart}-${datePart}.zip`
+      const a = document.createElement('a')
+      const href = URL.createObjectURL(out)
+      a.href = href
+      a.download = name
+      a.rel = 'noopener'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(href)
+      toast.success('ZIP download started')
+    } catch (e) {
+      console.error('[client schedule] completion zip', e)
+      toast.error(
+        'Could not download ZIP. If photos are on another domain, open each image in a new tab or try again later.'
+      )
+    } finally {
+      setCompletionZipDownloading(false)
+    }
+  }, [jobDetailPhotoUrls, jobDetailItem])
+
   async function applyScheduleStatus(item: ScheduleItem, nextStatus: string) {
     const email = String(user?.email || '').trim().toLowerCase()
     const op = String(item.operatorId || user?.operatorId || '').trim()
@@ -310,15 +536,20 @@ export function ClientDashboardSchedule() {
       toast.error('Sign in required')
       return
     }
-    const current = canonicalClientScheduleStatus(item.scheduleStatus)
+    const current = clientJobRowStatusSelectValue(item)
     if (nextStatus === current) return
+    if (nextStatus === 'in-progress') {
+      setExtendDeleteTarget(item)
+      setExtendDeleteOpen(true)
+      return
+    }
     setStatusUpdatingId(item.id)
     try {
       const r = await updateClientScheduleJob({
         email,
         operatorId: op,
         scheduleId: item.id,
-        status: nextStatus,
+        status: mapClientStatusKeyToApi(nextStatus),
         statusSetByEmail: email,
         ...(selectedGroupId ? { groupId: selectedGroupId } : {}),
       })
@@ -335,22 +566,40 @@ export function ClientDashboardSchedule() {
 
   return (
     <>
+    <GiveReviewDialog
+      open={reviewOpen}
+      onOpenChange={setReviewOpen}
+      reviewKind="client_to_operator"
+      operatorId={String(reviewTarget?.operatorId || user?.operatorId || '').trim()}
+      scheduleId={reviewTarget?.id}
+      syncPhotoUrls={
+        reviewTarget
+          ? (reviewTarget.completedPhotos ?? [])
+              .map((u) => normalizeDamageAttachmentUrl(String(u)))
+              .filter(Boolean)
+          : []
+      }
+      title="Rate your cleaning operator"
+    />
     <Card id="client-schedule" className="w-full scroll-mt-16 border-border shadow-sm md:scroll-mt-24">
       <CardHeader className="pb-2">
         <CardTitle className="text-lg">Schedule</CardTitle>
-        <CardDescription>
-          Jobs for the selected day or range. On desktop, sort columns in the table header; on mobile, change status from
-          the dropdown on each job.
+        <CardDescription className="text-pretty break-words">
+          Change status from the dropdown when the job is active (completed rows: dropdown is read-only). Pending check out
+          and Ready to clean: no Action menu. Other active rows: Action → Reschedule / extend date. Customer extend
+          confirms, then removes that schedule. Completed: Action → View detail for photos.
         </CardDescription>
         {propertyGroups.length > 0 ? (
-          <div className="flex w-full min-w-0 flex-col gap-1.5 pt-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
-            <Label className="text-xs text-muted-foreground shrink-0">Group</Label>
+          <div className="flex w-full min-w-0 flex-col gap-1.5 pt-2 sm:flex-row sm:items-start sm:gap-3">
+            <Label className="text-xs text-muted-foreground shrink-0 pt-2 sm:pt-2">
+              Property group
+            </Label>
             <Select value={selectedGroupId || 'all'} onValueChange={(v) => setSelectedGroupId(v === 'all' ? '' : v)}>
-              <SelectTrigger className="h-9 min-w-0 w-full flex-1 border-input sm:max-w-xs sm:flex-none">
-                <SelectValue placeholder="All properties" />
+              <SelectTrigger className="h-9 min-w-0 w-full flex-1 border-input sm:max-w-md sm:flex-none">
+                <SelectValue placeholder="All groups" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="all">All properties</SelectItem>
+                <SelectItem value="all">All groups (show every property)</SelectItem>
                 {propertyGroups.map((g) => (
                   <SelectItem key={g.id} value={g.id}>
                     {g.name}
@@ -363,7 +612,7 @@ export function ClientDashboardSchedule() {
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
-          <div className="inline-flex w-full max-w-md shrink-0 rounded-lg border border-border bg-muted/40 p-0.5">
+          <div className="inline-flex w-full max-w-none shrink-0 rounded-lg border border-border bg-muted/40 p-0.5 sm:max-w-md">
             <Button
               type="button"
               variant="ghost"
@@ -398,10 +647,10 @@ export function ClientDashboardSchedule() {
               Customize
             </Button>
           </div>
-          <div className="flex w-full min-w-0 items-center gap-2 sm:ml-auto sm:w-auto sm:max-w-md sm:justify-end">
-            <span className="text-sm text-muted-foreground shrink-0">Property</span>
+          <div className="flex w-full min-w-0 flex-col gap-1.5 sm:ml-auto sm:w-auto sm:max-w-md sm:flex-row sm:items-center sm:justify-end sm:gap-2">
+            <span className="text-xs font-medium text-muted-foreground sm:text-sm">Property</span>
             <Select value={propertyFilter} onValueChange={setPropertyFilter}>
-              <SelectTrigger className="min-w-0 flex-1 border-input sm:min-w-[12rem] sm:max-w-[min(100%,20rem)] sm:flex-none">
+              <SelectTrigger className="h-10 min-w-0 w-full border-input sm:h-9 sm:min-w-[12rem] sm:max-w-[min(100%,20rem)] sm:flex-none">
                 <SelectValue placeholder="All" />
               </SelectTrigger>
               <SelectContent>
@@ -422,54 +671,101 @@ export function ClientDashboardSchedule() {
           </p>
         ) : null}
 
-        {/* Mobile: stacked rows, no horizontal scroll; status dropdown on the right */}
-        <div className="md:hidden divide-y divide-border rounded-md border border-border bg-card">
+        {/* Mobile: single column — status full width under title (no side-by-side squeeze) */}
+        <div className="md:hidden divide-y divide-border overflow-x-hidden rounded-md border border-border bg-card">
           {sortedRows.length === 0 ? (
             <div className="px-3 py-10 text-center text-sm text-muted-foreground">No jobs in this view.</div>
           ) : (
             sortedRows.map((item) => {
-              const statusVal = canonicalClientScheduleStatus(item.scheduleStatus)
+              const statusLocked = isClientScheduleStatusDropdownLocked(item)
+              const showCancelledBadge = item.normalizedStatus === 'cancelled'
               const dateLine = `${formatDisplayDate(item.date)}${item.time ? ` · ${item.time}` : ''}`
               return (
-                <div key={item.id} className="flex gap-2 px-3 py-4">
-                  <div className="min-w-0 flex-1 space-y-1">
-                    <h2 className="text-lg font-bold leading-snug text-foreground">{item.property || '—'}</h2>
+                <div
+                  key={item.id}
+                  className={cn(
+                    'min-w-0 space-y-3 px-3 py-4',
+                    item.btob && 'border-l-4 border-l-red-600 bg-red-50/40',
+                  )}
+                >
+                  <div className="min-w-0 space-y-1.5">
+                    <h2 className="break-words text-base font-bold leading-snug text-foreground">
+                      {item.property || '—'}
+                    </h2>
                     <p className="text-sm text-muted-foreground">{item.unit || '—'}</p>
                     <p className="text-sm text-foreground">{item.cleaningType}</p>
                     <p className="text-sm text-muted-foreground">{dateLine}</p>
-                    <Button
-                      type="button"
-                      variant="link"
-                      className="h-auto p-0 text-xs"
-                      onClick={() => {
-                        setRescheduleTarget(item)
-                        const d = String(item.date || '').slice(0, 10)
-                        setRescheduleYmd(/^\d{4}-\d{2}-\d{2}$/.test(d) ? d : new Date().toISOString().slice(0, 10))
-                        setRescheduleOpen(true)
-                      }}
-                    >
-                      Reschedule / extend date
-                    </Button>
                   </div>
-                  <div className="flex w-[min(9.5rem,42vw)] shrink-0 flex-col justify-start gap-1">
+
+                  <div className="min-w-0 space-y-1.5">
                     <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Status</span>
-                    <Select
-                      value={statusVal}
-                      disabled={statusUpdatingId === item.id}
-                      onValueChange={(v) => void applyScheduleStatus(item, v)}
-                    >
-                      <SelectTrigger className="h-9 w-full text-left text-xs" aria-label="Change job status">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent position="popper" className="z-[200]">
-                        {CLIENT_SCHEDULE_STATUS_OPTIONS.map((opt) => (
-                          <SelectItem key={opt.value} value={opt.value} className="text-xs">
-                            {opt.label}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                    {showCancelledBadge ? (
+                      <div className="flex flex-wrap gap-2">{clientStatusBadge(item)}</div>
+                    ) : (
+                      <ClientScheduleJobQuickStatusSelect
+                        value={safeClientScheduleStatusSelectValue(item)}
+                        disabled={statusLocked || statusUpdatingId === item.id}
+                        className="h-10 w-full max-w-full text-xs"
+                        onCommit={(v) => void applyScheduleStatus(item, v)}
+                      />
+                    )}
                   </div>
+
+                  <label className="flex items-start gap-2.5 text-xs text-muted-foreground">
+                    <Checkbox
+                      className="mt-0.5 shrink-0"
+                      checked={!!item.btob}
+                      disabled={btobUpdatingId === item.id || statusLocked}
+                      onCheckedChange={(c) => void applyScheduleBtob(item, c === true)}
+                      aria-label="Same-day turnover BTOB"
+                    />
+                    <span className="min-w-0 leading-snug">Same-day turnover (BTOB)</span>
+                  </label>
+
+                  {clientScheduleShowActionMenu(item) ? (
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button type="button" variant="outline" size="sm" className="h-9 w-full gap-1 text-xs">
+                          Action
+                          <ChevronDown className="h-3.5 w-3.5 opacity-70" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end" className="z-[200] w-[min(100vw-2rem,260px)]">
+                        {item.normalizedStatus === 'completed' ? (
+                          <>
+                            <DropdownMenuItem onClick={() => openCompletedJobDetail(item)}>
+                              <Eye className="mr-2 h-4 w-4" />
+                              View detail
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onClick={() => {
+                                setReviewTarget(item)
+                                setReviewOpen(true)
+                              }}
+                            >
+                              <MessageSquare className="mr-2 h-4 w-4" />
+                              Give review
+                            </DropdownMenuItem>
+                          </>
+                        ) : item.normalizedStatus === 'cancelled' ? (
+                          <DropdownMenuItem disabled>No actions</DropdownMenuItem>
+                        ) : (
+                          <DropdownMenuItem
+                            onClick={() => {
+                              setRescheduleTarget(item)
+                              const d = String(item.date || '').slice(0, 10)
+                              setRescheduleYmd(/^\d{4}-\d{2}-\d{2}$/.test(d) ? d : new Date().toISOString().slice(0, 10))
+                              setRescheduleOpen(true)
+                            }}
+                          >
+                            Reschedule / extend date
+                          </DropdownMenuItem>
+                        )}
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  ) : (
+                    <p className="text-center text-xs text-muted-foreground">—</p>
+                  )}
                 </div>
               )
             })
@@ -498,19 +794,26 @@ export function ClientDashboardSchedule() {
                 <TableHead className="min-w-[100px]">
                   <SortHead label="Status" k="status" />
                 </TableHead>
-                <TableHead className="w-[120px] text-right">Actions</TableHead>
+                <TableHead className="w-[100px] text-center">BTOB</TableHead>
+                <TableHead className="w-[100px] text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {sortedRows.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={7} className="text-center text-muted-foreground py-10">
+                  <TableCell colSpan={8} className="text-center text-muted-foreground py-10">
                     No jobs in this view.
                   </TableCell>
                 </TableRow>
               ) : (
-                sortedRows.map((item) => (
-                  <TableRow key={item.id}>
+                sortedRows.map((item) => {
+                  const statusLocked = isClientScheduleStatusDropdownLocked(item)
+                  const showCancelledBadge = item.normalizedStatus === 'cancelled'
+                  return (
+                  <TableRow
+                    key={item.id}
+                    className={cn(item.btob && 'border-2 border-red-600 bg-red-50/30')}
+                  >
                     <TableCell className="align-top text-sm whitespace-nowrap">{formatDisplayDate(item.date)}</TableCell>
                     <TableCell className="align-top font-medium">{item.property}</TableCell>
                     <TableCell className="align-top text-sm">{item.unit}</TableCell>
@@ -522,27 +825,74 @@ export function ClientDashboardSchedule() {
                       </span>
                     </TableCell>
                     <TableCell className="align-top">
-                      <Badge className={`text-xs ${getStatusColor(item.scheduleStatus)}`}>
-                        {clientScheduleBadgeLabel(item.scheduleStatus)}
-                      </Badge>
+                      {showCancelledBadge ? (
+                        clientStatusBadge(item)
+                      ) : (
+                        <ClientScheduleJobQuickStatusSelect
+                          value={safeClientScheduleStatusSelectValue(item)}
+                          disabled={statusLocked || statusUpdatingId === item.id}
+                          className="h-8 min-w-[min(100%,280px)] max-w-[320px]"
+                          onCommit={(v) => void applyScheduleStatus(item, v)}
+                        />
+                      )}
+                    </TableCell>
+                    <TableCell className="align-top text-center">
+                      <Checkbox
+                        checked={!!item.btob}
+                        disabled={btobUpdatingId === item.id || statusLocked}
+                        onCheckedChange={(c) => void applyScheduleBtob(item, c === true)}
+                        aria-label="Same-day turnover BTOB"
+                      />
                     </TableCell>
                     <TableCell className="align-top text-right">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="shrink-0"
-                        onClick={() => {
-                          setRescheduleTarget(item)
-                          const d = String(item.date || '').slice(0, 10)
-                          setRescheduleYmd(/^\d{4}-\d{2}-\d{2}$/.test(d) ? d : new Date().toISOString().slice(0, 10))
-                          setRescheduleOpen(true)
-                        }}
-                      >
-                        Reschedule
-                      </Button>
+                      {clientScheduleShowActionMenu(item) ? (
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button type="button" variant="ghost" size="sm" className="shrink-0 gap-1">
+                              Action
+                              <ChevronDown className="ml-1 h-4 w-4" />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            {item.normalizedStatus === 'completed' ? (
+                              <>
+                                <DropdownMenuItem onClick={() => openCompletedJobDetail(item)}>
+                                  <Eye className="mr-2 h-4 w-4" />
+                                  View detail
+                                </DropdownMenuItem>
+                                <DropdownMenuItem
+                                  onClick={() => {
+                                    setReviewTarget(item)
+                                    setReviewOpen(true)
+                                  }}
+                                >
+                                  <MessageSquare className="mr-2 h-4 w-4" />
+                                  Give review
+                                </DropdownMenuItem>
+                              </>
+                            ) : item.normalizedStatus === 'cancelled' ? (
+                              <DropdownMenuItem disabled>No actions</DropdownMenuItem>
+                            ) : (
+                              <DropdownMenuItem
+                                onClick={() => {
+                                  setRescheduleTarget(item)
+                                  const d = String(item.date || '').slice(0, 10)
+                                  setRescheduleYmd(/^\d{4}-\d{2}-\d{2}$/.test(d) ? d : new Date().toISOString().slice(0, 10))
+                                  setRescheduleOpen(true)
+                                }}
+                              >
+                                Reschedule / extend date
+                              </DropdownMenuItem>
+                            )}
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      ) : (
+                        <span className="text-muted-foreground">—</span>
+                      )}
                     </TableCell>
                   </TableRow>
-                ))
+                  )
+                })
               )}
             </TableBody>
           </Table>
@@ -590,6 +940,72 @@ export function ClientDashboardSchedule() {
               }}
             >
               Confirm filter
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={extendDeleteOpen}
+        onOpenChange={(o) => {
+          setExtendDeleteOpen(o)
+          if (!o) setExtendDeleteTarget(null)
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Remove this job?</DialogTitle>
+            <DialogDescription>
+              Customer extend means this cleaning is no longer needed. This will delete the row from the schedule.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2 sm:gap-0">
+            <Button
+              type="button"
+              variant="outline"
+              disabled={extendDeleteSubmitting}
+              onClick={() => {
+                setExtendDeleteOpen(false)
+                setExtendDeleteTarget(null)
+              }}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={extendDeleteSubmitting}
+              onClick={() => {
+                void (async () => {
+                  const email = String(user?.email || '').trim().toLowerCase()
+                  const op = String(extendDeleteTarget?.operatorId || user?.operatorId || '').trim()
+                  if (!extendDeleteTarget || !email || !op) {
+                    toast.error('Sign in required')
+                    return
+                  }
+                  setExtendDeleteSubmitting(true)
+                  try {
+                    const r = await deleteClientScheduleJob({
+                      email,
+                      operatorId: op,
+                      scheduleId: extendDeleteTarget.id,
+                      ...(selectedGroupId ? { groupId: selectedGroupId } : {}),
+                    })
+                    if (!r.ok) {
+                      toast.error(typeof r.reason === 'string' ? r.reason : 'Could not remove job')
+                      return
+                    }
+                    toast.success('Schedule removed')
+                    setExtendDeleteOpen(false)
+                    setExtendDeleteTarget(null)
+                    setScheduleRefreshTick((t) => t + 1)
+                  } finally {
+                    setExtendDeleteSubmitting(false)
+                  }
+                })()
+              }}
+            >
+              {extendDeleteSubmitting ? 'Removing…' : 'Confirm remove'}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -661,6 +1077,130 @@ export function ClientDashboardSchedule() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <Dialog
+        open={jobDetailOpen}
+        onOpenChange={(o) => {
+          setJobDetailOpen(o)
+          if (!o) {
+            setJobDetailItem(null)
+            setJobDetailPhotoUrls([])
+          }
+        }}
+      >
+        <DialogContent className="max-h-[min(90vh,800px)] overflow-y-auto sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Job detail</DialogTitle>
+            <DialogDescription>
+              {jobDetailItem ? `${jobDetailItem.property} · ${jobDetailItem.unit || '—'}` : 'Completed cleaning'}
+            </DialogDescription>
+          </DialogHeader>
+          {jobDetailItem ? (
+            <div className="space-y-3 py-1 text-sm">
+              <div className="flex justify-between gap-3 border-b border-border/60 pb-2">
+                <span className="text-muted-foreground">Date</span>
+                <span className="text-right font-medium">{formatDisplayDate(jobDetailItem.date)}</span>
+              </div>
+              <div className="flex justify-between gap-3 border-b border-border/60 pb-2">
+                <span className="text-muted-foreground">Time</span>
+                <span className="text-right font-medium">{jobDetailItem.time || '—'}</span>
+              </div>
+              <div className="flex justify-between gap-3 border-b border-border/60 pb-2">
+                <span className="text-muted-foreground">Service</span>
+                <span className="text-right font-medium">{jobDetailItem.cleaningType}</span>
+              </div>
+              {jobDetailItem.team ? (
+                <div className="flex justify-between gap-3 border-b border-border/60 pb-2">
+                  <span className="text-muted-foreground">Team</span>
+                  <span className="text-right font-medium">{jobDetailItem.team}</span>
+                </div>
+              ) : null}
+              <div className="flex flex-col gap-1.5 border-b border-border/60 pb-2 sm:flex-row sm:items-center sm:justify-between">
+                <span className="text-muted-foreground">Status</span>
+                <div className="sm:text-right">{clientStatusBadge(jobDetailItem)}</div>
+              </div>
+              <p className="text-xs text-muted-foreground break-all">
+                Job ID: <span className="font-mono text-foreground">{jobDetailItem.id}</span>
+              </p>
+              {jobDetailPhotoUrls.length > 0 ? (
+                <div className="space-y-2 rounded-md border border-border bg-muted/30 p-3">
+                  <Label className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                    Completion photos
+                  </Label>
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                    {jobDetailPhotoUrls.map((url, i) => (
+                      <button
+                        key={`${url}-${i}`}
+                        type="button"
+                        onClick={() => setCompletionPhotoLightboxUrl(url)}
+                        className="block w-full overflow-hidden rounded-md border border-border/80 bg-background text-left shadow-sm outline-none ring-offset-background transition-opacity hover:opacity-95 focus-visible:ring-2 focus-visible:ring-ring"
+                      >
+                        {/* eslint-disable-next-line @next/next/no-img-element -- OSS / Wix CDN */}
+                        <img
+                          src={url}
+                          alt={`Completion photo ${i + 1}`}
+                          className="pointer-events-none aspect-square h-auto w-full object-cover"
+                          loading="lazy"
+                        />
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-[11px] text-muted-foreground">Tap a photo to enlarge. Press Esc or click outside to close.</p>
+                </div>
+              ) : (
+                <p className="rounded-md border border-dashed border-border bg-muted/20 px-3 py-4 text-center text-muted-foreground">
+                  No completion photos uploaded for this job.
+                </p>
+              )}
+            </div>
+          ) : null}
+          <DialogFooter className="flex-col gap-2 sm:flex-row sm:justify-end">
+            <Button type="button" variant="outline" onClick={() => setJobDetailOpen(false)}>
+              Close
+            </Button>
+            <Button
+              type="button"
+              variant="secondary"
+              className="gap-2"
+              disabled={jobDetailPhotoUrls.length === 0 || completionZipDownloading}
+              onClick={() => void downloadCompletionPhotosZip()}
+            >
+              {completionZipDownloading ? (
+                <Loader2 className="h-4 w-4 shrink-0 animate-spin" aria-hidden />
+              ) : (
+                <Download className="h-4 w-4 shrink-0" aria-hidden />
+              )}
+              Download ZIP
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {completionPhotoLightboxUrl ? (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Enlarged photo"
+          className="fixed inset-0 z-[10000] flex items-center justify-center bg-black/85 p-4 sm:p-8"
+          onClick={() => setCompletionPhotoLightboxUrl(null)}
+        >
+          <button
+            type="button"
+            onClick={() => setCompletionPhotoLightboxUrl(null)}
+            className="absolute right-3 top-3 inline-flex h-10 w-10 items-center justify-center rounded-full border border-white/30 bg-black/50 text-white shadow-md outline-none hover:bg-black/70 focus-visible:ring-2 focus-visible:ring-white"
+            aria-label="Close enlarged photo"
+          >
+            <X className="h-5 w-5" />
+          </button>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={completionPhotoLightboxUrl}
+            alt=""
+            className="max-h-[min(92vh,1200px)] max-w-full object-contain shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          />
+        </div>
+      ) : null}
     </>
   )
 }

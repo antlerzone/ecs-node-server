@@ -13,23 +13,185 @@ const {
   updatePortalProfile,
   ensurePortalAccountByEmail,
 } = require('../portal-auth/portal-auth.service');
+const { sendTransactionalEmail } = require('../portal-auth/portal-password-reset-sender');
 const contactSync = require('../contact/contact-sync.service');
 const contactService = require('../contact/contact.service');
 const clnOpInvAccounting = require('./cleanlemon-operator-invoice-accounting.service');
 const clnDc = require('./cleanlemon-cln-domain-contacts');
 const saasBukku = require('../billing/saas-bukku.service');
 const { splitAddressWazeGoogleFromText, resolveClnPropertyNavigationUrls } = require('./cln-property-address-split');
-const { malaysiaWallClockToUtcDatetimeForDb, getTodayMalaysiaDate } = require('../../utils/dateMalaysia');
+const {
+  malaysiaWallClockToUtcDatetimeForDb,
+  getTodayMalaysiaDate,
+  getMalaysiaMonthStartYmd,
+  malaysiaDateToUtcDatetimeForDb,
+} = require('../../utils/dateMalaysia');
 const {
   validateBookingLeadTimeForConfig,
   validateServiceInSelectedServices,
 } = require('../../utils/cleanlemonBookingEligibility');
+const { schedulePhotoDisplayUrl } = require('../../utils/schedulePhotoDisplayUrl');
 const clnPropGroup = require('./cleanlemon-property-group.service');
 const clnOperatorSalary = require('./cleanlemon-operator-salary.service');
+
+/** Malaysia YYYY-MM-DD from UTC-stored `cln_schedule.working_day` (pool +00:00). Matches operator schedule filter + AI chat. */
+const SQL_CLN_SCHEDULE_JOB_DATE_KL_YMD = `DATE_FORMAT(CONVERT_TZ(s.working_day, '+00:00', 'Asia/Kuala_Lumpur'), '%Y-%m-%d')`;
+const SQL_CLN_SCHEDULE_WORKING_DAY_KL_YMD_BARE = `DATE_FORMAT(CONVERT_TZ(working_day, '+00:00', 'Asia/Kuala_Lumpur'), '%Y-%m-%d')`;
+
+/**
+ * Scalar SQL fragment: human name for `s.staff_start_email` / `s.staff_end_email` (KPI report).
+ * Order: employeedetail.full_name (when linked to this operator) → portal_account.fullname → first+last.
+ * Fallback: portal_account only (staff may have login profile without employeedetail row or with empty full_name).
+ */
+function sqlScheduleStaffDisplayNameRaw(staffEmailCol) {
+  return `COALESCE(
+  (SELECT NULLIF(TRIM(COALESCE(
+       NULLIF(TRIM(d.full_name), ''),
+       NULLIF(TRIM(pa.fullname), ''),
+       NULLIF(TRIM(CONCAT_WS(' ', NULLIF(TRIM(pa.first_name),''), NULLIF(TRIM(pa.last_name),''))), '')
+     )), '')
+   FROM cln_employeedetail d
+   INNER JOIN cln_employee_operator eo ON eo.employee_id = d.id AND eo.operator_id = p.operator_id
+   LEFT JOIN portal_account pa ON LOWER(TRIM(pa.email)) = LOWER(TRIM(d.email))
+   WHERE NULLIF(TRIM(s.${staffEmailCol}), '') IS NOT NULL
+     AND LOWER(TRIM(d.email)) = LOWER(TRIM(s.${staffEmailCol}))
+   LIMIT 1),
+  (SELECT NULLIF(TRIM(COALESCE(
+       NULLIF(TRIM(pa2.fullname), ''),
+       NULLIF(TRIM(CONCAT_WS(' ', NULLIF(TRIM(pa2.first_name),''), NULLIF(TRIM(pa2.last_name),''))), '')
+     )), '')
+   FROM portal_account pa2
+   WHERE NULLIF(TRIM(s.${staffEmailCol}), '') IS NOT NULL
+     AND LOWER(TRIM(pa2.email)) = LOWER(TRIM(s.${staffEmailCol}))
+   LIMIT 1)
+)`;
+}
 
 const CLN_ACCOUNT_PROVIDERS = ['bukku', 'xero', 'autocount', 'sql'];
 const CLN_DEFAULT_CURRENCY = (process.env.CLEANLEMON_DEFAULT_CURRENCY || 'MYR').trim().toUpperCase() || 'MYR';
 let _clnAgreementExtraColsEnsured = false;
+
+function normalizeOperatorCleaningPricingRowInput(o) {
+  const service = String(o?.service ?? o?.serviceKey ?? '').trim().slice(0, 64);
+  const line = String(o?.line ?? '').trim().slice(0, 128);
+  const n = Number(o?.myr);
+  const myr =
+    o?.myr === null || o?.myr === '' || o?.myr === undefined
+      ? null
+      : Number.isFinite(n) && n >= 0
+        ? n
+        : null;
+  return { service: service || 'general', line, myr };
+}
+
+function normalizeOperatorCleaningPricingRowsInput(arr) {
+  if (!Array.isArray(arr)) return [];
+  return arr.map((x) => normalizeOperatorCleaningPricingRowInput(x)).filter((r) => r.service);
+}
+
+function parseOperatorCleaningPricingRowsFromDb({
+  jsonRaw,
+  operatorCleaningPricingService,
+  operatorCleaningPricingLine,
+  operatorCleaningPriceMyr,
+  /** Legacy Wix / import column `cleaning_fees` when operator_* pricing columns were never set. */
+  cleaningFeesMyr,
+}) {
+  const legacySvc = String(operatorCleaningPricingService ?? '').trim();
+  const legacyLine = String(operatorCleaningPricingLine ?? '').trim();
+  const lp = operatorCleaningPriceMyr;
+  const legacyMyr =
+    lp != null && lp !== '' && Number.isFinite(Number(lp)) && Number(lp) >= 0 ? Number(lp) : null;
+  const raw = jsonRaw != null ? String(jsonRaw).trim() : '';
+  if (raw) {
+    try {
+      const j = JSON.parse(raw);
+      if (Array.isArray(j) && j.length) {
+        const n = normalizeOperatorCleaningPricingRowsInput(j);
+        if (n.length) return n;
+      }
+    } catch (_) {
+      /* ignore */
+    }
+  }
+  if (legacySvc || legacyLine || legacyMyr != null) {
+    return [
+      normalizeOperatorCleaningPricingRowInput({
+        service: legacySvc || 'general',
+        line: legacyLine,
+        myr: legacyMyr,
+      }),
+    ];
+  }
+  const cf = cleaningFeesMyr;
+  const feeMyr =
+    cf != null && cf !== '' && Number.isFinite(Number(cf)) && Number(cf) >= 0 ? Number(cf) : null;
+  if (feeMyr != null) {
+    return [normalizeOperatorCleaningPricingRowInput({ service: 'homestay', line: '', myr: feeMyr })];
+  }
+  return [];
+}
+
+/** `min_value` minutes → operator UI placeholder style e.g. `2h 30m`. */
+function formatClnMinValueAsEstimatedTimeLabel(minVal) {
+  if (minVal == null || minVal === '') return '';
+  const n = Math.max(0, Math.floor(Number(minVal)));
+  if (!Number.isFinite(n) || n <= 0) return '';
+  const h = Math.floor(n / 60);
+  const r = n % 60;
+  const parts = [];
+  if (h) parts.push(`${h}h`);
+  if (r) parts.push(`${r}m`);
+  return parts.join(' ') || '';
+}
+
+/** Parse optional estimate field into minutes for `cln_property.min_value`. */
+function parseClnEstimateTimeInputToMinutes(raw) {
+  const s = String(raw ?? '').trim().toLowerCase();
+  if (!s) return null;
+  if (/^\d+$/.test(s)) {
+    const n = parseInt(s, 10);
+    return Number.isFinite(n) && n >= 0 ? n : null;
+  }
+  let total = 0;
+  const hMatch = s.match(/(\d+)\s*h/);
+  const mMatch = s.match(/(\d+)\s*m/);
+  if (hMatch) total += parseInt(hMatch[1], 10) * 60;
+  if (mMatch) total += parseInt(mMatch[1], 10);
+  if (hMatch || mMatch) return total;
+  const n = Number(s);
+  if (Number.isFinite(n) && n >= 0) return Math.floor(n);
+  return null;
+}
+
+/**
+ * Wix `warmcleaning` / `deepcleaning` / … columns on `cln_property` → extra operator pricing rows.
+ * Skips a service key already present in `rows` (so JSON / operator_* wins over legacy columns).
+ */
+function mergeClnLegacyWixCleaningPricesIntoPricingRows(rows, legacy) {
+  const out = Array.isArray(rows) ? rows.map((r) => ({ ...r })) : [];
+  const seen = new Set(
+    out.map((r) => String(r.service || '').trim().toLowerCase()).filter(Boolean)
+  );
+  const pushIf = (serviceKey, myrRaw) => {
+    const sk = String(serviceKey || '').trim().toLowerCase();
+    if (!sk || seen.has(sk)) return;
+    if (myrRaw == null || myrRaw === '') return;
+    const n = Number(myrRaw);
+    if (!Number.isFinite(n) || n < 0) return;
+    const rowN = normalizeOperatorCleaningPricingRowInput({ service: sk, line: '', myr: n });
+    if (!rowN.service) return;
+    out.push(rowN);
+    seen.add(sk);
+  };
+  if (!legacy || typeof legacy !== 'object') return out;
+  pushIf('warm', legacy.warmCleaning ?? legacy.warmcleaning);
+  pushIf('deep', legacy.deepCleaning ?? legacy.deepcleaning);
+  pushIf('general', legacy.generalCleaning ?? legacy.generalcleaning);
+  pushIf('renovation', legacy.renovationCleaning ?? legacy.renovationcleaning);
+  pushIf('homestay', legacy.cleaningFees ?? legacy.cleaning_fees);
+  return out;
+}
 
 /** Cached: Cleanlemons company master — `cln_operatordetail` (0198), else `cln_operator` / `cln_client`. */
 let _clnCompanyTableCache = null;
@@ -117,6 +279,9 @@ const CLN_PUBLIC_SUBDOMAIN_RESERVED = new Set([
   'login',
   'register',
   'pricing',
+  'privacy-policy',
+  'refund-policy',
+  'terms-and-conditions',
   'enquiry',
   'admin',
   'portal',
@@ -1182,8 +1347,10 @@ function makeId(prefix) {
 
 function safeJson(str, fallback) {
   if (str == null || str === '') return fallback;
+  /** mysql2 returns JSON columns as objects; LONGTEXT still returns a string. */
+  if (typeof str === 'object' && !Buffer.isBuffer(str)) return str;
   try {
-    return JSON.parse(str);
+    return JSON.parse(String(str));
   } catch {
     return fallback;
   }
@@ -1323,6 +1490,20 @@ async function getEmployeeProfileByEmail(email, operatorIdOptional = null) {
     profile.id = resolvedClientId;
   }
 
+  try {
+    const [[paRow]] = await pool.query(
+      'SELECT id FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+      [normalizedEmail]
+    );
+    if (paRow?.id) {
+      profile.portalAccountId = String(paRow.id).trim();
+    }
+  } catch (err) {
+    if (err?.code !== 'ER_NO_SUCH_TABLE' && err?.errno !== 1146) {
+      console.warn('[cleanlemon] getEmployeeProfileByEmail: portal_account id', err?.message || err);
+    }
+  }
+
   return profile;
 }
 
@@ -1457,7 +1638,7 @@ async function updateDriverVehicleByEmail(email, patch) {
 /**
  * Resolves B2B client scope for client-portal APIs.
  * With valid Portal JWT (`ensureClientdetailIfMissing`), creates `cln_clientdetail` for that email if missing — logged-in portal users always have email.
- * Tries: (1–3) junction / direct id when `operatorId` non-empty; (4) exactly one row by email; (5) insert row when JWT path and none found.
+ * Tries: portal_account (login email) → cln_clientdetail.portal_account_id; (1–3) junction / direct id when `operatorId` non-empty; (4) exactly one row by email; (5) insert row when JWT path and none found.
  * @param {{ ensureClientdetailIfMissing?: boolean }} [options]
  * @returns {Promise<string>} cln_clientdetail.id
  */
@@ -1468,6 +1649,31 @@ async function resolveClnClientdetailIdForClientPortal(email, operatorId, option
     const err = new Error('MISSING_EMAIL');
     err.code = 'MISSING_EMAIL';
     throw err;
+  }
+
+  /** Login email may differ from `cln_clientdetail.email` (Antlerzone CRM email); link is portal_account.id → portal_account_id. */
+  try {
+    const [[pa]] = await pool.query(
+      'SELECT id FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+      [em]
+    );
+    const paId = pa?.id != null && String(pa.id).trim() !== '' ? String(pa.id).trim() : '';
+    if (paId) {
+      try {
+        const [[cdByPa]] = await pool.query(
+          'SELECT id FROM cln_clientdetail WHERE portal_account_id = ? LIMIT 1',
+          [paId]
+        );
+        if (cdByPa?.id) return String(cdByPa.id).trim();
+      } catch (inner) {
+        const im = String(inner?.sqlMessage || inner?.message || '');
+        const missingCol = inner?.code === 'ER_BAD_FIELD_ERROR' || /Unknown column/i.test(im);
+        if (!missingCol && !/doesn't exist/i.test(im) && !/Unknown table/i.test(im)) throw inner;
+      }
+    }
+  } catch (e) {
+    const msg = String(e?.sqlMessage || e?.message || '');
+    if (!/doesn't exist/i.test(msg) && !/Unknown table/i.test(msg)) throw e;
   }
 
   if (oid) {
@@ -1596,26 +1802,54 @@ async function databaseHasTable(tableName) {
 }
 
 /**
- * Display name for schedule/damage rows: legacy `cln_property.client_id` → company master;
- * after migration, use `clientdetail_id` + `client_label`.
+ * Display name for schedule/damage rows: prefer B2B `clientdetail_id` → cln_clientdetail;
+ * else legacy `client_id` → company master (migration 0239 may drop `client_id`).
  */
 async function buildClnPropertyClientDisplaySql(companyTableName) {
   const ct = companyTableName;
   const hasPropClientId = await databaseHasColumn('cln_property', 'client_id');
   const hasClientdetailId = await databaseHasColumn('cln_property', 'clientdetail_id');
-  if (hasPropClientId) {
-    return {
-      joinSql: `LEFT JOIN \`${ct}\` c ON c.id = p.client_id`,
-      nameExpr: `COALESCE(c.name, p.client_label, '')`,
-    };
-  }
   if (hasClientdetailId) {
     return {
       joinSql: `LEFT JOIN cln_clientdetail cd ON cd.id = p.clientdetail_id`,
       nameExpr: `COALESCE(NULLIF(TRIM(cd.fullname),''), NULLIF(TRIM(cd.email),''), p.client_label, '')`,
     };
   }
+  if (hasPropClientId) {
+    return {
+      joinSql: `LEFT JOIN \`${ct}\` c ON c.id = p.client_id`,
+      nameExpr: `COALESCE(c.name, p.client_label, '')`,
+    };
+  }
   return { joinSql: '', nameExpr: `COALESCE(p.client_label, '')` };
+}
+
+/**
+ * When `client_id` still exists (pre–0239 or partial deploy), keep it aligned with binding:
+ * `clientdetail_id` if set, else `operator_id` (legacy list fallback). Canonical B2B key is `clientdetail_id`.
+ */
+async function syncClnPropertyLegacyClientIdColumn(propertyId) {
+  const pid = String(propertyId || '').trim();
+  if (!pid) return;
+  if (!(await databaseHasColumn('cln_property', 'client_id'))) return;
+  const hasCd = await databaseHasColumn('cln_property', 'clientdetail_id');
+  const hasOp = await databaseHasColumn('cln_property', 'operator_id');
+  const sel = [];
+  if (hasCd) sel.push('clientdetail_id');
+  if (hasOp) sel.push('operator_id');
+  if (!sel.length) return;
+  const [[row]] = await pool.query(`SELECT ${sel.join(', ')} FROM cln_property WHERE id = ? LIMIT 1`, [pid]);
+  if (!row) return;
+  const cd =
+    hasCd && row.clientdetail_id != null && String(row.clientdetail_id).trim() !== ''
+      ? String(row.clientdetail_id).trim()
+      : null;
+  const op =
+    hasOp && row.operator_id != null && String(row.operator_id).trim() !== ''
+      ? String(row.operator_id).trim()
+      : null;
+  const next = cd || op || null;
+  await pool.query('UPDATE cln_property SET client_id = ?, updated_at = NOW(3) WHERE id = ? LIMIT 1', [next, pid]);
 }
 
 async function getClnAccountProviderForOperator(operatorId) {
@@ -2275,23 +2509,44 @@ function providerToCleaningType(provider) {
 }
 
 function normalizeScheduleStatus(s) {
-  const x = String(s || '').toLowerCase().replace(/\s+/g, '-');
+  const raw = String(s ?? '').trim();
+  if (raw === '') return 'pending-checkout';
+  const x = raw.toLowerCase().replace(/\s+/g, '-');
   if (x.includes('complete')) return 'completed';
   if (x === 'done') return 'completed';
   if (x.includes('progress')) return 'in-progress';
   if (x.includes('cancel')) return 'cancelled';
-  if (x.includes('checkout') || x === 'pending-checkout') return 'pending-checkout';
+  if (
+    x.includes('checkout') ||
+    x.includes('check-out') ||
+    x === 'pending-checkout' ||
+    x === 'pending-check-out'
+  ) {
+    return 'pending-checkout';
+  }
   if (x.includes('customer') && x.includes('missing')) return 'pending-checkout';
-  return 'ready-to-clean';
+  if (x.includes('ready') && x.includes('clean')) return 'ready-to-clean';
+  return 'pending-checkout';
 }
 
 function extractPhotoList(finalPhotoJson) {
   if (finalPhotoJson == null || finalPhotoJson === '') return [];
   const raw =
     typeof finalPhotoJson === 'string' ? safeJson(finalPhotoJson, null) : finalPhotoJson;
-  if (Array.isArray(raw)) return raw.filter((u) => typeof u === 'string');
+  if (Array.isArray(raw)) {
+    return raw
+      .map((item) => {
+        if (typeof item === 'string') return schedulePhotoDisplayUrl(item);
+        if (item && typeof item === 'object' && typeof item.src === 'string')
+          return schedulePhotoDisplayUrl(item.src);
+        return null;
+      })
+      .filter((u) => u != null && String(u).trim() !== '');
+  }
   if (raw && typeof raw === 'object' && Array.isArray(raw.urls)) {
-    return raw.urls.filter((u) => typeof u === 'string');
+    return raw.urls
+      .filter((u) => typeof u === 'string')
+      .map((u) => schedulePhotoDisplayUrl(u));
   }
   return [];
 }
@@ -2425,6 +2680,8 @@ function mapScheduleRowToJobItem(r, teams) {
     date: r.jobDate || new Date().toISOString().slice(0, 10),
     time: timeStr,
     status: normalizeScheduleStatus(r.rawStatus),
+    /** DB `cln_schedule.status` before normalize (e.g. `Customer Missing` vs `pending-checkout`). */
+    statusRaw: r.rawStatus != null && String(r.rawStatus).trim() !== '' ? String(r.rawStatus).trim() : undefined,
     estimateKpi: Math.max(0, Math.min(100, 100 - (Number(r.kpiPoint) || 0))),
     teamId,
     teamName,
@@ -2435,6 +2692,34 @@ function mapScheduleRowToJobItem(r, teams) {
         ? String(r.readyToCleanByEmail).trim()
         : undefined,
     readyToCleanAt: r.readyToCleanAt != null ? String(r.readyToCleanAt) : undefined,
+    staffStartEmail:
+      r.staffStartEmailRaw != null && String(r.staffStartEmailRaw).trim()
+        ? String(r.staffStartEmailRaw).trim()
+        : undefined,
+    staffEndEmail:
+      r.staffEndEmailRaw != null && String(r.staffEndEmailRaw).trim()
+        ? String(r.staffEndEmailRaw).trim()
+        : undefined,
+    staffEmail: (() => {
+      const end =
+        r.staffEndEmailRaw != null && String(r.staffEndEmailRaw).trim()
+          ? String(r.staffEndEmailRaw).trim()
+          : '';
+      const start =
+        r.staffStartEmailRaw != null && String(r.staffStartEmailRaw).trim()
+          ? String(r.staffStartEmailRaw).trim()
+          : '';
+      const primary = end || start;
+      return primary || undefined;
+    })(),
+    staffStartFullName:
+      r.staffStartFullNameRaw != null && String(r.staffStartFullNameRaw).trim()
+        ? String(r.staffStartFullNameRaw).trim()
+        : undefined,
+    staffEndFullName:
+      r.staffEndFullNameRaw != null && String(r.staffEndFullNameRaw).trim()
+        ? String(r.staffEndFullNameRaw).trim()
+        : undefined,
     remarks: r.submitBy || undefined,
     price: (() => {
       const v = r.schedulePrice;
@@ -2455,6 +2740,7 @@ function mapScheduleRowToJobItem(r, teams) {
     staffRemark: undefined,
     completedPhotos: photos,
     aiAssignmentLocked,
+    btob: Number(r.btobRaw) === 1,
     mailboxPassword: r.mailboxPasswordRaw != null && String(r.mailboxPasswordRaw).trim()
       ? String(r.mailboxPasswordRaw).trim()
       : undefined,
@@ -2480,15 +2766,29 @@ function mapScheduleRowToJobItem(r, teams) {
   };
 }
 
-async function listOperatorScheduleJobs({ limit = 500, operatorId } = {}) {
+async function listOperatorScheduleJobs({ limit = 500, operatorId, dateFrom, dateTo } = {}) {
   await ensureOperatorTeamTable();
   const oid = String(operatorId || '').trim();
   const teams = await listOperatorTeams(oid || undefined);
-  const lim = Math.min(Math.max(Number(limit) || 500, 1), 1000);
+  const df = String(dateFrom || '')
+    .trim()
+    .slice(0, 10);
+  const dt = String(dateTo || '')
+    .trim()
+    .slice(0, 10);
+  const hasDateRange = Boolean(df && dt && oid);
+  const maxLim = hasDateRange ? 5000 : 1000;
+  const lim = Math.min(Math.max(Number(limit) || (hasDateRange ? 3000 : 500), 1), maxLim);
   const ct = await getClnCompanyTable();
   const clientDisp = await buildClnPropertyClientDisplaySql(ct);
-  const whereSql = oid ? 'WHERE p.operator_id = ?' : '';
-  const params = oid ? [oid, lim] : [lim];
+  const dateClause = hasDateRange
+    ? ` AND (${SQL_CLN_SCHEDULE_JOB_DATE_KL_YMD}) >= ? AND (${SQL_CLN_SCHEDULE_JOB_DATE_KL_YMD}) <= ? `
+    : '';
+  const whereSql = oid ? `WHERE p.operator_id = ?${dateClause}` : '';
+  const params = [];
+  if (oid) params.push(oid);
+  if (hasDateRange) params.push(df, dt);
+  params.push(lim);
   const [hasMailboxPwd, hasSmartdoorPwd, hasSmartdoorTok, hasSmartdoorIdCol] = await Promise.all([
     databaseHasColumn('cln_property', 'mailbox_password'),
     databaseHasColumn('cln_property', 'smartdoor_password'),
@@ -2562,7 +2862,7 @@ async function listOperatorScheduleJobs({ limit = 500, operatorId } = {}) {
             ${keyAccessSql},
             ${jobPinSelect},
             ${operatorDoorModeSelect},
-            DATE_FORMAT(s.working_day, '%Y-%m-%d') AS jobDate,
+            ${SQL_CLN_SCHEDULE_JOB_DATE_KL_YMD} AS jobDate,
             s.status AS rawStatus,
             s.cleaning_type AS cleaningType,
             s.team AS teamDbName,
@@ -2572,7 +2872,12 @@ async function listOperatorScheduleJobs({ limit = 500, operatorId } = {}) {
             TIME_FORMAT(s.end_time, '%H:%i') AS staffEndTime,
             s.finalphoto_json AS finalPhotoJson,
             s.submit_by AS submitBy,
+            COALESCE(s.btob, 0) AS btobRaw,
             s.price AS schedulePrice,
+            NULLIF(TRIM(s.staff_start_email), '') AS staffStartEmailRaw,
+            NULLIF(TRIM(s.staff_end_email), '') AS staffEndEmailRaw,
+            ${sqlScheduleStaffDisplayNameRaw('staff_start_email')} AS staffStartFullNameRaw,
+            ${sqlScheduleStaffDisplayNameRaw('staff_end_email')} AS staffEndFullNameRaw,
             ${auditSelect}
             ${pricingAddonsSelect}
             ${colivingSelect}
@@ -2580,7 +2885,7 @@ async function listOperatorScheduleJobs({ limit = 500, operatorId } = {}) {
      LEFT JOIN cln_property p ON p.id = s.property_id
      ${clientDisp.joinSql}
      ${whereSql}
-     ORDER BY s.working_day DESC, s.created_at DESC
+     ORDER BY ${hasDateRange ? 's.working_day ASC' : 's.working_day DESC'}, s.created_at DESC
      LIMIT ?`,
     params
   );
@@ -2641,7 +2946,7 @@ async function listOperatorPendingClientBookingRequests({ operatorId, limit = 20
             ${clientDisp.nameExpr} AS clientName,
             COALESCE(p.address, '') AS address,
             ${propNavColsPending},
-            DATE_FORMAT(s.working_day, '%Y-%m-%d') AS jobDate,
+            ${SQL_CLN_SCHEDULE_JOB_DATE_KL_YMD} AS jobDate,
             s.status AS rawStatus,
             s.cleaning_type AS cleaningType,
             s.team AS teamDbName,
@@ -2651,7 +2956,12 @@ async function listOperatorPendingClientBookingRequests({ operatorId, limit = 20
             TIME_FORMAT(s.end_time, '%H:%i') AS staffEndTime,
             s.finalphoto_json AS finalPhotoJson,
             s.submit_by AS submitBy,
+            COALESCE(s.btob, 0) AS btobRaw,
             s.price AS schedulePrice,
+            NULLIF(TRIM(s.staff_start_email), '') AS staffStartEmailRaw,
+            NULLIF(TRIM(s.staff_end_email), '') AS staffEndEmailRaw,
+            ${sqlScheduleStaffDisplayNameRaw('staff_start_email')} AS staffStartFullNameRaw,
+            ${sqlScheduleStaffDisplayNameRaw('staff_end_email')} AS staffEndFullNameRaw,
             ${auditSelect}
             ${pricingAddonsSelect}
             ${colivingSelect}
@@ -2756,6 +3066,66 @@ function resolveScheduleStatusFromPricingConfig(cfg, serviceProvider) {
 }
 
 /**
+ * Operator portal / Jarvis create when `price` omitted: property cleaning rows first, then Finance → Pricing (by-hour / homestay propertyPrices).
+ */
+async function resolveOperatorPortalCreateJobDefaultPriceMyr(operatorId, propertyId, serviceProvider) {
+  const oid = String(operatorId || '').trim();
+  const pid = String(propertyId || '').trim();
+  const sp = String(serviceProvider || 'general-cleaning').trim();
+  const pkey = pricingKeyFromServiceProvider(sp);
+  if (!oid || !pid || !pkey) return null;
+
+  const props = await listOperatorProperties({ operatorId: oid, limit: 500, offset: 0, includeArchived: true });
+  const pr = (Array.isArray(props) ? props : []).find((p) => String(p.id) === pid);
+  if (!pr) return null;
+
+  const rows = Array.isArray(pr.operatorCleaningPricingRows) ? pr.operatorCleaningPricingRows : [];
+  const rowMatch = rows.find(
+    (r) => String(r.service || '').trim().toLowerCase() === pkey && r.myr != null && Number(r.myr) > 0
+  );
+  if (rowMatch && Number.isFinite(Number(rowMatch.myr))) {
+    return Math.round(Number(rowMatch.myr) * 100) / 100;
+  }
+
+  const cfg = await getPricingConfig(oid);
+  if (!cfg || typeof cfg !== 'object') return null;
+  const svc = cfg[pkey];
+  if (!svc || typeof svc !== 'object') return null;
+  if (svc.quotationEnabled && !svc.byHourEnabled && !svc.byPropertyEnabled) return null;
+
+  if (svc.byHourEnabled && svc.byHour && typeof svc.byHour === 'object') {
+    const bh = svc.byHour;
+    const price = Number(bh.price);
+    const blockHours = Math.max(0, Number(bh.hours) || 0);
+    const workers = Math.max(0, Number(bh.workers) || 0);
+    if (Number.isFinite(price) && price > 0 && blockHours > 0 && workers > 0) {
+      const total = Math.round(price * blockHours * workers * 100) / 100;
+      const minSp = Math.max(0, Number(bh.minSellingPrice) || 0);
+      return minSp > 0 ? Math.max(total, Math.round(minSp * 100) / 100) : total;
+    }
+  }
+
+  if (pkey === 'homestay' && svc && typeof svc === 'object') {
+    const h = svc.homestay && typeof svc.homestay === 'object' ? svc.homestay : svc;
+    const pname = String(pr.name || '').trim().toLowerCase();
+    if (h.propertyPrices && typeof h.propertyPrices === 'object' && pname) {
+      const pp = h.propertyPrices;
+      for (const [k, v] of Object.entries(pp)) {
+        if (String(k).trim().toLowerCase() === pname && Number(v) > 0) {
+          return Math.round(Number(v) * 100) / 100;
+        }
+      }
+      const vals = Object.values(pp)
+        .map((n) => Number(n))
+        .filter((n) => Number.isFinite(n) && n > 0);
+      if (vals.length) return Math.round(Math.min(...vals) * 100) / 100;
+    }
+  }
+
+  return null;
+}
+
+/**
  * Single entry for cleaning jobs: applies operator pricing (bookingMode + bookingModeByService) when operatorId set.
  */
 async function createCleaningScheduleJobUnified(input = {}) {
@@ -2767,9 +3137,12 @@ async function createCleaningScheduleJobUnified(input = {}) {
   const operatorId = input.operatorId != null ? String(input.operatorId).trim() : '';
   const source = String(input.source || '').trim();
   let status = input.status;
-  /** Operator portal Create Job: always instant (ready-to-clean), ignore request-approve / lead-time. */
+  /** Operator portal Create Job: default pending check out; explicit `status` from caller is kept. */
   if (source === 'operator_portal') {
-    status = 'ready-to-clean';
+    status =
+      input.status != null && String(input.status).trim() !== ''
+        ? String(input.status).trim()
+        : 'pending-checkout';
   } else if (operatorId) {
     const cfg = await getPricingConfig(operatorId);
     if (source === 'client_portal') {
@@ -2811,6 +3184,18 @@ async function createCleaningScheduleJobUnified(input = {}) {
     status = 'ready-to-clean';
   }
   if (status == null) status = 'ready-to-clean';
+
+  let priceResolved = input.price;
+  if (
+    source === 'operator_portal' &&
+    operatorId &&
+    propertyId &&
+    (priceResolved === undefined || priceResolved === null || priceResolved === '')
+  ) {
+    const auto = await resolveOperatorPortalCreateJobDefaultPriceMyr(operatorId, propertyId, serviceProvider);
+    if (auto != null) priceResolved = auto;
+  }
+
   return createOperatorScheduleJob({
     propertyId,
     date,
@@ -2822,9 +3207,98 @@ async function createCleaningScheduleJobUnified(input = {}) {
     id: input.id,
     addons: input.addons,
     createdByEmail: input.createdByEmail,
-    price: input.price,
+    price: priceResolved,
     clientPortalGroupId: input.clientPortalGroupId,
+    btob: input.btob,
   });
+}
+
+/**
+ * Create homestay-cleaning rows for every operator property whose name contains `nameContains` (case-insensitive),
+ * for Malaysia calendar `dateYmd`, skipping units that already have any schedule row on that day.
+ */
+async function bulkCreateHomestayJobsByPropertyNameSubstring({
+  operatorId,
+  dateYmd,
+  nameContains,
+  createdByEmail,
+} = {}) {
+  const oid = String(operatorId || '').trim();
+  const day = String(dateYmd || '').trim().slice(0, 10);
+  const needle = String(nameContains || '').trim().toLowerCase();
+  if (!oid) {
+    const e = new Error('MISSING_OPERATOR_ID');
+    e.code = 'MISSING_OPERATOR_ID';
+    throw e;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+    const e = new Error('BAD_DATE');
+    e.code = 'BAD_DATE';
+    throw e;
+  }
+  if (needle.length < 2) {
+    const e = new Error('NAME_TOO_SHORT');
+    e.code = 'NAME_TOO_SHORT';
+    throw e;
+  }
+  const todayMy = getTodayMalaysiaDate();
+  if (day < todayMy) {
+    const e = new Error('PAST_DAY');
+    e.code = 'PAST_DAY';
+    throw e;
+  }
+
+  const props = await listOperatorProperties({ operatorId: oid, limit: 1000, offset: 0, includeArchived: false });
+  const arr = Array.isArray(props) ? props : [];
+  const candidates = arr.filter((p) => String(p.name || '').trim().toLowerCase().includes(needle));
+
+  let created = 0;
+  let skipped = 0;
+  const errors = [];
+  for (const p of candidates) {
+    const pid = String(p.id || '').trim();
+    if (!pid) continue;
+    try {
+      const [existRows] = await pool.query(
+        `SELECT 1 AS ok FROM cln_schedule s WHERE s.property_id = ? AND ${SQL_CLN_SCHEDULE_JOB_DATE_KL_YMD} = ? LIMIT 1`,
+        [pid, day]
+      );
+      if (Array.isArray(existRows) && existRows.length) {
+        skipped += 1;
+        continue;
+      }
+      await createCleaningScheduleJobUnified({
+        propertyId: pid,
+        date: day,
+        time: '09:00',
+        serviceProvider: 'homestay-cleaning',
+        remarks: 'Bulk homestay (property name match)',
+        operatorId: oid,
+        source: 'operator_portal',
+        status: 'pending-checkout',
+        createdByEmail: createdByEmail ? String(createdByEmail).trim().toLowerCase() : undefined,
+      });
+      created += 1;
+    } catch (err) {
+      errors.push({
+        propertyId: pid,
+        propertyName: String(p.name || '').trim(),
+        unitNumber: String(p.unitNumber || '').trim(),
+        message: String(err?.message || err).slice(0, 300),
+        code: String(err?.code || '').slice(0, 64),
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    workingDay: day,
+    nameContains: needle,
+    matched: candidates.length,
+    created,
+    skipped,
+    errors,
+  };
 }
 
 async function listClientPortalScheduleJobs({ clientdetailId, operatorId, limit = 200, groupId } = {}) {
@@ -2949,7 +3423,7 @@ async function listClientPortalScheduleJobs({ clientdetailId, operatorId, limit 
             ${clientDisp.nameExpr} AS clientName,
             COALESCE(p.address, '') AS address,
             ${propNavColsClient},
-            DATE_FORMAT(s.working_day, '%Y-%m-%d') AS jobDate,
+            ${SQL_CLN_SCHEDULE_JOB_DATE_KL_YMD} AS jobDate,
             s.status AS rawStatus,
             s.cleaning_type AS cleaningType,
             s.team AS teamDbName,
@@ -2958,6 +3432,7 @@ async function listClientPortalScheduleJobs({ clientdetailId, operatorId, limit 
             TIME_FORMAT(s.end_time, '%H:%i') AS staffEndTime,
             s.finalphoto_json AS finalPhotoJson,
             s.submit_by AS submitBy,
+            COALESCE(s.btob, 0) AS btobRaw,
             s.price AS schedulePrice,
             ${auditSelect}
             ${pricingAddonsSelect}
@@ -2986,6 +3461,7 @@ async function createClientPortalScheduleJob({
   price,
   clientRemark,
   groupId,
+  btob,
 }) {
   const cid = String(clientdetailId || '').trim();
   const oid = String(operatorId || '').trim();
@@ -3058,6 +3534,10 @@ async function createClientPortalScheduleJob({
   if (note) {
     remarks = `${remarks} | ${note}`;
   }
+  const btobFlag = isHomestay && (btob === true || btob === 1 || String(btob || '').toLowerCase() === 'true');
+  if (btobFlag) {
+    remarks = `${remarks} | BTOB: Same-day checkout + new check-in — please prioritize cleaning`;
+  }
   return createCleaningScheduleJobUnified({
     propertyId: pid,
     date: String(date || '').slice(0, 10),
@@ -3070,6 +3550,7 @@ async function createClientPortalScheduleJob({
     price,
     source: 'client_portal',
     clientPortalGroupId: gid || undefined,
+    btob: btobFlag,
   });
 }
 
@@ -3084,17 +3565,19 @@ async function updateClientPortalScheduleJob({
   status,
   statusSetByEmail,
   groupId,
+  btob,
+  loginEmail,
 }) {
   const cid = String(clientdetailId || '').trim();
-  const oid = String(operatorId || '').trim();
+  const oidIn = String(operatorId || '').trim();
   const sid = String(scheduleId || '').trim();
   const gidIn = String(groupId || '').trim();
-  if (!cid || !oid || !sid) {
+  const loginEmailNorm = loginEmail != null ? String(loginEmail).trim().toLowerCase() : '';
+  if (!cid || !sid) {
     const e = new Error('MISSING_IDS');
     e.code = 'MISSING_IDS';
     throw e;
   }
-  await assertClientdetailLinkedToOperator(oid, cid);
   const [[row]] = await pool.query(
     `SELECT p.id AS propertyId, p.clientdetail_id AS cd, p.operator_id AS op
      FROM cln_schedule s
@@ -3108,17 +3591,29 @@ async function updateClientPortalScheduleJob({
     e.code = 'NOT_FOUND';
     throw e;
   }
-  if (String(row.op || '').trim() !== oid) {
+  const oid = String(row.op || '').trim();
+  if (!oid) {
+    const e = new Error('PROPERTY_OPERATOR_MISMATCH');
+    e.code = 'PROPERTY_OPERATOR_MISMATCH';
+    throw e;
+  }
+  if (oidIn && oidIn !== oid) {
     const e = new Error('PROPERTY_OPERATOR_MISMATCH');
     e.code = 'PROPERTY_OPERATOR_MISMATCH';
     throw e;
   }
   const pid = String(row.propertyId || '').trim();
+  if ((await clnPropGroup.propertyGroupTablesExist()) && loginEmailNorm) {
+    await clnPropGroup.activatePendingInvitesForClientPortal(cid, loginEmailNorm);
+  }
   const acc = await clnPropGroup.getClientPropertyGroupAccess(cid, pid);
   if (acc.access === 'none') {
     const e = new Error('NOT_FOUND');
     e.code = 'NOT_FOUND';
     throw e;
+  }
+  if (acc.access === 'owner') {
+    await assertClientdetailLinkedToOperator(oid, cid);
   }
   if (gidIn && (await clnPropGroup.propertyGroupTablesExist())) {
     try {
@@ -3141,6 +3636,13 @@ async function updateClientPortalScheduleJob({
           .toLowerCase()
           .includes('cancel');
       if (workingDay !== undefined) {
+        if (!scope.perm.booking.edit) {
+          const e = new Error('GROUP_PERMISSION_DENIED');
+          e.code = 'GROUP_PERMISSION_DENIED';
+          throw e;
+        }
+      }
+      if (btob !== undefined) {
         if (!scope.perm.booking.edit) {
           const e = new Error('GROUP_PERMISSION_DENIED');
           e.code = 'GROUP_PERMISSION_DENIED';
@@ -3179,6 +3681,13 @@ async function updateClientPortalScheduleJob({
         throw e;
       }
     }
+    if (btob !== undefined) {
+      if (!acc.perm.booking.edit) {
+        const e = new Error('GROUP_PERMISSION_DENIED');
+        e.code = 'GROUP_PERMISSION_DENIED';
+        throw e;
+      }
+    }
     if (stIn != null) {
       if (isCancel) {
         if (!acc.perm.booking.delete) {
@@ -3197,7 +3706,182 @@ async function updateClientPortalScheduleJob({
   if (workingDay !== undefined) patch.workingDay = workingDay;
   if (status !== undefined) patch.status = status;
   if (statusSetByEmail !== undefined) patch.statusSetByEmail = statusSetByEmail;
+  if (btob !== undefined) patch.btob = btob === true || btob === 1 || String(btob || '').toLowerCase() === 'true';
   await updateOperatorScheduleJob(sid, patch);
+}
+
+/**
+ * Client portal: remove one schedule row (e.g. “Customer extend” — guest extended, job no longer needed).
+ * Requires same property access as updates; grantees need `booking.delete`. Deletes `cln_damage_report` rows
+ * for this schedule first (FK RESTRICT on `cln_damage_report.schedule_id`).
+ */
+async function deleteClientPortalScheduleJob({
+  clientdetailId,
+  operatorId,
+  scheduleId,
+  groupId,
+  loginEmail,
+}) {
+  const cid = String(clientdetailId || '').trim();
+  const oidIn = String(operatorId || '').trim();
+  const sid = String(scheduleId || '').trim();
+  const gidIn = String(groupId || '').trim();
+  const loginEmailNorm = loginEmail != null ? String(loginEmail).trim().toLowerCase() : '';
+  if (!cid || !sid) {
+    const e = new Error('MISSING_IDS');
+    e.code = 'MISSING_IDS';
+    throw e;
+  }
+  const [[row]] = await pool.query(
+    `SELECT p.id AS propertyId, p.clientdetail_id AS cd, p.operator_id AS op
+     FROM cln_schedule s
+     INNER JOIN cln_property p ON p.id = s.property_id
+     WHERE s.id = ?
+     LIMIT 1`,
+    [sid]
+  );
+  if (!row) {
+    const e = new Error('NOT_FOUND');
+    e.code = 'NOT_FOUND';
+    throw e;
+  }
+  const oid = String(row.op || '').trim();
+  if (!oid) {
+    const e = new Error('PROPERTY_OPERATOR_MISMATCH');
+    e.code = 'PROPERTY_OPERATOR_MISMATCH';
+    throw e;
+  }
+  if (oidIn && oidIn !== oid) {
+    const e = new Error('PROPERTY_OPERATOR_MISMATCH');
+    e.code = 'PROPERTY_OPERATOR_MISMATCH';
+    throw e;
+  }
+  const pid = String(row.propertyId || '').trim();
+  if ((await clnPropGroup.propertyGroupTablesExist()) && loginEmailNorm) {
+    await clnPropGroup.activatePendingInvitesForClientPortal(cid, loginEmailNorm);
+  }
+  const acc = await clnPropGroup.getClientPropertyGroupAccess(cid, pid);
+  if (acc.access === 'none') {
+    const e = new Error('NOT_FOUND');
+    e.code = 'NOT_FOUND';
+    throw e;
+  }
+  if (acc.access === 'owner') {
+    await assertClientdetailLinkedToOperator(oid, cid);
+  }
+  if (gidIn && (await clnPropGroup.propertyGroupTablesExist())) {
+    try {
+      const scope = await clnPropGroup.assertGroupPropertyInScope({
+        clientdetailId: cid,
+        groupId: gidIn,
+        propertyId: pid,
+        operatorId: oid,
+      });
+      if (acc.access === 'member' && acc.groupId && acc.groupId !== gidIn) {
+        const e = new Error('GROUP_PROPERTY_MISMATCH');
+        e.code = 'GROUP_PROPERTY_MISMATCH';
+        throw e;
+      }
+      if (!scope.perm.booking.delete) {
+        const e = new Error('GROUP_PERMISSION_DENIED');
+        e.code = 'GROUP_PERMISSION_DENIED';
+        throw e;
+      }
+    } catch (e) {
+      if (e?.code === 'GROUP_ACCESS_DENIED' || e?.code === 'GROUP_PROPERTY_MISMATCH') throw e;
+      throw e;
+    }
+  } else if (String(row.cd || '').trim() !== cid) {
+    if (!acc.perm.booking.delete) {
+      const e = new Error('GROUP_PERMISSION_DENIED');
+      e.code = 'GROUP_PERMISSION_DENIED';
+      throw e;
+    }
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    if (await clnDamageReportTableExists()) {
+      await conn.query('DELETE FROM cln_damage_report WHERE schedule_id = ?', [sid]);
+    }
+    const [del] = await conn.query('DELETE FROM cln_schedule WHERE id = ? LIMIT 1', [sid]);
+    if (!del.affectedRows) {
+      await conn.rollback();
+      const e = new Error('NOT_FOUND');
+      e.code = 'NOT_FOUND';
+      throw e;
+    }
+    await conn.commit();
+  } catch (e) {
+    try {
+      await conn.rollback();
+    } catch (_) {
+      /* ignore */
+    }
+    throw e;
+  } finally {
+    conn.release();
+  }
+  return { ok: true };
+}
+
+/**
+ * Operator portal: delete one schedule row for this operator's property.
+ * Deletes `cln_damage_report` rows first (FK RESTRICT on `cln_damage_report.schedule_id`).
+ */
+async function deleteOperatorScheduleJob({ scheduleId, operatorId }) {
+  const sid = String(scheduleId || '').trim();
+  const oidIn = String(operatorId || '').trim();
+  if (!sid || !oidIn) {
+    const e = new Error('MISSING_PARAMS');
+    e.code = 'MISSING_PARAMS';
+    throw e;
+  }
+  const [[row]] = await pool.query(
+    `SELECT p.operator_id AS op
+     FROM cln_schedule s
+     INNER JOIN cln_property p ON p.id = s.property_id
+     WHERE s.id = ?
+     LIMIT 1`,
+    [sid]
+  );
+  if (!row) {
+    const e = new Error('NOT_FOUND');
+    e.code = 'NOT_FOUND';
+    throw e;
+  }
+  const dbOp = String(row.op || '').trim();
+  if (!dbOp || dbOp !== oidIn) {
+    const e = new Error('OPERATOR_MISMATCH');
+    e.code = 'OPERATOR_MISMATCH';
+    throw e;
+  }
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    if (await clnDamageReportTableExists()) {
+      await conn.query('DELETE FROM cln_damage_report WHERE schedule_id = ?', [sid]);
+    }
+    const [del] = await conn.query('DELETE FROM cln_schedule WHERE id = ? LIMIT 1', [sid]);
+    if (!del.affectedRows) {
+      await conn.rollback();
+      const e = new Error('NOT_FOUND');
+      e.code = 'NOT_FOUND';
+      throw e;
+    }
+    await conn.commit();
+  } catch (e) {
+    try {
+      await conn.rollback();
+    } catch (_) {
+      /* ignore */
+    }
+    throw e;
+  } finally {
+    conn.release();
+  }
+  return { ok: true };
 }
 
 function safeParseScheduleSubmitByJson(raw) {
@@ -3306,6 +3990,70 @@ async function updateOperatorScheduleJob(id, patch) {
     fields.push('start_time = ?');
     vals.push(wdSql);
   }
+  /** Operator portal edit booking: move job calendar day + wall-clock start (Malaysia HH:mm). */
+  if (patch.date !== undefined) {
+    const d = String(patch.date || '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) {
+      const e = new Error('INVALID_DATE');
+      e.code = 'BAD_REQUEST';
+      throw e;
+    }
+    const tsRaw =
+      patch.timeStart != null && String(patch.timeStart).trim()
+        ? String(patch.timeStart).trim()
+        : patch.time != null && String(patch.time).trim()
+          ? String(patch.time).trim()
+          : '09:00';
+    const tsM = tsRaw.match(/^(\d{1,2}):(\d{2})/);
+    const timePart = tsM ? `${String(Math.min(23, Math.max(0, parseInt(tsM[1], 10)))).padStart(2, '0')}:${String(Math.min(59, Math.max(0, parseInt(tsM[2], 10)))).padStart(2, '0')}` : '09:00';
+    const wdSql = malaysiaLocalDateTimeForSchedule(d, timePart) || malaysiaWallClockToUtcDatetimeForDb(d, 9, 0);
+    fields.push('working_day = ?');
+    vals.push(wdSql);
+    fields.push('start_time = ?');
+    vals.push(wdSql);
+  }
+  if (patch.propertyId !== undefined) {
+    const pid = String(patch.propertyId || '').trim();
+    if (pid) {
+      const [[okRow]] = await pool.query(
+        `SELECT p.id AS okId
+         FROM cln_schedule s
+         INNER JOIN cln_property p0 ON p0.id = s.property_id
+         INNER JOIN cln_property p ON p.id = ? AND p.operator_id = p0.operator_id
+         WHERE s.id = ? LIMIT 1`,
+        [pid, sid]
+      );
+      if (!okRow?.okId) {
+        const e = new Error('PROPERTY_NOT_ALLOWED');
+        e.code = 'BAD_REQUEST';
+        throw e;
+      }
+      fields.push('property_id = ?');
+      vals.push(pid);
+    }
+  }
+  if (patch.serviceProvider !== undefined) {
+    const ct = providerToCleaningType(patch.serviceProvider);
+    fields.push('cleaning_type = ?');
+    vals.push(ct);
+  }
+  if (patch.remarks !== undefined) {
+    const r = patch.remarks != null ? String(patch.remarks).slice(0, 2000) : '';
+    fields.push('submit_by = ?');
+    vals.push(r || null);
+  }
+  if (patch.price !== undefined && (await databaseHasColumn('cln_schedule', 'price'))) {
+    const n = Number(patch.price);
+    if (Number.isFinite(n)) {
+      fields.push('price = ?');
+      vals.push(Math.round(Math.max(0, n) * 100) / 100);
+    }
+  }
+  if (patch.addons !== undefined && (await databaseHasColumn('cln_schedule', 'pricing_addons_json'))) {
+    const addonsSanitized = sanitizeScheduleJobAddons(patch.addons);
+    fields.push('pricing_addons_json = ?');
+    vals.push(addonsSanitized.length ? JSON.stringify(addonsSanitized) : null);
+  }
   if (patch.teamId !== undefined) {
     const name = patch.teamId ? await getOperatorTeamNameById(patch.teamId) : null;
     fields.push('team = ?');
@@ -3345,10 +4093,14 @@ async function updateOperatorScheduleJob(id, patch) {
     if (terminal) {
       fields.push('ai_assignment_locked = ?');
       vals.push(1);
-    } else if (patch.aiAssignmentLocked !== undefined) {
+    } else   if (patch.aiAssignmentLocked !== undefined) {
       fields.push('ai_assignment_locked = ?');
       vals.push(patch.aiAssignmentLocked ? 1 : 0);
     }
+  }
+  if (patch.btob !== undefined && (await databaseHasColumn('cln_schedule', 'btob'))) {
+    fields.push('btob = ?');
+    vals.push(patch.btob ? 1 : 0);
   }
   if (prepReadyAudit) {
     if (prepReadyAudit.email) {
@@ -3427,7 +4179,7 @@ async function loadScheduleJobsForEmployeeGroup(jobIds, operatorId) {
   const ph = ids.map(() => '?').join(',');
   const [rows] = await pool.query(
     `SELECT s.id, s.property_id, s.working_day, s.status,
-            DATE_FORMAT(s.working_day, '%Y-%m-%d') AS jobDate,
+            ${SQL_CLN_SCHEDULE_JOB_DATE_KL_YMD} AS jobDate,
             p.operator_id AS clnOperatorId,
             p.clientdetail_id AS clnClientdetailId,
             p.coliving_propertydetail_id AS colivingPid,
@@ -3749,7 +4501,7 @@ async function employeeTaskRemoteUnlock({ email, operatorId, jobId, lockDetailId
   if (dm === 'temporary_password_only') {
     const ymd = getTodayMalaysiaDate();
     const [[hit]] = await pool.query(
-      `SELECT 1 AS ok FROM cln_schedule WHERE id = ? AND working_day IS NOT NULL AND DATE(DATE_ADD(working_day, INTERVAL 8 HOUR)) = ? LIMIT 1`,
+      `SELECT 1 AS ok FROM cln_schedule WHERE id = ? AND working_day IS NOT NULL AND (${SQL_CLN_SCHEDULE_WORKING_DAY_KL_YMD_BARE}) = ? LIMIT 1`,
       [String(jobId).trim(), ymd]
     );
     if (!hit) {
@@ -3823,7 +4575,7 @@ async function createOperatorScheduleJob(input) {
     throw err;
   }
   const cleaningType = providerToCleaningType(input.serviceProvider);
-  const status = String(input.status || 'ready-to-clean');
+  const status = String(input.status || 'pending-checkout');
   let teamName = null;
   if (input.teamId) teamName = await getOperatorTeamNameById(input.teamId);
   const timePart = input.time != null && String(input.time).trim() !== '' ? String(input.time).trim() : '09:00';
@@ -3831,7 +4583,10 @@ async function createOperatorScheduleJob(input) {
     malaysiaLocalDateTimeForSchedule(date, timePart) || malaysiaWallClockToUtcDatetimeForDb(date, 9, 0);
   const remark = String(input.remarks || '').slice(0, 2000) || null;
   const addonsSanitized = sanitizeScheduleJobAddons(input.addons);
-  const hasAddonsCol = await databaseHasColumn('cln_schedule', 'pricing_addons_json');
+  const [hasAddonsCol, hasBtobCol] = await Promise.all([
+    databaseHasColumn('cln_schedule', 'pricing_addons_json'),
+    databaseHasColumn('cln_schedule', 'btob'),
+  ]);
   const addonsJson =
     hasAddonsCol && addonsSanitized.length > 0 ? JSON.stringify(addonsSanitized) : null;
   const startAt = workingDay;
@@ -3849,9 +4604,17 @@ async function createOperatorScheduleJob(input) {
     if (Number.isFinite(n)) priceNum = Math.round(Math.max(0, n) * 100) / 100;
   }
 
+  const btobVal =
+    hasBtobCol && (input.btob === true || input.btob === 1 || String(input.btob || '').toLowerCase() === 'true')
+      ? 1
+      : 0;
   const insertParams = [id, propertyId, workingDay, startAt, status, cleaningType, teamName, remark];
   let colList =
     'id, property_id, working_day, start_time, status, cleaning_type, team, submit_by';
+  if (hasBtobCol) {
+    colList += ', btob';
+    insertParams.push(btobVal);
+  }
   if (hasAddonsCol) {
     colList += ', pricing_addons_json';
     insertParams.push(addonsJson);
@@ -3982,6 +4745,22 @@ async function listOperatorProperties({ limit = 200, offset = 0, operatorId, inc
     hasGoogleMapsUrl,
     hasLatitudeCol,
     hasLongitudeCol,
+    hasOperatorCleaningLine,
+    hasOperatorCleaningPrice,
+    hasOperatorCleaningService,
+    hasOperatorCleaningRowsJson,
+    hasOpGroupTable,
+    hasOpGroupPropTable,
+    hasBedCountList,
+    hasRoomCountList,
+    hasBathroomCountList,
+    hasKitchenList,
+    hasLivingRoomList,
+    hasBalconyList,
+    hasStaircaseList,
+    hasLiftLevelList,
+    hasSpecialAreaCountList,
+    hasMinValueList,
   ] = await Promise.all([
     databaseHasColumn('cln_property', 'client_portal_owned'),
     databaseHasColumn('cln_property', 'premises_type'),
@@ -3996,7 +4775,24 @@ async function listOperatorProperties({ limit = 200, offset = 0, operatorId, inc
     databaseHasColumn('cln_property', 'google_maps_url'),
     databaseHasColumn('cln_property', 'latitude'),
     databaseHasColumn('cln_property', 'longitude'),
+    databaseHasColumn('cln_property', 'operator_cleaning_pricing_line'),
+    databaseHasColumn('cln_property', 'operator_cleaning_price_myr'),
+    databaseHasColumn('cln_property', 'operator_cleaning_pricing_service'),
+    databaseHasColumn('cln_property', 'operator_cleaning_pricing_rows_json'),
+    databaseHasTable('cln_operator_property_group'),
+    databaseHasTable('cln_operator_property_group_property'),
+    databaseHasColumn('cln_property', 'bed_count'),
+    databaseHasColumn('cln_property', 'room_count'),
+    databaseHasColumn('cln_property', 'bathroom_count'),
+    databaseHasColumn('cln_property', 'kitchen'),
+    databaseHasColumn('cln_property', 'living_room'),
+    databaseHasColumn('cln_property', 'balcony'),
+    databaseHasColumn('cln_property', 'staircase'),
+    databaseHasColumn('cln_property', 'lift_level'),
+    databaseHasColumn('cln_property', 'special_area_count'),
+    databaseHasColumn('cln_property', 'min_value'),
   ]);
+  const hasOpGroupSchema = hasOpGroupTable && hasOpGroupPropTable;
   const archivedClause =
     hasOpPortalArchived && !includeArchived ? ' AND COALESCE(p.operator_portal_archived, 0) = 0 ' : '';
   const scopeWhere = oid
@@ -4005,9 +4801,7 @@ async function listOperatorProperties({ limit = 200, offset = 0, operatorId, inc
       : hasClientIdCol
         ? ` WHERE p.client_id = ? ${archivedClause}`
         : ' WHERE 1=0 '
-    : archivedClause
-      ? ` WHERE 1=1 ${archivedClause.replace(/^ AND /, ' AND ')}`
-      : '';
+    : ' WHERE 1=0 ';
   const scopeParams = oid && (hasOpCol || hasClientIdCol) ? [oid] : oid ? [] : [];
   const extraSelect = [];
   if (hasPortalOwned) extraSelect.push('COALESCE(p.client_portal_owned, 0) AS clientPortalOwned');
@@ -4027,6 +4821,41 @@ async function listOperatorProperties({ limit = 200, offset = 0, operatorId, inc
   if (hasGoogleMapsUrl) extraSelect.push('NULLIF(TRIM(p.google_maps_url), \'\') AS googleMapsUrl');
   if (hasLatitudeCol) extraSelect.push('p.latitude AS latitude');
   if (hasLongitudeCol) extraSelect.push('p.longitude AS longitude');
+  if (hasOperatorCleaningLine) extraSelect.push('NULLIF(TRIM(p.operator_cleaning_pricing_line), \'\') AS operatorCleaningPricingLine');
+  if (hasOperatorCleaningPrice) extraSelect.push('p.operator_cleaning_price_myr AS operatorCleaningPriceMyr');
+  if (hasOperatorCleaningService) extraSelect.push('NULLIF(TRIM(p.operator_cleaning_pricing_service), \'\') AS operatorCleaningPricingService');
+  if (hasOperatorCleaningRowsJson) extraSelect.push('p.operator_cleaning_pricing_rows_json AS operatorCleaningPricingRowsJson');
+  if (hasOpGroupSchema && hasOpCol) {
+    extraSelect.push(`(
+      SELECT NULLIF(TRIM(og.name), '')
+      FROM cln_operator_property_group_property ogp
+      INNER JOIN cln_operator_property_group og ON og.id = ogp.group_id AND og.operator_id = p.operator_id
+      WHERE ogp.property_id = p.id
+      LIMIT 1
+    ) AS operatorPropertyGroupName`);
+  } else {
+    extraSelect.push('NULL AS operatorPropertyGroupName');
+  }
+  if (hasBedCountList) extraSelect.push('p.bed_count AS bedCount');
+  else extraSelect.push('NULL AS bedCount');
+  if (hasRoomCountList) extraSelect.push('p.room_count AS roomCount');
+  else extraSelect.push('NULL AS roomCount');
+  if (hasBathroomCountList) extraSelect.push('p.bathroom_count AS bathroomCount');
+  else extraSelect.push('NULL AS bathroomCount');
+  if (hasKitchenList) extraSelect.push('p.kitchen AS kitchen');
+  else extraSelect.push('NULL AS kitchen');
+  if (hasLivingRoomList) extraSelect.push('p.living_room AS livingRoom');
+  else extraSelect.push('NULL AS livingRoom');
+  if (hasBalconyList) extraSelect.push('p.balcony AS balcony');
+  else extraSelect.push('NULL AS balcony');
+  if (hasStaircaseList) extraSelect.push('p.staircase AS staircase');
+  else extraSelect.push('NULL AS staircase');
+  if (hasLiftLevelList) extraSelect.push('NULLIF(TRIM(p.lift_level), \'\') AS liftLevel');
+  else extraSelect.push('NULL AS liftLevel');
+  if (hasSpecialAreaCountList) extraSelect.push('p.special_area_count AS specialAreaCount');
+  else extraSelect.push('NULL AS specialAreaCount');
+  if (hasMinValueList) extraSelect.push('p.min_value AS minValue');
+  else extraSelect.push('NULL AS minValue');
   const extraSql = extraSelect.length ? `,\n      ${extraSelect.join(',\n      ')}` : '';
   const [rows] = await pool.query(
     `SELECT
@@ -4086,7 +4915,102 @@ async function listOperatorProperties({ limit = 200, offset = 0, operatorId, inc
      LIMIT ? OFFSET ?`,
     [...scopeParams, lim, off]
   );
-  return rows;
+  return (rows || []).map((row) => {
+    const operatorCleaningPricingRows = mergeClnLegacyWixCleaningPricesIntoPricingRows(
+      parseOperatorCleaningPricingRowsFromDb({
+        jsonRaw: hasOperatorCleaningRowsJson ? row.operatorCleaningPricingRowsJson : null,
+        operatorCleaningPricingService: row.operatorCleaningPricingService,
+        operatorCleaningPricingLine: row.operatorCleaningPricingLine,
+        operatorCleaningPriceMyr: row.operatorCleaningPriceMyr,
+        cleaningFeesMyr: row.cleaningFees,
+      }),
+      {
+        warmCleaning: row.warmCleaning,
+        deepCleaning: row.deepCleaning,
+        generalCleaning: row.generalCleaning,
+        renovationCleaning: row.renovationCleaning,
+        cleaningFees: row.cleaningFees,
+      }
+    );
+    /** Match operator form: whole minutes as digits (not `2h 30m`). */
+    const estimatedTime =
+      hasMinValueList && row.minValue != null && String(row.minValue).trim() !== ''
+        ? String(Math.max(0, Math.floor(Number(row.minValue))))
+        : '';
+    return { ...row, operatorCleaningPricingRows, estimatedTime };
+  });
+}
+
+/**
+ * Coliving propertydetail / roomdetail smartdoor_id → lockdetail (read-only), same shape as client portal detail.
+ */
+async function loadColivingSmartdoorBindingsForDetail(colivingPdId, colivingRoomId) {
+  const pd = String(colivingPdId || '').trim();
+  let smartdoorBindings = { property: null, rooms: [] };
+  if (!pd) return smartdoorBindings;
+  const rid = String(colivingRoomId || '').trim();
+  try {
+    const [[pdJoin]] = await pool.query(
+      `SELECT pd.smartdoor_id AS psd,
+              COALESCE(NULLIF(TRIM(l.lockalias), ''), NULLIF(TRIM(l.lockname), ''), CAST(l.id AS CHAR)) AS plbl
+         FROM propertydetail pd
+         LEFT JOIN lockdetail l ON l.id = pd.smartdoor_id
+        WHERE pd.id = ?
+        LIMIT 1`,
+      [pd]
+    );
+    let propBinding = null;
+    if (pdJoin?.psd != null && String(pdJoin.psd).trim() !== '') {
+      const psid = String(pdJoin.psd).trim();
+      propBinding = {
+        lockdetailId: psid,
+        displayLabel: String(pdJoin.plbl || psid).trim() || psid,
+      };
+    }
+    let rowRoomBinding = null;
+    if (rid) {
+      const [[rrJoin]] = await pool.query(
+        `SELECT r.smartdoor_id AS rsd,
+                COALESCE(NULLIF(TRIM(l2.lockalias), ''), NULLIF(TRIM(l2.lockname), ''), CAST(l2.id AS CHAR)) AS rlbl
+           FROM roomdetail r
+           LEFT JOIN lockdetail l2 ON l2.id = r.smartdoor_id
+          WHERE r.id = ? AND r.property_id = ?
+          LIMIT 1`,
+        [rid, pd]
+      );
+      if (rrJoin?.rsd != null && String(rrJoin.rsd).trim() !== '') {
+        const rsid = String(rrJoin.rsd).trim();
+        rowRoomBinding = {
+          lockdetailId: rsid,
+          displayLabel: String(rrJoin.rlbl || rsid).trim() || rsid,
+        };
+      }
+    }
+    smartdoorBindings.property = rowRoomBinding || propBinding;
+    const [rrows] = await pool.query(
+      `SELECT r.id AS rid,
+              COALESCE(NULLIF(TRIM(r.title_fld), ''), NULLIF(TRIM(r.roomname), ''), CAST(r.id AS CHAR)) AS room_lbl,
+              r.smartdoor_id AS sid,
+              COALESCE(NULLIF(TRIM(l3.lockalias), ''), NULLIF(TRIM(l3.lockname), ''), CAST(l3.id AS CHAR)) AS lock_lbl
+         FROM roomdetail r
+         LEFT JOIN lockdetail l3 ON l3.id = r.smartdoor_id
+        WHERE r.property_id = ?
+          AND r.smartdoor_id IS NOT NULL
+          AND NULLIF(TRIM(r.smartdoor_id), '') IS NOT NULL`,
+      [pd]
+    );
+    smartdoorBindings.rooms = (rrows || []).map((rr) => ({
+      roomId: String(rr.rid),
+      roomDisplayLabel: String(rr.room_lbl || rr.rid),
+      lockdetailId: String(rr.sid).trim(),
+      lockDisplayLabel: String(rr.lock_lbl || rr.sid).trim(),
+    }));
+  } catch (e) {
+    const isUnknown = e.code === 'ER_BAD_FIELD_ERROR' || e.errno === 1054;
+    if (!isUnknown) console.error('[cleanlemon] loadColivingSmartdoorBindingsForDetail', e?.message || e);
+    smartdoorBindings = { property: null, rooms: [] };
+  }
+  return smartdoorBindings;
 }
 
 /**
@@ -4113,6 +5037,44 @@ async function getOperatorPropertyDetail({ propertyId, operatorId } = {}) {
   const hasMailbox = await databaseHasColumn('cln_property', 'mailbox_password');
   const hasSdp = await databaseHasColumn('cln_property', 'smartdoor_password');
   const hasMode = await databaseHasColumn('cln_property', 'operator_door_access_mode');
+  const hasColivingRd = await databaseHasColumn('cln_property', 'coliving_roomdetail_id');
+  const hasCleaningLine = await databaseHasColumn('cln_property', 'operator_cleaning_pricing_line');
+  const hasCleaningPrice = await databaseHasColumn('cln_property', 'operator_cleaning_price_myr');
+  const hasCleaningService = await databaseHasColumn('cln_property', 'operator_cleaning_pricing_service');
+  const hasCleaningRowsJson = await databaseHasColumn('cln_property', 'operator_cleaning_pricing_rows_json');
+  const [
+    hasBedCountD,
+    hasRoomCountD,
+    hasBathroomCountD,
+    hasKitchenD,
+    hasLivingRoomD,
+    hasBalconyD,
+    hasStaircaseD,
+    hasLiftLevelD,
+    hasSpecialAreaCountD,
+    hasMinValueD,
+    hasCleaningFeesD,
+    hasWarmcleaningD,
+    hasDeepcleaningD,
+    hasGeneralcleaningD,
+    hasRenovationcleaningD,
+  ] = await Promise.all([
+    databaseHasColumn('cln_property', 'bed_count'),
+    databaseHasColumn('cln_property', 'room_count'),
+    databaseHasColumn('cln_property', 'bathroom_count'),
+    databaseHasColumn('cln_property', 'kitchen'),
+    databaseHasColumn('cln_property', 'living_room'),
+    databaseHasColumn('cln_property', 'balcony'),
+    databaseHasColumn('cln_property', 'staircase'),
+    databaseHasColumn('cln_property', 'lift_level'),
+    databaseHasColumn('cln_property', 'special_area_count'),
+    databaseHasColumn('cln_property', 'min_value'),
+    databaseHasColumn('cln_property', 'cleaning_fees'),
+    databaseHasColumn('cln_property', 'warmcleaning'),
+    databaseHasColumn('cln_property', 'deepcleaning'),
+    databaseHasColumn('cln_property', 'generalcleaning'),
+    databaseHasColumn('cln_property', 'renovationcleaning'),
+  ]);
   let sel = `SELECT p.id,
             p.operator_id,
             COALESCE(p.client_portal_owned, 0) AS client_portal_owned
@@ -4127,6 +5089,46 @@ async function getOperatorPropertyDetail({ propertyId, operatorId } = {}) {
   else sel += ', NULL AS smartdoor_password';
   if (hasMode) sel += ', p.operator_door_access_mode AS operator_door_access_mode';
   else sel += ', NULL AS operator_door_access_mode';
+  if (hasColivingRd) sel += ', p.coliving_roomdetail_id AS coliving_roomdetail_id';
+  else sel += ', NULL AS coliving_roomdetail_id';
+  if (hasCleaningLine) sel += ', p.operator_cleaning_pricing_line AS operator_cleaning_pricing_line';
+  else sel += ', NULL AS operator_cleaning_pricing_line';
+  if (hasCleaningPrice) sel += ', p.operator_cleaning_price_myr AS operator_cleaning_price_myr';
+  else sel += ', NULL AS operator_cleaning_price_myr';
+  if (hasCleaningService) sel += ', p.operator_cleaning_pricing_service AS operator_cleaning_pricing_service';
+  else sel += ', NULL AS operator_cleaning_pricing_service';
+  if (hasCleaningRowsJson) sel += ', p.operator_cleaning_pricing_rows_json AS operator_cleaning_pricing_rows_json';
+  else sel += ', NULL AS operator_cleaning_pricing_rows_json';
+  if (hasBedCountD) sel += ', p.bed_count AS bed_count';
+  else sel += ', NULL AS bed_count';
+  if (hasRoomCountD) sel += ', p.room_count AS room_count';
+  else sel += ', NULL AS room_count';
+  if (hasBathroomCountD) sel += ', p.bathroom_count AS bathroom_count';
+  else sel += ', NULL AS bathroom_count';
+  if (hasKitchenD) sel += ', p.kitchen AS kitchen';
+  else sel += ', NULL AS kitchen';
+  if (hasLivingRoomD) sel += ', p.living_room AS living_room';
+  else sel += ', NULL AS living_room';
+  if (hasBalconyD) sel += ', p.balcony AS balcony';
+  else sel += ', NULL AS balcony';
+  if (hasStaircaseD) sel += ', p.staircase AS staircase';
+  else sel += ', NULL AS staircase';
+  if (hasLiftLevelD) sel += ', NULLIF(TRIM(p.lift_level), \'\') AS lift_level';
+  else sel += ', NULL AS lift_level';
+  if (hasSpecialAreaCountD) sel += ', p.special_area_count AS special_area_count';
+  else sel += ', NULL AS special_area_count';
+  if (hasMinValueD) sel += ', p.min_value AS min_value';
+  else sel += ', NULL AS min_value';
+  if (hasCleaningFeesD) sel += ', p.cleaning_fees AS cleaning_fees';
+  else sel += ', NULL AS cleaning_fees';
+  if (hasWarmcleaningD) sel += ', p.warmcleaning AS warmCleaning';
+  else sel += ', NULL AS warmCleaning';
+  if (hasDeepcleaningD) sel += ', p.deepcleaning AS deepCleaning';
+  else sel += ', NULL AS deepCleaning';
+  if (hasGeneralcleaningD) sel += ', p.generalcleaning AS generalCleaning';
+  else sel += ', NULL AS generalCleaning';
+  if (hasRenovationcleaningD) sel += ', p.renovationcleaning AS renovationCleaning';
+  else sel += ', NULL AS renovationCleaning';
   sel += ' FROM cln_property p WHERE p.id = ? LIMIT 1';
   const [[row]] = await pool.query(sel, [pid]);
   if (!row) {
@@ -4176,7 +5178,7 @@ async function getOperatorPropertyDetail({ propertyId, operatorId } = {}) {
       `SELECT 1 AS ok FROM cln_schedule
        WHERE property_id = ?
          AND working_day IS NOT NULL
-         AND DATE(DATE_ADD(working_day, INTERVAL 8 HOUR)) = ?
+         AND (${SQL_CLN_SCHEDULE_WORKING_DAY_KL_YMD_BARE}) = ?
        LIMIT 1`,
       [pid, ymdToday]
     );
@@ -4185,10 +5187,43 @@ async function getOperatorPropertyDetail({ propertyId, operatorId } = {}) {
     hasBookingToday = false;
   }
 
+  const colivingRoomId =
+    hasColivingRd && row.coliving_roomdetail_id != null && String(row.coliving_roomdetail_id).trim() !== ''
+      ? String(row.coliving_roomdetail_id).trim()
+      : '';
+  const smartdoorBindings = await loadColivingSmartdoorBindingsForDetail(colivingPdId, colivingRoomId);
+
+  let nativeLockBindings = [];
+  try {
+    const clnPl = require('./cleanlemon-property-lock.service');
+    nativeLockBindings = await clnPl.listNativeLocksForClnProperty(pid);
+  } catch (_) {
+    nativeLockBindings = [];
+  }
+  const smartdoorBindManualAllowed = !colivingPdId;
+
+  const parsedCleaningRows = parseOperatorCleaningPricingRowsFromDb({
+    jsonRaw: hasCleaningRowsJson ? row.operator_cleaning_pricing_rows_json : null,
+    operatorCleaningPricingService: hasCleaningService ? row.operator_cleaning_pricing_service : '',
+    operatorCleaningPricingLine: hasCleaningLine ? row.operator_cleaning_pricing_line : '',
+    operatorCleaningPriceMyr: hasCleaningPrice ? row.operator_cleaning_price_myr : null,
+    cleaningFeesMyr: hasCleaningFeesD ? row.cleaning_fees : null,
+  });
+  const operatorCleaningPricingRows = mergeClnLegacyWixCleaningPricesIntoPricingRows(parsedCleaningRows, {
+    warmCleaning: hasWarmcleaningD ? row.warmCleaning : undefined,
+    deepCleaning: hasDeepcleaningD ? row.deepCleaning : undefined,
+    generalCleaning: hasGeneralcleaningD ? row.generalCleaning : undefined,
+    renovationCleaning: hasRenovationcleaningD ? row.renovationCleaning : undefined,
+    cleaningFees: hasCleaningFeesD ? row.cleaning_fees : undefined,
+  });
+  const firstMerged = operatorCleaningPricingRows[0];
+
   return {
     id: String(row.id),
     clientPortalOwned: Number(row.client_portal_owned) === 1,
     colivingPropertydetailId: colivingPdId || '',
+    nativeLockBindings,
+    smartdoorBindManualAllowed,
     securitySystemCredentials,
     smartdoorId: row.smartdoor_id != null ? String(row.smartdoor_id).trim() : '',
     mailboxPassword: row.mailbox_password != null ? String(row.mailbox_password) : '',
@@ -4199,6 +5234,54 @@ async function getOperatorPropertyDetail({ propertyId, operatorId } = {}) {
         : 'temporary_password_only',
     smartdoorGatewayReady,
     hasBookingToday,
+    smartdoorBindings,
+    operatorCleaningPricingLine:
+      firstMerged && String(firstMerged.line || '').trim() !== ''
+        ? String(firstMerged.line).trim()
+        : hasCleaningLine && row.operator_cleaning_pricing_line != null
+          ? String(row.operator_cleaning_pricing_line).trim()
+          : '',
+    operatorCleaningPriceMyr:
+      firstMerged &&
+      firstMerged.myr != null &&
+      Number.isFinite(Number(firstMerged.myr)) &&
+      Number(firstMerged.myr) >= 0
+        ? Number(firstMerged.myr)
+        : hasCleaningPrice &&
+            row.operator_cleaning_price_myr != null &&
+            Number.isFinite(Number(row.operator_cleaning_price_myr)) &&
+            Number(row.operator_cleaning_price_myr) >= 0
+          ? Number(row.operator_cleaning_price_myr)
+          : null,
+    operatorCleaningPricingService:
+      firstMerged && String(firstMerged.service || '').trim() !== ''
+        ? String(firstMerged.service).trim()
+        : hasCleaningService && row.operator_cleaning_pricing_service != null
+          ? String(row.operator_cleaning_pricing_service).trim()
+          : '',
+    operatorCleaningPricingRows,
+    /** Digits only — same as list API / operator “Estimate time” field (minutes). */
+    estimatedTime:
+      hasMinValueD && row.min_value != null && String(row.min_value).trim() !== ''
+        ? String(Math.max(0, Math.floor(Number(row.min_value))))
+        : '',
+    /** Whole minutes for operator portal form (same as `cln_property.min_value`). */
+    minValue:
+      hasMinValueD && row.min_value != null && String(row.min_value).trim() !== ''
+        ? Math.max(0, Math.floor(Number(row.min_value)))
+        : null,
+    bedCount: hasBedCountD && row.bed_count != null ? Number(row.bed_count) : null,
+    roomCount: hasRoomCountD && row.room_count != null ? Number(row.room_count) : null,
+    bathroomCount: hasBathroomCountD && row.bathroom_count != null ? Number(row.bathroom_count) : null,
+    kitchen: hasKitchenD && row.kitchen != null ? Number(row.kitchen) : null,
+    livingRoom: hasLivingRoomD && row.living_room != null ? Number(row.living_room) : null,
+    balcony: hasBalconyD && row.balcony != null ? Number(row.balcony) : null,
+    staircase: hasStaircaseD && row.staircase != null ? Number(row.staircase) : null,
+    liftLevel:
+      hasLiftLevelD && row.lift_level != null && String(row.lift_level).trim() !== ''
+        ? String(row.lift_level).trim()
+        : '',
+    specialAreaCount: hasSpecialAreaCountD && row.special_area_count != null ? Number(row.special_area_count) : null,
   };
 }
 
@@ -4228,12 +5311,20 @@ async function listOperatorDistinctPropertyNames({ operatorId } = {}) {
   return rows.map((r) => String(r.name || '').trim()).filter(Boolean);
 }
 
-/** All operators: distinct `property_name` for building search (optional `q` substring). */
-async function listGlobalDistinctPropertyNames({ q = '', limit = 50 } = {}) {
+/** Distinct `property_name` for building search; when `operatorId` set, only that operator's rows. */
+async function listGlobalDistinctPropertyNames({ q = '', limit = 50, operatorId = '' } = {}) {
   const term = String(q || '').trim();
   const lim = Math.min(Math.max(Number(limit) || 50, 1), 100);
+  const oid = String(operatorId || '').trim();
+  const hasOpCol = await databaseHasColumn('cln_property', 'operator_id');
   const params = [];
   let where = 'WHERE NULLIF(TRIM(p.property_name), \'\') IS NOT NULL';
+  if (oid && hasOpCol) {
+    where += ' AND p.operator_id = ?';
+    params.push(oid);
+  } else if (oid && !hasOpCol) {
+    where += ' AND 1=0';
+  }
   if (term) {
     where += ' AND TRIM(p.property_name) LIKE ?';
     params.push(`%${term}%`);
@@ -4256,12 +5347,14 @@ async function listGlobalDistinctPropertyNames({ q = '', limit = 50 } = {}) {
  * Picks the plurality normalized address, then plurality Waze / Google among rows in that bucket
  * (dedicated columns override parsed URLs from text).
  */
-async function getGlobalPropertyNameDefaults({ propertyName } = {}) {
+async function getGlobalPropertyNameDefaults({ propertyName, operatorId = '' } = {}) {
   const name = String(propertyName || '').trim();
   if (!name) return { address: '', wazeUrl: '', googleMapsUrl: '' };
 
   const hasW = await databaseHasColumn('cln_property', 'waze_url');
   const hasG = await databaseHasColumn('cln_property', 'google_maps_url');
+  const hasOpCol = await databaseHasColumn('cln_property', 'operator_id');
+  const oid = String(operatorId || '').trim();
   const sel = ['TRIM(p.address) AS address'];
   if (hasW) sel.push('TRIM(p.waze_url) AS waze_url');
   else sel.push('NULL AS waze_url');
@@ -4270,11 +5363,13 @@ async function getGlobalPropertyNameDefaults({ propertyName } = {}) {
 
   let rows = [];
   try {
+    const opClause = oid && hasOpCol ? ' AND p.operator_id = ? ' : oid && !hasOpCol ? ' AND 1=0 ' : '';
+    const params = oid && hasOpCol ? [name, oid] : [name];
     const [r] = await pool.query(
       `SELECT ${sel.join(', ')}
        FROM cln_property p
-       WHERE LOWER(TRIM(p.property_name)) = LOWER(TRIM(?))`,
-      [name]
+       WHERE LOWER(TRIM(p.property_name)) = LOWER(TRIM(?))${opClause}`,
+      params
     );
     rows = Array.isArray(r) ? r : [];
   } catch (_) {
@@ -4406,20 +5501,156 @@ function expandAddressSearchQueryVariants(q) {
   return out;
 }
 
-/** OpenStreetMap Nominatim (server-side; Malaysia-biased by default). */
+/** Common OSM spelling vs user input (Google tolerates apostrophe / letter swaps). */
+function pushDesplanadeTypoSeeds(push, raw) {
+  const b = String(raw || '').trim();
+  if (!b || /'/.test(b)) return;
+  if (/desplnade/i.test(b)) push(b.replace(/desplnade/gi, "d'esplanade"));
+  if (/desplanade/i.test(b)) push(b.replace(/desplanade/gi, "d'esplanade"));
+  if (/desplande/i.test(b)) push(b.replace(/desplande/gi, "d'esplanade"));
+  if (/\bd\s+esplanade\b/i.test(b)) push(b.replace(/\bd\s+esplanade\b/gi, "d'esplanade"));
+}
+
+/** Short tokens (e.g. "ksl") rarely hit in OSM without a city; bias to Johor Bahru when country = MY. */
+function pushShortQueryMalaysiaSeeds(push, raw, countrycodes) {
+  if (String(countrycodes || '').trim().toLowerCase() !== 'my') return;
+  const b = String(raw || '').trim();
+  if (b.length < 2 || b.length > 42) return;
+  if (/johor|jb\b|malaysia|singapore|kuala|penang|selangor|melaka|negeri|sabah|sarawak|labuan/i.test(b)) return;
+  const compact = b.replace(/\s+/g, '');
+  if (/\bksl\b/i.test(b) || compact.length <= 5) {
+    push(`${b} Johor Bahru`);
+    push(`${b}, Johor Bahru, Malaysia`);
+  }
+}
+
+/**
+ * Ordered unique search strings: user text, property name, combined, typo seeds, then expandAddressSearchQueryVariants each.
+ */
+function collectAddressSearchQueries(q, propertyName, countrycodes) {
+  const seeds = [];
+  const seenSeed = new Set();
+  function pushSeed(s) {
+    const t = String(s || '').trim();
+    if (t.length < 2) return;
+    const k = normalizeNominatimQuery(t);
+    if (seenSeed.has(k)) return;
+    seenSeed.add(k);
+    seeds.push(t);
+  }
+  const q0 = String(q || '').trim();
+  const pn0 = String(propertyName || '').trim();
+  pushSeed(q0);
+  pushDesplanadeTypoSeeds(pushSeed, q0);
+  pushShortQueryMalaysiaSeeds(pushSeed, q0, countrycodes);
+  if (pn0 && normalizeNominatimQuery(pn0) !== normalizeNominatimQuery(q0)) {
+    pushSeed(pn0);
+    pushDesplanadeTypoSeeds(pushSeed, pn0);
+    pushShortQueryMalaysiaSeeds(pushSeed, pn0, countrycodes);
+  }
+  if (pn0 && q0) {
+    pushSeed(`${pn0} ${q0}`.trim());
+    pushSeed(`${q0} ${pn0}`.trim());
+    pushDesplanadeTypoSeeds(pushSeed, `${pn0} ${q0}`.trim());
+  }
+  const ordered = [];
+  const seenQ = new Set();
+  for (const seed of seeds) {
+    for (const v of expandAddressSearchQueryVariants(seed)) {
+      const k = normalizeNominatimQuery(v);
+      if (k.length < 2 || seenQ.has(k)) continue;
+      seenQ.add(k);
+      ordered.push(v);
+    }
+  }
+  return ordered;
+}
+
+function isPhotonFeatureMalaysia(f) {
+  const p = f?.properties || {};
+  if (String(p.countrycode || '').trim().toUpperCase() === 'MY') return true;
+  if (/malaysia/i.test(String(p.country || ''))) return true;
+  const coords = f?.geometry?.coordinates;
+  if (Array.isArray(coords) && coords.length >= 2) {
+    const lon = Number(coords[0]);
+    const lat = Number(coords[1]);
+    if (Number.isFinite(lon) && Number.isFinite(lat) && lon >= 99.5 && lon <= 119.6 && lat >= 0.5 && lat <= 7.6) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Photon (OSM-based, different indexer) — used when Nominatim returns nothing. */
+async function fetchPhotonPlaces(queryStr, limit, bbox) {
+  const q = String(queryStr || '').trim();
+  if (normalizeNominatimQuery(q).length < 2) return [];
+  const lim = Math.min(Math.max(Number(limit) || 8, 1), 15);
+  async function runPhoton(useBbox) {
+    const params = { q, limit: lim, lang: 'en' };
+    if (useBbox && bbox) params.bbox = bbox;
+    const { data } = await axios.get('https://photon.komoot.io/api', {
+      params,
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'CleanlemonsPortal/1.0 (https://portal.cleanlemons.com)',
+      },
+      timeout: 12000,
+      validateStatus: (s) => s >= 200 && s < 300,
+    });
+    return Array.isArray(data?.features) ? data.features : [];
+  }
+  try {
+    let features = await runPhoton(true);
+    if (bbox && features.length === 0) {
+      const wide = await runPhoton(false);
+      features = wide.filter(isPhotonFeatureMalaysia);
+    }
+    return features
+      .map((f) => {
+        const coords = f.geometry?.coordinates;
+        const lon = Array.isArray(coords) ? coords[0] : null;
+        const lat = Array.isArray(coords) ? coords[1] : null;
+        const p = f.properties || {};
+        const streetLine =
+          p.housenumber && p.street ? `${p.housenumber} ${p.street}` : p.street ? String(p.street) : '';
+        const parts = [p.name, streetLine, p.district, p.city, p.state, p.country]
+          .map((x) => (x != null ? String(x).trim() : ''))
+          .filter(Boolean);
+        const displayName = parts.length ? parts.join(', ') : '';
+        const osmId = p.osm_id != null ? String(p.osm_id) : '';
+        const osmT = p.osm_type != null ? String(p.osm_type) : '';
+        const placeId = osmId ? `photon:${osmT}:${osmId}` : `photon:${lat},${lon}`;
+        return {
+          displayName,
+          lat: lat != null && Number.isFinite(Number(lat)) ? String(lat) : '',
+          lon: lon != null && Number.isFinite(Number(lon)) ? String(lon) : '',
+          placeId,
+        };
+      })
+      .filter((x) => x.displayName && x.lat && x.lon);
+  } catch (e) {
+    console.warn('[cleanlemon] fetchPhotonPlaces', e?.message || e);
+    return [];
+  }
+}
+
+/** Nominatim first, then Photon fallback (both OSM; improves hits vs Nominatim-only). */
 async function searchAddressPlaces({ q, limit = 8, countrycodes = 'my', propertyName = '' } = {}) {
   const termNorm = normalizeNominatimQuery(q);
   if (termNorm.length < 2) return [];
   const lim = Math.min(Math.max(Number(limit) || 8, 1), 10);
   const cc = String(countrycodes || '').trim().toLowerCase();
   const pnRaw = String(propertyName || '').trim();
+  const queries = collectAddressSearchQueries(q, pnRaw, cc);
+  const photonBbox = cc === 'my' || cc === '' ? '99.5,0.5,119.6,7.6' : '';
 
   async function fetchNominatim(queryStr) {
     const qs = normalizeNominatimQuery(queryStr);
     if (qs.length < 2) return [];
     try {
       const params = {
-        q: qs,
+        q: queryStr.trim(),
         format: 'json',
         limit: lim,
         addressdetails: 1,
@@ -4444,24 +5675,20 @@ async function searchAddressPlaces({ q, limit = 8, countrycodes = 'my', property
         }))
         .filter((x) => x.displayName);
     } catch (e) {
-      console.warn('[cleanlemon] searchAddressPlaces', e?.message || e);
+      console.warn('[cleanlemon] searchAddressPlaces nominatim', e?.message || e);
       return [];
     }
   }
 
-  for (const queryStr of expandAddressSearchQueryVariants(q)) {
+  for (const queryStr of queries) {
     const out = dedupeAddressPlaceRows(await fetchNominatim(queryStr));
-    if (out.length > 0) return out;
+    if (out.length > 0) return out.slice(0, lim);
   }
 
-  if (pnRaw) {
-    const pnNorm = normalizeNominatimQuery(pnRaw);
-    if (pnNorm && pnNorm !== termNorm) {
-      for (const queryStr of expandAddressSearchQueryVariants(pnRaw)) {
-        const out = dedupeAddressPlaceRows(await fetchNominatim(queryStr));
-        if (out.length > 0) return out;
-      }
-    }
+  for (const queryStr of queries) {
+    const raw = await fetchPhotonPlaces(queryStr, lim, photonBbox || null);
+    const out = dedupeAddressPlaceRows(raw);
+    if (out.length > 0) return out.slice(0, lim);
   }
 
   return [];
@@ -4865,6 +6092,7 @@ async function getClientPortalPropertyDetail({ clientdetailId, propertyId } = {}
   if (await databaseHasColumn('cln_property', 'coliving_sync_archived')) clnCols.push('coliving_sync_archived');
   const hasClientPortalOwnedCol = await databaseHasColumn('cln_property', 'client_portal_owned');
   if (hasClientPortalOwnedCol) clnCols.push('client_portal_owned');
+  if (hasClientdetailCol) clnCols.push('clientdetail_id');
   for (const c of clnOptional) {
     if (await databaseHasColumn('cln_property', c)) clnCols.push(c);
   }
@@ -5062,6 +6290,14 @@ async function getClientPortalPropertyDetail({ clientdetailId, propertyId } = {}
   }
 
   const clientPortalOwned = !hasClientPortalOwnedCol ? true : Number(row.client_portal_owned) === 1;
+  const propClientdetailId =
+    hasClientdetailCol && row.clientdetail_id != null ? String(row.clientdetail_id).trim() : '';
+  const hasBoundB2bClient = propClientdetailId !== '';
+  const hasCleaningOperator =
+    hasOpCol && row.operator_id != null && String(row.operator_id).trim() !== '';
+  /** Full client-portal edit: client-created, or operator-linked unit with a bound B2B client (not Coliving-list-only). */
+  const clientPortalAllowsFullEdit =
+    !hasClientPortalOwnedCol || clientPortalOwned || (hasCleaningOperator && hasBoundB2bClient);
 
   let smartdoorGatewayReady = false;
   try {
@@ -5070,12 +6306,22 @@ async function getClientPortalPropertyDetail({ clientdetailId, propertyId } = {}
     smartdoorGatewayReady = false;
   }
 
+  let nativeLockBindings = [];
+  try {
+    const clnPl = require('./cleanlemon-property-lock.service');
+    nativeLockBindings = await clnPl.listNativeLocksForClnProperty(pid);
+  } catch (_) {
+    nativeLockBindings = [];
+  }
+  const smartdoorBindManualAllowed = !colivingPdId;
+
   return {
     id: String(row.id || ''),
     name: String(row.property_name || '').trim() || 'Property',
     address: String(row.address || '').trim() || '—',
     unitNumber: String(row.unit_name || '').trim(),
     clientPortalOwned,
+    clientPortalAllowsFullEdit,
     operatorId: hasOpCol && row.operator_id ? String(row.operator_id) : '',
     cleanlemonsOperatorName,
     cleanlemonsOperatorEmail,
@@ -5122,6 +6368,8 @@ async function getClientPortalPropertyDetail({ clientdetailId, propertyId } = {}
         ? Number(row.longitude)
         : null,
     smartdoorBindings,
+    nativeLockBindings,
+    smartdoorBindManualAllowed,
     groupAccess: {
       access: gAcc.access,
       groupId: gAcc.groupId,
@@ -5168,14 +6416,17 @@ async function patchClientPortalProperty({ clientdetailId, propertyId, body } = 
     throw e;
   }
   await clnPropGroup.assertPropertyActionAllowed(cid, pid, 'property', 'edit');
-  const [hasWNavCol, hasGNavCol, hasLatColPatch, hasLngColPatch, hasPortalOwnedPatch] = await Promise.all([
-    databaseHasColumn('cln_property', 'waze_url'),
-    databaseHasColumn('cln_property', 'google_maps_url'),
-    databaseHasColumn('cln_property', 'latitude'),
-    databaseHasColumn('cln_property', 'longitude'),
-    databaseHasColumn('cln_property', 'client_portal_owned'),
-  ]);
+  const [hasWNavCol, hasGNavCol, hasLatColPatch, hasLngColPatch, hasPortalOwnedPatch, hasOpColPatch] =
+    await Promise.all([
+      databaseHasColumn('cln_property', 'waze_url'),
+      databaseHasColumn('cln_property', 'google_maps_url'),
+      databaseHasColumn('cln_property', 'latitude'),
+      databaseHasColumn('cln_property', 'longitude'),
+      databaseHasColumn('cln_property', 'client_portal_owned'),
+      databaseHasColumn('cln_property', 'operator_id'),
+    ]);
   let selExisting = 'id, clientdetail_id AS propOwnerClientdetailId, coliving_propertydetail_id AS colivingPd, address';
+  if (hasOpColPatch) selExisting += ', operator_id';
   if (hasWNavCol) selExisting += ', waze_url';
   if (hasGNavCol) selExisting += ', google_maps_url';
   if (hasLatColPatch) selExisting += ', latitude';
@@ -5192,12 +6443,20 @@ async function patchClientPortalProperty({ clientdetailId, propertyId, body } = 
   }
   const colivingPdId = existing.colivingPd != null ? String(existing.colivingPd) : '';
   const isPropertyOwner = String(existing.propOwnerClientdetailId || '').trim() === cid;
-  /** 1 = created in client portal (full edit); 0 = Coliving-synced / imported (limited fields). */
+  const hasBoundB2bClient =
+    existing.propOwnerClientdetailId != null && String(existing.propOwnerClientdetailId).trim() !== '';
+  const hasCleaningOperatorPatch =
+    hasOpColPatch &&
+    existing.operator_id != null &&
+    String(existing.operator_id).trim() !== '';
+  /** 1 = client portal–created (full); 0 + operator + bound client = operator-linked B2B (full); 0 + no operator = Coliving-list style (limited). */
   const portalOwnedFullEdit =
-    !hasPortalOwnedPatch || Number(existing.client_portal_owned) === 1;
+    !hasPortalOwnedPatch ||
+    Number(existing.client_portal_owned) === 1 ||
+    (hasCleaningOperatorPatch && hasBoundB2bClient);
 
   const b = body && typeof body === 'object' ? body : {};
-  const hasOpCol = await databaseHasColumn('cln_property', 'operator_id');
+  const hasOpCol = hasOpColPatch || (await databaseHasColumn('cln_property', 'operator_id'));
 
   if (b.clearCleanlemonsOperator) {
     if (!isPropertyOwner) {
@@ -5305,6 +6564,7 @@ async function patchClientPortalProperty({ clientdetailId, propertyId, body } = 
       'bathroomCount',
       'operatorDoorAccessMode',
       'smartdoorPassword',
+      'smartdoorTokenEnabled',
       'mailboxPassword',
     ]);
     for (const k of Object.keys(normalized)) {
@@ -5545,6 +6805,11 @@ async function bulkRequestClientPortalOperatorBinding({
         cid,
       ]);
       try {
+        await syncClnPropertyLegacyClientIdColumn(pid);
+      } catch (e) {
+        console.warn('[cleanlemon] bulkBindClientPortalOperator sync client_id', pid, e?.message || e);
+      }
+      try {
         await plr.assignClnOperatorToPropertySmartDoorRows(pid, cid, opId);
       } catch (e) {
         console.warn('[cleanlemon] bulk bind assignClnOperatorToPropertySmartDoorRows', pid, e?.message || e);
@@ -5682,6 +6947,11 @@ async function createOperatorProperty(input) {
     hasSpecialAreaCount,
   ] = colChecks;
 
+  let teamInsertVal = String(input.team || '').trim();
+  if (input.teamId !== undefined) {
+    const tid = String(input.teamId ?? '').trim();
+    teamInsertVal = tid ? String((await getOperatorTeamNameById(tid)) || '').trim() : '';
+  }
   const columns = ['id', 'property_name', 'address', 'unit_name', 'client_label', 'team'];
   const values = [
     id,
@@ -5689,7 +6959,7 @@ async function createOperatorProperty(input) {
     String(input.address || ''),
     String(input.unitNumber || ''),
     String(input.client || ''),
-    String(input.team || ''),
+    teamInsertVal,
   ];
 
   if (hasOpCol) {
@@ -5697,7 +6967,8 @@ async function createOperatorProperty(input) {
     values.push(opId);
     if (await databaseHasColumn('cln_property', 'client_id')) {
       columns.push('client_id');
-      values.push(opId);
+      /** Mirror B2B binding: same UUID as `clientdetail_id` when set; else operator (legacy scope). */
+      values.push(clientdetailId || opId);
     }
   }
   if (hasClientdetailCol) {
@@ -5743,6 +7014,18 @@ async function createOperatorProperty(input) {
   if (hasSpecialAreaCount) {
     columns.push('special_area_count');
     values.push(specialAreaCount);
+  }
+
+  const hasMinValueCreate = await databaseHasColumn('cln_property', 'min_value');
+  if (hasMinValueCreate) {
+    let mv = null;
+    if (input.minValue !== undefined || input.min_value !== undefined) {
+      mv = toNullableInt(input.minValue !== undefined ? input.minValue : input.min_value);
+    } else if (input.estimatedTime !== undefined) {
+      mv = parseClnEstimateTimeInputToMinutes(input.estimatedTime);
+    }
+    columns.push('min_value');
+    values.push(mv);
   }
 
   const [
@@ -5856,6 +7139,60 @@ async function createOperatorProperty(input) {
   if (hasLngColCreate) {
     columns.push('longitude');
     values.push(geoCreate.lng);
+  }
+
+  const [hasOperatorDoorModeC, hasOperatorCleaningLineC, hasOperatorCleaningPriceC, hasOperatorCleaningServiceC, hasOperatorCleaningRowsJsonC] =
+    await Promise.all([
+      databaseHasColumn('cln_property', 'operator_door_access_mode'),
+      databaseHasColumn('cln_property', 'operator_cleaning_pricing_line'),
+      databaseHasColumn('cln_property', 'operator_cleaning_price_myr'),
+      databaseHasColumn('cln_property', 'operator_cleaning_pricing_service'),
+      databaseHasColumn('cln_property', 'operator_cleaning_pricing_rows_json'),
+    ]);
+  if (hasOperatorDoorModeC && input.operatorDoorAccessMode !== undefined) {
+    const raw = String(input.operatorDoorAccessMode ?? '').trim().toLowerCase();
+    const allowed = ['full_access', 'temporary_password_only', 'working_date_only', 'fixed_password'];
+    const m = !raw || allowed.includes(raw) ? raw || 'temporary_password_only' : 'temporary_password_only';
+    columns.push('operator_door_access_mode');
+    values.push(m);
+  }
+  const wantsCleaningRowsC =
+    hasOperatorCleaningRowsJsonC &&
+    (input.operatorCleaningPricingRows !== undefined || input.operator_cleaning_pricing_rows !== undefined);
+  const cleaningRowsInC = input.operatorCleaningPricingRows ?? input.operator_cleaning_pricing_rows;
+  if (wantsCleaningRowsC) {
+    const normalized = normalizeOperatorCleaningPricingRowsInput(Array.isArray(cleaningRowsInC) ? cleaningRowsInC : []);
+    columns.push('operator_cleaning_pricing_rows_json');
+    values.push(normalized.length ? JSON.stringify(normalized) : null);
+    const first = normalized[0];
+    if (hasOperatorCleaningLineC) {
+      columns.push('operator_cleaning_pricing_line');
+      values.push(first && first.line ? first.line.slice(0, 128) : null);
+    }
+    if (hasOperatorCleaningPriceC) {
+      columns.push('operator_cleaning_price_myr');
+      values.push(first && first.myr != null ? first.myr : null);
+    }
+    if (hasOperatorCleaningServiceC) {
+      columns.push('operator_cleaning_pricing_service');
+      values.push(first ? first.service.slice(0, 32) : null);
+    }
+  } else {
+    if (hasOperatorCleaningLineC && input.operatorCleaningPricingLine !== undefined) {
+      const s = input.operatorCleaningPricingLine == null ? '' : String(input.operatorCleaningPricingLine).trim();
+      columns.push('operator_cleaning_pricing_line');
+      values.push(s === '' ? null : s.slice(0, 128));
+    }
+    if (hasOperatorCleaningPriceC && input.operatorCleaningPriceMyr !== undefined) {
+      const n = Number(input.operatorCleaningPriceMyr);
+      columns.push('operator_cleaning_price_myr');
+      values.push(Number.isFinite(n) && n >= 0 ? n : null);
+    }
+    if (hasOperatorCleaningServiceC && input.operatorCleaningPricingService !== undefined) {
+      const s = input.operatorCleaningPricingService == null ? '' : String(input.operatorCleaningPricingService).trim();
+      columns.push('operator_cleaning_pricing_service');
+      values.push(s === '' ? null : s.slice(0, 32));
+    }
   }
 
   const placeholders = columns.map(() => '?').join(', ');
@@ -6015,7 +7352,7 @@ async function updateOperatorProperty(id, input) {
     databaseHasColumn('cln_property', 'operator_portal_archived'),
   ]);
 
-  const sel = ['id', 'address'];
+  const sel = ['id', 'address', 'property_name', 'unit_name', 'client_label', 'team'];
   if (hasWazeUrlCol) sel.push('waze_url');
   if (hasGoogleMapsUrlCol) sel.push('google_maps_url');
   if (hasLatCol) sel.push('latitude');
@@ -6072,12 +7409,7 @@ async function updateOperatorProperty(id, input) {
     return;
   }
 
-  /** Client-created property: operator cannot change fields via this endpoint (portal disables save). */
-  if (portalOwned) {
-    const e = new Error('NOT_CLIENT_PORTAL_OWNED');
-    e.code = 'NOT_CLIENT_PORTAL_OWNED';
-    throw e;
-  }
+  /** Client-created (`client_portal_owned=1`): operator may update service fields but not door / access credentials (client-only). */
 
   const definedInputKeys = Object.keys(input || {}).filter((k) => input[k] !== undefined);
   const nonOperatorKeys = definedInputKeys.filter((k) => k !== 'operatorId' && k !== 'operator_id');
@@ -6145,20 +7477,39 @@ async function updateOperatorProperty(id, input) {
   }
   const clientdetailForUpdate = pendingClientBind ? prevClientdetail : nextClientdetail;
 
-  const sets = [
-    'property_name = ?',
-    'address = ?',
-    'unit_name = ?',
-    'client_label = ?',
-    'team = ?',
-  ];
-  const vals = [
-    String(input.name || ''),
-    String(input.address || ''),
-    String(input.unitNumber || ''),
-    String(input.client || ''),
-    String(input.team || ''),
-  ];
+  /** Partial PATCH: only overwrite columns the client sent (omit key = leave DB value). Previously missing keys became '' and wiped e.g. unit_name on bulk pricing updates. */
+  const sets = [];
+  const vals = [];
+  if (input.name !== undefined) {
+    const nm = String(input.name ?? '').trim();
+    /** Never persist the row's primary key as `property_name` (bulk/UI mix-ups wrote UUIDs into the name column). */
+    if (nm !== pid) {
+      sets.push('property_name = ?');
+      vals.push(nm);
+    }
+  }
+  if (input.address !== undefined) {
+    sets.push('address = ?');
+    vals.push(String(input.address ?? '').trim());
+  }
+  if (input.unitNumber !== undefined || input.unit_name !== undefined) {
+    sets.push('unit_name = ?');
+    const u = input.unitNumber !== undefined ? input.unitNumber : input.unit_name;
+    vals.push(u == null ? '' : String(u).trim());
+  }
+  if (input.client !== undefined) {
+    sets.push('client_label = ?');
+    vals.push(String(input.client ?? '').trim());
+  }
+  if (input.teamId !== undefined) {
+    const tid = String(input.teamId ?? '').trim();
+    const name = tid ? await getOperatorTeamNameById(tid) : '';
+    sets.push('team = ?');
+    vals.push(name != null && String(name).trim() !== '' ? String(name).trim() : '');
+  } else if (input.team !== undefined) {
+    sets.push('team = ?');
+    vals.push(String(input.team ?? '').trim());
+  }
 
   if (hasClientdetailCol) {
     /* NULLIF: never write '' — FK to cln_clientdetail rejects empty string; some clients send "". */
@@ -6180,31 +7531,31 @@ async function updateOperatorProperty(id, input) {
     vals.push(pt === '' ? null : pt);
   }
 
-  if (hasSecuritySystemCol && input.securitySystem !== undefined) {
+  if (!portalOwned && hasSecuritySystemCol && input.securitySystem !== undefined) {
     sets.push('security_system = ?');
     vals.push(String(input.securitySystem ?? '').trim() || null);
   }
 
-  if (hasSecurityUsernameCol && input.securityUsername !== undefined) {
+  if (!portalOwned && hasSecurityUsernameCol && input.securityUsername !== undefined) {
     sets.push('security_username = ?');
     vals.push(String(input.securityUsername ?? '').trim() || null);
   }
 
-  if (hasMailboxPwdCol && input.mailboxPassword !== undefined) {
+  if (!portalOwned && hasMailboxPwdCol && input.mailboxPassword !== undefined) {
     sets.push('mailbox_password = ?');
     vals.push(String(input.mailboxPassword ?? '').trim() || null);
   }
 
-  if (hasSmartdoorPwdCol && input.smartdoorPassword !== undefined) {
+  if (!portalOwned && hasSmartdoorPwdCol && input.smartdoorPassword !== undefined) {
     sets.push('smartdoor_password = ?');
     vals.push(String(input.smartdoorPassword ?? '').trim() || null);
   }
 
-  if (hasSmartdoorTokCol && input.smartdoorTokenEnabled !== undefined) {
+  if (!portalOwned && hasSmartdoorTokCol && input.smartdoorTokenEnabled !== undefined) {
     const en = input.smartdoorTokenEnabled === true || input.smartdoorTokenEnabled === 1 || input.smartdoorTokenEnabled === '1';
     sets.push('smartdoor_token_enabled = ?');
     vals.push(en ? 1 : 0);
-  } else if (hasSmartdoorTokCol && input.smartdoorToken !== undefined) {
+  } else if (!portalOwned && hasSmartdoorTokCol && input.smartdoorToken !== undefined) {
     const en = input.smartdoorToken === '1' || input.smartdoorToken === 1;
     sets.push('smartdoor_token_enabled = ?');
     vals.push(en ? 1 : 0);
@@ -6222,9 +7573,76 @@ async function updateOperatorProperty(id, input) {
     vals.push(clnSanitizePersistableUrl(input.keyPhotoUrl ?? input.key_photo_url ?? input.keyPhoto));
   }
 
+  const hasOperatorDoorModeU = await databaseHasColumn('cln_property', 'operator_door_access_mode');
+  if (!portalOwned && hasOperatorDoorModeU && input.operatorDoorAccessMode !== undefined) {
+    const raw = String(input.operatorDoorAccessMode ?? '').trim().toLowerCase();
+    const allowed = ['full_access', 'temporary_password_only', 'working_date_only', 'fixed_password'];
+    if (raw && !allowed.includes(raw)) {
+      const e = new Error('INVALID_OPERATOR_DOOR_ACCESS_MODE');
+      e.code = 'INVALID_OPERATOR_DOOR_ACCESS_MODE';
+      throw e;
+    }
+    const m = raw || 'temporary_password_only';
+    if (m === 'full_access' || m === 'working_date_only' || m === 'temporary_password_only') {
+      const okGw = await clnPropertyHasRemoteGatewayReady(pid);
+      if (!okGw) {
+        const e = new Error('OPERATOR_DOOR_GATEWAY_REQUIRED');
+        e.code = 'OPERATOR_DOOR_GATEWAY_REQUIRED';
+        throw e;
+      }
+    }
+    sets.push('operator_door_access_mode = ?');
+    vals.push(m);
+  }
+
+  const hasOperatorCleaningLineU = await databaseHasColumn('cln_property', 'operator_cleaning_pricing_line');
+  const hasOperatorCleaningPriceU = await databaseHasColumn('cln_property', 'operator_cleaning_price_myr');
+  const hasOperatorCleaningServiceU = await databaseHasColumn('cln_property', 'operator_cleaning_pricing_service');
+  const hasOperatorCleaningRowsJsonU = await databaseHasColumn('cln_property', 'operator_cleaning_pricing_rows_json');
+  const wantsCleaningRowsU =
+    hasOperatorCleaningRowsJsonU &&
+    (input.operatorCleaningPricingRows !== undefined || input.operator_cleaning_pricing_rows !== undefined);
+  const cleaningRowsInU = input.operatorCleaningPricingRows ?? input.operator_cleaning_pricing_rows;
+  if (wantsCleaningRowsU) {
+    const normalized = normalizeOperatorCleaningPricingRowsInput(Array.isArray(cleaningRowsInU) ? cleaningRowsInU : []);
+    sets.push('operator_cleaning_pricing_rows_json = ?');
+    vals.push(normalized.length ? JSON.stringify(normalized) : null);
+    const first = normalized[0];
+    if (hasOperatorCleaningLineU) {
+      sets.push('operator_cleaning_pricing_line = ?');
+      vals.push(first && first.line ? first.line.slice(0, 128) : null);
+    }
+    if (hasOperatorCleaningPriceU) {
+      sets.push('operator_cleaning_price_myr = ?');
+      vals.push(first && first.myr != null ? first.myr : null);
+    }
+    if (hasOperatorCleaningServiceU) {
+      sets.push('operator_cleaning_pricing_service = ?');
+      vals.push(first ? first.service.slice(0, 32) : null);
+    }
+  } else {
+    if (hasOperatorCleaningLineU && input.operatorCleaningPricingLine !== undefined) {
+      const s = input.operatorCleaningPricingLine == null ? '' : String(input.operatorCleaningPricingLine).trim();
+      sets.push('operator_cleaning_pricing_line = ?');
+      vals.push(s === '' ? null : s.slice(0, 128));
+    }
+    if (hasOperatorCleaningPriceU && input.operatorCleaningPriceMyr !== undefined) {
+      const n = Number(input.operatorCleaningPriceMyr);
+      sets.push('operator_cleaning_price_myr = ?');
+      vals.push(Number.isFinite(n) && n >= 0 ? n : null);
+    }
+    if (hasOperatorCleaningServiceU && input.operatorCleaningPricingService !== undefined) {
+      const s = input.operatorCleaningPricingService == null ? '' : String(input.operatorCleaningPricingService).trim();
+      sets.push('operator_cleaning_pricing_service = ?');
+      vals.push(s === '' ? null : s.slice(0, 32));
+    }
+  }
+
   if (hasWazeUrlCol || hasGoogleMapsUrlCol) {
+    const nextAddrForNav =
+      input.address !== undefined ? String(input.address ?? '') : String(cur.address ?? '');
     const nav = resolveClnPropertyNavigationUrls({
-      nextAddressRaw: String(input.address || ''),
+      nextAddressRaw: nextAddrForNav,
       prevAddress: String(cur.address ?? ''),
       prevWaze: hasWazeUrlCol ? String(cur.waze_url ?? '') : '',
       prevGoogle: hasGoogleMapsUrlCol ? String(cur.google_maps_url ?? '') : '',
@@ -6278,8 +7696,104 @@ async function updateOperatorProperty(id, input) {
     vals.push(en ? 1 : 0);
   }
 
-  vals.push(pid);
-  await pool.query(`UPDATE cln_property SET ${sets.join(', ')}, updated_at = NOW(3) WHERE id = ?`, vals);
+  const toNullableIntUp = (v) => {
+    const s = String(v ?? '').trim();
+    if (!s) return null;
+    const n = Number(v);
+    if (!Number.isFinite(n)) return null;
+    return Math.max(0, Math.floor(n));
+  };
+  const [
+    hasBedCountU,
+    hasRoomCountU,
+    hasBathroomCountU,
+    hasKitchenU,
+    hasLivingRoomU,
+    hasBalconyU,
+    hasStaircaseU,
+    hasLiftLevelU,
+    hasSpecialAreaCountU,
+  ] = await Promise.all([
+    databaseHasColumn('cln_property', 'bed_count'),
+    databaseHasColumn('cln_property', 'room_count'),
+    databaseHasColumn('cln_property', 'bathroom_count'),
+    databaseHasColumn('cln_property', 'kitchen'),
+    databaseHasColumn('cln_property', 'living_room'),
+    databaseHasColumn('cln_property', 'balcony'),
+    databaseHasColumn('cln_property', 'staircase'),
+    databaseHasColumn('cln_property', 'lift_level'),
+    databaseHasColumn('cln_property', 'special_area_count'),
+  ]);
+  if (hasBedCountU && (input.bedCount !== undefined || input.bed_count !== undefined)) {
+    sets.push('bed_count = ?');
+    vals.push(toNullableIntUp(input.bedCount !== undefined ? input.bedCount : input.bed_count));
+  }
+  if (hasRoomCountU && (input.roomCount !== undefined || input.room_count !== undefined)) {
+    sets.push('room_count = ?');
+    vals.push(toNullableIntUp(input.roomCount !== undefined ? input.roomCount : input.room_count));
+  }
+  if (hasBathroomCountU && (input.bathroomCount !== undefined || input.bathroom_count !== undefined)) {
+    sets.push('bathroom_count = ?');
+    vals.push(toNullableIntUp(input.bathroomCount !== undefined ? input.bathroomCount : input.bathroom_count));
+  }
+  if (hasKitchenU && input.kitchen !== undefined) {
+    sets.push('kitchen = ?');
+    vals.push(toNullableIntUp(input.kitchen));
+  }
+  if (hasLivingRoomU && (input.livingRoom !== undefined || input.living_room !== undefined)) {
+    sets.push('living_room = ?');
+    vals.push(toNullableIntUp(input.livingRoom !== undefined ? input.livingRoom : input.living_room));
+  }
+  if (hasBalconyU && input.balcony !== undefined) {
+    sets.push('balcony = ?');
+    vals.push(toNullableIntUp(input.balcony));
+  }
+  if (hasStaircaseU && (input.staircase !== undefined || input.stairCase !== undefined)) {
+    sets.push('staircase = ?');
+    vals.push(toNullableIntUp(input.staircase !== undefined ? input.staircase : input.stairCase));
+  }
+  if (hasLiftLevelU && (input.liftLevel !== undefined || input.lift_level !== undefined)) {
+    const ll = String(input.liftLevel ?? input.lift_level ?? '').trim().toLowerCase();
+    const liftLevel = ['slow', 'medium', 'fast'].includes(ll) ? ll : null;
+    sets.push('lift_level = ?');
+    vals.push(liftLevel);
+  }
+  if (hasSpecialAreaCountU && (input.specialAreaCount !== undefined || input.special_area_count !== undefined)) {
+    sets.push('special_area_count = ?');
+    vals.push(
+      toNullableIntUp(
+        input.specialAreaCount !== undefined ? input.specialAreaCount : input.special_area_count
+      )
+    );
+  }
+
+  const hasMinValueU = await databaseHasColumn('cln_property', 'min_value');
+  if (
+    hasMinValueU &&
+    (input.estimatedTime !== undefined || input.minValue !== undefined || input.min_value !== undefined)
+  ) {
+    let mv = null;
+    if (input.minValue !== undefined || input.min_value !== undefined) {
+      mv = toNullableIntUp(input.minValue !== undefined ? input.minValue : input.min_value);
+    } else {
+      mv = parseClnEstimateTimeInputToMinutes(input.estimatedTime);
+    }
+    sets.push('min_value = ?');
+    vals.push(mv);
+  }
+
+  if (sets.length === 0) {
+    await pool.query('UPDATE cln_property SET updated_at = NOW(3) WHERE id = ? LIMIT 1', [pid]);
+  } else {
+    vals.push(pid);
+    await pool.query(`UPDATE cln_property SET ${sets.join(', ')}, updated_at = NOW(3) WHERE id = ?`, vals);
+  }
+
+  try {
+    await syncClnPropertyLegacyClientIdColumn(pid);
+  } catch (e) {
+    console.warn('[cleanlemon] syncClnPropertyLegacyClientIdColumn', pid, e?.message || e);
+  }
 
   const colivingPdIdForCred =
     hasColivingPdCol &&
@@ -6287,7 +7801,7 @@ async function updateOperatorProperty(id, input) {
     String(cur.coliving_propertydetail_id).trim() !== ''
       ? String(cur.coliving_propertydetail_id).trim()
       : '';
-  if (colivingPdIdForCred && input.securitySystemCredentials !== undefined) {
+  if (!portalOwned && colivingPdIdForCred && input.securitySystemCredentials !== undefined) {
     const credCol = await databaseHasColumn('propertydetail', 'security_system_credentials_json');
     if (credCol) {
       const rawCred = input.securitySystemCredentials;
@@ -6312,9 +7826,12 @@ async function updateOperatorProperty(id, input) {
       clientdetailId: nextClientdetail,
       operatorId: opIdAssert,
       payloadJson: {
-        name: String(input.name || ''),
-        address: String(input.address || ''),
-        unitNumber: String(input.unitNumber || ''),
+        name: input.name !== undefined ? String(input.name || '') : String(cur.property_name || ''),
+        address: input.address !== undefined ? String(input.address || '') : String(cur.address || ''),
+        unitNumber:
+          input.unitNumber !== undefined || input.unit_name !== undefined
+            ? String((input.unitNumber !== undefined ? input.unitNumber : input.unit_name) || '')
+            : String(cur.unit_name || ''),
       },
     });
   }
@@ -6437,8 +7954,12 @@ function enrichInvoiceRowStatusAndDue(row, settingsMap) {
   const oid = String(row.operatorId || '').trim();
   const settings = oid && settingsMap.has(oid) ? settingsMap.get(oid) : {};
   const policy = getInvoicePaymentDuePolicyFromSettings(settings);
+  const storedDueRaw = row.dueDateFromDb != null ? String(row.dueDateFromDb).trim() : '';
+  const storedDue = /^\d{4}-\d{2}-\d{2}$/.test(storedDueRaw) ? storedDueRaw.slice(0, 10) : '';
   let dueYmd = null;
-  if (policy.mode === 'days' && issueYmd) {
+  if (storedDue) {
+    dueYmd = storedDue;
+  } else if (policy.mode === 'days' && issueYmd) {
     dueYmd = utcYmdAddDays(issueYmd, policy.days);
   }
   if (paid) {
@@ -6452,12 +7973,15 @@ function enrichInvoiceRowStatusAndDue(row, settingsMap) {
   return { ...row, status: overdue ? 'overdue' : 'pending', dueDate: dueYmd };
 }
 
-async function listOperatorInvoices({ limit = 300 } = {}) {
+async function listOperatorInvoices({ limit = 300, operatorId } = {}) {
   const lim = Math.min(Math.max(Number(limit) || 300, 1), 1000);
+  const scopeOpId = String(operatorId || '').trim();
   const ct = await getClnCompanyTable();
   const hasPaymentReceivedCol = await databaseHasColumn('cln_client_invoice', 'payment_received');
   const hasTransactionIdCol = await databaseHasColumn('cln_client_invoice', 'transaction_id');
   const hasOpCol = await databaseHasColumn('cln_client_invoice', 'operator_id');
+  const hasIssueDateCol = await databaseHasColumn('cln_client_invoice', 'issue_date');
+  const hasDueDateCol = await databaseHasColumn('cln_client_invoice', 'due_date');
   const [[payTableRow]] = await pool.query(
     `SELECT COUNT(*) AS n FROM information_schema.tables
      WHERE table_schema = DATABASE() AND table_name = 'cln_client_payment'`
@@ -6479,6 +8003,10 @@ async function listOperatorInvoices({ limit = 300 } = {}) {
     : '';
   const hasPdfUrlCol = await databaseHasColumn('cln_client_invoice', 'pdf_url');
   const pdfUrlExpr = hasPdfUrlCol ? "NULLIF(TRIM(COALESCE(i.pdf_url, '')), '')" : 'NULL';
+  const hasAccountingMetaCol = await databaseHasColumn('cln_client_invoice', 'accounting_meta_json');
+  const accountingMetaJsonExpr = hasAccountingMetaCol
+    ? 'i.accounting_meta_json AS accountingMetaJson'
+    : 'NULL AS accountingMetaJson';
   const hasReceiptUrlCol =
     hasClientPaymentTable && (await databaseHasColumn('cln_client_payment', 'receipt_url'));
   const receiptUrlExpr = hasReceiptUrlCol
@@ -6487,38 +8015,63 @@ async function listOperatorInvoices({ limit = 300 } = {}) {
   const opSelect = hasOpCol
     ? `COALESCE(NULLIF(TRIM(i.operator_id), ''), '') AS operatorId`
     : `'' AS operatorId`;
+  const issueDateSql = hasIssueDateCol
+    ? `DATE_FORMAT(COALESCE(i.issue_date, DATE(i.created_at)), '%Y-%m-%d')`
+    : `DATE_FORMAT(COALESCE(i.created_at, NOW()), '%Y-%m-%d')`;
+  const dueDateFromDbSql = hasDueDateCol ? `DATE_FORMAT(i.due_date, '%Y-%m-%d')` : `NULL`;
+  const opScopeSql = hasOpCol && scopeOpId ? ' AND i.operator_id = ? ' : '';
+  const listParams = hasOpCol && scopeOpId ? [scopeOpId, lim] : [lim];
   const [rows] = await pool.query(
     `SELECT
       i.id,
       COALESCE(i.invoice_number, i.id) AS invoiceNo,
       i.client_id AS clientId,
-      COALESCE(c.name, '') AS client,
-      COALESCE(c.email, '') AS clientEmail,
+      COALESCE(
+        NULLIF(TRIM(cd.fullname), ''),
+        NULLIF(TRIM(cd.email), ''),
+        NULLIF(TRIM(c.name), ''),
+        ''
+      ) AS client,
+      COALESCE(NULLIF(TRIM(cd.email), ''), NULLIF(TRIM(c.email), ''), '') AS clientEmail,
       COALESCE(i.description, '') AS description,
       COALESCE(i.amount, 0) AS amount,
       0 AS tax,
       COALESCE(i.amount, 0) AS total,
       CASE WHEN ${paymentStatusExpr} = 1 THEN 1 ELSE 0 END AS paymentReceived,
-      DATE_FORMAT(COALESCE(i.created_at, NOW()), '%Y-%m-%d') AS issueDate,
+      ${issueDateSql} AS issueDate,
+      ${dueDateFromDbSql} AS dueDateFromDb,
       ${paidDateExpr} AS paidDate,
       ${accountingInvoiceExpr} AS accountingInvoiceId,
       ${pdfUrlExpr} AS pdfUrl,
       ${receiptUrlExpr} AS receiptUrl,
+      ${accountingMetaJsonExpr},
       ${opSelect}
      FROM cln_client_invoice i
+     LEFT JOIN cln_clientdetail cd ON cd.id = i.client_id
      LEFT JOIN \`${ct}\` c ON c.id = i.client_id
      ${paymentJoin}
+     WHERE 1=1
+     ${opScopeSql}
      ORDER BY i.created_at DESC
      LIMIT ?`,
-    [lim]
+    listParams
   );
   const raw = rows || [];
   const opIds = raw.map((r) => String(r.operatorId || '').trim()).filter(Boolean);
   const settingsMap = await getOperatorSettingsJsonMapForOperatorIds(opIds);
   return raw.map((r) => {
+    let accountingMeta = null;
+    if (r.accountingMetaJson != null && String(r.accountingMetaJson).trim() !== '') {
+      try {
+        accountingMeta = JSON.parse(String(r.accountingMetaJson));
+      } catch {
+        accountingMeta = null;
+      }
+    }
     const enriched = enrichInvoiceRowStatusAndDue(
       {
         issueDate: r.issueDate,
+        dueDateFromDb: r.dueDateFromDb,
         paymentReceived: r.paymentReceived,
         operatorId: r.operatorId
       },
@@ -6541,7 +8094,8 @@ async function listOperatorInvoices({ limit = 300 } = {}) {
       paidDate: r.paidDate,
       accountingInvoiceId: r.accountingInvoiceId,
       pdfUrl: r.pdfUrl,
-      receiptUrl: r.receiptUrl
+      receiptUrl: r.receiptUrl,
+      accountingMeta
     };
   });
 }
@@ -6569,6 +8123,107 @@ async function listLinkedOperatorsForClientPortal(clientdetailId) {
 }
 
 /**
+ * Grantees may have no `cln_client_operator` rows while invoices still carry `operator_id` — merge those
+ * operators into the portal list so filters / display names resolve.
+ */
+async function mergePortalInvoiceOperatorsIntoLinkedList(linkedOperators, items) {
+  const byId = new Map(
+    (linkedOperators || []).map((o) => {
+      const id = String(o.id || '').trim();
+      return [id, { id, name: String(o.name || id).trim() || id }];
+    })
+  );
+  const need = new Set();
+  for (const it of items || []) {
+    const id = String(it.operatorId || '').trim();
+    if (id && !byId.has(id)) need.add(id);
+  }
+  if (!need.size) return Array.from(byId.values());
+  const odTable = await resolveClnOperatordetailTable();
+  const ids = [...need];
+  const ph = ids.map(() => '?').join(',');
+  try {
+    const [rows] = await pool.query(
+      `SELECT id,
+         TRIM(COALESCE(NULLIF(name, ''), NULLIF(email, ''), id)) AS displayName
+       FROM \`${odTable}\` WHERE id IN (${ph})`,
+      ids
+    );
+    for (const r of rows || []) {
+      const id = String(r.id || '').trim();
+      if (!id) continue;
+      const name = String(r.displayName || id).trim() || id;
+      byId.set(id, { id, name });
+    }
+  } catch (e) {
+    console.warn('[cleanlemon] mergePortalInvoiceOperatorsIntoLinkedList', e?.message || e);
+    for (const id of ids) {
+      if (!byId.has(id)) byId.set(id, { id, name: id });
+    }
+  }
+  return Array.from(byId.values()).sort((a, b) => String(a.name).localeCompare(String(b.name)));
+}
+
+/**
+ * SQL fragment + params: invoices the portal viewer may see (own + property-group shared billing).
+ * @param {string} alias Table alias (e.g. i)
+ */
+async function buildClientPortalInvoiceAccessWhere(alias, viewerClientdetailId) {
+  const cid = String(viewerClientdetailId || '').trim();
+  const a = String(alias || 'i').trim() || 'i';
+  const hasGroupTables =
+    (await databaseHasTable('cln_property_group_member')) && (await databaseHasTable('cln_property_group'));
+  const hasOpCol = await databaseHasColumn('cln_client_invoice', 'operator_id');
+  const params = [cid];
+  let sql = `(${a}.client_id = ?`;
+  if (hasGroupTables) {
+    sql += ` OR (
+      ${a}.client_id IN (
+        SELECT g.owner_clientdetail_id
+        FROM cln_property_group_member m
+        INNER JOIN cln_property_group g ON g.id = m.group_id
+        WHERE m.grantee_clientdetail_id = ?
+          AND m.invite_status = 'active'
+          AND g.owner_clientdetail_id IS NOT NULL
+      )`;
+    params.push(cid);
+    if (hasOpCol) {
+      sql += ` AND (
+        COALESCE(NULLIF(TRIM(${a}.operator_id), ''), '') = '' OR EXISTS (
+          SELECT 1 FROM cln_client_operator j
+          WHERE j.clientdetail_id = ? AND j.operator_id = ${a}.operator_id
+        )
+      )`;
+      params.push(cid);
+    }
+    sql += ')';
+  }
+  sql += ')';
+  return { sql, params };
+}
+
+function parseClientPortalInvoiceReceiptsJson(raw) {
+  if (raw == null || raw === '') return [];
+  try {
+    const v = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!Array.isArray(v)) return [];
+    return v
+      .map((x) => ({
+        receiptUrl: x && x.receiptUrl != null ? String(x.receiptUrl).trim() : '',
+        paymentDate: x && x.paymentDate != null ? String(x.paymentDate).trim() : '',
+        receiptNumber: x && x.receiptNumber != null ? String(x.receiptNumber).trim() : '',
+        transactionId: x && x.transactionId != null ? String(x.transactionId).trim() : '',
+        amount: x && x.amount != null && Number.isFinite(Number(x.amount)) ? Number(x.amount) : null,
+        isPortalProof:
+          x && (x.isPortalProof === true || x.isPortalProof === 1 || x.isPortalProof === '1' || x.isPortalProof === 'true'),
+      }))
+      .filter((x) => x.receiptUrl && /^https?:\/\//i.test(x.receiptUrl));
+  } catch (_) {
+    return [];
+  }
+}
+
+/**
  * B2B client portal — invoices where `cln_client_invoice.client_id` is the portal `cln_clientdetail.id`
  * (same id used in operator invoice client picker after merge).
  */
@@ -6581,6 +8236,8 @@ async function listClientPortalInvoices({ clientdetailId, filterOperatorId, limi
   const lim = Math.min(Math.max(Number(limit) || 500, 1), 1000);
   const hasPaymentReceivedCol = await databaseHasColumn('cln_client_invoice', 'payment_received');
   const hasTransactionIdCol = await databaseHasColumn('cln_client_invoice', 'transaction_id');
+  const hasIssueDateCol = await databaseHasColumn('cln_client_invoice', 'issue_date');
+  const hasDueDateCol = await databaseHasColumn('cln_client_invoice', 'due_date');
   const [[payTableRow]] = await pool.query(
     `SELECT COUNT(*) AS n FROM information_schema.tables
      WHERE table_schema = DATABASE() AND table_name = 'cln_client_payment'`
@@ -6600,15 +8257,124 @@ async function listClientPortalInvoices({ clientdetailId, filterOperatorId, limi
       GROUP BY invoice_id
     ) p ON p.invoice_id = i.id`
     : '';
+  const hasPdfUrlCol = await databaseHasColumn('cln_client_invoice', 'pdf_url');
+  const pdfUrlExpr = hasPdfUrlCol ? "NULLIF(TRIM(COALESCE(i.pdf_url, '')), '')" : 'NULL';
+  const hasPortalAccountingMetaCol = await databaseHasColumn('cln_client_invoice', 'accounting_meta_json');
+  const portalAccountingMetaJsonExpr = hasPortalAccountingMetaCol
+    ? 'i.accounting_meta_json AS accountingMetaJson'
+    : 'NULL AS accountingMetaJson';
+  const hasReceiptUrlCol =
+    hasClientPaymentTable && (await databaseHasColumn('cln_client_payment', 'receipt_url'));
+  const receiptUrlExpr = hasReceiptUrlCol
+    ? `(SELECT NULLIF(TRIM(COALESCE(receipt_url, '')), '') FROM cln_client_payment WHERE invoice_id = i.id ORDER BY payment_date DESC LIMIT 1)`
+    : 'NULL';
+  const receiptsJsonSelect =
+    hasClientPaymentTable && hasReceiptUrlCol
+      ? `(SELECT IFNULL(JSON_ARRAYAGG(JSON_OBJECT(
+          'receiptUrl', NULLIF(TRIM(pr.receipt_url), ''),
+          'paymentDate', DATE_FORMAT(pr.payment_date, '%Y-%m-%d'),
+          'receiptNumber', pr.receipt_number,
+          'transactionId', NULLIF(TRIM(pr.transaction_id), ''),
+          'amount', pr.amount,
+          'isPortalProof', IF(
+            LOWER(TRIM(COALESCE(pr.receipt_number, ''))) = 'portal_upload'
+            OR TRIM(COALESCE(pr.transaction_id, '')) LIKE 'portal_bank_receipt:%',
+            1,
+            0
+          )
+        )), JSON_ARRAY())
+        FROM cln_client_payment pr
+        WHERE pr.invoice_id = i.id AND TRIM(COALESCE(pr.receipt_url, '')) <> '') AS receiptsJson`
+      : 'CAST(JSON_ARRAY() AS JSON) AS receiptsJson';
   const odTable = await resolveClnOperatordetailTable();
-  const opJoin = hasOpCol ? `LEFT JOIN \`${odTable}\` od ON od.id = i.operator_id` : '';
+  const hasGrp =
+    (await databaseHasTable('cln_property_group_member')) && (await databaseHasTable('cln_property_group'));
+  /** Many legacy rows have NULL `operator_id`; resolve display name from billing client's first linked operator. */
+  const opFallbackJoin = hasOpCol
+    ? `LEFT JOIN (
+         SELECT clientdetail_id, MIN(operator_id) AS fo_op_id
+         FROM cln_client_operator
+         GROUP BY clientdetail_id
+       ) fo ON fo.clientdetail_id = i.client_id`
+    : '';
+  /**
+   * Grantee B may see invoices billed to B with NULL `operator_id` and no `cln_client_operator` on B — use any
+   * operator linked to a property-group owner that invited B. Also intersect / viewer fallbacks for other shapes.
+   */
+  const intersectOpSub = hasOpCol
+    ? `(SELECT MIN(j1.operator_id)
+         FROM cln_client_operator j1
+         INNER JOIN cln_client_operator j2
+           ON j2.operator_id = j1.operator_id AND j2.clientdetail_id = ?
+         WHERE j1.clientdetail_id = i.client_id)`
+    : '';
+  const ownerGroupOpSub =
+    hasOpCol && hasGrp
+      ? `(SELECT MIN(j.operator_id)
+           FROM cln_client_operator j
+           WHERE j.clientdetail_id IN (
+             SELECT g.owner_clientdetail_id
+             FROM cln_property_group_member m
+             INNER JOIN cln_property_group g ON g.id = m.group_id
+             WHERE m.grantee_clientdetail_id = ?
+               AND m.invite_status = 'active'
+               AND g.owner_clientdetail_id IS NOT NULL
+           ))`
+      : '';
+  const viewerOnlyOpSub = hasOpCol
+    ? `(SELECT MIN(j.operator_id) FROM cln_client_operator j WHERE j.clientdetail_id = ?)`
+    : '';
+  const resolvedOpIdExpr = hasOpCol
+    ? `COALESCE(
+         NULLIF(TRIM(i.operator_id), ''),
+         NULLIF(TRIM(fo.fo_op_id), ''),
+         NULLIF(TRIM(${intersectOpSub}), ''),
+         ${hasGrp ? `NULLIF(TRIM(${ownerGroupOpSub}), ''),` : ''}
+         NULLIF(TRIM(${viewerOnlyOpSub}), '')
+       )`
+    : `''`;
+  const opJoin = hasOpCol
+    ? `${opFallbackJoin}
+       LEFT JOIN \`${odTable}\` od ON od.id = ${resolvedOpIdExpr}`
+    : '';
   const opSelect = hasOpCol
-    ? `COALESCE(NULLIF(TRIM(i.operator_id), ''), '') AS operatorId,
+    ? `${resolvedOpIdExpr} AS operatorId,
        TRIM(COALESCE(NULLIF(od.name, ''), NULLIF(od.email, ''), '')) AS operatorName`
     : `'' AS operatorId, '' AS operatorName`;
 
+  /** Do not treat client-portal “proof only” rows as money received (balance stays full until operator marks paid). */
+  const paymentTotalsJoin =
+    hasClientPaymentTable
+      ? `LEFT JOIN (
+           SELECT invoice_id, COALESCE(SUM(amount), 0) AS paid_total
+           FROM cln_client_payment
+           WHERE NOT (
+             LOWER(TRIM(COALESCE(receipt_number, ''))) = 'portal_upload'
+             OR TRIM(COALESCE(transaction_id, '')) LIKE 'portal_bank_receipt:%'
+           )
+           GROUP BY invoice_id
+         ) ps ON ps.invoice_id = i.id`
+      : '';
+  const balanceAmountExpr = hasClientPaymentTable
+    ? `CASE WHEN ${paymentStatusExpr} = 1 THEN 0
+           ELSE GREATEST(COALESCE(i.amount, 0) - COALESCE(ps.paid_total, 0), 0) END`
+    : `CASE WHEN ${paymentStatusExpr} = 1 THEN 0 ELSE COALESCE(i.amount, 0) END`;
+
+  const issueDateSql = hasIssueDateCol
+    ? `DATE_FORMAT(COALESCE(i.issue_date, DATE(i.created_at)), '%Y-%m-%d')`
+    : `DATE_FORMAT(COALESCE(i.created_at, NOW()), '%Y-%m-%d')`;
+  const dueDateFromDbSql = hasDueDateCol ? `DATE_FORMAT(i.due_date, '%Y-%m-%d')` : `NULL`;
+
+  const access = await buildClientPortalInvoiceAccessWhere('i', cid);
   let opFilterSql = '';
-  const params = [cid];
+  /**
+   * `resolvedOpIdExpr` appears twice (SELECT operatorId + JOIN od); each copy binds intersect ?,
+   * optional owner-group ?, viewer-only ?. Then CASE i.client_id <>, then access WHERE params.
+   */
+  const opResolveParams = hasOpCol ? (hasGrp ? [cid, cid, cid] : [cid, cid]) : [];
+  const params = hasOpCol
+    ? [...opResolveParams, cid, ...opResolveParams, ...access.params]
+    : [cid, ...access.params];
   if (hasOpCol && fop) {
     opFilterSql = ' AND i.operator_id = ?';
     params.push(fop);
@@ -6624,36 +8390,74 @@ async function listClientPortalInvoices({ clientdetailId, filterOperatorId, limi
       0 AS tax,
       COALESCE(i.amount, 0) AS total,
       CASE WHEN ${paymentStatusExpr} = 1 THEN 1 ELSE 0 END AS paymentReceived,
-      DATE_FORMAT(COALESCE(i.created_at, NOW()), '%Y-%m-%d') AS issueDate,
+      ${issueDateSql} AS issueDate,
+      ${dueDateFromDbSql} AS dueDateFromDb,
       ${paidDateExpr} AS paidDate,
       ${accountingInvoiceExpr} AS accountingInvoiceId,
-      ${opSelect}
+      ${pdfUrlExpr} AS pdfUrl,
+      ${receiptUrlExpr} AS receiptUrl,
+      ${portalAccountingMetaJsonExpr},
+      ${opSelect},
+      ${balanceAmountExpr} AS balanceAmount,
+      CASE
+        WHEN i.client_id <> ? THEN TRIM(COALESCE(NULLIF(cd_bill.fullname, ''), NULLIF(cd_bill.email, ''), ''))
+        ELSE NULL
+      END AS sharedFromClientRemark,
+      ${receiptsJsonSelect}
      FROM cln_client_invoice i
+     LEFT JOIN cln_clientdetail cd_bill ON cd_bill.id = i.client_id
      ${opJoin}
      ${paymentJoin}
-     WHERE i.client_id = ?
+     ${paymentTotalsJoin}
+     WHERE ${access.sql}
      ${opFilterSql}
      ORDER BY i.created_at DESC
      LIMIT ?`,
     params
   );
   const raw = rows || [];
-  const opIds = raw.map((r) => String(r.operatorId || '').trim()).filter(Boolean);
-  const settingsMap = await getOperatorSettingsJsonMapForOperatorIds(opIds);
+  const rowOpId = (r) => String(r.operatorId ?? r.operatorid ?? r.operator_id ?? '').trim();
+  const rowOpName = (r) => String(r.operatorName ?? r.operatorname ?? r.operator_name ?? '').trim();
+  /** When `operator_id` column is missing or legacy rows are NULL, due-policy lookup would be empty → legacy 14-day overdue. If this client links exactly one operator, use that id for payment-due policy (matches operator "No limit" settings). */
+  const singleLinkedOpIdForDuePolicy =
+    Array.isArray(operators) && operators.length === 1
+      ? String(operators[0].id || '').trim()
+      : '';
+  const opIdsForSettings = new Set(raw.map((r) => rowOpId(r)).filter(Boolean));
+  if (singleLinkedOpIdForDuePolicy) opIdsForSettings.add(singleLinkedOpIdForDuePolicy);
+  const settingsMap = await getOperatorSettingsJsonMapForOperatorIds([...opIdsForSettings]);
   const items = raw.map((r) => {
+    const oidRow = rowOpId(r);
+    const oidForDuePolicy = oidRow || singleLinkedOpIdForDuePolicy;
     const enriched = enrichInvoiceRowStatusAndDue(
       {
         issueDate: r.issueDate,
+        dueDateFromDb: r.dueDateFromDb,
         paymentReceived: r.paymentReceived,
-        operatorId: r.operatorId
+        operatorId: oidForDuePolicy
       },
       settingsMap
     );
+    const remark =
+      r.sharedFromClientRemark != null && String(r.sharedFromClientRemark).trim() !== ''
+        ? String(r.sharedFromClientRemark).trim()
+        : null;
+    const bal = Number(r.balanceAmount != null ? r.balanceAmount : r.amount);
+    const balanceAmount = Number.isFinite(bal) ? bal : Number(r.amount) || 0;
+    let portalAccountingMeta = null;
+    if (r.accountingMetaJson != null && String(r.accountingMetaJson).trim() !== '') {
+      try {
+        portalAccountingMeta = JSON.parse(String(r.accountingMetaJson));
+      } catch {
+        portalAccountingMeta = null;
+      }
+    }
     return {
       id: r.id,
       invoiceNo: r.invoiceNo,
       description: r.description,
       amount: r.amount,
+      balanceAmount,
       tax: r.tax,
       total: r.total,
       status: enriched.status,
@@ -6661,63 +8465,611 @@ async function listClientPortalInvoices({ clientdetailId, filterOperatorId, limi
       dueDate: enriched.dueDate || null,
       paidDate: r.paidDate,
       accountingInvoiceId: r.accountingInvoiceId,
-      operatorId: r.operatorId,
-      operatorName: r.operatorName
+      pdfUrl: r.pdfUrl != null && String(r.pdfUrl).trim() !== '' ? String(r.pdfUrl).trim() : null,
+      receiptUrl: r.receiptUrl != null && String(r.receiptUrl).trim() !== '' ? String(r.receiptUrl).trim() : null,
+      receipts: parseClientPortalInvoiceReceiptsJson(r.receiptsJson),
+      operatorId: oidRow,
+      operatorName: rowOpName(r),
+      sharedFromClientRemark: remark,
+      accountingMeta: portalAccountingMeta
     };
   });
-  return { items, operators };
+  const opNameFromList = new Map(
+    (operators || []).map((o) => [String(o.id || '').trim(), String(o.name || '').trim()])
+  );
+  const singleLinkedOp = Array.isArray(operators) && operators.length === 1 ? operators[0] : null;
+  for (const it of items) {
+    let oid = String(it.operatorId || '').trim();
+    let oname = String(it.operatorName || '').trim();
+    if (!oname && oid) {
+      const fromList = opNameFromList.get(oid);
+      if (fromList) it.operatorName = fromList;
+    }
+    if (!oid && singleLinkedOp) {
+      it.operatorId = String(singleLinkedOp.id || '').trim();
+      it.operatorName = String(singleLinkedOp.name || '').trim() || it.operatorId;
+    }
+  }
+  const operatorsMerged = await mergePortalInvoiceOperatorsIntoLinkedList(operators, items);
+  const opNameMerged = new Map(
+    operatorsMerged.map((o) => [String(o.id || '').trim(), String(o.name || '').trim()])
+  );
+  for (const it of items) {
+    const oid = String(it.operatorId || '').trim();
+    const oname = String(it.operatorName || '').trim();
+    if (oid && !oname) {
+      const n = opNameMerged.get(oid);
+      if (n) it.operatorName = n;
+    }
+  }
+  const operatorsEnriched = await Promise.all(
+    operatorsMerged.map(async (o) => {
+      const oid = String(o.id || '').trim();
+      const settingsRaw = await readOperatorSettingsJsonRaw(oid);
+      return {
+        ...o,
+        stripeConnected: Boolean(
+          await clnIntegration.getStripeConnectedAccountIdForOperator(oid)
+        ),
+        billplzClientInvoice: Boolean(parseClientInvoiceBillplzFromSettings(settingsRaw)),
+        xenditClientInvoice: Boolean(parseClientInvoiceXenditFromSettings(settingsRaw))
+      };
+    })
+  );
+  return { items, operators: operatorsEnriched };
 }
 
-/**
- * B2B client portal — Stripe Checkout (payment) for one or more unpaid invoices for the same operator.
- * Funds go to the operator’s Stripe Connect account when configured.
- */
-async function createClientPortalInvoiceCheckoutSession({
-  clientdetailId,
-  operatorId,
-  invoiceIds,
-  email,
-  successUrl,
-  cancelUrl
-}) {
+async function assertB2bInvoiceCheckoutRows(clientdetailId, operatorId, invoiceIds) {
   const cid = String(clientdetailId || '').trim();
   const oid = String(operatorId || '').trim();
   const ids = [...new Set((invoiceIds || []).map((x) => String(x).trim()).filter(Boolean))];
   if (!cid || !oid || !ids.length) {
     return { ok: false, code: 'INVALID_PARAMS' };
   }
+  const hasPr = await databaseHasColumn('cln_client_invoice', 'payment_received');
+  const hasOpCol = await databaseHasColumn('cln_client_invoice', 'operator_id');
+  const prExpr = hasPr ? 'COALESCE(i.payment_received,0)' : '0';
+  const placeholders = ids.map(() => '?').join(',');
+  const access = await buildClientPortalInvoiceAccessWhere('i', cid);
+  let sql = `SELECT i.id,
+    COALESCE(i.amount, 0) AS amount,
+    COALESCE(i.invoice_number, '') AS invoice_number,
+    COALESCE(i.description, '') AS description,
+    COALESCE(NULLIF(TRIM(i.client_id), ''), '') AS invoice_client_id`;
+  sql += hasOpCol ? `, COALESCE(NULLIF(TRIM(i.operator_id), ''), '') AS operator_id` : `, '' AS operator_id`;
+  sql += `, ${prExpr} AS pr FROM cln_client_invoice i WHERE ${access.sql} AND i.id IN (${placeholders})`;
+  const [rows] = await pool.query(sql, [...access.params, ...ids]);
+  if (rows.length !== ids.length) {
+    return { ok: false, code: 'INVOICE_NOT_FOUND' };
+  }
+  const needClientLinkCheck = [];
+  for (const r of rows) {
+    if (Number(r.pr) === 1) {
+      return { ok: false, code: 'INVOICE_ALREADY_PAID' };
+    }
+    if (hasOpCol) {
+      const rowOp = String(r.operator_id || '').trim();
+      if (rowOp && rowOp !== oid) {
+        return { ok: false, code: 'OPERATOR_MISMATCH' };
+      }
+      if (!rowOp) {
+        const billCid = String(r.invoice_client_id || '').trim();
+        if (billCid) needClientLinkCheck.push(billCid);
+      }
+    }
+  }
+  if (hasOpCol && needClientLinkCheck.length) {
+    const uniq = [...new Set(needClientLinkCheck.map((x) => String(x).trim()).filter(Boolean))];
+    const ph = uniq.map(() => '?').join(',');
+    const [lnkRows] = await pool.query(
+      `SELECT clientdetail_id FROM cln_client_operator WHERE operator_id = ? AND clientdetail_id IN (${ph})`,
+      [oid, ...uniq]
+    );
+    const okSet = new Set((lnkRows || []).map((x) => String(x.clientdetail_id || '').trim()));
+    for (const id of uniq) {
+      if (!okSet.has(id)) {
+        return { ok: false, code: 'OPERATOR_MISMATCH' };
+      }
+    }
+  }
+  const totalMyr = rows.reduce((s, r) => s + Number(r.amount || 0), 0);
+  if (!(totalMyr > 0)) {
+    return { ok: false, code: 'INVALID_AMOUNT' };
+  }
+  return { ok: true, rows, totalMyr, cid, oid, ids };
+}
+
+async function ensureB2bInvoiceCheckoutTable() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS cln_b2b_invoice_checkout (
+    id CHAR(36) NOT NULL,
+    operator_id CHAR(36) NOT NULL,
+    clientdetail_id CHAR(36) NOT NULL,
+    invoice_ids TEXT NOT NULL,
+    amount DECIMAL(14,2) NOT NULL,
+    provider VARCHAR(16) NOT NULL,
+    billplz_bill_id VARCHAR(64) NULL,
+    xendit_invoice_id VARCHAR(128) NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'pending',
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    PRIMARY KEY (id),
+    KEY idx_cln_b2b_chk_op (operator_id),
+    KEY idx_cln_b2b_chk_bp (billplz_bill_id),
+    KEY idx_cln_b2b_chk_xi (xendit_invoice_id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+}
+
+/** Same rules as tenantdashboard.appendQueryParams — preserves Stripe `{CHECKOUT_SESSION_ID}` unencoded. */
+function appendClnB2bInvoiceUrlQueryParams(url, params) {
+  let next = String(url || '');
+  for (const [key, value] of Object.entries(params || {})) {
+    if (value == null || value === '') continue;
+    const rawValue = String(value);
+    const encodedValue = /^\{[A-Z0-9_]+\}$/.test(rawValue) ? rawValue : encodeURIComponent(rawValue);
+    next += (next.includes('?') ? '&' : '?') + `${encodeURIComponent(key)}=${encodedValue}`;
+  }
+  return next;
+}
+
+function getClnClientPortalInvoicesPageBaseUrl() {
+  const raw = (
+    process.env.CLEANLEMON_PORTAL_APP_BASE_URL ||
+    process.env.CLEANLEMON_PORTAL_AUTH_BASE_URL ||
+    process.env.PORTAL_APP_URL ||
+    'https://portal.cleanlemons.com'
+  )
+    .trim()
+    .replace(/\/$/, '');
+  return `${raw}/portal/client/invoices`;
+}
+
+async function readOperatorSettingsJsonRaw(operatorId) {
+  await ensureOperatorSettingsTable();
+  const oid = String(operatorId || '').trim();
+  if (!oid) return {};
+  const [rows] = await pool.query('SELECT settings_json FROM cln_operator_settings WHERE operator_id = ? LIMIT 1', [
+    oid,
+  ]);
+  if (!rows.length) return {};
+  try {
+    return JSON.parse(rows[0].settings_json) || {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Shallow-merge `patch` into stored settings_json (no integration-flag rewrite).
+ * Used for Xendit client-invoice credentials so saves do not depend on `upsertOperatorSettings` merge path.
+ */
+async function patchClnOperatorSettingsJson(operatorId, patch) {
+  await ensureOperatorSettingsTable();
+  const oid = String(operatorId || '').trim();
+  if (!oid) {
+    const e = new Error('MISSING_OPERATOR_ID');
+    e.code = 'MISSING_OPERATOR_ID';
+    throw e;
+  }
+  const p = patch && typeof patch === 'object' ? { ...patch } : {};
+  const prev = (await readOperatorSettingsJsonRaw(oid)) || {};
+  delete prev.publicSubdomain;
+  const next = { ...prev, ...p };
+  delete next.publicSubdomain;
+  const id = `setting-${oid}`;
+  await pool.query(
+    `INSERT INTO cln_operator_settings (id, operator_id, settings_json)
+     VALUES (?, ?, ?)
+     ON DUPLICATE KEY UPDATE settings_json = VALUES(settings_json), updated_at = CURRENT_TIMESTAMP`,
+    [id, oid, JSON.stringify(next)]
+  );
+}
+
+function parseClientInvoiceBillplzFromSettings(settings) {
+  const raw = settings && typeof settings === 'object' ? settings.clientInvoiceBillplz : undefined;
+  if (!raw || typeof raw !== 'object') return null;
+  const apiKey = String(raw.apiKey || '').trim();
+  const collectionId = String(raw.collectionId || '').trim();
+  const xSignatureKey = String(raw.xSignatureKey || '').trim();
+  if (!apiKey || !collectionId || !xSignatureKey) return null;
+  return {
+    apiKey,
+    collectionId,
+    xSignatureKey,
+    useSandbox: raw.useSandbox === true || String(raw.useSandbox || '').toLowerCase() === 'true',
+  };
+}
+
+function parseClientInvoiceXenditFromSettings(settings) {
+  const raw = settings && typeof settings === 'object' ? settings.clientInvoiceXendit : undefined;
+  if (!raw || typeof raw !== 'object') return null;
+  const secretKey = String(raw.secretKey || '').trim();
+  const callbackToken = String(raw.callbackToken || raw.webhookToken || '').trim();
+  if (!secretKey || !callbackToken) return null;
+  return { secretKey, callbackToken };
+}
+
+function buildClnClientInvoiceXenditGatewayUi(base, stripeOn) {
+  const raw = base?.clientInvoiceXendit;
+  const cfg = parseClientInvoiceXenditFromSettings(base);
+  const sk = raw && typeof raw === 'object' ? String(raw.secretKey || '').trim() : '';
+  const tok = raw && typeof raw === 'object' ? String(raw.callbackToken || raw.webhookToken || '').trim() : '';
+  const verified = !!(raw && typeof raw === 'object' && String(raw.callbackVerifiedAt || '').trim());
+  let connectionStatus = 'no_connect';
+  if (stripeOn) connectionStatus = 'no_connect';
+  else if (cfg) connectionStatus = verified ? 'connected' : 'pending_verification';
+  return {
+    connectionStatus,
+    hasSecretKey: !!sk,
+    hasWebhookToken: !!tok,
+    secretKeyLast4: sk.length >= 4 ? sk.slice(-4) : sk ? '****' : '',
+    webhookTokenLast4: tok.length >= 4 ? tok.slice(-4) : tok ? '****' : '',
+    lastWebhookAt: raw && typeof raw === 'object' ? String(raw.lastWebhookAt || '').trim() || null : null,
+    lastWebhookType: raw && typeof raw === 'object' ? String(raw.lastWebhookType || '').trim() || null : null,
+  };
+}
+
+async function markClnXenditWebhookVerified(operatorId, meta = {}) {
+  const oid = String(operatorId || '').trim();
+  const prev = (await readOperatorSettingsJsonRaw(oid)) || {};
+  const raw = prev.clientInvoiceXendit;
+  if (!raw || typeof raw !== 'object') return;
+  if (!parseClientInvoiceXenditFromSettings({ ...prev, clientInvoiceXendit: raw })) return;
+  const next = { ...raw };
+  next.callbackVerifiedAt = new Date().toISOString();
+  next.xendit_connection_status = 'connected';
+  if (meta.lastWebhookType) next.lastWebhookType = String(meta.lastWebhookType).slice(0, 120);
+  next.lastWebhookAt = new Date().toISOString();
+  await patchClnOperatorSettingsJson(oid, { clientInvoiceXendit: next, xendit: true });
+}
+
+async function saveClnOperatorClientInvoiceXenditCredentials(operatorId, payload = {}) {
+  const oid = String(operatorId || '').trim();
+  if (!oid) {
+    const e = new Error('MISSING_OPERATOR_ID');
+    e.code = 'MISSING_OPERATOR_ID';
+    throw e;
+  }
+  const p = payload && typeof payload === 'object' ? payload : {};
+  const prev = (await readOperatorSettingsJsonRaw(oid)) || {};
+  const prevX = prev.clientInvoiceXendit && typeof prev.clientInvoiceXendit === 'object' ? { ...prev.clientInvoiceXendit } : {};
+  const prevSk = String(prevX.secretKey || '').trim();
+  const prevTok = String(prevX.callbackToken || prevX.webhookToken || '').trim();
+  const hasSk = Object.prototype.hasOwnProperty.call(p, 'secretKey');
+  const hasTok = Object.prototype.hasOwnProperty.call(p, 'callbackToken');
+  const sk = hasSk ? String(p.secretKey ?? '').trim() || prevSk : prevSk;
+  const tok = hasTok ? String(p.callbackToken ?? '').trim() || prevTok : prevTok;
+  if (!sk || !tok) {
+    const e = new Error('MISSING_KEYS');
+    e.code = 'MISSING_KEYS';
+    throw e;
+  }
+  const merged = { ...prevX, secretKey: sk, callbackToken: tok };
+  await patchClnOperatorSettingsJson(oid, {
+    clientInvoiceXendit: merged,
+    xendit: true,
+  });
+  return { ok: true };
+}
+
+async function clearClnOperatorClientInvoiceXenditCredentials(operatorId) {
+  const oid = String(operatorId || '').trim();
+  if (!oid) {
+    const e = new Error('MISSING_OPERATOR_ID');
+    e.code = 'MISSING_OPERATOR_ID';
+    throw e;
+  }
+  const raw = (await readOperatorSettingsJsonRaw(oid)) || {};
+  const prev = { ...raw };
+  delete prev.publicSubdomain;
+  delete prev.clientInvoiceXendit;
+  prev.xendit = false;
+  const id = `setting-${oid}`;
+  await ensureOperatorSettingsTable();
+  await pool.query(
+    `INSERT INTO cln_operator_settings (id, operator_id, settings_json)
+     VALUES (?, ?, ?)
+     ON DUPLICATE KEY UPDATE settings_json = VALUES(settings_json), updated_at = CURRENT_TIMESTAMP`,
+    [id, oid, JSON.stringify(prev)]
+  );
+  return { ok: true };
+}
+
+async function createB2bInvoiceBillplzCheckoutSession(params) {
+  const { clientdetailId, operatorId, invoiceIds, email, successUrl, cancelUrl } = params;
+  const chk = await assertB2bInvoiceCheckoutRows(clientdetailId, operatorId, invoiceIds);
+  if (!chk.ok) return chk;
+  const { rows, totalMyr, cid, oid, ids } = chk;
+  const totalSen = Math.round(totalMyr * 100);
+  if (totalSen < 100) {
+    return { ok: false, code: 'AMOUNT_BELOW_MINIMUM' };
+  }
+  const settings = await readOperatorSettingsJsonRaw(oid);
+  const bp = parseClientInvoiceBillplzFromSettings(settings);
+  if (!bp) return { ok: false, code: 'BILLPLZ_NOT_CONFIGURED' };
+  await ensureB2bInvoiceCheckoutTable();
+  const { randomUUID } = require('crypto');
+  const checkoutId = randomUUID();
+  const apiBase = String(
+    process.env.CLEANLEMON_API_PUBLIC_URL || process.env.PUBLIC_APP_URL || process.env.API_BASE_URL || ''
+  )
+    .trim()
+    .replace(/\/$/, '');
+  if (!apiBase) return { ok: false, code: 'API_BASE_URL_MISSING' };
+  const callbackUrl = `${apiBase}/api/cleanlemon/client/invoices/billplz-callback?checkout_id=${encodeURIComponent(checkoutId)}`;
+  const desc = rows
+    .map((r) => String(r.invoice_number || r.id || '').trim())
+    .filter(Boolean)
+    .join(', ')
+    .slice(0, 200);
+  const { createBill } = require('../billplz/wrappers/bill.wrapper');
+  await pool.query(
+    `INSERT INTO cln_b2b_invoice_checkout (id, operator_id, clientdetail_id, invoice_ids, amount, provider, status)
+     VALUES (?, ?, ?, ?, ?, 'billplz', 'pending')`,
+    [checkoutId, oid, cid, ids.join(','), Number(totalMyr.toFixed(2))]
+  );
+  const billRes = await createBill({
+    apiKey: bp.apiKey,
+    collectionId: bp.collectionId,
+    email: String(email || '').trim().toLowerCase(),
+    mobile: '',
+    name: String(email || 'Client').trim().slice(0, 255),
+    amount: totalSen,
+    callbackUrl,
+    redirectUrl: String(successUrl || '').trim(),
+    description: desc || 'Cleaning invoices',
+    reference1Label: 'Checkout',
+    reference1: checkoutId.slice(0, 120),
+    reference2Label: 'Type',
+    reference2: 'cleanlemon_b2b_invoice',
+    useSandbox: bp.useSandbox === true,
+  });
+  if (!billRes?.ok) {
+    await pool.query('DELETE FROM cln_b2b_invoice_checkout WHERE id = ? LIMIT 1', [checkoutId]).catch(() => {});
+    return { ok: false, code: 'BILLPLZ_CREATE_FAILED' };
+  }
+  const bill = billRes.data || {};
+  const billId = bill.id != null ? String(bill.id).trim() : '';
+  const billUrl = bill.url != null ? String(bill.url).trim() : '';
+  if (!billId || !billUrl) {
+    await pool.query('DELETE FROM cln_b2b_invoice_checkout WHERE id = ? LIMIT 1', [checkoutId]).catch(() => {});
+    return { ok: false, code: 'BILLPLZ_NO_URL' };
+  }
+  await pool.query('UPDATE cln_b2b_invoice_checkout SET billplz_bill_id = ? WHERE id = ? LIMIT 1', [billId, checkoutId]);
+  return { ok: true, url: billUrl, sessionId: billId, provider: 'billplz' };
+}
+
+async function createB2bInvoiceXenditCheckoutSession(params) {
+  const axios = require('axios');
+  const { clientdetailId, operatorId, invoiceIds, email, successUrl, cancelUrl } = params;
+  const chk = await assertB2bInvoiceCheckoutRows(clientdetailId, operatorId, invoiceIds);
+  if (!chk.ok) return chk;
+  const { rows, totalMyr, cid, oid, ids } = chk;
+  const totalSen = Math.round(totalMyr * 100);
+  if (totalSen < 100) {
+    return { ok: false, code: 'AMOUNT_BELOW_MINIMUM' };
+  }
+  const settings = await readOperatorSettingsJsonRaw(oid);
+  const xcfg = parseClientInvoiceXenditFromSettings(settings);
+  if (!xcfg) return { ok: false, code: 'XENDIT_NOT_CONFIGURED' };
+  await ensureB2bInvoiceCheckoutTable();
+  const { randomUUID } = require('crypto');
+  const checkoutId = randomUUID();
+  const externalId = `cln-b2b-${checkoutId}`;
+  const auth = Buffer.from(`${xcfg.secretKey}:`).toString('base64');
+  const desc = rows
+    .map((r) => String(r.invoice_number || r.id || '').trim())
+    .filter(Boolean)
+    .join(', ')
+    .slice(0, 200);
+  await pool.query(
+    `INSERT INTO cln_b2b_invoice_checkout (id, operator_id, clientdetail_id, invoice_ids, amount, provider, xendit_invoice_id, status)
+     VALUES (?, ?, ?, ?, ?, 'xendit', NULL, 'pending')`,
+    [checkoutId, oid, cid, ids.join(','), Number(totalMyr.toFixed(2))]
+  );
+  const rawSuccess = String(successUrl || '').trim();
+  const rawFail = String(cancelUrl || successUrl || '').trim();
+  const success_redirect_url = appendClnB2bInvoiceUrlQueryParams(rawSuccess, {
+    success: '1',
+    provider: 'xendit',
+    payment_type: 'cln_client_invoice',
+    checkout_id: checkoutId,
+  });
+  const failure_redirect_url = appendClnB2bInvoiceUrlQueryParams(rawFail, { cancel: '1' });
+  const body = {
+    external_id: externalId,
+    amount: Number(totalMyr.toFixed(2)),
+    currency: 'MYR',
+    payer_email: String(email || '').trim().toLowerCase().slice(0, 255),
+    description: desc || 'Cleaning invoices',
+    invoice_duration: 86400,
+    success_redirect_url,
+    failure_redirect_url,
+    metadata: {
+      type: 'cleanlemon_b2b_invoice',
+      checkout_id: checkoutId,
+      operator_id: oid,
+      clientdetail_id: cid,
+      invoice_ids: ids.join(',').slice(0, 500),
+    },
+  };
+  let inv;
+  try {
+    const res = await axios.post('https://api.xendit.co/v2/invoices', body, {
+      headers: {
+        Authorization: `Basic ${auth}`,
+        'Content-Type': 'application/json',
+      },
+      timeout: 25000,
+    });
+    inv = res.data;
+  } catch (e) {
+    await pool.query('DELETE FROM cln_b2b_invoice_checkout WHERE id = ? LIMIT 1', [checkoutId]).catch(() => {});
+    return { ok: false, code: 'XENDIT_CREATE_FAILED', message: String(e?.response?.data || e?.message || e) };
+  }
+  const invId = inv?.id != null ? String(inv.id).trim() : '';
+  const invUrl = inv?.invoice_url != null ? String(inv.invoice_url).trim() : '';
+  if (!invId || !invUrl) {
+    await pool.query('DELETE FROM cln_b2b_invoice_checkout WHERE id = ? LIMIT 1', [checkoutId]).catch(() => {});
+    return { ok: false, code: 'XENDIT_NO_URL' };
+  }
+  await pool.query('UPDATE cln_b2b_invoice_checkout SET xendit_invoice_id = ? WHERE id = ? LIMIT 1', [
+    invId,
+    checkoutId,
+  ]);
+  return { ok: true, url: invUrl, sessionId: invId, provider: 'xendit' };
+}
+
+async function handleB2bInvoiceBillplzCallback(checkoutId, payload) {
+  const cid0 = String(checkoutId || '').trim();
+  if (!cid0) return { ok: false, reason: 'MISSING_CHECKOUT_ID' };
+  await ensureB2bInvoiceCheckoutTable();
+  const [[row]] = await pool.query(
+    'SELECT * FROM cln_b2b_invoice_checkout WHERE id = ? AND provider = ? LIMIT 1',
+    [cid0, 'billplz']
+  );
+  if (!row) return { ok: false, reason: 'CHECKOUT_NOT_FOUND' };
+  if (String(row.status || '') === 'paid') return { ok: true, idempotent: true };
+  const oid = String(row.operator_id || '').trim();
+  const settings = await readOperatorSettingsJsonRaw(oid);
+  const bp = parseClientInvoiceBillplzFromSettings(settings);
+  if (!bp) return { ok: false, reason: 'BILLPLZ_NOT_CONFIGURED' };
+  const { verifyBillplzXSignature } = require('../billplz/lib/signature');
+  const sig = payload?.x_signature || payload?.xSignature;
+  if (!verifyBillplzXSignature(payload, bp.xSignatureKey, sig)) {
+    return { ok: false, reason: 'BILLPLZ_SIGNATURE_INVALID' };
+  }
+  const paid =
+    payload?.paid === true ||
+    payload?.paid === 'true' ||
+    payload?.paid === 1 ||
+    String(payload?.state || '').toLowerCase() === 'paid';
+  if (!paid) return { ok: false, reason: 'NOT_PAID' };
+  const ref1 = String(payload?.reference_1 || payload?.reference1 || '').trim();
+  if (ref1 && ref1 !== cid0) {
+    return { ok: false, reason: 'REFERENCE_MISMATCH' };
+  }
+  const billId = String(payload?.id || '').trim();
+  if (row.billplz_bill_id && billId && row.billplz_bill_id !== billId) {
+    return { ok: false, reason: 'BILL_ID_MISMATCH' };
+  }
+  const amountCents = Math.round(Number(payload?.amount || 0));
+  const expectedSen = Math.round(Number(row.amount) * 100);
+  if (!Number.isFinite(amountCents) || Math.abs(amountCents - expectedSen) > 2) {
+    return { ok: false, reason: 'AMOUNT_MISMATCH' };
+  }
+  const ids = String(row.invoice_ids || '')
+    .split(',')
+    .map((x) => String(x).trim())
+    .filter(Boolean);
+  const txn = `billplz:${billId || cid0}`;
+  const mrk = await markB2bClientInvoicesPaidFromGateway({
+    clientdetailId: row.clientdetail_id,
+    operatorId: oid,
+    invoiceIds: ids,
+    transactionId: txn,
+    amountMyr: Number(row.amount),
+  });
+  if (!mrk.ok) return mrk;
+  await pool.query(`UPDATE cln_b2b_invoice_checkout SET status = 'paid' WHERE id = ? LIMIT 1`, [cid0]);
+  return { ok: true };
+}
+
+async function handleB2bInvoiceXenditWebhook(opts = {}) {
+  const headers = opts.headers || {};
+  const body = opts.body || {};
+  const query = opts.query || {};
+  const oidFromQuery = String(query.operator_id || query.operatorId || '').trim();
+  const token = String(headers?.['x-callback-token'] || headers?.['X-Callback-Token'] || '').trim();
+  const ext = String(body?.external_id || body?.externalId || '').trim();
+  const uuidRe =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+  /** Xendit Dashboard test / invoice callbacks: `?operator_id=` + valid token marks gateway verified. */
+  if (oidFromQuery && uuidRe.test(oidFromQuery)) {
+    const settingsQ = await readOperatorSettingsJsonRaw(oidFromQuery);
+    const xcfgQ = parseClientInvoiceXenditFromSettings(settingsQ);
+    if (!xcfgQ) return { ok: false, reason: 'XENDIT_NOT_CONFIGURED' };
+    if (!token || token !== xcfgQ.callbackToken) {
+      return { ok: false, reason: 'XENDIT_CALLBACK_TOKEN_INVALID' };
+    }
+    if (!ext.startsWith('cln-b2b-')) {
+      const evt = String(body?.status || body?.event || body?.type || 'callback').slice(0, 120);
+      await markClnXenditWebhookVerified(oidFromQuery, { lastWebhookType: evt });
+      return { ok: true, verified: true };
+    }
+  }
+
+  await ensureB2bInvoiceCheckoutTable();
+  if (!ext.startsWith('cln-b2b-')) return { ok: false, reason: 'WRONG_EXTERNAL' };
+  const checkoutId = ext.replace(/^cln-b2b-/, '').trim();
+  if (!checkoutId) return { ok: false, reason: 'MISSING_CHECKOUT' };
+  const [[row]] = await pool.query(
+    'SELECT * FROM cln_b2b_invoice_checkout WHERE id = ? AND provider = ? LIMIT 1',
+    [checkoutId, 'xendit']
+  );
+  if (!row) return { ok: false, reason: 'CHECKOUT_NOT_FOUND' };
+  if (String(row.status || '') === 'paid') return { ok: true, idempotent: true };
+  const oid = String(row.operator_id || '').trim();
+  const settings = await readOperatorSettingsJsonRaw(oid);
+  const xcfg = parseClientInvoiceXenditFromSettings(settings);
+  if (!xcfg) return { ok: false, reason: 'XENDIT_NOT_CONFIGURED' };
+  if (!token || token !== xcfg.callbackToken) {
+    return { ok: false, reason: 'XENDIT_CALLBACK_TOKEN_INVALID' };
+  }
+  if (oidFromQuery && uuidRe.test(oidFromQuery) && oidFromQuery !== oid) {
+    return { ok: false, reason: 'OPERATOR_MISMATCH' };
+  }
+  const st = String(body?.status || '').toUpperCase();
+  if (st !== 'PAID' && st !== 'SETTLED') {
+    return { ok: false, reason: 'NOT_PAID' };
+  }
+  const paidAmount = Number(body?.amount || body?.paid_amount || row.amount);
+  if (!Number.isFinite(paidAmount) || Math.abs(paidAmount - Number(row.amount)) > 0.02) {
+    return { ok: false, reason: 'AMOUNT_MISMATCH' };
+  }
+  const ids = String(row.invoice_ids || '')
+    .split(',')
+    .map((x) => String(x).trim())
+    .filter(Boolean);
+  const invId = String(body?.id || row.xendit_invoice_id || '').trim();
+  const txn = `xendit:${invId}`;
+  const mrk = await markB2bClientInvoicesPaidFromGateway({
+    clientdetailId: row.clientdetail_id,
+    operatorId: oid,
+    invoiceIds: ids,
+    transactionId: txn,
+    amountMyr: Number(row.amount),
+  });
+  if (!mrk.ok) return mrk;
+  await pool.query(`UPDATE cln_b2b_invoice_checkout SET status = 'paid' WHERE id = ? LIMIT 1`, [checkoutId]);
+  await markClnXenditWebhookVerified(oid, { lastWebhookType: 'invoice_paid' });
+  return { ok: true };
+}
+
+/**
+ * B2B client portal — Stripe Checkout (payment) for one or more unpaid invoices for the same operator.
+ * Funds go to the operator’s Stripe Connect account when configured.
+ */
+async function createClientPortalInvoiceCheckoutSession(params = {}) {
+  const paymentProvider = String(params.paymentProvider || params.provider || 'stripe')
+    .trim()
+    .toLowerCase();
+  if (paymentProvider === 'billplz') {
+    return createB2bInvoiceBillplzCheckoutSession(params);
+  }
+  if (paymentProvider === 'xendit') {
+    return createB2bInvoiceXenditCheckoutSession(params);
+  }
+
+  const { clientdetailId, operatorId, invoiceIds, email, successUrl, cancelUrl } = params;
+  const chk = await assertB2bInvoiceCheckoutRows(clientdetailId, operatorId, invoiceIds);
+  if (!chk.ok) return chk;
+  const { rows, totalMyr, oid } = chk;
+
   const destination = await clnIntegration.getStripeConnectedAccountIdForOperator(oid);
   if (!destination) {
     return { ok: false, code: 'STRIPE_CONNECT_REQUIRED' };
   }
 
-  const hasPr = await databaseHasColumn('cln_client_invoice', 'payment_received');
-  const hasOpCol = await databaseHasColumn('cln_client_invoice', 'operator_id');
-  const prExpr = hasPr ? 'COALESCE(i.payment_received,0)' : '0';
-  const placeholders = ids.map(() => '?').join(',');
-  let sql = `SELECT i.id,
-    COALESCE(i.amount, 0) AS amount,
-    COALESCE(i.invoice_number, '') AS invoice_number,
-    COALESCE(i.description, '') AS description`;
-  sql += hasOpCol ? `, COALESCE(NULLIF(TRIM(i.operator_id), ''), '') AS operator_id` : `, '' AS operator_id`;
-  sql += `, ${prExpr} AS pr FROM cln_client_invoice i WHERE i.client_id = ? AND i.id IN (${placeholders})`;
-  const [rows] = await pool.query(sql, [cid, ...ids]);
-  if (rows.length !== ids.length) {
-    return { ok: false, code: 'INVOICE_NOT_FOUND' };
-  }
-  for (const r of rows) {
-    if (Number(r.pr) === 1) {
-      return { ok: false, code: 'INVOICE_ALREADY_PAID' };
-    }
-    if (hasOpCol && String(r.operator_id || '') !== oid) {
-      return { ok: false, code: 'OPERATOR_MISMATCH' };
-    }
-  }
-
-  const totalMyr = rows.reduce((s, r) => s + Number(r.amount || 0), 0);
-  if (!(totalMyr > 0)) {
-    return { ok: false, code: 'INVALID_AMOUNT' };
-  }
   const totalSen = Math.round(totalMyr * 100);
   if (totalSen < 200) {
     return { ok: false, code: 'AMOUNT_BELOW_STRIPE_MINIMUM' };
@@ -6730,6 +9082,8 @@ async function createClientPortalInvoiceCheckoutSession({
   }
   const stripe = new Stripe(key, { apiVersion: '2024-11-20.acacia' });
 
+  const cid = chk.cid;
+  const ids = chk.ids;
   const invLabels = rows
     .map((r) => String(r.invoice_number || r.id || '').trim())
     .filter(Boolean)
@@ -6773,11 +9127,801 @@ async function createClientPortalInvoiceCheckoutSession({
       }
     }
   });
-  return { ok: true, url: session.url, sessionId: session.id };
+  return { ok: true, url: session.url, sessionId: session.id, provider: 'stripe' };
+}
+
+/** Auto pick gateway (same priority as client invoices UI): Stripe ≥ RM2, else Billplz / Xendit ≥ RM1. */
+async function resolveClnB2bInvoiceAutoPaymentProvider(operatorId, totalMyr) {
+  const oid = String(operatorId || '').trim();
+  const totalSen = Math.round(Number(totalMyr) * 100);
+  if (!(totalSen > 0)) return null;
+  const destination = await clnIntegration.getStripeConnectedAccountIdForOperator(oid);
+  if (destination && totalSen >= 200) return 'stripe';
+  const settings = await readOperatorSettingsJsonRaw(oid);
+  if (parseClientInvoiceBillplzFromSettings(settings) && totalSen >= 100) return 'billplz';
+  if (parseClientInvoiceXenditFromSettings(settings) && totalSen >= 100) return 'xendit';
+  return null;
+}
+
+/**
+ * Coliving-style `create-payment`: builds return URLs with `provider` / `session_id` / etc., then starts checkout.
+ * Body should pass `returnUrl` / `cancelUrl` like tenant meter (e.g. `?success=1` / `?cancel=1`); defaults to portal client invoices page.
+ */
+async function createClientPortalInvoicePayment(params = {}) {
+  const {
+    clientdetailId,
+    operatorId,
+    invoiceIds,
+    email,
+    returnUrl,
+    cancelUrl,
+    paymentProvider: forcedRaw,
+  } = params;
+  const chk = await assertB2bInvoiceCheckoutRows(clientdetailId, operatorId, invoiceIds);
+  if (!chk.ok) return chk;
+  const { totalMyr, oid } = chk;
+  const forced = String(forcedRaw || '').trim().toLowerCase();
+  const provider =
+    forced && ['stripe', 'billplz', 'xendit'].includes(forced)
+      ? forced
+      : await resolveClnB2bInvoiceAutoPaymentProvider(oid, totalMyr);
+  if (!provider) {
+    return { ok: false, code: 'NO_ONLINE_PAYMENT' };
+  }
+  const pageBase = getClnClientPortalInvoicesPageBaseUrl();
+  const successBase = String(returnUrl || '').trim() || `${pageBase}?success=1`;
+  const cancelBase = String(cancelUrl || '').trim() || `${pageBase}?cancel=1`;
+
+  let successUrl = successBase;
+  if (provider === 'stripe') {
+    successUrl = appendClnB2bInvoiceUrlQueryParams(successBase, {
+      provider: 'stripe',
+      payment_type: 'cln_client_invoice',
+      session_id: '{CHECKOUT_SESSION_ID}',
+    });
+  } else if (provider === 'billplz') {
+    successUrl = appendClnB2bInvoiceUrlQueryParams(successBase, {
+      provider: 'billplz',
+      payment_type: 'cln_client_invoice',
+      operator_id: oid,
+    });
+  } else if (provider === 'xendit') {
+    successUrl = successBase;
+  }
+
+  const out = await createClientPortalInvoiceCheckoutSession({
+    clientdetailId,
+    operatorId,
+    invoiceIds,
+    email,
+    successUrl,
+    cancelUrl: cancelBase,
+    paymentProvider: provider,
+  });
+  if (!out.ok) return out;
+  return { ok: true, type: 'redirect', url: out.url, sessionId: out.sessionId, provider: out.provider || provider };
+}
+
+async function confirmClnB2bClientInvoiceBillplzFromBrowser({ clientdetailId, billId }) {
+  const cid = String(clientdetailId || '').trim();
+  const bid = String(billId || '').trim();
+  if (!cid || !bid) return { ok: false, reason: 'MISSING_PARAMS' };
+  await ensureB2bInvoiceCheckoutTable();
+  const [[row]] = await pool.query(
+    'SELECT * FROM cln_b2b_invoice_checkout WHERE billplz_bill_id = ? AND provider = ? AND clientdetail_id = ? LIMIT 1',
+    [bid, 'billplz', cid]
+  );
+  if (!row) return { ok: false, reason: 'CHECKOUT_NOT_FOUND' };
+  if (String(row.status || '') === 'paid') return { ok: true, idempotent: true };
+  const oid = String(row.operator_id || '').trim();
+  const settings = await readOperatorSettingsJsonRaw(oid);
+  const bp = parseClientInvoiceBillplzFromSettings(settings);
+  if (!bp) return { ok: false, reason: 'BILLPLZ_NOT_CONFIGURED' };
+  const { getBill } = require('../billplz/wrappers/bill.wrapper');
+  const billRes = await getBill({ apiKey: bp.apiKey, billId: bid, useSandbox: bp.useSandbox === true });
+  if (!billRes?.ok) return { ok: false, reason: 'BILL_NOT_FOUND' };
+  const bill = billRes.data || {};
+  const paid =
+    bill?.paid === true ||
+    bill?.paid === 'true' ||
+    bill?.paid === 1 ||
+    String(bill?.state || '').toLowerCase() === 'paid';
+  if (!paid) return { ok: false, reason: 'PAYMENT_NOT_PAID' };
+  const amountCents = Math.round(Number(bill?.amount || 0));
+  const expectedSen = Math.round(Number(row.amount) * 100);
+  if (!Number.isFinite(amountCents) || Math.abs(amountCents - expectedSen) > 2) {
+    return { ok: false, reason: 'AMOUNT_MISMATCH' };
+  }
+  const ids = String(row.invoice_ids || '')
+    .split(',')
+    .map((x) => String(x).trim())
+    .filter(Boolean);
+  const txn = `billplz:${bid}`;
+  const mrk = await markB2bClientInvoicesPaidFromGateway({
+    clientdetailId: row.clientdetail_id,
+    operatorId: oid,
+    invoiceIds: ids,
+    transactionId: txn,
+    amountMyr: Number(row.amount),
+  });
+  if (!mrk.ok) return mrk;
+  await pool.query(`UPDATE cln_b2b_invoice_checkout SET status = 'paid' WHERE id = ? LIMIT 1`, [row.id]);
+  return { ok: true };
+}
+
+async function confirmClnB2bClientInvoiceXenditFromBrowser({ clientdetailId, checkoutId }) {
+  const cid = String(clientdetailId || '').trim();
+  const chkId = String(checkoutId || '').trim();
+  if (!cid || !chkId) return { ok: false, reason: 'MISSING_PARAMS' };
+  await ensureB2bInvoiceCheckoutTable();
+  const [[row]] = await pool.query(
+    'SELECT * FROM cln_b2b_invoice_checkout WHERE id = ? AND provider = ? AND clientdetail_id = ? LIMIT 1',
+    [chkId, 'xendit', cid]
+  );
+  if (!row) return { ok: false, reason: 'CHECKOUT_NOT_FOUND' };
+  if (String(row.status || '') === 'paid') return { ok: true, idempotent: true };
+  const oid = String(row.operator_id || '').trim();
+  const settings = await readOperatorSettingsJsonRaw(oid);
+  const xcfg = parseClientInvoiceXenditFromSettings(settings);
+  if (!xcfg) return { ok: false, reason: 'XENDIT_NOT_CONFIGURED' };
+  const invId = String(row.xendit_invoice_id || '').trim();
+  if (!invId) return { ok: false, reason: 'MISSING_XENDIT_INVOICE' };
+  const axios = require('axios');
+  const auth = Buffer.from(`${xcfg.secretKey}:`).toString('base64');
+  let inv;
+  try {
+    const res = await axios.get(`https://api.xendit.co/v2/invoices/${encodeURIComponent(invId)}`, {
+      headers: { Authorization: `Basic ${auth}` },
+      timeout: 20000,
+    });
+    inv = res.data;
+  } catch (e) {
+    return { ok: false, reason: 'XENDIT_FETCH_FAILED' };
+  }
+  const st = String(inv?.status || '').toUpperCase();
+  if (st !== 'PAID' && st !== 'SETTLED') {
+    return { ok: false, reason: 'PAYMENT_NOT_PAID' };
+  }
+  const paidAmount = Number(inv?.amount || row.amount);
+  if (!Number.isFinite(paidAmount) || Math.abs(paidAmount - Number(row.amount)) > 0.02) {
+    return { ok: false, reason: 'AMOUNT_MISMATCH' };
+  }
+  const ids = String(row.invoice_ids || '')
+    .split(',')
+    .map((x) => String(x).trim())
+    .filter(Boolean);
+  const txn = `xendit:${invId}`;
+  const mrk = await markB2bClientInvoicesPaidFromGateway({
+    clientdetailId: row.clientdetail_id,
+    operatorId: oid,
+    invoiceIds: ids,
+    transactionId: txn,
+    amountMyr: Number(row.amount),
+  });
+  if (!mrk.ok) return mrk;
+  await pool.query(`UPDATE cln_b2b_invoice_checkout SET status = 'paid' WHERE id = ? LIMIT 1`, [chkId]);
+  return { ok: true };
+}
+
+/**
+ * Coliving-style `confirm-payment` after redirect (Stripe session_id, Billplz bill_id, or Xendit checkout_id).
+ */
+async function confirmClientPortalInvoicePayment(params = {}) {
+  const {
+    clientdetailId,
+    provider: providerRaw,
+    sessionId,
+    billId,
+    checkoutId,
+  } = params;
+  const cid = String(clientdetailId || '').trim();
+  if (!cid) return { ok: false, reason: 'MISSING_CLIENTDETAIL' };
+  const provider = String(providerRaw || (sessionId ? 'stripe' : billId ? 'billplz' : checkoutId ? 'xendit' : ''))
+    .trim()
+    .toLowerCase();
+  if (!provider) return { ok: false, reason: 'MISSING_PROVIDER' };
+  if (provider === 'stripe') {
+    const sid = String(sessionId || '').trim();
+    if (!sid) return { ok: false, reason: 'MISSING_SESSION_ID' };
+    const Stripe = require('stripe');
+    const key = String(process.env.CLEANLEMON_STRIPE_SECRET_KEY || process.env.STRIPE_SECRET_KEY || '').trim();
+    if (!key) return { ok: false, reason: 'STRIPE_KEY_MISSING' };
+    const stripe = new Stripe(key, { apiVersion: '2024-11-20.acacia' });
+    const session = await stripe.checkout.sessions.retrieve(sid);
+    const meta = session.metadata || {};
+    if (String(meta.type || '').trim() !== 'cleanlemon_client_invoices') {
+      return { ok: false, reason: 'WRONG_TYPE' };
+    }
+    const metaCid = String(meta.clientdetail_id || '').trim();
+    if (metaCid && metaCid !== cid) return { ok: false, reason: 'CLIENT_MISMATCH' };
+    return applyCleanlemonClientInvoicesFromCheckoutSession(session);
+  }
+  if (provider === 'billplz') {
+    const bid = String(billId || '').trim();
+    if (!bid) return { ok: false, reason: 'MISSING_BILL_ID' };
+    return confirmClnB2bClientInvoiceBillplzFromBrowser({ clientdetailId: cid, billId: bid });
+  }
+  if (provider === 'xendit') {
+    const xid = String(checkoutId || '').trim();
+    if (!xid) return { ok: false, reason: 'MISSING_CHECKOUT_ID' };
+    return confirmClnB2bClientInvoiceXenditFromBrowser({ clientdetailId: cid, checkoutId: xid });
+  }
+  return { ok: false, reason: 'UNSUPPORTED_PROVIDER' };
+}
+
+/**
+ * Mark B2B client portal invoices paid after any gateway (Stripe / Billplz / Xendit). Idempotent by transactionId.
+ */
+async function markB2bClientInvoicesPaidFromGateway({
+  clientdetailId,
+  operatorId,
+  invoiceIds,
+  transactionId,
+  amountMyr
+}) {
+  const cid = String(clientdetailId || '').trim();
+  const oid = String(operatorId || '').trim();
+  const ids = [...new Set((invoiceIds || []).map((x) => String(x).trim()).filter(Boolean))];
+  const sessionTxnId = String(transactionId || '').trim();
+  if (!cid || !oid || !ids.length || !sessionTxnId) return { ok: false, reason: 'MISSING_PARAMS' };
+
+  const [[payTableRow]] = await pool.query(
+    `SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'cln_client_payment'`
+  );
+  const hasClientPaymentTable = Number(payTableRow?.n || 0) > 0;
+  const hasPr = await databaseHasColumn('cln_client_invoice', 'payment_received');
+  const hasOpCol = await databaseHasColumn('cln_client_invoice', 'operator_id');
+  const hasPayOpCol = hasClientPaymentTable && (await databaseHasColumn('cln_client_payment', 'operator_id'));
+  if (!hasClientPaymentTable || !hasPr) return { ok: false, reason: 'SCHEMA_MISSING' };
+
+  const [[dup]] = await pool.query('SELECT id FROM cln_client_payment WHERE transaction_id = ? LIMIT 1', [
+    sessionTxnId,
+  ]);
+  if (dup?.id) return { ok: true, idempotent: true };
+
+  const access = await buildClientPortalInvoiceAccessWhere('i', cid);
+  const ph = ids.map(() => '?').join(',');
+  const prCol = hasPr ? 'COALESCE(i.payment_received, 0)' : '0';
+  const opExpr = hasOpCol ? "COALESCE(NULLIF(TRIM(i.operator_id), ''), '')" : "''";
+  const [rows] = await pool.query(
+    `SELECT i.id, i.client_id, COALESCE(i.amount, 0) AS amount, ${prCol} AS pr, ${opExpr} AS row_op
+     FROM cln_client_invoice i WHERE ${access.sql} AND i.id IN (${ph})`,
+    [...access.params, ...ids]
+  );
+  if (rows.length !== ids.length) return { ok: false, reason: 'INVOICE_ACCESS' };
+
+  const toMark = [];
+  let sum = 0;
+  for (const r of rows) {
+    if (Number(r.pr) === 1) continue;
+    if (hasOpCol) {
+      const ro = String(r.row_op || '').trim();
+      if (ro && ro !== oid) return { ok: false, reason: 'OPERATOR_MISMATCH' };
+    }
+    sum += Number(r.amount) || 0;
+    toMark.push(r);
+  }
+  if (!toMark.length) return { ok: true, alreadyPaid: true };
+
+  const receivedMyr = Number(amountMyr);
+  if (!Number.isFinite(receivedMyr) || Math.abs(sum - receivedMyr) > 0.02) {
+    return { ok: false, reason: 'AMOUNT_MISMATCH', expected: sum, received: receivedMyr };
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const { randomUUID } = require('crypto');
+    const today = new Date().toISOString().slice(0, 10);
+    for (const r of toMark) {
+      const pid = randomUUID();
+      if (hasPayOpCol) {
+        await conn.query(
+          `INSERT INTO cln_client_payment (id, client_id, operator_id, receipt_number, amount, payment_date, receipt_url, transaction_id, invoice_id, created_at, updated_at)
+           VALUES (?, ?, ?, '', ?, ?, NULL, ?, ?, NOW(3), NOW(3))`,
+          [pid, r.client_id, oid, Number(r.amount), today, sessionTxnId, r.id]
+        );
+      } else {
+        await conn.query(
+          `INSERT INTO cln_client_payment (id, client_id, receipt_number, amount, payment_date, receipt_url, transaction_id, invoice_id, created_at, updated_at)
+           VALUES (?, ?, '', ?, ?, NULL, ?, ?, NOW(3), NOW(3))`,
+          [pid, r.client_id, Number(r.amount), today, sessionTxnId, r.id]
+        );
+      }
+      await conn.query('UPDATE cln_client_invoice SET payment_received = 1, updated_at = NOW(3) WHERE id = ?', [r.id]);
+    }
+    await conn.commit();
+
+    const cryptoMod = require('crypto');
+    async function insertGatewayPaymentRowForInvoice(r) {
+      const pid = cryptoMod.randomUUID();
+      if (hasPayOpCol) {
+        await pool.query(
+          `INSERT INTO cln_client_payment (id, client_id, operator_id, receipt_number, amount, payment_date, receipt_url, transaction_id, invoice_id, created_at, updated_at)
+           VALUES (?, ?, ?, '', ?, ?, NULL, ?, ?, NOW(3), NOW(3))`,
+          [pid, r.client_id, oid, Number(r.amount), today, sessionTxnId, r.id]
+        );
+      } else {
+        await pool.query(
+          `INSERT INTO cln_client_payment (id, client_id, receipt_number, amount, payment_date, receipt_url, transaction_id, invoice_id, created_at, updated_at)
+           VALUES (?, ?, '', ?, ?, NULL, ?, ?, NOW(3), NOW(3))`,
+          [pid, r.client_id, Number(r.amount), today, sessionTxnId, r.id]
+        );
+      }
+    }
+
+    /** Post receipt to Bukku/Xero (same as operator “Mark as paid”); gateway row is replaced by provider payment row on success. */
+    const accountingSyncFailed = [];
+    for (const r of toMark) {
+      const pr = await clnOpInvAccounting.markPaidAccountingForOperator(oid, r.id, {
+        paymentMethod: 'bank',
+        paymentDate: today,
+      });
+      if (!pr.ok && !pr.skipped) {
+        accountingSyncFailed.push({ invoiceId: r.id, reason: String(pr.reason || 'FAILED') });
+        try {
+          const [[cnt]] = await pool.query(
+            'SELECT COUNT(*) AS n FROM cln_client_payment WHERE invoice_id = ? LIMIT 1',
+            [r.id]
+          );
+          if (Number(cnt?.n || 0) === 0) {
+            await insertGatewayPaymentRowForInvoice(r);
+          }
+        } catch (re) {
+          console.error('[cleanlemon] markB2b: accounting failed and could not restore gateway payment row', r.id, re?.message || re);
+        }
+      }
+    }
+
+    return {
+      ok: true,
+      marked: toMark.length,
+      ...(accountingSyncFailed.length ? { accountingSyncFailed } : {}),
+    };
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+}
+
+/**
+ * Stripe Checkout webhook — mark B2B client invoices paid and insert `cln_client_payment` rows (idempotent by session id).
+ * @param {import('stripe').Stripe.Checkout.Session} session
+ */
+async function applyCleanlemonClientInvoicesFromCheckoutSession(session) {
+  const meta = session.metadata || {};
+  if (String(meta.type || '').trim() !== 'cleanlemon_client_invoices') {
+    return { ok: false, reason: 'WRONG_TYPE' };
+  }
+  if (String(session.payment_status || '').toLowerCase() !== 'paid') {
+    return { ok: false, reason: 'NOT_PAID' };
+  }
+  const oid = String(meta.operator_id || '').trim();
+  const cid = String(meta.clientdetail_id || '').trim();
+  const idsStr = String(meta.invoice_ids || '').trim();
+  const ids = [...new Set(idsStr.split(',').map((x) => String(x).trim()).filter(Boolean))];
+  if (!oid || !cid || !ids.length) return { ok: false, reason: 'MISSING_META' };
+
+  const sessionTxnId = `stripe:${String(session.id)}`;
+  const receivedMyr = (typeof session.amount_total === 'number' ? session.amount_total : 0) / 100;
+  return markB2bClientInvoicesPaidFromGateway({
+    clientdetailId: cid,
+    operatorId: oid,
+    invoiceIds: ids,
+    transactionId: sessionTxnId,
+    amountMyr: receivedMyr,
+  });
+}
+
+/**
+ * Client portal — attach proof-of-payment URL to latest `cln_client_payment` per invoice (same access as invoice list).
+ * When the client pays by bank transfer first, there may be no payment row yet — insert one with receipt only (invoice stays unpaid).
+ */
+async function attachClientPortalInvoiceReceipt({ clientdetailId, invoiceIds, receiptUrl }) {
+  const cid = String(clientdetailId || '').trim();
+  const url = String(receiptUrl || '').trim();
+  const ids = [...new Set((invoiceIds || []).map((x) => String(x).trim()).filter(Boolean))];
+  if (!cid || !url || !ids.length) return { ok: false, code: 'INVALID_PARAMS' };
+  if (!/^https?:\/\//i.test(url)) return { ok: false, code: 'INVALID_RECEIPT_URL' };
+  const [[payTableRow]] = await pool.query(
+    `SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'cln_client_payment'`
+  );
+  if (!Number(payTableRow?.n)) return { ok: false, code: 'NO_PAYMENT_TABLE' };
+
+  const access = await buildClientPortalInvoiceAccessWhere('i', cid);
+  const hasPayOpCol = await databaseHasColumn('cln_client_payment', 'operator_id');
+  const hasReceiptBatchCol = await databaseHasColumn('cln_client_payment', 'receipt_batch_id');
+  const hasPr = await databaseHasColumn('cln_client_invoice', 'payment_received');
+  const hasOpCol = await databaseHasColumn('cln_client_invoice', 'operator_id');
+  const prExpr = hasPr ? 'COALESCE(i.payment_received, 0)' : '0';
+  const { randomUUID } = require('crypto');
+  const paymentDateYmd = new Date().toISOString().slice(0, 10);
+  const receiptBatchId = randomUUID();
+
+  const idPh = ids.map(() => '?').join(',');
+  await pool.query(
+    `DELETE p FROM cln_client_payment p
+     INNER JOIN cln_client_invoice i ON i.id = p.invoice_id
+     WHERE p.invoice_id IN (${idPh})
+       AND (${access.sql})
+       AND (
+         LOWER(TRIM(COALESCE(p.receipt_number, ''))) = 'portal_upload'
+         OR TRIM(COALESCE(p.transaction_id, '')) LIKE 'portal_bank_receipt:%'
+       )`,
+    [...ids, ...access.params]
+  );
+
+  let updated = 0;
+  for (const invId of ids) {
+    const [chk] = await pool.query(
+      `SELECT i.id FROM cln_client_invoice i WHERE i.id = ? AND ${access.sql} LIMIT 1`,
+      [invId, ...access.params]
+    );
+    if (!chk.length) return { ok: false, code: 'INVOICE_NOT_FOUND' };
+
+    let invSql = `SELECT i.id, COALESCE(NULLIF(TRIM(i.client_id), ''), '') AS invoice_client_id, COALESCE(i.amount, 0) AS amount, ${prExpr} AS pr`;
+    invSql += hasOpCol
+      ? `, COALESCE(NULLIF(TRIM(i.operator_id), ''), '') AS operator_id`
+      : `, '' AS operator_id`;
+    invSql += ` FROM cln_client_invoice i WHERE i.id = ? AND ${access.sql} LIMIT 1`;
+    const [[invRow]] = await pool.query(invSql, [invId, ...access.params]);
+    if (!invRow?.id) return { ok: false, code: 'INVOICE_NOT_FOUND' };
+    if (Number(invRow.pr) === 1) {
+      return { ok: false, code: 'INVOICE_ALREADY_PAID' };
+    }
+
+    const pid = randomUUID();
+    const txnId = `portal_bank_receipt:${randomUUID()}`;
+    const payClientId = String(invRow.invoice_client_id || '').trim() || cid;
+    const rowOp = String(invRow.operator_id || '').trim();
+    const amt = Number(invRow.amount) || 0;
+
+    if (hasPayOpCol && hasReceiptBatchCol) {
+      await pool.query(
+        `INSERT INTO cln_client_payment (id, client_id, operator_id, receipt_number, amount, payment_date, receipt_url, transaction_id, receipt_batch_id, invoice_id, created_at, updated_at)
+         VALUES (?, ?, ?, 'portal_upload', ?, ?, ?, ?, ?, ?, NOW(3), NOW(3))`,
+        [pid, payClientId || null, rowOp || null, amt, paymentDateYmd, url, txnId, receiptBatchId, invId]
+      );
+    } else if (hasPayOpCol) {
+      await pool.query(
+        `INSERT INTO cln_client_payment (id, client_id, operator_id, receipt_number, amount, payment_date, receipt_url, transaction_id, invoice_id, created_at, updated_at)
+         VALUES (?, ?, ?, 'portal_upload', ?, ?, ?, ?, ?, NOW(3), NOW(3))`,
+        [pid, payClientId || null, rowOp || null, amt, paymentDateYmd, url, txnId, invId]
+      );
+    } else if (hasReceiptBatchCol) {
+      await pool.query(
+        `INSERT INTO cln_client_payment (id, client_id, receipt_number, amount, payment_date, receipt_url, transaction_id, receipt_batch_id, invoice_id, created_at, updated_at)
+         VALUES (?, ?, 'portal_upload', ?, ?, ?, ?, ?, ?, NOW(3), NOW(3))`,
+        [pid, payClientId || null, amt, paymentDateYmd, url, txnId, receiptBatchId, invId]
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO cln_client_payment (id, client_id, receipt_number, amount, payment_date, receipt_url, transaction_id, invoice_id, created_at, updated_at)
+         VALUES (?, ?, 'portal_upload', ?, ?, ?, ?, ?, NOW(3), NOW(3))`,
+        [pid, payClientId || null, amt, paymentDateYmd, url, txnId, invId]
+      );
+    }
+    updated += 1;
+  }
+  if (updated < ids.length) return { ok: false, code: 'NO_PAYMENT_ROW', updated };
+  return { ok: true, updated, receiptBatchId: hasReceiptBatchCol ? receiptBatchId : undefined };
+}
+
+function paymentQueueCreatedAtSecondKey(createdAt) {
+  const t = createdAt ? Date.parse(String(createdAt)) : NaN;
+  if (!Number.isFinite(t)) return '0';
+  return String(Math.floor(t / 1000));
+}
+
+function normalizeOperatorPaymentQueueBatchItem(receiptBatchId, group) {
+  const sorted = [...group].sort((a, b) => {
+    const ca = Date.parse(String(a.createdAt || '')) || 0;
+    const cb = Date.parse(String(b.createdAt || '')) || 0;
+    return cb - ca;
+  });
+  const first = sorted[0];
+  const paymentIds = sorted.map((x) => String(x.paymentId || '').trim()).filter(Boolean);
+  const invoiceIds = sorted.map((x) => String(x.invoiceId || '').trim()).filter(Boolean);
+  const invoiceNos = sorted.map((x) => String(x.invoiceNo || '').trim());
+  const amounts = sorted.map((x) => Number(x.amount) || 0);
+  const totalAmount = amounts.reduce((s, n) => s + n, 0);
+  let maxCreated = first.createdAt;
+  for (const x of sorted) {
+    const t = Date.parse(String(x.createdAt || '')) || 0;
+    const m = Date.parse(String(maxCreated || '')) || 0;
+    if (t > m) maxCreated = x.createdAt;
+  }
+  const bid =
+    receiptBatchId != null && String(receiptBatchId).trim() !== '' ? String(receiptBatchId).trim() : null;
+  const paymentId = bid || `legacy:${paymentIds.slice().sort().join('-')}`;
+  /** Several invoices in one upload — not “batch” when only one payment row. */
+  const isBatch = paymentIds.length > 1;
+  const joinedNo = invoiceNos.filter((n) => n).join(', ');
+  return {
+    paymentId,
+    receiptBatchId: bid,
+    isBatch,
+    paymentIds,
+    invoiceIds,
+    invoiceNos,
+    amounts,
+    amount: totalAmount,
+    totalAmount,
+    invoiceId: invoiceIds[0] || '',
+    invoiceNo: joinedNo || invoiceIds.join(', '),
+    receiptUrl: first.receiptUrl,
+    transactionId: first.transactionId,
+    receiptNumber: first.receiptNumber,
+    paymentDate: first.paymentDate,
+    createdAt: maxCreated,
+    operatorAckAt: first.operatorAckAt,
+    invoicePaid: sorted.some((x) => Number(x.invoicePaid) === 1) ? 1 : 0,
+    clientName: first.clientName,
+    clientEmail: first.clientEmail,
+  };
+}
+
+function normalizeOperatorPaymentQueueSingleItem(r) {
+  const pid = String(r.paymentId || '').trim();
+  const iid = String(r.invoiceId || '').trim();
+  const amt = Number(r.amount) || 0;
+  const bid =
+    r.receiptBatchId != null && String(r.receiptBatchId).trim() !== '' ? String(r.receiptBatchId).trim() : null;
+  return {
+    ...r,
+    isBatch: false,
+    receiptBatchId: bid,
+    paymentIds: [pid],
+    invoiceIds: [iid],
+    invoiceNos: [String(r.invoiceNo || '').trim()],
+    amounts: [amt],
+    totalAmount: amt,
+  };
+}
+
+/** Operator portal — recent client payments on this operator’s invoices (Stripe + manual). */
+async function listOperatorClientPaymentQueue({ operatorId, limit = 120 } = {}) {
+  const oid = String(operatorId || '').trim();
+  if (!oid) return { items: [] };
+  const [[payTableRow]] = await pool.query(
+    `SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'cln_client_payment'`
+  );
+  if (!Number(payTableRow?.n)) return { items: [] };
+  const hasAck = await databaseHasColumn('cln_client_payment', 'operator_ack_at');
+  const ackSel = hasAck ? 'p.operator_ack_at AS operatorAckAt' : 'NULL AS operatorAckAt';
+  const lim = Math.min(Math.max(Number(limit) || 120, 1), 500);
+  const hasOpCol = await databaseHasColumn('cln_client_invoice', 'operator_id');
+  if (!hasOpCol) return { items: [] };
+  const hasReceiptBatchCol = await databaseHasColumn('cln_client_payment', 'receipt_batch_id');
+  const batchSel = hasReceiptBatchCol ? 'p.receipt_batch_id AS receiptBatchId' : 'NULL AS receiptBatchId';
+  const [rows] = await pool.query(
+    `SELECT p.id AS paymentId, p.invoice_id AS invoiceId, p.amount, p.payment_date AS paymentDate,
+            p.receipt_url AS receiptUrl, p.transaction_id AS transactionId, p.created_at AS createdAt,
+            p.receipt_number AS receiptNumber,
+            ${batchSel},
+            ${ackSel},
+            COALESCE(NULLIF(TRIM(i.invoice_number), ''), i.id) AS invoiceNo,
+            COALESCE(i.payment_received, 0) AS invoicePaid,
+            COALESCE(NULLIF(TRIM(cd.fullname), ''), NULLIF(TRIM(cd.email), ''), '') AS clientName,
+            COALESCE(NULLIF(TRIM(cd.email), ''), '') AS clientEmail
+     FROM cln_client_payment p
+     INNER JOIN cln_client_invoice i ON i.id = p.invoice_id
+     LEFT JOIN cln_clientdetail cd ON cd.id = i.client_id
+     WHERE COALESCE(NULLIF(TRIM(i.operator_id), ''), '') = ?
+       AND COALESCE(i.payment_received, 0) <> 1
+       AND NULLIF(TRIM(COALESCE(p.receipt_url, '')), '') IS NOT NULL
+       AND NULLIF(TRIM(COALESCE(p.receipt_url, '')), '') LIKE 'http%'
+       AND (
+         LOWER(TRIM(COALESCE(p.receipt_number, ''))) = 'portal_upload'
+         OR TRIM(COALESCE(p.transaction_id, '')) LIKE 'portal_bank_receipt:%'
+       )
+     ORDER BY p.created_at DESC
+     LIMIT ?`,
+    [oid, lim]
+  );
+  const list = rows || [];
+  const consumed = new Set();
+  const items = [];
+
+  const byBatch = new Map();
+  for (const r of list) {
+    const bid = r.receiptBatchId != null ? String(r.receiptBatchId).trim() : '';
+    if (!bid) continue;
+    if (!byBatch.has(bid)) byBatch.set(bid, []);
+    byBatch.get(bid).push(r);
+  }
+  for (const [bid, group] of byBatch) {
+    for (const r of group) consumed.add(String(r.paymentId));
+    items.push(normalizeOperatorPaymentQueueBatchItem(bid, group));
+  }
+
+  const remaining = list.filter((r) => !consumed.has(String(r.paymentId)));
+  const legacyUsed = new Set();
+  for (const r of remaining) {
+    const pid = String(r.paymentId);
+    if (legacyUsed.has(pid)) continue;
+    const url = String(r.receiptUrl || '').trim();
+    const email = String(r.clientEmail || '').trim().toLowerCase();
+    const sec = paymentQueueCreatedAtSecondKey(r.createdAt);
+    const cluster = [r];
+    legacyUsed.add(pid);
+    for (const r2 of remaining) {
+      const pid2 = String(r2.paymentId);
+      if (legacyUsed.has(pid2)) continue;
+      if (String(r2.receiptUrl || '').trim() !== url) continue;
+      if (String(r2.clientEmail || '').trim().toLowerCase() !== email) continue;
+      if (paymentQueueCreatedAtSecondKey(r2.createdAt) !== sec) continue;
+      cluster.push(r2);
+      legacyUsed.add(pid2);
+    }
+    if (cluster.length > 1) {
+      items.push(normalizeOperatorPaymentQueueBatchItem(null, cluster));
+    } else {
+      items.push(normalizeOperatorPaymentQueueSingleItem(cluster[0]));
+    }
+  }
+
+  items.sort((a, b) => {
+    const ta = Date.parse(String(a.createdAt || '')) || 0;
+    const tb = Date.parse(String(b.createdAt || '')) || 0;
+    return tb - ta;
+  });
+
+  return { items };
+}
+
+async function acknowledgeOperatorClientPayment({ operatorId, paymentId }) {
+  const oid = String(operatorId || '').trim();
+  const pid = String(paymentId || '').trim();
+  if (!oid || !pid) return { ok: false, reason: 'INVALID_PARAMS' };
+  const hasAck = await databaseHasColumn('cln_client_payment', 'operator_ack_at');
+  if (!hasAck) return { ok: true, skipped: true };
+  const [r] = await pool.query(
+    `UPDATE cln_client_payment p
+     INNER JOIN cln_client_invoice i ON i.id = p.invoice_id
+     SET p.operator_ack_at = NOW(3), p.updated_at = NOW(3)
+     WHERE p.id = ? AND COALESCE(NULLIF(TRIM(i.operator_id), ''), '') = ?`,
+    [pid, oid]
+  );
+  if (!Number(r.affectedRows)) return { ok: false, reason: 'NOT_FOUND' };
+  return { ok: true };
+}
+
+/**
+ * Operator rejects a client-portal uploaded receipt row (invoice stays unpaid; client can upload again).
+ */
+async function rejectOperatorClientPortalReceipt({ operatorId, paymentId }) {
+  const oid = String(operatorId || '').trim();
+  const pid = String(paymentId || '').trim();
+  if (!oid || !pid) return { ok: false, reason: 'INVALID_PARAMS' };
+  const hasOpCol = await databaseHasColumn('cln_client_invoice', 'operator_id');
+  if (!hasOpCol) return { ok: false, reason: 'SCHEMA_MISSING' };
+  const hasPr = await databaseHasColumn('cln_client_invoice', 'payment_received');
+  const prExpr = hasPr ? 'COALESCE(i.payment_received, 0)' : '0';
+  const [[row]] = await pool.query(
+    `SELECT p.id, p.receipt_number AS receiptNumber, p.transaction_id AS transactionId,
+            ${prExpr} AS pr
+     FROM cln_client_payment p
+     INNER JOIN cln_client_invoice i ON i.id = p.invoice_id
+     WHERE p.id = ? AND COALESCE(NULLIF(TRIM(i.operator_id), ''), '') = ?
+     LIMIT 1`,
+    [pid, oid]
+  );
+  if (!row?.id) return { ok: false, reason: 'NOT_FOUND' };
+  if (Number(row.pr) === 1) return { ok: false, reason: 'INVOICE_ALREADY_PAID' };
+  const rn = String(row.receiptNumber || '').trim().toLowerCase();
+  const tid = String(row.transactionId || '').trim();
+  const isPortal = rn === 'portal_upload' || tid.startsWith('portal_bank_receipt:');
+  if (!isPortal) return { ok: false, reason: 'NOT_CLIENT_PORTAL_RECEIPT' };
+  const [del] = await pool.query('DELETE FROM cln_client_payment WHERE id = ? LIMIT 1', [pid]);
+  if (!Number(del.affectedRows)) return { ok: false, reason: 'DELETE_FAILED' };
+  return { ok: true };
+}
+
+/**
+ * Operator rejects all client-portal receipt rows in one upload batch (`receipt_batch_id`),
+ * or a caller-supplied list of `paymentIds` (legacy same-second / same-url clusters).
+ */
+async function rejectOperatorClientPortalReceiptBatch({ operatorId, receiptBatchId, paymentIds } = {}) {
+  const oid = String(operatorId || '').trim();
+  const bid = String(receiptBatchId || '').trim();
+  const ids = Array.isArray(paymentIds)
+    ? [...new Set(paymentIds.map((x) => String(x || '').trim()).filter(Boolean))].slice(0, 80)
+    : [];
+  if (!oid) return { ok: false, reason: 'INVALID_PARAMS' };
+  if (!bid && !ids.length) return { ok: false, reason: 'INVALID_PARAMS' };
+  if (bid && ids.length) return { ok: false, reason: 'INVALID_PARAMS' };
+  const hasOpCol = await databaseHasColumn('cln_client_invoice', 'operator_id');
+  if (!hasOpCol) return { ok: false, reason: 'SCHEMA_MISSING' };
+  const hasPr = await databaseHasColumn('cln_client_invoice', 'payment_received');
+  const prExpr = hasPr ? 'COALESCE(i.payment_received, 0)' : '0';
+  const hasReceiptBatchCol = await databaseHasColumn('cln_client_payment', 'receipt_batch_id');
+  const portalSql = `(
+      LOWER(TRIM(COALESCE(p.receipt_number, ''))) = 'portal_upload'
+      OR TRIM(COALESCE(p.transaction_id, '')) LIKE 'portal_bank_receipt:%'
+    )`;
+
+  if (bid) {
+    if (!hasReceiptBatchCol) return { ok: false, reason: 'BATCH_NOT_SUPPORTED' };
+    const [del] = await pool.query(
+      `DELETE p FROM cln_client_payment p
+       INNER JOIN cln_client_invoice i ON i.id = p.invoice_id
+       WHERE COALESCE(NULLIF(TRIM(i.operator_id), ''), '') = ?
+         AND p.receipt_batch_id = ?
+         AND ${prExpr} <> 1
+         AND ${portalSql}`,
+      [oid, bid]
+    );
+    if (!Number(del.affectedRows)) return { ok: false, reason: 'NOT_FOUND' };
+    return { ok: true, deleted: Number(del.affectedRows) };
+  }
+
+  if (!ids.length) return { ok: false, reason: 'INVALID_PARAMS' };
+  const ph = ids.map(() => '?').join(',');
+  const [del] = await pool.query(
+    `DELETE p FROM cln_client_payment p
+     INNER JOIN cln_client_invoice i ON i.id = p.invoice_id
+     WHERE COALESCE(NULLIF(TRIM(i.operator_id), ''), '') = ?
+       AND p.id IN (${ph})
+       AND ${prExpr} <> 1
+       AND ${portalSql}`,
+    [oid, ...ids]
+  );
+  if (!Number(del.affectedRows)) return { ok: false, reason: 'NOT_FOUND' };
+  return { ok: true, deleted: Number(del.affectedRows) };
+}
+
+/**
+ * B2B client portal: bank transfer details from operator Company profile (same fields as /operator/company).
+ * Used when online card payment (Stripe Connect) is not available.
+ */
+async function getClientPortalOperatorBankTransferInfo(operatorId) {
+  const oid = String(operatorId || '').trim();
+  if (!oid) {
+    return { ok: false, code: 'INVALID_PARAMS' };
+  }
+  const settings = await getOperatorSettings(oid);
+  const cp =
+    settings && settings.companyProfile && typeof settings.companyProfile === 'object'
+      ? settings.companyProfile
+      : {};
+  const bankdetailId = String(cp.bankdetailId || '').trim();
+  const accountNumber = String(cp.accountNumber || '').trim();
+  const accountHolder = String(cp.accountHolder || '').trim();
+  let bankName = String(cp.bank || '').trim();
+  if (bankdetailId) {
+    try {
+      const [br] = await pool.query('SELECT bankname FROM bankdetail WHERE id = ? LIMIT 1', [bankdetailId]);
+      if (br.length && br[0].bankname) bankName = String(br[0].bankname || '').trim();
+    } catch (_) {
+      /* keep legacy bank label */
+    }
+  }
+  return {
+    ok: true,
+    bankName,
+    accountNumber,
+    accountHolder,
+    companyName: String(cp.companyName || '').trim()
+  };
 }
 
 async function updateInvoiceStatus(id, status, opts = {}) {
-  const operatorId = String(opts.operatorId || '').trim();
+  let operatorId = String(opts.operatorId || '').trim();
+  if (!operatorId) {
+    const hasOpCol = await databaseHasColumn('cln_client_invoice', 'operator_id');
+    if (hasOpCol) {
+      const [[row]] = await pool.query(
+        'SELECT operator_id FROM cln_client_invoice WHERE id = ? LIMIT 1',
+        [String(id)]
+      );
+      if (row?.operator_id != null && String(row.operator_id).trim() !== '') {
+        operatorId = String(row.operator_id).trim();
+      }
+    }
+  }
   const st = String(status || '').trim().toLowerCase();
 
   if (operatorId && st === 'overdue') {
@@ -6807,7 +9951,19 @@ async function updateInvoiceStatus(id, status, opts = {}) {
 }
 
 async function deleteInvoice(id, operatorId) {
-  const oid = String(operatorId || '').trim();
+  let oid = String(operatorId || '').trim();
+  if (!oid) {
+    const hasOpCol = await databaseHasColumn('cln_client_invoice', 'operator_id');
+    if (hasOpCol) {
+      const [[row]] = await pool.query(
+        'SELECT operator_id FROM cln_client_invoice WHERE id = ? LIMIT 1',
+        [String(id)]
+      );
+      if (row?.operator_id != null && String(row.operator_id).trim() !== '') {
+        oid = String(row.operator_id).trim();
+      }
+    }
+  }
   if (oid) {
     const dr = await clnOpInvAccounting.deleteInvoiceAccountingForOperator(oid, id);
     if (!dr.ok && !dr.skipped) {
@@ -6819,13 +9975,119 @@ async function deleteInvoice(id, operatorId) {
   await pool.query('DELETE FROM cln_client_invoice WHERE id = ? LIMIT 1', [String(id)]);
 }
 
+function escapeHtmlForInvoiceEmail(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/**
+ * Email to client bill-to address using the same SMTP as portal password reset (CLEANLEMON_SMTP_* on Cleanlemons).
+ * @returns {Promise<{ ok: true } | { ok: false, reason: string }>}
+ */
+async function sendOperatorInvoicePaymentReminder(_req, { invoiceId, operatorId } = {}) {
+  const iid = String(invoiceId || '').trim();
+  const oid = String(operatorId || '').trim();
+  if (!iid) return { ok: false, reason: 'MISSING_INVOICE_ID' };
+  if (!oid) return { ok: false, reason: 'MISSING_OPERATOR_ID' };
+
+  const ct = await getClnCompanyTable();
+  const hasOpCol = await databaseHasColumn('cln_client_invoice', 'operator_id');
+  const hasPaymentReceivedCol = await databaseHasColumn('cln_client_invoice', 'payment_received');
+  const hasPdfUrlCol = await databaseHasColumn('cln_client_invoice', 'pdf_url');
+  const hasIssueDateCol = await databaseHasColumn('cln_client_invoice', 'issue_date');
+  const hasDueDateCol = await databaseHasColumn('cln_client_invoice', 'due_date');
+  const paymentReceivedExpr = hasPaymentReceivedCol ? 'COALESCE(i.payment_received, 0)' : '0';
+  const pdfUrlExpr = hasPdfUrlCol ? "NULLIF(TRIM(COALESCE(i.pdf_url, '')), '')" : 'NULL';
+  const issueDateSql = hasIssueDateCol
+    ? `DATE_FORMAT(COALESCE(i.issue_date, DATE(i.created_at)), '%Y-%m-%d')`
+    : `DATE_FORMAT(COALESCE(i.created_at, NOW()), '%Y-%m-%d')`;
+  const dueDateFromDbSql = hasDueDateCol ? `DATE_FORMAT(i.due_date, '%Y-%m-%d')` : `NULL`;
+  const opWhere = hasOpCol ? ' AND i.operator_id = ? ' : '';
+  const params = hasOpCol ? [iid, oid] : [iid];
+
+  const [rows] = await pool.query(
+    `SELECT i.id,
+      COALESCE(i.invoice_number, i.id) AS invoiceNo,
+      COALESCE(
+        NULLIF(TRIM(cd.fullname), ''),
+        NULLIF(TRIM(c.name), ''),
+        ''
+      ) AS clientName,
+      COALESCE(NULLIF(TRIM(cd.email), ''), NULLIF(TRIM(c.email), ''), '') AS clientEmail,
+      COALESCE(i.amount, 0) AS amount,
+      ${paymentReceivedExpr} AS paymentReceived,
+      ${issueDateSql} AS issueDate,
+      ${dueDateFromDbSql} AS dueDateFromDb,
+      ${pdfUrlExpr} AS pdfUrl,
+      ${hasOpCol ? `COALESCE(NULLIF(TRIM(i.operator_id), ''), '') AS operatorId` : `'' AS operatorId`}
+     FROM cln_client_invoice i
+     LEFT JOIN cln_clientdetail cd ON cd.id = i.client_id
+     LEFT JOIN \`${ct}\` c ON c.id = i.client_id
+     WHERE i.id = ?
+     ${opWhere}
+     LIMIT 1`,
+    params
+  );
+  const r = rows && rows[0];
+  if (!r) return { ok: false, reason: 'INVOICE_NOT_FOUND' };
+  if (hasOpCol && String(r.operatorId || '').trim() !== oid) {
+    return { ok: false, reason: 'FORBIDDEN_OPERATOR' };
+  }
+
+  const paid = Number(r.paymentReceived || 0) === 1;
+  if (paid) return { ok: false, reason: 'INVOICE_ALREADY_PAID' };
+
+  const to = String(r.clientEmail || '').trim();
+  if (!to) return { ok: false, reason: 'MISSING_CLIENT_EMAIL' };
+
+  const settingsMap = await getOperatorSettingsJsonMapForOperatorIds([oid]);
+  const enriched = enrichInvoiceRowStatusAndDue(
+    {
+      issueDate: r.issueDate,
+      dueDateFromDb: r.dueDateFromDb,
+      paymentReceived: r.paymentReceived,
+      operatorId: oid,
+    },
+    settingsMap
+  );
+  const st = enriched.status;
+  if (st === 'paid') return { ok: false, reason: 'INVOICE_ALREADY_PAID' };
+  if (st !== 'pending' && st !== 'overdue') {
+    return { ok: false, reason: 'REMINDER_NOT_APPLICABLE' };
+  }
+
+  /** Cleanlemons-only route — always use CLEANLEMON_SMTP_* / CLEANLEMON_PORTAL_RESET_FROM_*. */
+  const portalProduct = 'cleanlemons';
+  const invoiceNo = String(r.invoiceNo || iid);
+  const clientName = String(r.clientName || 'customer').trim() || 'customer';
+  const amountStr = Number(r.amount || 0).toFixed(2);
+  const dueLine = enriched.dueDate ? `Due date: ${enriched.dueDate}\n` : '';
+  const pdfRaw = r.pdfUrl != null && String(r.pdfUrl).trim() !== '' ? String(r.pdfUrl).trim() : '';
+  const pdfLine = pdfRaw ? `Invoice link: ${pdfRaw}\n` : '';
+
+  const subject = `Payment reminder: ${invoiceNo}`;
+  const textBody = `Dear ${clientName},\n\nPlease arrange payment for invoice ${invoiceNo} (RM ${amountStr}).\n${dueLine}${pdfLine}\nThank you.`;
+  const htmlBody = `<p>Dear ${escapeHtmlForInvoiceEmail(clientName)},</p>
+<p>Please arrange payment for invoice <strong>${escapeHtmlForInvoiceEmail(invoiceNo)}</strong> (RM ${escapeHtmlForInvoiceEmail(amountStr)}).</p>
+${enriched.dueDate ? `<p>Due date: <strong>${escapeHtmlForInvoiceEmail(enriched.dueDate)}</strong></p>` : ''}
+${pdfRaw ? `<p><a href="${escapeHtmlForInvoiceEmail(pdfRaw)}">View invoice</a></p>` : ''}
+<p>Thank you.</p>`;
+
+  return sendTransactionalEmail(portalProduct, to, subject, textBody, htmlBody);
+}
+
 async function ensureClnAgreementExtraColumns() {
   if (_clnAgreementExtraColsEnsured) return;
   const stmts = [
     'ALTER TABLE cln_operator_agreement ADD COLUMN operator_id CHAR(36) NULL',
     'ALTER TABLE cln_operator_agreement ADD COLUMN automation_rule_id VARCHAR(128) NULL',
     'ALTER TABLE cln_operator_agreement ADD COLUMN template_id VARCHAR(64) NULL',
-    'ALTER TABLE cln_operator_agreement ADD COLUMN final_agreement_url TEXT NULL'
+    'ALTER TABLE cln_operator_agreement ADD COLUMN final_agreement_url TEXT NULL',
+    'ALTER TABLE cln_operator_agreement ADD COLUMN hash_draft VARCHAR(128) NULL',
+    'ALTER TABLE cln_operator_agreement ADD COLUMN hash_final VARCHAR(128) NULL'
   ];
   for (const sql of stmts) {
     try {
@@ -6941,26 +10203,55 @@ async function listAgreements(operatorId) {
   const hasTid = await databaseHasColumn('cln_operator_agreement', 'template_id');
   const hasFinalUrl = await databaseHasColumn('cln_operator_agreement', 'final_agreement_url');
   const hasOpAgr = await databaseHasColumn('cln_operator_agreement', 'operator_id');
+  const hasHashCols = await databaseHasColumn('cln_operator_agreement', 'hash_final');
+  const ct = await getClnCompanyTable();
   const oid = String(operatorId || '').trim();
-  const opWhere = hasOpAgr && oid ? (hasTid ? ' WHERE a.operator_id <=> ?' : ' WHERE operator_id <=> ?') : '';
+  /** Avoid utf8mb4_unicode_ci vs utf8mb4_0900_ai_ci mix on CHAR UUID joins (MySQL 8). */
+  const opIdCmp = (leftCol, rightCol) =>
+    `CAST(${leftCol} AS CHAR(36)) COLLATE utf8mb4_unicode_ci <=> CAST(${rightCol} AS CHAR(36)) COLLATE utf8mb4_unicode_ci`;
+  const opWhere =
+    hasOpAgr && oid
+      ? hasTid
+        ? ` WHERE ${opIdCmp('a.operator_id', '?')}`
+        : ` WHERE ${opIdCmp('operator_id', '?')}`
+      : '';
   const opParams = hasOpAgr && oid ? [oid] : [];
+  const hashSel = hasHashCols ? ', a.hash_draft AS hashDraft, a.hash_final AS hashFinal' : '';
   const finalSel = hasFinalUrl ? ', a.final_agreement_url AS finalAgreementUrl' : '';
+  const opCompanySel = hasOpAgr
+    ? `, COALESCE(od.name, '') AS operatorCompanyName`
+    : `, '' AS operatorCompanyName`;
+  const opCompanyJoin = hasOpAgr
+    ? `LEFT JOIN \`${ct}\` od ON ${opIdCmp('od.id', 'a.operator_id')} `
+    : '';
   const sql = hasTid
     ? `SELECT a.id, a.recipient_name AS recipientName, a.recipient_email AS recipientEmail, a.recipient_type AS recipientType,
               a.template_name AS templateName, a.template_id AS templateId, t.mode AS templateMode, a.salary,
               DATE_FORMAT(a.start_date, '%Y-%m-%d') AS startDate,
               a.status, DATE_FORMAT(a.created_at, '%Y-%m-%d') AS createdAt,
               DATE_FORMAT(a.signed_at, '%Y-%m-%d') AS signedAt,
-              a.signed_meta_json AS signedMetaJson${finalSel}
+              a.signed_meta_json AS signedMetaJson${finalSel}${hashSel}${opCompanySel}
        FROM cln_operator_agreement a
-       LEFT JOIN cln_operator_agreement_template t ON t.id = a.template_id${opWhere}
+       LEFT JOIN cln_operator_agreement_template t ON t.id = a.template_id
+       ${opCompanyJoin}${opWhere}
        ORDER BY a.created_at DESC`
     : `SELECT id, recipient_name AS recipientName, recipient_email AS recipientEmail, recipient_type AS recipientType,
               template_name AS templateName, salary,
               DATE_FORMAT(start_date, '%Y-%m-%d') AS startDate,
               status, DATE_FORMAT(created_at, '%Y-%m-%d') AS createdAt,
               DATE_FORMAT(signed_at, '%Y-%m-%d') AS signedAt,
-              signed_meta_json AS signedMetaJson
+              signed_meta_json AS signedMetaJson${
+                hasFinalUrl ? ', final_agreement_url AS finalAgreementUrl' : ''
+              }${
+                hasHashCols ? ', hash_draft AS hashDraft, hash_final AS hashFinal' : ''
+              }${
+                hasOpAgr
+                  ? `, (SELECT COALESCE(name,'') FROM \`${ct}\` od2 WHERE ${opIdCmp(
+                      'od2.id',
+                      'cln_operator_agreement.operator_id'
+                    )} LIMIT 1) AS operatorCompanyName`
+                  : `, '' AS operatorCompanyName`
+              }
        FROM cln_operator_agreement${opWhere}
        ORDER BY created_at DESC`;
   const [rows] = await pool.query(sql, opParams);
@@ -6968,6 +10259,202 @@ async function listAgreements(operatorId) {
     ...r,
     signedMeta: safeJson(r.signedMetaJson, null),
   }));
+}
+
+/**
+ * B2B client portal: agreements where this login email is the named recipient and template is operator–client.
+ */
+async function listAgreementsForClientPortal(clientEmail) {
+  const em = String(clientEmail || '').trim().toLowerCase();
+  if (!em) return [];
+  await ensureAgreementTables();
+  await ensureClnAgreementExtraColumns();
+  const hasTid = await databaseHasColumn('cln_operator_agreement', 'template_id');
+  const hasFinalUrl = await databaseHasColumn('cln_operator_agreement', 'final_agreement_url');
+  const hasOpAgr = await databaseHasColumn('cln_operator_agreement', 'operator_id');
+  const hasHashCols = await databaseHasColumn('cln_operator_agreement', 'hash_final');
+  const ct = await getClnCompanyTable();
+  const opIdJoin = (a, b) =>
+    `CAST(${a} AS CHAR(36)) COLLATE utf8mb4_unicode_ci <=> CAST(${b} AS CHAR(36)) COLLATE utf8mb4_unicode_ci`;
+  const hashSel = hasHashCols ? ', a.hash_draft AS hashDraft, a.hash_final AS hashFinal' : '';
+  const finalSel = hasFinalUrl ? ', a.final_agreement_url AS finalAgreementUrl' : '';
+  const opCompanySel = hasOpAgr ? `, COALESCE(od.name, '') AS operatorCompanyName` : `, '' AS operatorCompanyName`;
+  const opCompanyJoin = hasOpAgr ? `LEFT JOIN \`${ct}\` od ON ${opIdJoin('od.id', 'a.operator_id')} ` : '';
+  if (!hasTid) {
+    const hashSelLegacy = hasHashCols ? ', hash_draft AS hashDraft, hash_final AS hashFinal' : '';
+    const [rows] = await pool.query(
+      `SELECT id, recipient_name AS recipientName, recipient_email AS recipientEmail, recipient_type AS recipientType,
+              template_name AS templateName, salary,
+              DATE_FORMAT(start_date, '%Y-%m-%d') AS startDate,
+              status, DATE_FORMAT(created_at, '%Y-%m-%d') AS createdAt,
+              DATE_FORMAT(signed_at, '%Y-%m-%d') AS signedAt,
+              signed_meta_json AS signedMetaJson${hasFinalUrl ? ', final_agreement_url AS finalAgreementUrl' : ''}${hashSelLegacy}
+       FROM cln_operator_agreement
+       WHERE LOWER(TRIM(recipient_email)) = ?
+       ORDER BY created_at DESC`,
+      [em]
+    );
+    return rows.map((r) => ({
+      ...r,
+      signedMeta: safeJson(r.signedMetaJson, null),
+    }));
+  }
+  const [rows] = await pool.query(
+    `SELECT a.id, a.recipient_name AS recipientName, a.recipient_email AS recipientEmail, a.recipient_type AS recipientType,
+            a.template_name AS templateName, a.template_id AS templateId, t.mode AS templateMode, a.salary,
+            DATE_FORMAT(a.start_date, '%Y-%m-%d') AS startDate,
+            a.status, DATE_FORMAT(a.created_at, '%Y-%m-%d') AS createdAt,
+            DATE_FORMAT(a.signed_at, '%Y-%m-%d') AS signedAt,
+            a.signed_meta_json AS signedMetaJson${finalSel}${hashSel}${opCompanySel}
+     FROM cln_operator_agreement a
+     INNER JOIN cln_operator_agreement_template t ON t.id = a.template_id
+     ${opCompanyJoin}
+     WHERE LOWER(TRIM(a.recipient_email)) = ? AND t.mode = 'operator_client'
+     ORDER BY a.created_at DESC`,
+    [em]
+  );
+  return rows.map((r) => ({
+    ...r,
+    signedMeta: safeJson(r.signedMetaJson, null),
+  }));
+}
+
+async function clnPersistHashDraftIfEmpty(agreementId, pdfBuffer) {
+  const id = String(agreementId || '').trim();
+  if (!id || !pdfBuffer?.length) return;
+  const hasCol = await databaseHasColumn('cln_operator_agreement', 'hash_draft');
+  if (!hasCol) return;
+  const hex = crypto.createHash('sha256').update(pdfBuffer).digest('hex');
+  try {
+    await pool.query(
+      `UPDATE cln_operator_agreement SET hash_draft = ?, created_at = created_at WHERE id = ? AND (hash_draft IS NULL OR TRIM(COALESCE(hash_draft,'')) = '') LIMIT 1`,
+      [hex, id]
+    );
+  } catch (e) {
+    console.warn('[cleanlemon] clnPersistHashDraftIfEmpty', e?.message || e);
+  }
+}
+
+/**
+ * Filled-instance PDF body (Google template + variables). Used for preview, operator preview, and final merge.
+ * @param {object} row — agreement row with template_url, folder_url, template_mode, signed_meta_json, etc.
+ */
+async function clnBuildAgreementInstancePdfBuffer(row) {
+  if (!row?.template_id || !row.template_url || !row.folder_url) {
+    throw new Error('MISSING_TEMPLATE');
+  }
+  const { generatePdfFromTemplate } = require('../agreement/google-docs-pdf');
+  const { resolveAgreementPdfAuth, extractIdFromUrlOrId } = require('../agreement/agreement.service');
+  const oid = row.operator_id != null ? String(row.operator_id).trim() : '';
+  const authForPdf = await resolveAgreementPdfAuth(oid || null);
+  if (!authForPdf) throw new Error('GOOGLE_DRIVE_NOT_CONNECTED');
+  const templateId = extractIdFromUrlOrId(row.template_url);
+  const folderId = extractIdFromUrlOrId(row.folder_url);
+  if (!templateId || !folderId) throw new Error('INVALID_TEMPLATE_URL');
+  const meta = safeJson(row.signed_meta_json, {});
+  const variables = await buildClnAgreementVariablesForFinal(row, row.template_mode, meta);
+  const baseName = `Preview-${String(row.template_name || 'agreement')
+    .replace(/[^\w\-]+/g, '-')
+    .slice(0, 40)}-${String(row.id || '').slice(0, 8)}`;
+  const result = await generatePdfFromTemplate({
+    templateId,
+    folderId,
+    filename: baseName,
+    variables,
+    styleReplacedTextRed: false,
+    returnBufferOnly: true,
+    authClient: authForPdf
+  });
+  if (!result?.pdfBuffer?.length) throw new Error('EMPTY_PDF');
+  return result.pdfBuffer;
+}
+
+/** Operator portal: same filled PDF as signing preview; persists hash_draft when first generated. */
+async function previewClnAgreementInstancePdfForOperator(operatorId, agreementId) {
+  const oid = String(operatorId || '').trim();
+  const id = String(agreementId || '').trim();
+  if (!oid || !id) throw new Error('INVALID_INPUT');
+  await ensureAgreementTables();
+  await ensureClnAgreementExtraColumns();
+  const [rows] = await pool.query(
+    `SELECT a.id, a.operator_id, a.recipient_name, a.recipient_email, a.salary, a.start_date, a.signed_meta_json, a.template_id,
+            t.template_url AS template_url, t.folder_url AS folder_url, t.mode AS template_mode, t.name AS template_name
+     FROM cln_operator_agreement a
+     LEFT JOIN cln_operator_agreement_template t ON t.id = a.template_id
+     WHERE a.id = ?
+     LIMIT 1`,
+    [id]
+  );
+  const row = rows[0];
+  if (!row) throw new Error('NOT_FOUND');
+  const rowOp = row.operator_id != null ? String(row.operator_id).trim() : '';
+  if (!rowOp || rowOp !== oid) throw new Error('FORBIDDEN');
+  const buf = await clnBuildAgreementInstancePdfBuffer(row);
+  await clnPersistHashDraftIfEmpty(id, buf);
+  return buf;
+}
+
+/**
+ * Delete agreement for operator UI when not finalized (no hash_final / no final PDF / not complete).
+ */
+async function deleteClnOperatorAgreement(operatorId, agreementId) {
+  await ensureAgreementTables();
+  await ensureClnAgreementExtraColumns();
+  const oid = String(operatorId || '').trim();
+  const id = String(agreementId || '').trim();
+  if (!oid || !id) return { ok: false, reason: 'MISSING_PARAMS' };
+  const hasOpAgr = await databaseHasColumn('cln_operator_agreement', 'operator_id');
+  if (!hasOpAgr) return { ok: false, reason: 'OPERATOR_SCOPE_UNAVAILABLE' };
+  const hasHashFinal = await databaseHasColumn('cln_operator_agreement', 'hash_final');
+  const selCols = hasHashFinal
+    ? 'id, status, final_agreement_url, hash_final, operator_id'
+    : 'id, status, final_agreement_url, operator_id';
+  const opCmp =
+    'CAST(operator_id AS CHAR(36)) COLLATE utf8mb4_unicode_ci <=> CAST(? AS CHAR(36)) COLLATE utf8mb4_unicode_ci';
+  const [rows] = await pool.query(
+    `SELECT ${selCols} FROM cln_operator_agreement WHERE id = ? AND ${opCmp} LIMIT 1`,
+    [id, oid]
+  );
+  const row = rows[0];
+  if (!row) return { ok: false, reason: 'NOT_FOUND' };
+  const st = String(row.status || '')
+    .trim()
+    .toLowerCase();
+  const finalUrl = String(row.final_agreement_url || '').trim();
+  if (hasHashFinal) {
+    const hf = String(row.hash_final || '').trim();
+    if (hf) return { ok: false, reason: 'FINAL_HASH_EXISTS' };
+  }
+  if (finalUrl) return { ok: false, reason: 'FINAL_PDF_EXISTS' };
+  if (st === 'complete' || st === 'signed') return { ok: false, reason: 'AGREEMENT_COMPLETE' };
+  const [del] = await pool.query(`DELETE FROM cln_operator_agreement WHERE id = ? AND ${opCmp} LIMIT 1`, [id, oid]);
+  if (!Number(del?.affectedRows || 0)) return { ok: false, reason: 'NOT_FOUND' };
+  return { ok: true };
+}
+
+/** Same merge + export as final PDF, but return buffer for an authenticated client recipient only. */
+async function previewClnAgreementInstancePdfForRecipient(agreementId, clientEmail) {
+  const id = String(agreementId || '').trim();
+  const em = String(clientEmail || '').trim().toLowerCase();
+  if (!id || !em) throw new Error('INVALID_INPUT');
+  await ensureAgreementTables();
+  await ensureClnAgreementExtraColumns();
+  const [rows] = await pool.query(
+    `SELECT a.id, a.operator_id, a.recipient_name, a.recipient_email, a.salary, a.start_date, a.signed_meta_json, a.template_id,
+            t.template_url AS template_url, t.folder_url AS folder_url, t.mode AS template_mode, t.name AS template_name
+     FROM cln_operator_agreement a
+     INNER JOIN cln_operator_agreement_template t ON t.id = a.template_id
+     WHERE a.id = ? AND t.mode = 'operator_client'
+     LIMIT 1`,
+    [id]
+  );
+  const row = rows[0];
+  if (!row) throw new Error('NOT_FOUND');
+  const recEm = String(row.recipient_email || '').trim().toLowerCase();
+  if (recEm !== em) throw new Error('FORBIDDEN');
+  const buf = await clnBuildAgreementInstancePdfBuffer(row);
+  await clnPersistHashDraftIfEmpty(id, buf);
+  return buf;
 }
 
 async function createAgreement(input) {
@@ -7147,7 +10634,7 @@ async function signAgreement(id, patch) {
   await ensureClnAgreementExtraColumns();
   const agrId = String(id);
   const [rows] = await pool.query(
-    `SELECT a.id, a.status, a.signed_meta_json, a.template_id, t.mode AS template_mode
+    `SELECT a.id, a.status, a.signed_meta_json, a.template_id, a.recipient_email, t.mode AS template_mode
      FROM cln_operator_agreement a
      LEFT JOIN cln_operator_agreement_template t ON t.id = a.template_id
      WHERE a.id = ? LIMIT 1`,
@@ -7202,11 +10689,7 @@ async function signAgreement(id, patch) {
       );
       const ok = Number(res?.affectedRows || 0) > 0;
       if (ok) {
-        setImmediate(() => {
-          tryFinalizeClnAgreementPdf(agrId).catch((e) =>
-            console.error('[cleanlemon] tryFinalizeClnAgreementPdf', e?.message || e)
-          );
-        });
+        await tryFinalizeClnAgreementPdfWithTimeout(agrId, 45000);
       }
       return { ok };
     }
@@ -7225,6 +10708,11 @@ async function signAgreement(id, patch) {
   if (signedFrom === 'client_portal') {
     if (!isClientMode) {
       return { ok: false, reason: 'CLIENT_SIGN_ONLY_FOR_OPERATOR_CLIENT_MODE' };
+    }
+    const portalEm = String(patch?.portalClientEmail || '').trim().toLowerCase();
+    const recipEm = String(row.recipient_email || '').trim().toLowerCase();
+    if (!portalEm || !recipEm || portalEm !== recipEm) {
+      return { ok: false, reason: 'CLIENT_PORTAL_EMAIL_REQUIRED' };
     }
     if (!patch?.signatureDataUrl) {
       return { ok: false, reason: 'SIGNATURE_REQUIRED' };
@@ -7246,11 +10734,7 @@ async function signAgreement(id, patch) {
       );
       const ok = Number(res?.affectedRows || 0) > 0;
       if (ok) {
-        setImmediate(() => {
-          tryFinalizeClnAgreementPdf(agrId).catch((e) =>
-            console.error('[cleanlemon] tryFinalizeClnAgreementPdf', e?.message || e)
-          );
-        });
+        await tryFinalizeClnAgreementPdfWithTimeout(agrId, 45000);
       }
       return { ok };
     }
@@ -7287,11 +10771,7 @@ async function signAgreement(id, patch) {
       );
       const ok = Number(res?.affectedRows || 0) > 0;
       if (ok) {
-        setImmediate(() => {
-          tryFinalizeClnAgreementPdf(agrId).catch((e) =>
-            console.error('[cleanlemon] tryFinalizeClnAgreementPdf', e?.message || e)
-          );
-        });
+        await tryFinalizeClnAgreementPdfWithTimeout(agrId, 45000);
       }
       return { ok };
     }
@@ -7343,6 +10823,26 @@ function clnSigVar(val) {
   const s = val != null ? String(val).trim() : '';
   if (s && /^https?:\/\//i.test(s)) return s;
   return '(signed electronically)';
+}
+
+/** Google Docs image placeholders need public https URLs — upload data-URL signatures to OSS when needed. */
+async function clnSignaturePartyImageForDoc(agreementId, partyKey, signatureDataUrl) {
+  const raw = signatureDataUrl != null ? String(signatureDataUrl).trim() : '';
+  if (!raw) return '';
+  if (/^https?:\/\//i.test(raw)) return raw;
+  const { signatureValueToPublicUrl } = require('../upload/signature-image-to-oss-url');
+  try {
+    const aid = String(agreementId || '').trim().slice(0, 80);
+    const pk = String(partyKey || 'party').replace(/[^a-z0-9_-]/gi, '-').slice(0, 24);
+    const res = await signatureValueToPublicUrl(raw, {
+      clientId: null,
+      signatureKey: `cln-agr-${aid}-${pk}`,
+    });
+    if (res?.ok && res.value) return String(res.value).trim();
+  } catch (e) {
+    console.warn('[cleanlemon] clnSignaturePartyImageForDoc', partyKey, e?.message || e);
+  }
+  return clnSigVar(raw);
 }
 
 async function buildClnAgreementVariablesForFinal(agrRow, templateMode, meta) {
@@ -7417,9 +10917,16 @@ async function buildClnAgreementVariablesForFinal(agrRow, templateMode, meta) {
   }
 
   const parties = meta?.parties && typeof meta.parties === 'object' ? meta.parties : {};
-  vars.staff_sign = parties.staff?.signatureDataUrl ? clnSigVar(parties.staff.signatureDataUrl) : vars.staff_sign;
-  vars.operator_sign = parties.operator?.signatureDataUrl ? clnSigVar(parties.operator.signatureDataUrl) : vars.operator_sign;
-  vars.client_sign = parties.client?.signatureDataUrl ? clnSigVar(parties.client.signatureDataUrl) : vars.client_sign;
+  const agrIdForSig = String(agrRow.id || '').trim();
+  if (parties.staff?.signatureDataUrl) {
+    vars.staff_sign = await clnSignaturePartyImageForDoc(agrIdForSig, 'staff', parties.staff.signatureDataUrl);
+  }
+  if (parties.operator?.signatureDataUrl) {
+    vars.operator_sign = await clnSignaturePartyImageForDoc(agrIdForSig, 'operator', parties.operator.signatureDataUrl);
+  }
+  if (parties.client?.signatureDataUrl) {
+    vars.client_sign = await clnSignaturePartyImageForDoc(agrIdForSig, 'client', parties.client.signatureDataUrl);
+  }
 
   const today = new Date();
   vars.agreement_date = clnFormatClnDate(today);
@@ -7445,8 +10952,9 @@ async function tryFinalizeClnAgreementPdf(agrId) {
   const row = rows[0];
   if (!row?.template_id || !row.template_url || !row.folder_url) return;
 
-  const { generatePdfFromTemplate } = require('../agreement/google-docs-pdf');
+  const { uploadPdfBufferToDriveFolder } = require('../agreement/google-docs-pdf');
   const { resolveAgreementPdfAuth, extractIdFromUrlOrId } = require('../agreement/agreement.service');
+  const { mergePdfBuffers, buildCleanlemonsSigningAuditPdfBuffer } = require('../agreement/agreement-pdf-appendix');
   const oid = row.operator_id != null ? String(row.operator_id).trim() : '';
   const authForPdf = await resolveAgreementPdfAuth(oid || null);
   if (!authForPdf) {
@@ -7454,31 +10962,153 @@ async function tryFinalizeClnAgreementPdf(agrId) {
     return;
   }
 
-  const templateId = extractIdFromUrlOrId(row.template_url);
   const folderId = extractIdFromUrlOrId(row.folder_url);
-  if (!templateId || !folderId) return;
+  if (!folderId) return;
 
-  const meta = safeJson(row.signed_meta_json, {});
-  const variables = await buildClnAgreementVariablesForFinal(row, row.template_mode, meta);
+  let mainBodyBuf;
+  try {
+    mainBodyBuf = await clnBuildAgreementInstancePdfBuffer(row);
+  } catch (e) {
+    console.warn('[cleanlemon] tryFinalizeClnAgreementPdf: build body', e?.message || e);
+    return;
+  }
+  await clnPersistHashDraftIfEmpty(id, mainBodyBuf);
+  const mainBodySha256 = crypto.createHash('sha256').update(mainBodyBuf).digest('hex');
+
+  const [metaRows] = await pool.query(
+    `SELECT signed_meta_json, hash_draft FROM cln_operator_agreement WHERE id = ? LIMIT 1`,
+    [id]
+  );
+  const metaRow = metaRows[0] || {};
+  const signedMeta = safeJson(metaRow.signed_meta_json, {});
+  const hashDraftStored = String(metaRow.hash_draft || '').trim();
+  const hashDraftForAppendix = hashDraftStored || mainBodySha256;
+  const modeRaw = String(row.template_mode || '').trim().toLowerCase();
+  const modeForAppendix = modeRaw === 'operator_client' ? 'operator_client' : 'operator_staff';
+
+  const generatedAt = new Date();
+  let appendixBuf;
+  try {
+    appendixBuf = await buildCleanlemonsSigningAuditPdfBuffer({
+      agreementId: id,
+      mode: modeForAppendix,
+      hashDraft: hashDraftForAppendix,
+      mainBodySha256,
+      parties: signedMeta.parties,
+      generatedAt
+    });
+  } catch (e) {
+    console.warn('[cleanlemon] tryFinalizeClnAgreementPdf: appendix', e?.message || e);
+    return;
+  }
+
+  let mergedBuf;
+  try {
+    mergedBuf = await mergePdfBuffers(mainBodyBuf, appendixBuf);
+  } catch (e) {
+    console.warn('[cleanlemon] tryFinalizeClnAgreementPdf: merge', e?.message || e);
+    return;
+  }
+
+  const hashFinal = crypto.createHash('sha256').update(mergedBuf).digest('hex');
   const baseName = `Agreement-${String(row.template_name || 'final')
     .replace(/[^\w\-]+/g, '-')
     .slice(0, 40)}-${id.slice(0, 8)}`;
 
-  const { pdfUrl } = await generatePdfFromTemplate({
-    templateId,
-    folderId,
-    filename: baseName,
-    variables,
-    styleReplacedTextRed: false,
-    returnBufferOnly: false,
-    authClient: authForPdf
-  });
-  if (pdfUrl) {
+  let pdfUrl;
+  try {
+    pdfUrl = await uploadPdfBufferToDriveFolder({
+      pdfBuffer: mergedBuf,
+      fileName: `${baseName}-final`,
+      folderId,
+      authClient: authForPdf
+    });
+  } catch (e) {
+    console.warn('[cleanlemon] tryFinalizeClnAgreementPdf: upload', e?.message || e);
+    return;
+  }
+  if (!pdfUrl) return;
+
+  const hasHashFinal = await databaseHasColumn('cln_operator_agreement', 'hash_final');
+  if (hasHashFinal) {
+    await pool.query(
+      `UPDATE cln_operator_agreement SET final_agreement_url = ?, hash_final = ?, created_at = created_at WHERE id = ? LIMIT 1`,
+      [String(pdfUrl), hashFinal, id]
+    );
+  } else {
     await pool.query(
       `UPDATE cln_operator_agreement SET final_agreement_url = ?, created_at = created_at WHERE id = ? LIMIT 1`,
       [String(pdfUrl), id]
     );
   }
+}
+
+/** Await final PDF generation after sign; bounded wait so the HTTP response is not unbounded. */
+async function tryFinalizeClnAgreementPdfWithTimeout(agrId, timeoutMs = 45000) {
+  const id = String(agrId || '').trim();
+  if (!id) return;
+  let to = null;
+  try {
+    await Promise.race([
+      tryFinalizeClnAgreementPdf(id),
+      new Promise((_, rej) => {
+        to = setTimeout(
+          () => rej(Object.assign(new Error('finalize timeout'), { code: 'FINALIZE_TIMEOUT' })),
+          timeoutMs
+        );
+      }),
+    ]);
+  } catch (e) {
+    if (e && e.code === 'FINALIZE_TIMEOUT') {
+      console.warn('[cleanlemon] tryFinalizeClnAgreementPdf timed out', id);
+    } else {
+      console.error('[cleanlemon] tryFinalizeClnAgreementPdf', e?.message || e);
+    }
+  } finally {
+    if (to) clearTimeout(to);
+  }
+}
+
+/**
+ * Re-run final PDF merge + Drive upload (e.g. first async pass failed silently).
+ * Operator must own the agreement; row must be complete with all required signatures.
+ */
+async function retryFinalizeClnOperatorAgreementPdf(operatorId, agreementId) {
+  const oid = String(operatorId || '').trim();
+  const aid = String(agreementId || '').trim();
+  if (!oid || !aid) return { ok: false, reason: 'MISSING_ID' };
+  await ensureAgreementTables();
+  await ensureClnAgreementExtraColumns();
+  const hasFinal = await databaseHasColumn('cln_operator_agreement', 'final_agreement_url');
+  if (!hasFinal) return { ok: false, reason: 'FINAL_URL_COLUMN_MISSING' };
+
+  const [rows] = await pool.query(
+    `SELECT a.id, a.operator_id, a.status, a.signed_meta_json, t.mode AS template_mode
+       FROM cln_operator_agreement a
+       LEFT JOIN cln_operator_agreement_template t ON t.id = a.template_id
+      WHERE a.id = ?
+      LIMIT 1`,
+    [aid]
+  );
+  if (!rows.length) return { ok: false, reason: 'NOT_FOUND' };
+  const row = rows[0];
+  if (String(row.operator_id || '').trim() !== oid) return { ok: false, reason: 'FORBIDDEN' };
+  const st = String(row.status || '')
+    .trim()
+    .toLowerCase();
+  if (st !== 'complete' && st !== 'signed') return { ok: false, reason: 'NOT_COMPLETE' };
+  const meta = safeJson(row.signed_meta_json, {});
+  const mode = String(row.template_mode || '').trim();
+  if (!clnSignaturesComplete(mode, meta)) return { ok: false, reason: 'SIGNATURES_INCOMPLETE' };
+
+  await tryFinalizeClnAgreementPdf(aid);
+  const [check] = await pool.query(
+    `SELECT TRIM(COALESCE(final_agreement_url,'')) AS u FROM cln_operator_agreement WHERE id = ? LIMIT 1`,
+    [aid]
+  );
+  const u = String(check[0]?.u || '').trim();
+  if (!u) return { ok: false, reason: 'FINAL_PDF_FAILED' };
+  return { ok: true, finalAgreementUrl: u };
 }
 
 async function buildClnAgreementVariablesReferenceDocxBuffer() {
@@ -7744,14 +11374,88 @@ async function listKpi(operatorId) {
   }));
 }
 
-async function operatorDashboard() {
-  const [[{ totalProperties }]] = await pool.query('SELECT COUNT(*) AS totalProperties FROM cln_property');
-  const [[{ totalSchedules }]] = await pool.query('SELECT COUNT(*) AS totalSchedules FROM cln_schedule');
+function _nextMalaysiaMonthFirstYmd(monthStartYmd) {
+  const m = String(monthStartYmd || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(m)) return null;
+  const d = new Date(`${m}T12:00:00+08:00`);
+  d.setMonth(d.getMonth() + 1);
+  const yy = d.getFullYear();
+  const mo = d.getMonth() + 1;
+  return `${yy}-${String(mo).padStart(2, '0')}-01`;
+}
+
+function _malaysiaYmdToEnglishMonthYear(ymd) {
+  const m = String(ymd || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(m)) return '';
+  const d = new Date(`${m}T12:00:00+08:00`);
+  try {
+    return new Intl.DateTimeFormat('en', { month: 'long', year: 'numeric', timeZone: 'Asia/Singapore' }).format(d);
+  } catch (_) {
+    return m;
+  }
+}
+
+async function operatorDashboard({ operatorId } = {}) {
+  const oid = String(operatorId || '').trim();
+  const monthStartYmd = getMalaysiaMonthStartYmd();
+  const nextMonthFirst = _nextMalaysiaMonthFirstYmd(monthStartYmd);
+  const fromUtc = malaysiaDateToUtcDatetimeForDb(monthStartYmd);
+  const toUtcExclusive = nextMonthFirst ? malaysiaDateToUtcDatetimeForDb(nextMonthFirst) : null;
+  let monthlyProgress = {
+    monthLabel: _malaysiaYmdToEnglishMonthYear(monthStartYmd),
+    monthStartYmd,
+    tasksCompleted: 0,
+    tasksTotal: 0,
+    tasksPercent: 0,
+    onTimePercent: 0,
+  };
+  if (!oid) {
+    return {
+      stats: {
+        totalStaff: 0,
+        properties: 0,
+        completedToday: 0,
+        inProgress: 0,
+        totalSchedules: 0,
+      },
+      todayTasks: [],
+      monthlyProgress,
+    };
+  }
+
+  const hasOpCol = await databaseHasColumn('cln_property', 'operator_id');
+  const hasEoTable = await clnDc.databaseHasTable(pool, 'cln_employee_operator');
+  if (!hasOpCol) {
+    return {
+      stats: {
+        totalStaff: 0,
+        properties: 0,
+        completedToday: 0,
+        inProgress: 0,
+        totalSchedules: 0,
+      },
+      todayTasks: [],
+      monthlyProgress,
+    };
+  }
+
+  const schedJoin = `FROM cln_schedule s
+     INNER JOIN cln_property p ON p.id = s.property_id AND p.operator_id = ?`;
+
+  const [[{ totalProperties }]] = await pool.query(
+    'SELECT COUNT(*) AS totalProperties FROM cln_property WHERE operator_id = ?',
+    [oid]
+  );
+  const [[{ totalSchedules }]] = await pool.query(`SELECT COUNT(*) AS totalSchedules ${schedJoin}`, [oid]);
   const [[{ completedToday }]] = await pool.query(
-    "SELECT COUNT(*) AS completedToday FROM cln_schedule WHERE status IN ('completed','done') AND DATE(working_day)=CURDATE()"
+    `SELECT COUNT(*) AS completedToday ${schedJoin}
+     WHERE s.status IN ('completed','done') AND DATE(s.working_day)=CURDATE()`,
+    [oid]
   );
   const [[{ inProgress }]] = await pool.query(
-    "SELECT COUNT(*) AS inProgress FROM cln_schedule WHERE status IN ('in-progress','pending-checkout','ready-to-clean')"
+    `SELECT COUNT(*) AS inProgress ${schedJoin}
+     WHERE s.status IN ('in-progress','pending-checkout','ready-to-clean')`,
+    [oid]
   );
   const [todayTasks] = await pool.query(
     `SELECT s.id, COALESCE(p.property_name, p.unit_name, 'Property') AS property,
@@ -7759,25 +11463,86 @@ async function operatorDashboard() {
             COALESCE(s.team, '-') AS team,
             DATE_FORMAT(s.start_time, '%H:%i') AS startTime,
             DATE_FORMAT(s.end_time, '%H:%i') AS endTime
-     FROM cln_schedule s
-     LEFT JOIN cln_property p ON p.id = s.property_id
+     ${schedJoin}
      WHERE DATE(COALESCE(s.working_day, s.created_at)) = CURDATE()
      ORDER BY s.start_time ASC
-     LIMIT 20`
+     LIMIT 20`,
+    [oid]
   );
   const normalizedTodayTasks = (todayTasks || []).map((task) => ({
     ...task,
     status: normalizeScheduleStatus(task.status),
   }));
+
+  if (fromUtc && toUtcExclusive) {
+    const [[row]] = await pool.query(
+      `SELECT
+        SUM(CASE WHEN LOWER(IFNULL(s.status, '')) LIKE '%cancel%' THEN 0 ELSE 1 END) AS jobsInMonth,
+        SUM(
+          CASE
+            WHEN LOWER(IFNULL(s.status, '')) LIKE '%cancel%' THEN 0
+            WHEN (
+              LOWER(REPLACE(REPLACE(TRIM(IFNULL(s.status, '')), ' ', '-'), '_', '-')) LIKE '%complete%'
+              OR LOWER(TRIM(IFNULL(s.status, ''))) = 'done'
+            ) THEN 1
+            ELSE 0
+          END
+        ) AS completedInMonth,
+        SUM(
+          CASE
+            WHEN LOWER(IFNULL(s.status, '')) LIKE '%cancel%' THEN 0
+            WHEN (
+              LOWER(REPLACE(REPLACE(TRIM(IFNULL(s.status, '')), ' ', '-'), '_', '-')) LIKE '%complete%'
+              OR LOWER(TRIM(IFNULL(s.status, ''))) = 'done'
+            ) AND COALESCE(s.point, 0) = 0 THEN 1
+            ELSE 0
+          END
+        ) AS onTimeCompleted
+       ${schedJoin}
+       WHERE COALESCE(s.working_day, s.created_at) >= ?
+         AND COALESCE(s.working_day, s.created_at) < ?`,
+      [oid, fromUtc, toUtcExclusive]
+    );
+    const tasksTotal = Number(row?.jobsInMonth || 0);
+    const tasksCompleted = Number(row?.completedInMonth || 0);
+    const onTimeCompleted = Number(row?.onTimeCompleted || 0);
+    const tasksPercent =
+      tasksTotal > 0 ? Math.min(100, Math.round((100 * tasksCompleted) / tasksTotal)) : 0;
+    const onTimePercent =
+      tasksCompleted > 0 ? Math.min(100, Math.round((100 * onTimeCompleted) / tasksCompleted)) : 0;
+    monthlyProgress = {
+      monthLabel: _malaysiaYmdToEnglishMonthYear(monthStartYmd),
+      monthStartYmd,
+      tasksCompleted,
+      tasksTotal,
+      tasksPercent,
+      onTimePercent,
+    };
+  }
+
+  let totalStaff = 0;
+  if (hasEoTable) {
+    try {
+      const [[{ n }]] = await pool.query(
+        'SELECT COUNT(DISTINCT eo.employee_id) AS n FROM cln_employee_operator eo WHERE eo.operator_id = ?',
+        [oid]
+      );
+      totalStaff = Number(n || 0);
+    } catch (_) {
+      totalStaff = 0;
+    }
+  }
+
   return {
     stats: {
-      totalStaff: 0,
+      totalStaff,
       properties: Number(totalProperties || 0),
       completedToday: Number(completedToday || 0),
       inProgress: Number(inProgress || 0),
       totalSchedules: Number(totalSchedules || 0),
     },
     todayTasks: normalizedTodayTasks,
+    monthlyProgress,
   };
 }
 
@@ -7805,30 +11570,58 @@ async function listNotifications(operatorId) {
   await ensureNotificationsTable();
   const oid = String(operatorId || '').trim();
   const hasOd = await databaseHasColumn('cln_operator_notification', 'operatordetail_id');
+  if (!oid || !hasOd) {
+    return [];
+  }
   const [rows] = await pool.query(
-    hasOd && oid
-      ? `SELECT id, title, message, type, is_read AS isRead, created_at AS createdAt
-         FROM cln_operator_notification
-         WHERE operatordetail_id <=> ?
-         ORDER BY created_at DESC
-         LIMIT 50`
-      : `SELECT id, title, message, type, is_read AS isRead, created_at AS createdAt
-         FROM cln_operator_notification
-         ORDER BY created_at DESC
-         LIMIT 50`,
-    hasOd && oid ? [oid] : []
+    `SELECT id, title, message, type, is_read AS isRead, created_at AS createdAt
+     FROM cln_operator_notification
+     WHERE operatordetail_id <=> ?
+     ORDER BY created_at DESC
+     LIMIT 50`,
+    [oid]
   );
   return rows;
 }
 
-async function markNotificationRead(id) {
+async function markNotificationRead(id, operatorId) {
   await ensureNotificationsTable();
-  await pool.query('UPDATE cln_operator_notification SET is_read = 1 WHERE id = ? LIMIT 1', [String(id)]);
+  const oid = String(operatorId || '').trim();
+  const hasOd = await databaseHasColumn('cln_operator_notification', 'operatordetail_id');
+  if (!oid || !hasOd) {
+    const err = new Error('NOT_FOUND');
+    err.code = 'NOT_FOUND';
+    throw err;
+  }
+  const [r] = await pool.query(
+    'UPDATE cln_operator_notification SET is_read = 1 WHERE id = ? AND operatordetail_id <=> ? LIMIT 1',
+    [String(id), oid]
+  );
+  if (!r || Number(r.affectedRows || 0) < 1) {
+    const err = new Error('NOT_FOUND');
+    err.code = 'NOT_FOUND';
+    throw err;
+  }
 }
 
-async function dismissNotification(id) {
+async function dismissNotification(id, operatorId) {
   await ensureNotificationsTable();
-  await pool.query('DELETE FROM cln_operator_notification WHERE id = ? LIMIT 1', [String(id)]);
+  const oid = String(operatorId || '').trim();
+  const hasOd = await databaseHasColumn('cln_operator_notification', 'operatordetail_id');
+  if (!oid || !hasOd) {
+    const err = new Error('NOT_FOUND');
+    err.code = 'NOT_FOUND';
+    throw err;
+  }
+  const [r] = await pool.query(
+    'DELETE FROM cln_operator_notification WHERE id = ? AND operatordetail_id <=> ? LIMIT 1',
+    [String(id), oid]
+  );
+  if (!r || Number(r.affectedRows || 0) < 1) {
+    const err = new Error('NOT_FOUND');
+    err.code = 'NOT_FOUND';
+    throw err;
+  }
 }
 
 async function ensureOperatorSettingsTable() {
@@ -7901,14 +11694,16 @@ async function getOperatorSettings(operatorId) {
     ...(flags.aiProvider ? { aiProvider: flags.aiProvider } : {}),
     aiKeyConfigured: !!flags.aiKeyConfigured,
     stripe: stripeOn,
-    xendit: stripeOn ? false : !!base.xendit,
+    xendit: stripeOn ? false : !!parseClientInvoiceXenditFromSettings(base),
+    xenditGateway: buildClnClientInvoiceXenditGatewayUi(base, stripeOn),
     ttlock: !!flags.ttlockConnected,
     ttlockCreateEverUsed: !!flags.ttlockCreateEverUsed
   };
 }
 
 /**
- * Operator portal setup gate: company profile, portal user profile, pricing config (≥1 selected service).
+ * Operator portal setup gate: company profile + pricing config (≥1 selected service).
+ * Personal portal_account profile is not a blocking step for operators.
  */
 async function getOperatorPortalSetupStatus(operatorId, email) {
   const oid = String(operatorId || '').trim();
@@ -7935,7 +11730,6 @@ async function getOperatorPortalSetupStatus(operatorId, email) {
   );
   let firstIncomplete = null;
   if (!companyComplete) firstIncomplete = 'company';
-  else if (!profileComplete) firstIncomplete = 'profile';
   else if (!pricingComplete) firstIncomplete = 'pricing';
   return {
     ok: true,
@@ -10211,13 +14005,19 @@ async function createOperatorCalendarAdjustment(operatorId = 'op_demo_001', inpu
   return id;
 }
 
-async function updateOperatorCalendarAdjustment(id, input = {}) {
+async function updateOperatorCalendarAdjustment(id, operatorId, input = {}) {
   await ensureOperatorCalendarAdjustmentTable();
-  await pool.query(
+  const op = String(operatorId || '').trim();
+  if (!op) {
+    const err = new Error('MISSING_OPERATOR_ID');
+    err.code = 'MISSING_OPERATOR_ID';
+    throw err;
+  }
+  const [r] = await pool.query(
     `UPDATE cln_operator_calendar_adjustment
      SET name = ?, remark = ?, start_date = ?, end_date = ?, adjustment_type = ?, value_type = ?, value = ?,
          products_json = ?, properties_json = ?, clients_json = ?, updated_at = CURRENT_TIMESTAMP
-     WHERE id = ?
+     WHERE id = ? AND operator_id = ?
      LIMIT 1`,
     [
       String(input.name || ''),
@@ -10231,13 +14031,33 @@ async function updateOperatorCalendarAdjustment(id, input = {}) {
       JSON.stringify(Array.isArray(input.properties) ? input.properties : []),
       JSON.stringify(Array.isArray(input.clients) ? input.clients : []),
       String(id),
+      op,
     ]
   );
+  if (!r || Number(r.affectedRows || 0) < 1) {
+    const err = new Error('NOT_FOUND');
+    err.code = 'NOT_FOUND';
+    throw err;
+  }
 }
 
-async function deleteOperatorCalendarAdjustment(id) {
+async function deleteOperatorCalendarAdjustment(id, operatorId) {
   await ensureOperatorCalendarAdjustmentTable();
-  await pool.query('DELETE FROM cln_operator_calendar_adjustment WHERE id = ? LIMIT 1', [String(id)]);
+  const op = String(operatorId || '').trim();
+  if (!op) {
+    const err = new Error('MISSING_OPERATOR_ID');
+    err.code = 'MISSING_OPERATOR_ID';
+    throw err;
+  }
+  const [r] = await pool.query(
+    'DELETE FROM cln_operator_calendar_adjustment WHERE id = ? AND operator_id = ? LIMIT 1',
+    [String(id), op]
+  );
+  if (!r || Number(r.affectedRows || 0) < 1) {
+    const err = new Error('NOT_FOUND');
+    err.code = 'NOT_FOUND';
+    throw err;
+  }
 }
 
 /** Merge `cln_clientdetail` (via `cln_client_operator`) into invoice client picker for the operator. */
@@ -10506,6 +14326,12 @@ async function createOperatorInvoice(input = {}) {
   const amount = Number(input.amount || 0);
   const opId = String(input.operatorId || '').trim();
   const hasInvOp = await databaseHasColumn('cln_client_invoice', 'operator_id');
+  if (hasInvOp && !opId) {
+    const err = new Error('OPERATOR_ID_REQUIRED');
+    err.code = 'OPERATOR_ID_REQUIRED';
+    err.statusCode = 400;
+    throw err;
+  }
   if (hasInvOp && opId) {
     await pool.query(
       `INSERT INTO cln_client_invoice
@@ -10536,6 +14362,32 @@ async function createOperatorInvoice(input = {}) {
       ]
     );
   }
+  const clipYmd = (v) => {
+    const s = String(v || '').trim().slice(0, 10);
+    return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+  };
+  const issueYmd = clipYmd(input.issueDate);
+  const dueYmd = clipYmd(input.dueDate);
+  const hasIssueCol = await databaseHasColumn('cln_client_invoice', 'issue_date');
+  const hasDueCol = await databaseHasColumn('cln_client_invoice', 'due_date');
+  if ((hasIssueCol && issueYmd) || (hasDueCol && dueYmd)) {
+    const sets = [];
+    const vals = [];
+    if (hasIssueCol && issueYmd) {
+      sets.push('issue_date = ?');
+      vals.push(issueYmd);
+    }
+    if (hasDueCol && dueYmd) {
+      sets.push('due_date = ?');
+      vals.push(dueYmd);
+    }
+    if (sets.length) {
+      vals.push(id);
+      await pool.query(`UPDATE cln_client_invoice SET ${sets.join(', ')}, updated_at = NOW(3) WHERE id = ? LIMIT 1`, vals);
+    }
+  }
+  let pdfUrlFromAccounting;
+  let accountingMetaFromAccounting;
   const operatorId = String(input.operatorId || '').trim();
   if (operatorId) {
     try {
@@ -10544,36 +14396,79 @@ async function createOperatorInvoice(input = {}) {
         await pool.query('DELETE FROM cln_client_invoice WHERE id = ? LIMIT 1', [id]);
         const err = new Error(ar.reason || 'ACCOUNTING_INVOICE_FAILED');
         err.detail = ar.detail;
+        err.code = ar.code || ar.reason || 'ACCOUNTING_INVOICE_FAILED';
+        err.statusCode = 400;
         throw err;
+      }
+      if (ar.pdfUrl != null && String(ar.pdfUrl).trim() !== '') {
+        pdfUrlFromAccounting = String(ar.pdfUrl).trim();
+      }
+      if (ar.accountingMeta != null && typeof ar.accountingMeta === 'object') {
+        accountingMetaFromAccounting = ar.accountingMeta;
       }
     } catch (e) {
       await pool.query('DELETE FROM cln_client_invoice WHERE id = ? LIMIT 1', [id]).catch(() => {});
       throw e;
     }
   }
-  const [[row]] = await pool.query('SELECT invoice_number FROM cln_client_invoice WHERE id = ? LIMIT 1', [id]);
+  const hasInvMetaCol = await databaseHasColumn('cln_client_invoice', 'accounting_meta_json');
+  const invSelectCols = hasInvMetaCol ? 'invoice_number, pdf_url, accounting_meta_json' : 'invoice_number, pdf_url';
+  const [[row]] = await pool.query(`SELECT ${invSelectCols} FROM cln_client_invoice WHERE id = ? LIMIT 1`, [id]);
   const invoiceNoFinal = row?.invoice_number != null && String(row.invoice_number).trim() !== ''
     ? String(row.invoice_number).trim()
     : String(input.invoiceNo || id);
-  return { id, invoiceNo: invoiceNoFinal };
+  const pdfUrlFinal =
+    pdfUrlFromAccounting != null && String(pdfUrlFromAccounting).trim() !== ''
+      ? String(pdfUrlFromAccounting).trim()
+      : row?.pdf_url != null && String(row.pdf_url).trim() !== ''
+        ? String(row.pdf_url).trim()
+        : undefined;
+  let accountingMetaOut = accountingMetaFromAccounting;
+  if (!accountingMetaOut && hasInvMetaCol && row?.accounting_meta_json) {
+    try {
+      accountingMetaOut = JSON.parse(String(row.accounting_meta_json));
+    } catch {
+      accountingMetaOut = undefined;
+    }
+  }
+  return {
+    id,
+    invoiceNo: invoiceNoFinal,
+    ...(pdfUrlFinal ? { pdfUrl: pdfUrlFinal } : {}),
+    ...(accountingMetaOut ? { accountingMeta: accountingMetaOut } : {})
+  };
 }
 
 async function updateOperatorInvoice(id, patch = {}) {
   const status = String(patch.status || '').trim();
-  await pool.query(
-    `UPDATE cln_client_invoice
-     SET invoice_number = ?, client_id = ?, description = ?, amount = ?, payment_received = ?, updated_at = NOW(3)
-     WHERE id = ?
-     LIMIT 1`,
-    [
-      String(patch.invoiceNo || id),
-      String(patch.clientId || ''),
-      String(patch.description || ''),
-      Number(patch.amount || 0),
-      status === 'paid' ? 1 : 0,
-      String(id),
-    ]
-  );
+  const clipYmd = (v) => {
+    const s = String(v || '').trim().slice(0, 10);
+    return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+  };
+  const issueYmd = clipYmd(patch.issueDate);
+  const dueYmd = clipYmd(patch.dueDate);
+  const hasIssueCol = await databaseHasColumn('cln_client_invoice', 'issue_date');
+  const hasDueCol = await databaseHasColumn('cln_client_invoice', 'due_date');
+  let sql = `UPDATE cln_client_invoice
+     SET invoice_number = ?, client_id = ?, description = ?, amount = ?, payment_received = ?`;
+  const vals = [
+    String(patch.invoiceNo || id),
+    String(patch.clientId || ''),
+    String(patch.description || ''),
+    Number(patch.amount || 0),
+    status === 'paid' ? 1 : 0,
+  ];
+  if (hasIssueCol && issueYmd) {
+    sql += ', issue_date = ?';
+    vals.push(issueYmd);
+  }
+  if (hasDueCol && dueYmd) {
+    sql += ', due_date = ?';
+    vals.push(dueYmd);
+  }
+  sql += ', updated_at = NOW(3) WHERE id = ? LIMIT 1';
+  vals.push(String(id));
+  await pool.query(sql, vals);
 }
 
 async function ensureEmployeeAttendanceTable() {
@@ -10895,6 +14790,18 @@ async function clnDamageReportTableExists() {
   }
 }
 
+async function clnLegacyDamageTableExists() {
+  try {
+    const [[r]] = await pool.query(
+      `SELECT COUNT(*) AS n FROM information_schema.TABLES
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cln_damage'`
+    );
+    return Number(r?.n) > 0;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Employee portal: submit damage report for a schedule job (photos + remark).
  */
@@ -10966,16 +14873,108 @@ async function createEmployeeScheduleDamageReport({ email, operatorId, scheduleI
   return { ok: true, id };
 }
 
-function mapDamageReportRow(r) {
-  let photoUrls = [];
-  if (r.photosJson != null && String(r.photosJson).trim() !== '') {
+/** Wix `wix:video://v1/{fileId}/{filename}.mp4` → CDN MP4 (720p lane; pattern from Wix-hosted assets). */
+function wixVideoPlayUrlFromRaw(raw) {
+  const s = String(raw || '').trim();
+  if (!s.startsWith('wix:video://')) return '';
+  const m = s.match(/wix:video:\/\/v1\/([^/]+)\/([^#?]+)/i);
+  if (!m) return '';
+  const fileId = m[1];
+  const fileName = m[2];
+  return `https://video.wixstatic.com/video/${fileId}/720p/mp4/${fileName}`;
+}
+
+function wixVideoPosterUrlFromRaw(raw) {
+  const s = String(raw || '');
+  const poster = s.match(/[#&]posterUri=([^&]+)/);
+  if (!poster || !poster[1]) return '';
+  const id = decodeURIComponent(String(poster[1]).trim());
+  return id ? `https://static.wixstatic.com/media/${id}` : '';
+}
+
+/** Wix CMS / import — images → static; videos → playable MP4; OSS http → https. */
+function normalizeClnDamageMediaUrl(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  if (s.startsWith('wix:image://')) {
+    const m = s.match(/wix:image:\/\/v1\/([^/#?]+)/);
+    return m ? `https://static.wixstatic.com/media/${m[1]}` : s;
+  }
+  if (s.startsWith('wix:video://')) {
+    return wixVideoPlayUrlFromRaw(s) || '';
+  }
+  if (s.startsWith('http://')) {
     try {
-      const p = JSON.parse(String(r.photosJson));
-      photoUrls = Array.isArray(p) ? p.filter((u) => typeof u === 'string') : [];
-    } catch {
-      photoUrls = [];
+      const h = new URL(s).hostname.toLowerCase();
+      if (h.endsWith('.aliyuncs.com')) return s.replace(/^http:\/\//i, 'https://');
+    } catch (_) {
+      /* ignore */
     }
   }
+  return s;
+}
+
+function inferDamageMediaKindFromUrl(url) {
+  const u = String(url || '').trim().toLowerCase();
+  if (!u) return 'image';
+  if (/\.(mp4|webm|mov|mkv|m4v|ogv|3gp)(\?|#|$)/i.test(u)) return 'video';
+  if (u.includes('video.wixstatic.com/video')) return 'video';
+  return 'image';
+}
+
+function parseDamagePhotosJsonToAttachments(photosJson) {
+  if (photosJson == null || String(photosJson).trim() === '') return [];
+  let p;
+  try {
+    p = JSON.parse(String(photosJson));
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(p)) return [];
+  const out = [];
+  for (const item of p) {
+    let raw = '';
+    let wixType = '';
+    if (typeof item === 'string') raw = item;
+    else if (item && typeof item === 'object') {
+      raw = String(item.src || item.url || item.fileUrl || '').trim();
+      wixType = String(item.type || '').toLowerCase();
+    }
+    if (!raw) continue;
+
+    if (raw.startsWith('wix:video://')) {
+      const play = wixVideoPlayUrlFromRaw(raw);
+      if (!play) continue;
+      out.push({
+        url: play,
+        kind: 'video',
+        posterUrl: wixVideoPosterUrlFromRaw(raw) || null,
+      });
+      continue;
+    }
+    if (raw.startsWith('wix:image://')) {
+      const n = normalizeClnDamageMediaUrl(raw);
+      if (n) out.push({ url: n, kind: 'image', posterUrl: null });
+      continue;
+    }
+
+    const n = normalizeClnDamageMediaUrl(raw);
+    if (!n) continue;
+    let kind = 'image';
+    if (wixType === 'video') kind = 'video';
+    else if (wixType === 'image') kind = 'image';
+    else kind = inferDamageMediaKindFromUrl(n);
+    out.push({ url: n, kind, posterUrl: null });
+  }
+  return out;
+}
+
+function mapDamageReportRow(r) {
+  const photoAttachments =
+    r.photosJson != null && String(r.photosJson).trim() !== ''
+      ? parseDamagePhotosJsonToAttachments(r.photosJson)
+      : [];
+  const photoUrls = photoAttachments.map((a) => a.url);
   return {
     id: String(r.id),
     scheduleId: r.scheduleId != null ? String(r.scheduleId) : '',
@@ -10988,6 +14987,7 @@ function mapDamageReportRow(r) {
     staffEmail: String(r.staffEmail || ''),
     remark: r.remark != null ? String(r.remark) : '',
     photoUrls,
+    photoAttachments,
     reportedAt: r.reportedAt ? new Date(r.reportedAt).toISOString() : null,
     jobDate: r.jobDate != null ? String(r.jobDate).slice(0, 10) : null,
     jobStartTime: r.jobStartTime != null ? String(r.jobStartTime) : null,
@@ -10999,83 +14999,205 @@ function mapDamageReportRow(r) {
 async function listOperatorDamageReports({ operatorId, limit = 200 } = {}) {
   const oid = String(operatorId || '').trim();
   if (!oid) return [];
-  if (!(await clnDamageReportTableExists())) return [];
   const lim = Math.min(Math.max(Number(limit) || 200, 1), 1000);
   const ct = await getClnCompanyTable();
   const clientDisp = await buildClnPropertyClientDisplaySql(ct);
-  const [rows] = await pool.query(
-    `SELECT dr.id,
-            dr.schedule_id AS scheduleId,
-            dr.property_id AS propertyId,
-            dr.operator_id AS operatorId,
-            dr.staff_email AS staffEmail,
-            dr.remark,
-            dr.photos_json AS photosJson,
-            dr.reported_at AS reportedAt,
-            dr.acknowledged_at AS acknowledgedAt,
-            dr.acknowledged_by_email AS acknowledgedByEmail,
-            DATE_FORMAT(s.working_day, '%Y-%m-%d') AS jobDate,
-            TIME_FORMAT(s.start_time, '%H:%i') AS jobStartTime,
-            COALESCE(p.property_name, p.unit_name, 'Property') AS propertyName,
-            COALESCE(p.unit_name, '') AS unitNumber,
-            ${clientDisp.nameExpr} AS clientName,
-            COALESCE(od.name, '') AS operatorName
-     FROM cln_damage_report dr
-     INNER JOIN cln_schedule s ON s.id = dr.schedule_id
-     INNER JOIN cln_property p ON p.id = dr.property_id
-     ${clientDisp.joinSql}
-     LEFT JOIN cln_operatordetail od ON od.id = dr.operator_id
-     WHERE dr.operator_id = ?
-     ORDER BY dr.reported_at DESC
-     LIMIT ?`,
-    [oid, lim]
-  );
-  return (rows || []).map((r) => mapDamageReportRow(r));
+
+  let fromReports = [];
+  if (await clnDamageReportTableExists()) {
+    const [rows] = await pool.query(
+      `SELECT dr.id,
+              dr.schedule_id AS scheduleId,
+              dr.property_id AS propertyId,
+              dr.operator_id AS operatorId,
+              dr.staff_email AS staffEmail,
+              dr.remark,
+              dr.photos_json AS photosJson,
+              dr.reported_at AS reportedAt,
+              dr.acknowledged_at AS acknowledgedAt,
+              dr.acknowledged_by_email AS acknowledgedByEmail,
+              ${SQL_CLN_SCHEDULE_JOB_DATE_KL_YMD} AS jobDate,
+              TIME_FORMAT(s.start_time, '%H:%i') AS jobStartTime,
+              COALESCE(p.property_name, p.unit_name, 'Property') AS propertyName,
+              COALESCE(p.unit_name, '') AS unitNumber,
+              ${clientDisp.nameExpr} AS clientName,
+              COALESCE(od.name, '') AS operatorName
+       FROM cln_damage_report dr
+       INNER JOIN cln_schedule s ON s.id = dr.schedule_id
+       INNER JOIN cln_property p ON p.id = dr.property_id
+       ${clientDisp.joinSql}
+       LEFT JOIN cln_operatordetail od ON od.id = dr.operator_id
+       WHERE dr.operator_id = ?
+       ORDER BY dr.reported_at DESC
+       LIMIT ?`,
+      [oid, lim]
+    );
+    fromReports = (rows || []).map((r) => mapDamageReportRow(r));
+  }
+
+  let fromLegacy = [];
+  if (await clnLegacyDamageTableExists()) {
+    const hasPropOp = await databaseHasColumn('cln_property', 'operator_id');
+    if (hasPropOp) {
+      const [lrows] = await pool.query(
+        `SELECT d.id,
+                CAST('' AS CHAR(36)) AS scheduleId,
+                d.property_id AS propertyId,
+                p.operator_id AS operatorId,
+                COALESCE(NULLIF(TRIM(e.email), ''), '') AS staffEmail,
+                d.remark,
+                d.damage_photo_json AS photosJson,
+                d.created_at AS reportedAt,
+                NULL AS acknowledgedAt,
+                NULL AS acknowledgedByEmail,
+                DATE_FORMAT(d.created_at, '%Y-%m-%d') AS jobDate,
+                NULL AS jobStartTime,
+                COALESCE(p.property_name, p.unit_name, 'Property') AS propertyName,
+                COALESCE(p.unit_name, '') AS unitNumber,
+                ${clientDisp.nameExpr} AS clientName,
+                COALESCE(od.name, '') AS operatorName
+         FROM cln_damage d
+         INNER JOIN cln_property p ON p.id = d.property_id AND LOWER(TRIM(p.operator_id)) = LOWER(?)
+         ${clientDisp.joinSql}
+         LEFT JOIN cln_employeedetail e ON e.id = d.staff_id
+         LEFT JOIN cln_operatordetail od ON od.id = p.operator_id
+         WHERE d.property_id IS NOT NULL
+         ORDER BY d.created_at DESC
+         LIMIT ?`,
+        [oid, lim]
+      );
+      fromLegacy = (lrows || []).map((r) => mapDamageReportRow(r));
+    }
+  }
+
+  const merged = [...fromReports, ...fromLegacy];
+  merged.sort((a, b) => {
+    const ta = a.reportedAt ? new Date(a.reportedAt).getTime() : 0;
+    const tb = b.reportedAt ? new Date(b.reportedAt).getTime() : 0;
+    return tb - ta;
+  });
+  return merged.slice(0, lim);
 }
 
-async function listClientPortalDamageReports({ clientdetailId, operatorId, limit = 200 } = {}) {
+/**
+ * Property IDs the client may see in portal — same rules as `listClientPortalProperties`
+ * (operator-bound properties + property-group share / grantee).
+ */
+async function getClientPortalAccessiblePropertyIds({ clientdetailId, loginEmail, limit = 1000 } = {}) {
   const cid = String(clientdetailId || '').trim();
-  const oid = String(operatorId || '').trim();
-  if (!cid || !oid) return [];
-  if (!(await clnDamageReportTableExists())) return [];
+  if (!cid) return [];
+  const rows = await listClientPortalProperties({ clientdetailId: cid, limit, loginEmail });
+  return (rows || []).map((r) => String(r.id || '').trim()).filter(Boolean);
+}
+
+/** operatorId from the portal session is ignored — damage is scoped by the same property list as the client Properties page. */
+async function listClientPortalDamageReports({ clientdetailId, operatorId: _operatorId, limit = 200, loginEmail } = {}) {
+  const cid = String(clientdetailId || '').trim();
+  if (!cid) return [];
+  const hasReportTable = await clnDamageReportTableExists();
+  const hasLegacyTable = await clnLegacyDamageTableExists();
+  if (!hasReportTable && !hasLegacyTable) return [];
   const lim = Math.min(Math.max(Number(limit) || 200, 1), 1000);
+  const hasPropClientdetailId = await databaseHasColumn('cln_property', 'clientdetail_id');
+  if (!hasPropClientdetailId) return [];
+
+  const propertyIds = await getClientPortalAccessiblePropertyIds({
+    clientdetailId: cid,
+    loginEmail,
+    limit: 1000,
+  });
+  if (!propertyIds.length) return [];
+
   const ct = await getClnCompanyTable();
   const clientDisp = await buildClnPropertyClientDisplaySql(ct);
-  const [rows] = await pool.query(
-    `SELECT dr.id,
-            dr.schedule_id AS scheduleId,
-            dr.property_id AS propertyId,
-            dr.operator_id AS operatorId,
-            dr.staff_email AS staffEmail,
-            dr.remark,
-            dr.photos_json AS photosJson,
-            dr.reported_at AS reportedAt,
-            dr.acknowledged_at AS acknowledgedAt,
-            dr.acknowledged_by_email AS acknowledgedByEmail,
-            DATE_FORMAT(s.working_day, '%Y-%m-%d') AS jobDate,
-            TIME_FORMAT(s.start_time, '%H:%i') AS jobStartTime,
-            COALESCE(p.property_name, p.unit_name, 'Property') AS propertyName,
-            COALESCE(p.unit_name, '') AS unitNumber,
-            ${clientDisp.nameExpr} AS clientName,
-            COALESCE(od.name, '') AS operatorName
-     FROM cln_damage_report dr
-     INNER JOIN cln_schedule s ON s.id = dr.schedule_id
-     INNER JOIN cln_property p ON p.id = dr.property_id
-     ${clientDisp.joinSql}
-     LEFT JOIN cln_operatordetail od ON od.id = dr.operator_id
-     WHERE p.clientdetail_id = ? AND p.operator_id = ?
-     ORDER BY dr.reported_at DESC
-     LIMIT ?`,
-    [cid, oid, lim]
-  );
-  return (rows || []).map((r) => mapDamageReportRow(r));
+  const ph = propertyIds.map(() => '?').join(',');
+
+  let fromReports = [];
+  if (hasReportTable) {
+    const [rows] = await pool.query(
+      `SELECT dr.id,
+              dr.schedule_id AS scheduleId,
+              dr.property_id AS propertyId,
+              dr.operator_id AS operatorId,
+              dr.staff_email AS staffEmail,
+              dr.remark,
+              dr.photos_json AS photosJson,
+              dr.reported_at AS reportedAt,
+              dr.acknowledged_at AS acknowledgedAt,
+              dr.acknowledged_by_email AS acknowledgedByEmail,
+              ${SQL_CLN_SCHEDULE_JOB_DATE_KL_YMD} AS jobDate,
+              TIME_FORMAT(s.start_time, '%H:%i') AS jobStartTime,
+              COALESCE(p.property_name, p.unit_name, 'Property') AS propertyName,
+              COALESCE(p.unit_name, '') AS unitNumber,
+              ${clientDisp.nameExpr} AS clientName,
+              COALESCE(od.name, '') AS operatorName
+       FROM cln_damage_report dr
+       INNER JOIN cln_schedule s ON s.id = dr.schedule_id
+       INNER JOIN cln_property p ON p.id = dr.property_id
+       ${clientDisp.joinSql}
+       LEFT JOIN cln_operatordetail od ON od.id = dr.operator_id
+       WHERE dr.property_id IN (${ph})
+       ORDER BY dr.reported_at DESC
+       LIMIT ?`,
+      [...propertyIds, lim]
+    );
+    fromReports = (rows || []).map((r) => mapDamageReportRow(r));
+  }
+
+  let fromLegacy = [];
+  if (hasLegacyTable) {
+    const hasPropOp = await databaseHasColumn('cln_property', 'operator_id');
+    if (hasPropOp) {
+      const [lrows] = await pool.query(
+        `SELECT d.id,
+                CAST('' AS CHAR(36)) AS scheduleId,
+                d.property_id AS propertyId,
+                p.operator_id AS operatorId,
+                COALESCE(NULLIF(TRIM(e.email), ''), '') AS staffEmail,
+                d.remark,
+                d.damage_photo_json AS photosJson,
+                d.created_at AS reportedAt,
+                NULL AS acknowledgedAt,
+                NULL AS acknowledgedByEmail,
+                DATE_FORMAT(d.created_at, '%Y-%m-%d') AS jobDate,
+                NULL AS jobStartTime,
+                COALESCE(p.property_name, p.unit_name, 'Property') AS propertyName,
+                COALESCE(p.unit_name, '') AS unitNumber,
+                ${clientDisp.nameExpr} AS clientName,
+                COALESCE(od.name, '') AS operatorName
+         FROM cln_damage d
+         INNER JOIN cln_property p ON p.id = d.property_id
+         ${clientDisp.joinSql}
+         LEFT JOIN cln_employeedetail e ON e.id = d.staff_id
+         LEFT JOIN cln_operatordetail od ON od.id = p.operator_id
+         WHERE d.property_id IS NOT NULL AND d.property_id IN (${ph})
+         ORDER BY d.created_at DESC
+         LIMIT ?`,
+        [...propertyIds, lim]
+      );
+      fromLegacy = (lrows || []).map((r) => mapDamageReportRow(r));
+    }
+  }
+
+  const merged = [...fromReports, ...fromLegacy];
+  merged.sort((a, b) => {
+    const ta = a.reportedAt ? new Date(a.reportedAt).getTime() : 0;
+    const tb = b.reportedAt ? new Date(b.reportedAt).getTime() : 0;
+    return tb - ta;
+  });
+  return merged.slice(0, lim);
 }
 
-async function acknowledgeClientPortalDamageReport({ clientdetailId, operatorId, reportId, acknowledgedByEmail }) {
+async function acknowledgeClientPortalDamageReport({
+  clientdetailId,
+  operatorId: _operatorId,
+  reportId,
+  acknowledgedByEmail,
+  loginEmail,
+}) {
   const cid = String(clientdetailId || '').trim();
-  const oid = String(operatorId || '').trim();
   const rid = String(reportId || '').trim();
-  if (!cid || !oid || !rid) {
+  if (!cid || !rid) {
     const e = new Error('MISSING_IDS');
     e.code = 'MISSING_IDS';
     throw e;
@@ -11086,8 +15208,11 @@ async function acknowledgeClientPortalDamageReport({ clientdetailId, operatorId,
     throw e;
   }
   const ackEmail = acknowledgedByEmail != null ? String(acknowledgedByEmail).trim().toLowerCase() : '';
+  const inviteEmail = String(loginEmail || ackEmail || '')
+    .trim()
+    .toLowerCase();
   const [[row]] = await pool.query(
-    `SELECT dr.id, dr.acknowledged_at AS acknowledgedAt, p.clientdetail_id AS clientdetailId, p.operator_id AS op
+    `SELECT dr.id, dr.acknowledged_at AS acknowledgedAt, p.id AS propertyId
      FROM cln_damage_report dr
      INNER JOIN cln_property p ON p.id = dr.property_id
      WHERE dr.id = ? LIMIT 1`,
@@ -11098,7 +15223,14 @@ async function acknowledgeClientPortalDamageReport({ clientdetailId, operatorId,
     e.code = 'REPORT_NOT_FOUND';
     throw e;
   }
-  if (String(row.clientdetailId || '') !== cid || String(row.op || '') !== oid) {
+  const allowedIds = new Set(
+    await getClientPortalAccessiblePropertyIds({
+      clientdetailId: cid,
+      loginEmail: inviteEmail || undefined,
+      limit: 1000,
+    })
+  );
+  if (!allowedIds.has(String(row.propertyId || '').trim())) {
     const e = new Error('REPORT_ACCESS_DENIED');
     e.code = 'REPORT_ACCESS_DENIED';
     throw e;
@@ -11340,6 +15472,12 @@ async function adminTransferClnProperty({ propertyId, operatorId, clientdetailId
   }
   vals.push(pid);
   await pool.query(`UPDATE cln_property SET ${sets.join(', ')}, updated_at = NOW(3) WHERE id = ?`, vals);
+
+  try {
+    await syncClnPropertyLegacyClientIdColumn(pid);
+  } catch (e) {
+    console.warn('[cleanlemon] syncClnPropertyLegacyClientIdColumn adminTransfer', pid, e?.message || e);
+  }
 
   const finalOp = (opId || (hasOpCol && cur.operator_id != null ? String(cur.operator_id).trim() : '')) || '';
   const finalCd = (cdId || (hasCdCol && cur.clientdetail_id != null ? String(cur.clientdetail_id).trim() : '')) || '';
@@ -12546,6 +16684,7 @@ module.exports = {
   getOperatorPropertyDetail,
   listOperatorLinkedClientdetails,
   listClientPortalProperties,
+  getClientPortalAccessiblePropertyIds,
   syncClientPortalPropertiesFromColiving,
   getClientPortalPropertyDetail,
   patchClientPortalProperty,
@@ -12562,9 +16701,15 @@ module.exports = {
   listOperatorInvoices,
   updateInvoiceStatus,
   deleteInvoice,
+  sendOperatorInvoicePaymentReminder,
   listAgreements,
+  listAgreementsForClientPortal,
+  previewClnAgreementInstancePdfForRecipient,
+  previewClnAgreementInstancePdfForOperator,
+  deleteClnOperatorAgreement,
   createAgreement,
   signAgreement,
+  retryFinalizeClnOperatorAgreementPdf,
   listAgreementTemplates,
   createAgreementTemplate,
   previewOperatorAgreementTemplatePdf,
@@ -12592,13 +16737,29 @@ module.exports = {
   listOperatorPendingClientBookingRequests,
   decideOperatorClientBookingRequest,
   updateOperatorScheduleJob,
+  deleteOperatorScheduleJob,
   createOperatorScheduleJob,
   createCleaningScheduleJobUnified,
+  bulkCreateHomestayJobsByPropertyNameSubstring,
   listClientPortalScheduleJobs,
   createClientPortalScheduleJob,
   updateClientPortalScheduleJob,
+  deleteClientPortalScheduleJob,
   listClientPortalInvoices,
   createClientPortalInvoiceCheckoutSession,
+  createClientPortalInvoicePayment,
+  confirmClientPortalInvoicePayment,
+  handleB2bInvoiceBillplzCallback,
+  handleB2bInvoiceXenditWebhook,
+  saveClnOperatorClientInvoiceXenditCredentials,
+  clearClnOperatorClientInvoiceXenditCredentials,
+  applyCleanlemonClientInvoicesFromCheckoutSession,
+  attachClientPortalInvoiceReceipt,
+  listOperatorClientPaymentQueue,
+  acknowledgeOperatorClientPayment,
+  rejectOperatorClientPortalReceipt,
+  rejectOperatorClientPortalReceiptBatch,
+  getClientPortalOperatorBankTransferInfo,
   listOperatorAccountingMappings,
   upsertOperatorAccountingMapping,
   syncOperatorAccountingMappings,

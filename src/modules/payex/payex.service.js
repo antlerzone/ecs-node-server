@@ -941,10 +941,18 @@ async function handleCallback(data, opts = {}) {
     if (rows.length) rentalIds = rows.map((r) => r.id);
   }
 
-  const type = (metadataObj.type || data.type || '').toString();
+  let type = (metadataObj.type || data.type || '').toString();
   const tenantId = metadataObj.tenant_id || null;
   const tenancyId = metadataObj.tenancy_id || null;
-  const meterTransactionId = (metadataObj.meter_transaction_id || '').trim();
+  let meterTransactionId = (metadataObj.meter_transaction_id || '').trim();
+  const refForExternal = String(referenceId || '').trim();
+  /** Meter checkout uses `external_id` = `MT-{metertransaction.id}` so PAID webhooks still match if Xendit omits metadata. */
+  if (!meterTransactionId && /^MT-/i.test(refForExternal)) {
+    meterTransactionId = refForExternal.replace(/^MT-/i, '').trim();
+  }
+  if (!type && meterTransactionId && /^MT-/i.test(refForExternal)) {
+    type = 'TenantMeter';
+  }
   const clientIdFromMeta = (metadataObj.client_id || '').trim();
   const clientId = clientIdFromMeta || String(opts.routeClientId || '').trim();
   const amountPaid = Number(data?.paidAmount ?? data?.amount ?? 0);

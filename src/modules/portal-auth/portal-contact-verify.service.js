@@ -7,7 +7,7 @@ const pool = require('../../config/db');
 const { getOperatorMasterTableName } = require('../../config/operatorMasterTable');
 const { resolveClnOperatordetailTable } = require('../../config/clnOperatordetailTable');
 const { normalizeEmail } = require('../access/access.service');
-const { sendPortalOtpEmail } = require('./portal-password-reset-sender');
+const { sendPortalOtpEmail, getPortalProductFromRequest } = require('./portal-password-reset-sender');
 
 /**
  * True if email is already used for another portal account or any Coliving / Cleanlemons identity
@@ -110,7 +110,13 @@ function normalizePhoneDigits(p) {
   return String(p || '').replace(/\s+/g, '').trim();
 }
 
-async function migratePortalAccountEmail(oldEmail, newEmail) {
+/**
+ * @param {string} oldEmail
+ * @param {string} newEmail
+ * @param {string|null} operatordetailClientId - When set (Coliving operator company), updates operatordetail.email for this id after verifying it matches oldEmail.
+ * @param {string|null} clnOperatordetailId - When set (Cleanlemons), updates cln_operatordetail (or legacy company table) email for this id.
+ */
+async function migratePortalAccountEmail(oldEmail, newEmail, operatordetailClientId = null, clnOperatordetailId = null) {
   const o = normalizeEmail(oldEmail);
   const n = normalizeEmail(newEmail);
   if (!o || !n) return { ok: false, reason: 'NO_EMAIL' };
@@ -120,12 +126,61 @@ async function migratePortalAccountEmail(oldEmail, newEmail) {
   );
   if (!acctRows.length) return { ok: false, reason: 'NO_ACCOUNT' };
   const accountId = String(acctRows[0].id);
-  const takenElsewhere = await isNewEmailRegisteredByAnotherAccount(n, accountId);
+  /** Coliving / Cleanlemons operator company scheduled change: block if another company row already uses the new master email. */
+  let takenElsewhere;
+  if (operatordetailClientId) {
+    const cid = String(operatordetailClientId).trim();
+    const [opRows] = await pool.query(
+      'SELECT id FROM operatordetail WHERE LOWER(TRIM(email)) = ? AND id <> ? LIMIT 1',
+      [n, cid]
+    );
+    takenElsewhere = opRows.length > 0;
+  } else if (clnOperatordetailId) {
+    const ct = await resolveClnOperatordetailTable();
+    const oid = String(clnOperatordetailId).trim();
+    const [opRows] = await pool.query(
+      `SELECT id FROM \`${ct}\` WHERE LOWER(TRIM(email)) = ? AND id <> ? LIMIT 1`,
+      [n, oid]
+    );
+    takenElsewhere = opRows.length > 0;
+  } else {
+    takenElsewhere = await isNewEmailRegisteredByAnotherAccount(n, accountId);
+  }
   if (takenElsewhere) return { ok: false, reason: 'EMAIL_TAKEN' };
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    if (operatordetailClientId) {
+      const cid = String(operatordetailClientId).trim();
+      const [odRows] = await conn.query(
+        'SELECT id, email FROM operatordetail WHERE id = ? LIMIT 1',
+        [cid]
+      );
+      if (!odRows.length || normalizeEmail(odRows[0].email) !== o) {
+        await conn.rollback();
+        return { ok: false, reason: 'OPERATORDETAIL_MISMATCH' };
+      }
+      await conn.query('UPDATE operatordetail SET email = ?, updated_at = NOW() WHERE id = ?', [n, cid]);
+    }
+    if (clnOperatordetailId) {
+      const ct = await resolveClnOperatordetailTable();
+      const oid = String(clnOperatordetailId).trim();
+      const [odRows] = await conn.query(`SELECT id, email FROM \`${ct}\` WHERE id = ? LIMIT 1`, [oid]);
+      if (!odRows.length || normalizeEmail(odRows[0].email) !== o) {
+        await conn.rollback();
+        return { ok: false, reason: 'CLN_OPERATORDETAIL_MISMATCH' };
+      }
+      try {
+        await conn.query(`UPDATE \`${ct}\` SET email = ?, updated_at = NOW() WHERE id = ?`, [n, oid]);
+      } catch (e) {
+        if (e?.code === 'ER_BAD_FIELD_ERROR') {
+          await conn.query(`UPDATE \`${ct}\` SET email = ? WHERE id = ?`, [n, oid]);
+        } else {
+          throw e;
+        }
+      }
+    }
     await conn.query('UPDATE portal_account SET email = ?, updated_at = NOW() WHERE id = ?', [n, accountId]);
     const tables = [
       ['tenantdetail', 'email'],
@@ -169,10 +224,11 @@ async function migratePortalAccountEmail(oldEmail, newEmail) {
   }
 }
 
-async function requestEmailChangeOtp(portalEmail, newEmailRaw) {
+async function requestEmailChangeOtp(portalEmail, newEmailRaw, req = null) {
   const newE = normalizeEmail(newEmailRaw);
   const oldE = normalizeEmail(portalEmail);
   if (!newE || !oldE) return { ok: false, reason: 'NO_EMAIL' };
+  const portalProduct = getPortalProductFromRequest(req);
   if (newE === oldE) return { ok: false, reason: 'SAME_EMAIL' };
   const [acct] = await pool.query('SELECT id FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1', [oldE]);
   if (!acct.length) return { ok: false, reason: 'NO_ACCOUNT' };
@@ -196,9 +252,10 @@ async function requestEmailChangeOtp(portalEmail, newEmailRaw) {
   }
   await sendPortalOtpEmail(
     newE,
-    'Verify your new Coliving email',
+    portalProduct === 'cleanlemons' ? 'Verify your new email' : 'Verify your new Coliving email',
     `Your verification code is: ${code}\n\nThis code expires in 30 minutes.`,
-    `<p>Your verification code is: <strong>${code}</strong></p><p>This code expires in 30 minutes.</p>`
+    `<p>Your verification code is: <strong>${code}</strong></p><p>This code expires in 30 minutes.</p>`,
+    { portalProduct }
   );
   return { ok: true };
 }
@@ -235,10 +292,11 @@ async function confirmEmailChange(portalEmail, newEmailRaw, codeStr) {
   return { ok: true, newEmail: newE };
 }
 
-async function requestPhoneVerifyOtp(portalEmail, phoneRaw) {
+async function requestPhoneVerifyOtp(portalEmail, phoneRaw, req = null) {
   const em = normalizeEmail(portalEmail);
   const phone = normalizePhoneDigits(phoneRaw);
   if (!em) return { ok: false, reason: 'NO_EMAIL' };
+  const portalProduct = getPortalProductFromRequest(req);
   if (!phone || phone.length < 8) return { ok: false, reason: 'INVALID_PHONE' };
   let acct;
   try {
@@ -272,7 +330,8 @@ async function requestPhoneVerifyOtp(portalEmail, phoneRaw) {
     em,
     'Phone verification code',
     `Your code to verify phone ${phone} is: ${code}\n\nExpires in 15 minutes.`,
-    `<p>Your code to verify phone <strong>${phone}</strong> is: <strong>${code}</strong></p><p>Expires in 15 minutes.</p>`
+    `<p>Your code to verify phone <strong>${phone}</strong> is: <strong>${code}</strong></p><p>Expires in 15 minutes.</p>`,
+    { portalProduct }
   );
   return { ok: true };
 }
@@ -320,10 +379,11 @@ async function confirmPhoneVerifyOtp(portalEmail, phoneRaw, codeStr) {
   return { ok: true };
 }
 
-async function requestPhoneChangeOtp(portalEmail, newPhoneRaw) {
+async function requestPhoneChangeOtp(portalEmail, newPhoneRaw, req = null) {
   const em = normalizeEmail(portalEmail);
   const newPhone = normalizePhoneDigits(newPhoneRaw);
   if (!em) return { ok: false, reason: 'NO_EMAIL' };
+  const portalProduct = getPortalProductFromRequest(req);
   if (!newPhone || newPhone.length < 8) return { ok: false, reason: 'INVALID_PHONE' };
   let acct;
   try {
@@ -354,7 +414,8 @@ async function requestPhoneChangeOtp(portalEmail, newPhoneRaw) {
     em,
     'Confirm new phone number',
     `Your code to change your phone to ${newPhone} is: ${code}\n\nExpires in 15 minutes.`,
-    `<p>Your code to change your phone to <strong>${newPhone}</strong> is: <strong>${code}</strong></p>`
+    `<p>Your code to change your phone to <strong>${newPhone}</strong> is: <strong>${code}</strong></p>`,
+    { portalProduct }
   );
   return { ok: true };
 }
@@ -400,6 +461,7 @@ async function confirmPhoneChangeOtp(portalEmail, newPhoneRaw, codeStr) {
 }
 
 module.exports = {
+  isNewEmailRegisteredByAnotherAccount,
   migratePortalAccountEmail,
   requestEmailChangeOtp,
   confirmEmailChange,

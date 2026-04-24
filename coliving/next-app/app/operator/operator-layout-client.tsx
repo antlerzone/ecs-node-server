@@ -12,12 +12,11 @@ import { isDemoSite } from "@/lib/portal-api"
 
 const CREDIT_LOW_THRESHOLD = 100
 
-/** Zero-balance operators may still complete onboarding; do not trap them on Credit before terms / company / profile / quick setup. */
+/** Zero-balance operators may still complete onboarding; do not trap them on Credit before terms / company / quick setup. */
 const CREDIT_REDIRECT_EXEMPT = new Set<string>([
   "/operator/credit",
   "/operator/terms",
   "/operator/company",
-  "/operator/profile",
   "/operator/quicksetup",
 ])
 
@@ -25,7 +24,7 @@ function OperatorLayoutInner({ children }: { children: React.ReactNode }) {
   const { user, isLoading } = useAuth("operator")
   const router = useRouter()
   const pathname = usePathname()
-  const { creditBalance, creditOk, accessCtx, permission, companyProfileComplete, personalProfileComplete, termsAccepted, hasAccountingCapability, isLoading: ctxLoading, error } = useOperatorContext()
+  const { creditBalance, creditOk, accessCtx, permission, companyProfileComplete, termsAccepted, hasAccountingCapability, isLoading: ctxLoading, error } = useOperatorContext()
   const [mobileOpen, setMobileOpen] = useState(false)
   const isLowCredit = creditOk && creditBalance < CREDIT_LOW_THRESHOLD
 
@@ -43,7 +42,7 @@ function OperatorLayoutInner({ children }: { children: React.ReactNode }) {
       router.replace("/operator/credit")
       return
     }
-    // 1) Terms first – must accept before company/profile/other tabs
+    // 1) Terms first – must accept before company/other tabs
     if (!termsAccepted && pathname !== "/operator/terms" && pathname !== "/operator/quicksetup") {
       router.replace("/operator/terms")
       return
@@ -53,15 +52,10 @@ function OperatorLayoutInner({ children }: { children: React.ReactNode }) {
       router.replace("/operator/company")
       return
     }
-    // 3) Personal profile (My Profile – staff name at minimum)
-    if (termsAccepted && companyProfileComplete && !personalProfileComplete && pathname !== "/operator/profile" && pathname !== "/operator/quicksetup") {
-      router.replace("/operator/profile")
-      return
-    }
     if (pathname !== "/operator/billing" && pathname !== "/operator/credit" && pathname !== "/operator/quicksetup" && !hasPermissionForPath(permission, pathname)) {
       router.replace("/operator/billing")
     }
-  }, [pathname, ctxLoading, accessCtx?.ok, creditBalance, companyProfileComplete, personalProfileComplete, termsAccepted, hasAccountingCapability, permission, router])
+  }, [pathname, ctxLoading, accessCtx?.ok, creditBalance, companyProfileComplete, termsAccepted, hasAccountingCapability, permission, router])
 
   if (isLoading) {
     return (

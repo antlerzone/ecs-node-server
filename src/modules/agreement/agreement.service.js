@@ -19,11 +19,27 @@ const { signatureValueToPublicUrl } = require('../upload/signature-image-to-oss-
 /** Single source for Cleanlemons General placeholder keys — keep in sync with operator portal UI. */
 const CLN_AGREEMENT_VAR_REF = require('../cleanlemon/cln-agreement-variable-reference.json');
 
-/** Prefer per-client Google OAuth (operator’s Drive); else service account. */
+/**
+ * Google auth for agreement PDF generation (Google Docs + Drive).
+ * - Coliving: `clientId` = operatordetail `client_id` → `client_integration` (storage / google_drive).
+ * - Cleanlemons: same argument is `cln_operatordetail.id` → `cln_operator_integration` via `getOAuth2ClientForOperator`.
+ * - Else: service account from env when configured.
+ */
 async function resolveAgreementPdfAuth(clientId) {
-  const oauth = clientId ? await getOAuth2ClientForClient(clientId) : null;
+  const id = clientId ? String(clientId).trim() : '';
+  if (id) {
+    const oauthColiving = await getOAuth2ClientForClient(id);
+    if (oauthColiving) return oauthColiving;
+    try {
+      const clnInt = require('../cleanlemon/cleanlemon-integration.service');
+      const oauthCln = await clnInt.getOAuth2ClientForOperator(id);
+      if (oauthCln) return oauthCln;
+    } catch (e) {
+      console.warn('[agreement] resolveAgreementPdfAuth Cleanlemons', e?.message || e);
+    }
+  }
   const sa = getAuth();
-  return oauth || sa || null;
+  return sa || null;
 }
 
 const TIMEZONE_MY = 'Asia/Kuala_Lumpur';

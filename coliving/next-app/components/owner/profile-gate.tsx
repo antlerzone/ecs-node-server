@@ -5,8 +5,9 @@ import { usePathname, useRouter } from "next/navigation"
 import { useOwnerOptional } from "@/contexts/owner-context"
 import { isDemoSite } from "@/lib/portal-api"
 
+/** Only the profile route counts — `/owner` is the dashboard and must redirect when incomplete (same idea as tenant gate). */
 function isProfilePath(path: string): boolean {
-  return path === "/owner/profile" || path === "/owner"
+  return path === "/owner/profile"
 }
 
 function isAgreementPath(path: string): boolean {

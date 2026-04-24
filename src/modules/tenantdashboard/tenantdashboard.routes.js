@@ -498,7 +498,11 @@ router.post('/create-payment', (req, res) => {
     const invoiceIds = Array.isArray(metadata.invoiceIds) ? metadata.invoiceIds : [];
     const invoiceIdsJoined = invoiceIds.join(',');
     const stripeInvoiceIdsMeta = invoiceIdsJoined.length <= 500 ? invoiceIdsJoined : '';
-    const paymentReferenceNumber = String(referenceNumber || '').trim() || `INV-${String(tenancyId).slice(0, 8)}-${Date.now()}`;
+    /** Invoice checkout: human-readable INV ref. Meter: set to `MT-{uuid}` after row insert — Xendit `external_id` must match DB row (webhook may omit metadata). */
+    let paymentReferenceNumber = String(referenceNumber || '').trim();
+    if (type !== 'meter' && !paymentReferenceNumber) {
+      paymentReferenceNumber = `INV-${String(tenancyId).slice(0, 8)}-${Date.now()}`;
+    }
     if (type === 'invoice' && invoiceIds.length > 0) {
       const [typeRows] = await pool.query(
         'SELECT a.title FROM rentalcollection r JOIN account a ON a.id = r.type_id WHERE r.id = ? AND r.tenancy_id = ? LIMIT 1',
@@ -529,11 +533,30 @@ router.post('/create-payment', (req, res) => {
       meterTransactionId = randomUUID();
       const amountRm = (amountCents / 100).toFixed(2);
       const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+      const [[recentPending]] = await pool.query(
+        `SELECT id FROM metertransaction
+         WHERE tenancy_id = ? AND ispaid = 0 AND (status = 'pending' OR status IS NULL OR status = '')
+           AND ABS(CAST(amount AS DECIMAL(14,2)) - CAST(? AS DECIMAL(14,2))) < 0.02
+           AND created_at > DATE_SUB(NOW(3), INTERVAL 90 SECOND)
+         LIMIT 1`,
+        [tenancyId, amountRm]
+      );
+      if (recentPending?.id) {
+        return {
+          ok: false,
+          reason: 'METER_TOPUP_COOLDOWN',
+          message:
+            'A meter top-up was just started. Please finish payment at the bank page, or wait about 90 seconds before trying again.'
+        };
+      }
       await pool.query(
         `INSERT INTO metertransaction (id, tenant_id, tenancy_id, property_id, amount, ispaid, status, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, 0, 'pending', ?, ?)`,
         [meterTransactionId, tenant._id, tenancyId, propertyId, amountRm, now, now]
       );
+      if (!paymentReferenceNumber) {
+        paymentReferenceNumber = `MT-${meterTransactionId}`;
+      }
     }
 
     const { getClientPaymentGateway } = require('../payment-gateway/payment-gateway.service');

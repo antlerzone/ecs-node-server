@@ -147,7 +147,6 @@ type PendingEditSaveSnapshot = {
   managementFeesFixedValue: string | number
   propertyType: PremisesTypeOption
   securitySystem: string
-  securityUsername: string
   keyCollection: { mailboxPassword: boolean; smartdoorPassword: boolean; smartdoorToken: boolean }
   mailboxPassword: string
   smartdoorPassword: string
@@ -175,7 +174,7 @@ function buildEditPropertyPayloadFromSnapshot(
     fixedRentToOwner: isGuarantee ? nFixed : isFixedLike ? nFixed : null,
     premisesType: s.propertyType,
     securitySystem: s.securitySystem,
-    securityUsername: s.securityUsername.trim() || null,
+    securityUsername: null,
     mailboxPassword: s.keyCollection.mailboxPassword ? s.mailboxPassword.trim() || null : null,
     smartdoorPassword: s.keyCollection.smartdoorPassword ? s.smartdoorPassword.trim() || null : null,
     smartdoorTokenEnabled: !!s.keyCollection.smartdoorToken,
@@ -639,7 +638,6 @@ export default function PropertySettingsPage() {
     },
     mailboxPassword: "",
     smartdoorPassword: "",
-    securityUsername: "",
     securitySystem: "icare" as SecuritySystemIdOption,
     bedSection: {
       single: 0,
@@ -677,7 +675,6 @@ export default function PropertySettingsPage() {
       },
       mailboxPassword: "",
       smartdoorPassword: "",
-      securityUsername: "",
       securitySystem: "icare" as SecuritySystemIdOption,
       bedSection: {
         single: 0,
@@ -973,7 +970,6 @@ export default function PropertySettingsPage() {
           : "apartment"
       )
       const secRaw = String((p as PropertyItem).securitySystem || "").trim().toLowerCase()
-      const secUser = String((p as { securityUsername?: string }).securityUsername || "").trim()
       const credRaw = (p as PropertyItem).securitySystemCredentials
       setPersistedSecurityCredentials(
         credRaw != null && typeof credRaw === "object" ? (credRaw as Record<string, unknown>) : null
@@ -985,7 +981,6 @@ export default function PropertySettingsPage() {
         ...prev,
         propertyType: premisesTypeLoaded,
         securitySystem: parseSecuritySystemFromDb(secRaw),
-        securityUsername: secUser,
         keyCollection: {
           mailboxPassword: !!mb,
           smartdoorPassword: !!sdp,
@@ -1457,7 +1452,6 @@ export default function PropertySettingsPage() {
       managementFeesFixedValue: editForm.managementFeesFixedValue,
       propertyType: opsForm.propertyType,
       securitySystem: opsForm.securitySystem,
-      securityUsername: opsForm.securityUsername,
       keyCollection: { ...opsForm.keyCollection },
       mailboxPassword: opsForm.mailboxPassword,
       smartdoorPassword: opsForm.smartdoorPassword,
@@ -1511,7 +1505,7 @@ export default function PropertySettingsPage() {
         ownerSettlementModel: addSettlementModel,
         premisesType: opsForm.propertyType,
         securitySystem: opsForm.securitySystem,
-        securityUsername: opsForm.securityUsername.trim() || null,
+        securityUsername: null,
         latitude: latitudeStr.trim(),
         longitude: longitudeStr.trim(),
         mailboxPassword: opsForm.keyCollection.mailboxPassword
@@ -2210,15 +2204,6 @@ export default function PropertySettingsPage() {
                 </div>
               </div>
               <div>
-                <Label className="text-xs">Security username</Label>
-                <Input
-                  className="mt-1"
-                  value={opsForm.securityUsername}
-                  onChange={(e) => setOpsForm((prev) => ({ ...prev, securityUsername: e.target.value }))}
-                  placeholder="e.g. icare / gprop username"
-                />
-              </div>
-              <div>
                 <Label className="text-xs">Security system</Label>
                 <div className="flex flex-col sm:flex-row gap-2 mt-1 sm:items-start sm:justify-between">
                   <div className="flex-1 min-w-0 space-y-1">
@@ -2611,15 +2596,6 @@ export default function PropertySettingsPage() {
                   {opsForm.keyCollection.smartdoorPassword && <Input value={opsForm.smartdoorPassword} onChange={(e) => setOpsForm((prev) => ({ ...prev, smartdoorPassword: e.target.value }))} placeholder="Smartdoor password" className="mt-1" />}
                   <label className="flex items-center gap-2 text-xs"><Checkbox checked={opsForm.keyCollection.smartdoorToken} onCheckedChange={(v) => setOpsForm((prev) => ({ ...prev, keyCollection: { ...prev.keyCollection, smartdoorToken: v === true } }))} />Smartdoor (token)</label>
                 </div>
-              </div>
-              <div>
-                <Label className="text-xs">Security username</Label>
-                <Input
-                  className="mt-1"
-                  value={opsForm.securityUsername}
-                  onChange={(e) => setOpsForm((prev) => ({ ...prev, securityUsername: e.target.value }))}
-                  placeholder="e.g. icare / gprop username"
-                />
               </div>
               <div>
                 <Label className="text-xs">Security system</Label>

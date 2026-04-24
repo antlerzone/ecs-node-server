@@ -59,7 +59,13 @@ async function bukkurequest({ method = 'get', endpoint, token, subdomain, data, 
       data,
       params
     });
-    const out = { ok: true, data: res.data };
+    const out = {
+      ok: true,
+      data: res.data,
+      status: res.status,
+      /** Used by POST /sales/invoices when body omits id but API returns Location. */
+      headers: res.headers && typeof res.headers === 'object' ? { ...res.headers } : undefined
+    };
     if (isSalesInvoicePost) logBukkuSalesInvoice(method, endpoint, data, out);
     return out;
   } catch (err) {

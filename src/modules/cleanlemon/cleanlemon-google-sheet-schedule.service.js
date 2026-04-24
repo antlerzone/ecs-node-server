@@ -6,14 +6,19 @@
  *
  * Body：
  * - property: Listing UUID → 匹配 `homestay_source_id` 或 `source_id`（与 L 列一致）
- * - reservationId: 可选，用于 upsert 去重
- * - workingDay: 必填 — ISO 或可被 `Date` 解析的字符串（吉隆坡日）
+ * - reservationId: 可选。有值：`reservation_id` + `property_id` 命中则 update。无值：同一 `property_id`
+ *   且吉隆坡同一日历日、且 `reservation_id` 为空的历史行 → update（避免无订单号重复建）
+ * - workingDay: 必填 — 推荐 `yyyy-MM-dd'T'00:00:00.000'+08:00'`（吉隆坡日历日 00:00）；Node 解析为 UTC 瞬时写入 MySQL（+00）；Portal 按 +8 显示
  * - date: 可选 — 仅写入 `date_display`；新 GScript 可不传
+ *
+ * 业务约定（Antlerzone Sheet）：Homestay Cleaning、无 addon、无 remark、btob=false、不做 client 提前预订校验。
+ * 运营商 / 客户上下文：`Authorization` / `x-api-key` 匹配 `cln_client_integration`（B2B api_key）→ `operator_id`。
  */
 
 const crypto = require('crypto');
 const { randomUUID } = crypto;
 const pool = require('../../config/db');
+const { parseDateParts } = require('../../utils/dateMalaysia');
 const {
   resolveSyncContextFromApiKey,
   resolveSyncContextFromEnv
@@ -131,6 +136,12 @@ async function handleGoogleSheetSchedule(req) {
   const cleaningType = 'Homestay Cleaning';
   const submitBy = 'GoogleSheet';
 
+  const parts = parseDateParts(workingDay);
+  const klYmd =
+    parts != null
+      ? `${parts.y}-${String(parts.m).padStart(2, '0')}-${String(parts.d).padStart(2, '0')}`
+      : null;
+
   let existingId = null;
   if (reservationId) {
     const [found] = await pool.query(
@@ -138,6 +149,17 @@ async function handleGoogleSheetSchedule(req) {
       [reservationId, propertyId]
     );
     if (found && found.length) existingId = found[0].id;
+  }
+  if (!existingId && !reservationId && klYmd) {
+    const [found2] = await pool.query(
+      `SELECT id FROM cln_schedule
+       WHERE property_id = ?
+         AND (reservation_id IS NULL OR TRIM(reservation_id) = '')
+         AND DATE(CONVERT_TZ(working_day, '+00:00', 'Asia/Kuala_Lumpur')) = ?
+       LIMIT 1`,
+      [propertyId, klYmd]
+    );
+    if (found2 && found2.length) existingId = found2[0].id;
   }
 
   const wdSql = workingDay;

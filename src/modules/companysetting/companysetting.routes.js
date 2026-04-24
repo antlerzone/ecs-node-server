@@ -58,7 +58,11 @@ const {
   xeroDisconnect,
   ttlockConnect,
   ttlockDisconnect,
-  getEmail
+  getEmail,
+  requestOperatorCompanyEmailChange,
+  confirmOperatorCompanyEmailChange,
+  cancelOperatorCompanyEmailChange,
+  getOperatorCompanyEmailChangeStatus
 } = companysettingService;
 const getPayexCredentials = companysettingService.getPayexCredentials;
 const googleDriveOauth = require('./google-drive-oauth.service');
@@ -84,7 +88,14 @@ const COMPANYSETTING_CLIENT_ERRORS = [
   'GOOGLE_DRIVE_OAUTH_STATE_OR_TOKEN_SECRET_NOT_SET',
   'STATE_SIGN_FAILED',
   'ACCOUNTING_METHOD_REQUIRED',
-  'ACCOUNTING_PAYMENT_DATE_REQUIRED'
+  'ACCOUNTING_PAYMENT_DATE_REQUIRED',
+  'NOT_MASTER',
+  'ALREADY_SCHEDULED',
+  'INVALID_OR_EXPIRED_CODE',
+  'EMAIL_TAKEN',
+  'SAME_EMAIL',
+  'MIGRATION_REQUIRED',
+  'NOTHING_TO_CANCEL'
 ];
 
 function withEmail(req, res, handler) {
@@ -215,6 +226,31 @@ router.post('/profile-update', (req, res) => {
     console.error('[companysetting] profile-update', err);
     res.status(500).json({ ok: false, reason: err?.message || 'BACKEND_ERROR' });
   });
+});
+
+/** Master operator: request TAC for scheduled company email change (+7 days after confirm). */
+router.post('/company-email-change/request', (req, res) => {
+  const clientId = getClientId(req);
+  withEmail(req, res, (email) =>
+    requestOperatorCompanyEmailChange(email, req.body?.newEmail, clientId)
+  );
+});
+
+router.post('/company-email-change/confirm', (req, res) => {
+  const clientId = getClientId(req);
+  withEmail(req, res, (email) =>
+    confirmOperatorCompanyEmailChange(email, req.body?.newEmail, req.body?.code, clientId)
+  );
+});
+
+router.post('/company-email-change/status', (req, res) => {
+  const clientId = getClientId(req);
+  withEmail(req, res, (email) => getOperatorCompanyEmailChangeStatus(email, clientId));
+});
+
+router.post('/company-email-change/cancel', (req, res) => {
+  const clientId = getClientId(req);
+  withEmail(req, res, (email) => cancelOperatorCompanyEmailChange(email, clientId));
 });
 
 router.post('/paynow-qr-log', (req, res) => {

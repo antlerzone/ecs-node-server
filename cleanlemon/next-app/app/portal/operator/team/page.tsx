@@ -52,6 +52,8 @@ type PropertyRecord = {
 
 type ContactRecord = {
   id: string
+  /** `cln_employeedetail.id` — team `member_ids_json` uses this from CSV import; `id` is `cln_employee_operator.id`. */
+  employeeDetailId?: string
   name: string
   permissions: Permission[]
   status: 'active' | 'archived' | 'resigned'
@@ -83,6 +85,52 @@ function districtGroupKey(p: PropertyRecord): string {
   if (n) return normalizePropertyGroupKey(n)
   return `__row:${p.id}`
 }
+
+/** Match contact by junction id or employee (`cln_employeedetail`) id — team members may store either. */
+function resolveContact(contacts: ContactRecord[], rawId: string): ContactRecord | undefined {
+  const r = String(rawId || '').trim().toLowerCase()
+  if (!r) return undefined
+  return contacts.find(
+    (c) =>
+      String(c.id).toLowerCase() === r ||
+      (c.employeeDetailId != null && String(c.employeeDetailId).toLowerCase() === r)
+  )
+}
+
+/** Prefer junction id for pickers when `member_ids_json` has employee id (e.g. CSV import). */
+function toJunctionMemberId(contacts: ContactRecord[], rawId: string): string {
+  const c = resolveContact(contacts, rawId)
+  return c?.id ?? rawId
+}
+
+/** Same person may appear as junction id or employee id in `member_ids_json`. */
+function canonicalMemberKey(contacts: ContactRecord[], rawId: string): string {
+  const c = resolveContact(contacts, rawId)
+  if (c?.employeeDetailId) return String(c.employeeDetailId).trim().toLowerCase()
+  if (c) return String(c.id).trim().toLowerCase()
+  return String(rawId || '').trim().toLowerCase()
+}
+
+/** Created date in MY (DD/MM/YYYY) — uses fixed timeZone so SSR and browser match. */
+function formatCreatedDateMalaysia(iso: string | undefined): string {
+  if (iso == null || String(iso).trim() === '') return '—'
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return '—'
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kuala_Lumpur',
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+  }).formatToParts(d)
+  const map: Record<string, string> = {}
+  for (const p of parts) {
+    if (p.type !== 'literal') map[p.type] = p.value
+  }
+  const { day, month, year } = map
+  if (!day || !month || !year) return '—'
+  return `${day}/${month}/${year}`
+}
+
 const teamBadgeColorClasses = [
   'bg-sky-100 text-sky-800 border border-sky-200',
   'bg-emerald-100 text-emerald-800 border border-emerald-200',
@@ -99,6 +147,11 @@ export default function TeamPage() {
   const [contacts, setContacts] = useState<ContactRecord[]>([])
   const [teams, setTeams] = useState<TeamRecord[]>([])
   const [pageLoading, setPageLoading] = useState(true)
+  /** Avoid hydration mismatch: calendar uses `new Date()` (server clock ≠ client). */
+  const [hasMounted, setHasMounted] = useState(false)
+  useEffect(() => {
+    setHasMounted(true)
+  }, [])
 
   const refreshAll = useCallback(async () => {
     setPageLoading(true)
@@ -125,12 +178,17 @@ export default function TeamPage() {
           cr.items.map(
             (c: {
               id: string
+              employeeDetailId?: string
               name: string
               permissions: Permission[]
               status: ContactRecord['status']
               employmentStatus: EmploymentStatus
             }) => ({
               id: c.id,
+              employeeDetailId:
+                c.employeeDetailId != null && String(c.employeeDetailId).trim() !== ''
+                  ? String(c.employeeDetailId).trim()
+                  : undefined,
               name: c.name,
               permissions: c.permissions,
               status: c.status,
@@ -359,6 +417,9 @@ export default function TeamPage() {
   }
 
   const calendarCells = useMemo(() => {
+    if (!hasMounted) {
+      return { cells: [] as Array<{ day: number; date: Date } | null>, monthLabel: '' }
+    }
     const now = new Date()
     const year = now.getFullYear()
     const month = now.getMonth()
@@ -370,7 +431,7 @@ export default function TeamPage() {
     for (let d = 1; d <= daysInMonth; d++) cells.push({ day: d, date: new Date(year, month, d) })
     while (cells.length % 7 !== 0) cells.push(null)
     return { cells, monthLabel: now.toLocaleString('en-US', { month: 'long', year: 'numeric' }) }
-  }, [])
+  }, [hasMounted])
 
   const weekdayName = (date: Date) =>
     date.toLocaleString('en-US', { weekday: 'long' })
@@ -391,10 +452,15 @@ export default function TeamPage() {
   }
 
   const findOtherTeamByMemberId = (memberId: string): TeamRecord | null => {
-    const otherTeam = teams.find(
-      (t) => t.id !== editingTeamId && t.memberIds.includes(memberId)
+    const key = canonicalMemberKey(contacts, memberId)
+    if (!key) return null
+    return (
+      teams.find(
+        (t) =>
+          t.id !== editingTeamId &&
+          t.memberIds.some((mid) => canonicalMemberKey(contacts, mid) === key)
+      ) || null
     )
-    return otherTeam || null
   }
 
   const resetTeamEditor = () => {
@@ -418,7 +484,7 @@ export default function TeamPage() {
   const openEditTeam = (team: TeamRecord) => {
     setEditingTeamId(team.id)
     setTeamName(team.name)
-    setSelectedTeamMembers([...team.memberIds])
+    setSelectedTeamMembers(team.memberIds.map((mid) => toJunctionMemberId(contacts, mid)))
     setAuthorizeMode(team.authorizeMode)
     setSelectedPropertyIds([...team.selectedPropertyIds])
     setSelectedRestDays([...team.restDays])
@@ -517,7 +583,7 @@ export default function TeamPage() {
       : `selected: ${[...new Set(t.selectedPropertyIds.map(propertyLabelById))].join(', ') || '-'}`
 
   const membersLabel = (t: TeamRecord) =>
-    t.memberIds.map((id) => contacts.find((c) => c.id === id)?.name ?? id).join(', ') || '—'
+    t.memberIds.map((id) => resolveContact(contacts, id)?.name ?? id).join(', ') || '—'
 
   const deleteTeam = async (team: TeamRecord) => {
     const res = await deleteOperatorTeam(team.id, operatorId)
@@ -829,7 +895,7 @@ export default function TeamPage() {
                       <tr key={t.id} className="border-t">
                         <td className="p-3 font-medium">{t.name}</td>
                         <td className="p-3 max-w-[220px] whitespace-normal break-words">{membersLabel(t)}</td>
-                        <td className="p-3 whitespace-nowrap">{new Date(t.createdAt).toLocaleDateString('en-MY')}</td>
+                        <td className="p-3 whitespace-nowrap">{formatCreatedDateMalaysia(t.createdAt)}</td>
                         <td className="p-3 max-w-[280px] whitespace-normal break-words capitalize">
                           {teamAuthoriseLabel(t)}
                         </td>
@@ -909,7 +975,7 @@ export default function TeamPage() {
           <CardHeader>
             <CardTitle>Calendar</CardTitle>
             <CardDescription className="hidden md:block">
-              Rest-day badge by team ({calendarCells.monthLabel})
+              Rest-day badge by team ({hasMounted ? calendarCells.monthLabel || '—' : '…'})
             </CardDescription>
             <CardDescription className="md:hidden">Which teams are off each weekday</CardDescription>
           </CardHeader>

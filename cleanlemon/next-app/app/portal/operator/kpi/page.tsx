@@ -22,12 +22,22 @@ import { toast } from "sonner"
 import { Check, ListFilter, MoreHorizontal, Pencil, Search, X } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { fetchCleanlemonPricingConfig, fetchOperatorScheduleJobs, saveCleanlemonPricingConfig, type CleanlemonPricingConfig, type EmployeeCleanerKpiPersisted } from "@/lib/cleanlemon-api"
+import {
+  computeCompletedJobKpiPoints,
+  formatReportPersonDisplay,
+  jobYmdInGoalRange,
+  pickBetterPersonDisplay,
+  resolveReportPersonKey,
+  type StaffKpiRuleCard,
+} from "@/lib/cleanlemon-kpi-report-score"
 
 type GoalTarget = "team" | "person" | "company"
 type GoalCard = {
   id: string
   name: string
   status: "active" | "archived"
+  startDate?: string
+  endDate?: string
   goalItems?: Array<{
     id: string
     target: GoalTarget
@@ -130,10 +140,7 @@ export default function KPIPage() {
     let cancelled = false
     ;(async () => {
       setLoading(true)
-      const [cfgR, jobsR] = await Promise.all([
-        fetchCleanlemonPricingConfig(operatorId),
-        fetchOperatorScheduleJobs({ operatorId, limit: 800 }),
-      ])
+      const cfgR = await fetchCleanlemonPricingConfig(operatorId)
       if (cancelled) return
       const cfg = (cfgR.ok && cfgR.config ? cfgR.config : null) as CleanlemonPricingConfig | null
       setFullConfig(cfg)
@@ -143,7 +150,19 @@ export default function KPIPage() {
         ? (currentEk.goalCards as GoalCard[]).filter((g) => g.status !== "archived")
         : []
       setGoalCards(goals)
-      setSelectedGoalId((prev) => prev || (goals[0]?.id || ""))
+      const nextSel =
+        selectedGoalId && goals.some((g) => g.id === selectedGoalId) ? selectedGoalId : goals[0]?.id || ""
+      if (nextSel !== selectedGoalId) setSelectedGoalId(nextSel)
+      const g = goals.find((x) => x.id === nextSel) || null
+      const df = String(g?.startDate || "").trim().slice(0, 10)
+      const dt = String(g?.endDate || "").trim().slice(0, 10)
+      const jobsR = await fetchOperatorScheduleJobs({
+        operatorId,
+        limit: df && dt ? 5000 : 800,
+        dateFrom: df && dt ? df : undefined,
+        dateTo: df && dt ? dt : undefined,
+      })
+      if (cancelled) return
       const scheduleJobs = Array.isArray(jobsR?.items) ? jobsR.items : []
       setJobs(scheduleJobs)
       const logs = Array.isArray(currentEk.deductionLogs) ? currentEk.deductionLogs : []
@@ -178,7 +197,7 @@ export default function KPIPage() {
     return () => {
       cancelled = true
     }
-  }, [operatorId])
+  }, [operatorId, selectedGoalId])
 
   const selectedGoal = useMemo(
     () => goalCards.find((g) => g.id === selectedGoalId) || null,
@@ -193,6 +212,19 @@ export default function KPIPage() {
     for (const t of tickets) set.add(t.team || "Unassigned")
     return Array.from(set).sort((a, b) => a.localeCompare(b))
   }, [tickets])
+
+  const staffTicketOptions = useMemo(() => {
+    const labelByKey = new Map<string, string>()
+    for (const j of jobs) {
+      const k = resolveReportPersonKey(j)
+      if (k === "__unknown_staff__") continue
+      const label = formatReportPersonDisplay(j)
+      labelByKey.set(k, pickBetterPersonDisplay(labelByKey.get(k), label))
+    }
+    return Array.from(labelByKey.entries())
+      .map(([value, label]) => ({ value, label }))
+      .sort((a, b) => a.label.localeCompare(b.label))
+  }, [jobs])
 
   const filteredTickets = useMemo(() => {
     const key = ticketSearch.trim().toLowerCase()
@@ -261,10 +293,14 @@ export default function KPIPage() {
       toast.error(createForm.actionKind === "allowance" ? "Point allowance must be > 0" : "Point deduct must be > 0")
       return
     }
+    const jStaff =
+      createForm.assignBy === "staff"
+        ? jobs.find((j) => resolveReportPersonKey(j) === createForm.staff.trim().toLowerCase())
+        : undefined
     const inferredTeam =
       createForm.assignBy === "team"
         ? createForm.team.trim()
-        : String(jobs.find((j) => String(j?.staffName || j?.cleanerName || j?.assignedTo || "") === createForm.staff)?.teamName || jobs.find((j) => String(j?.staffName || j?.cleanerName || j?.assignedTo || "") === createForm.staff)?.team || "Unassigned")
+        : String(jStaff?.teamName || jStaff?.team || "Unassigned")
     const nextTicket: DeductionTicket = {
       id: `ticket-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
       actionKind: createForm.actionKind,
@@ -298,6 +334,14 @@ export default function KPIPage() {
     const targets = Array.isArray(selectedGoal.goalItems) ? selectedGoal.goalItems : []
     if (targets.length === 0) return []
 
+    const rules = Array.isArray((ek as { serviceKpiRules?: unknown }).serviceKpiRules)
+      ? ((ek as { serviceKpiRules: StaffKpiRuleCard[] }).serviceKpiRules as StaffKpiRuleCard[])
+      : []
+    const spr = ek.servicePointRules
+    const goalFrom = selectedGoal.startDate
+    const goalTo = selectedGoal.endDate
+    const jobsInRange = jobs.filter((j) => jobYmdInGoalRange(String(j?.date || ""), goalFrom, goalTo))
+
     const approvedByTeam = new Map<string, number>()
     for (const t of tickets) {
       if (t.status !== "approved") continue
@@ -314,20 +358,29 @@ export default function KPIPage() {
         }
       }
       if (item.target === "person") {
-        const m = new Map<string, number>()
-        for (const j of jobs) {
-          const label = String(j?.staffName || j?.cleanerName || j?.assignedTo || "Unknown Staff")
-          m.set(label, (m.get(label) || 0) + 10)
+        const scoreByKey = new Map<string, number>()
+        const labelByKey = new Map<string, string>()
+        for (const j of jobsInRange) {
+          const key = resolveReportPersonKey(j)
+          const label = formatReportPersonDisplay(j)
+          const pts = computeCompletedJobKpiPoints(j, rules, spr)
+          scoreByKey.set(key, (scoreByKey.get(key) || 0) + pts)
+          labelByKey.set(key, pickBetterPersonDisplay(labelByKey.get(key), label))
         }
-        const rows = Array.from(m.entries())
-          .map(([label, score]) => ({ label, score, target: item.minScore }))
+        const rows = Array.from(scoreByKey.entries())
+          .map(([key, score]) => ({
+            label: labelByKey.get(key) || key,
+            score,
+            target: item.minScore,
+          }))
           .sort((a, b) => a.label.localeCompare(b.label))
         return { key: item.id, title: "By person", rows }
       }
       const m = new Map<string, number>()
-      for (const j of jobs) {
+      for (const j of jobsInRange) {
         const label = String(j?.teamName || j?.team || "Unassigned")
-        m.set(label, (m.get(label) || 0) + 10)
+        const pts = computeCompletedJobKpiPoints(j, rules, spr)
+        m.set(label, (m.get(label) || 0) + pts)
       }
       for (const [team, deducted] of approvedByTeam.entries()) {
         m.set(team, (m.get(team) || 0) - deducted)
@@ -337,7 +390,7 @@ export default function KPIPage() {
         .sort((a, b) => a.label.localeCompare(b.label))
       return { key: item.id, title: "By team", rows }
     })
-  }, [selectedGoal, tickets, jobs])
+  }, [selectedGoal, tickets, jobs, ek])
 
   if (loading) {
     return <div className="py-10 text-sm text-muted-foreground">Loading KPI...</div>
@@ -665,13 +718,24 @@ export default function KPIPage() {
                               </TableRow>
                             </TableHeader>
                             <TableBody>
-                              {section.rows.map((r) => (
-                                <TableRow key={r.label}>
-                                  <TableCell>{r.label}</TableCell>
-                                  <TableCell className="text-right">{r.score}</TableCell>
-                                  <TableCell className="text-right">{r.target}</TableCell>
-                                </TableRow>
-                              ))}
+                              {section.rows.map((r) => {
+                                const targetN = Number(r.target) || 0
+                                const scoreN = Number(r.score) || 0
+                                const metTarget = targetN > 0 && scoreN >= targetN
+                                return (
+                                  <TableRow
+                                    key={r.label}
+                                    className={cn(
+                                      metTarget &&
+                                        "bg-green-50/90 hover:bg-green-50 dark:bg-green-950/35 dark:hover:bg-green-950/45 border-l-4 border-l-green-600 dark:border-l-green-500",
+                                    )}
+                                  >
+                                    <TableCell>{r.label}</TableCell>
+                                    <TableCell className="text-right tabular-nums">{r.score}</TableCell>
+                                    <TableCell className="text-right tabular-nums">{r.target}</TableCell>
+                                  </TableRow>
+                                )
+                              })}
                             </TableBody>
                           </Table>
                         </div>
@@ -771,17 +835,11 @@ export default function KPIPage() {
                 <Select value={createForm.staff} onValueChange={(v) => setCreateForm((p) => ({ ...p, staff: v }))}>
                   <SelectTrigger><SelectValue placeholder="Select staff" /></SelectTrigger>
                   <SelectContent>
-                    {Array.from(
-                      new Set(
-                        jobs
-                          .map((j) => String(j?.staffName || j?.cleanerName || j?.assignedTo || "").trim())
-                          .filter(Boolean),
-                      ),
-                    )
-                      .sort((a, b) => a.localeCompare(b))
-                      .map((staff) => (
-                        <SelectItem key={staff} value={staff}>{staff}</SelectItem>
-                      ))}
+                    {staffTicketOptions.map(({ value, label }) => (
+                      <SelectItem key={value} value={value}>
+                        {label}
+                      </SelectItem>
+                    ))}
                   </SelectContent>
                 </Select>
               </div>

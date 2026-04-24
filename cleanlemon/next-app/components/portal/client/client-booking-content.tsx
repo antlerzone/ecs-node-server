@@ -156,6 +156,8 @@ export function ClientBookingContent({ embedded, bookingSessionKey }: ClientBook
   const [propertyDetail, setPropertyDetail] = useState<ClientPortalPropertyDetail | null>(null)
   const [createJobAddonDraft, setCreateJobAddonDraft] = useState<Record<string, { selected: boolean; qty: number }>>({})
   const [bookingRemark, setBookingRemark] = useState('')
+  /** Homestay: same-day checkout + new check-in — priority flag for operator (`btob`). */
+  const [homestayBtob, setHomestayBtob] = useState(false)
   const [submittingBooking, setSubmittingBooking] = useState(false)
   const [propertyGroups, setPropertyGroups] = useState<Array<{ id: string; name: string }>>([])
   const [selectedGroupId, setSelectedGroupId] = useState('')
@@ -459,6 +461,10 @@ export function ClientBookingContent({ embedded, bookingSessionKey }: ClientBook
     setBookingTimeEnd('')
   }, [bookingServiceKey, scheduleTimeStepMinutes, scheduleDayBounds])
 
+  useEffect(() => {
+    if (bookingServiceKey !== 'homestay') setHomestayBtob(false)
+  }, [bookingServiceKey])
+
   const createJobAddonOptions = useMemo(
     () => collectJobAddonOptions(bookingServiceKey, pricingServiceConfigs),
     [bookingServiceKey, pricingServiceConfigs]
@@ -731,6 +737,7 @@ export function ClientBookingContent({ embedded, bookingSessionKey }: ClientBook
             price,
             ...(bookingRemark.trim() ? { clientRemark: bookingRemark.trim() } : {}),
             ...(groupIdForJob ? { groupId: groupIdForJob } : {}),
+            ...(bookingServiceKey === 'homestay' && homestayBtob ? { btob: true } : {}),
           })
           if (!res?.ok) {
             const msg =
@@ -763,6 +770,7 @@ export function ClientBookingContent({ embedded, bookingSessionKey }: ClientBook
         price: computedTotalCharge!,
         ...(bookingRemark.trim() ? { clientRemark: bookingRemark.trim() } : {}),
         ...(groupIdForJob ? { groupId: groupIdForJob } : {}),
+        ...(bookingServiceKey === 'homestay' && homestayBtob ? { btob: true } : {}),
       })
       if (!res?.ok) {
         const msg =
@@ -1314,6 +1322,24 @@ export function ClientBookingContent({ embedded, bookingSessionKey }: ClientBook
                       </p>
                     ) : null}
                   </div>
+
+                  {bookingServiceKey === 'homestay' ? (
+                    <label className="flex cursor-pointer items-start gap-3 rounded-md border border-red-200 bg-red-50/60 p-3 text-sm">
+                      <Checkbox
+                        checked={homestayBtob}
+                        onCheckedChange={(c) => setHomestayBtob(c === true)}
+                        className="mt-0.5"
+                        aria-label="Same-day turnover — prioritize cleaning"
+                      />
+                      <span className="min-w-0 leading-snug">
+                        <span className="font-medium text-red-900">Same-day turnover (BTOB)</span>
+                        <span className="mt-1 block text-xs text-muted-foreground">
+                          Guest checks out and a new guest checks in the same day — tick to ask the operator to
+                          prioritize this clean.
+                        </span>
+                      </span>
+                    </label>
+                  ) : null}
 
                   {!isDesktopBooking && bookingMobileStep === 'schedule' && (
                     <div className="border-t border-border pt-4">

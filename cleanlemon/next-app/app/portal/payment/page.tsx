@@ -72,8 +72,6 @@ export default function PortalPaymentPage() {
     return "starter";
   }, [profile?.selectedPlan]);
 
-  const successUrl = "https://portal.cleanlemons.com/portal?payment=success";
-  const cancelUrl = "https://portal.cleanlemons.com/portal/payment?payment=cancelled";
   const selectedAmount = PLAN_PRICING[normalizedPlan]?.[interval] || 0;
 
   async function handlePayNow() {
@@ -81,6 +79,10 @@ export default function PortalPaymentPage() {
     setIsPaying(true);
     setError("");
     try {
+      const origin =
+        typeof window !== "undefined" ? window.location.origin : "https://portal.cleanlemons.com";
+      const successUrl = `${origin}/portal?payment=success`;
+      const cancelUrl = `${origin}/portal/payment?payment=cancelled`;
       const res = await fetch("/api/cleanlemon/subscription/checkout", {
         method: "POST",
         headers: { "Content-Type": "application/json" },

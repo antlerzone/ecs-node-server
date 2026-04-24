@@ -56,8 +56,13 @@ const mobileDrawerNavItems: ClientNavItem[] = [
   { href: '/smart-door', icon: Lock, label: 'Smart Door' },
 ]
 
-function isProfileComplete(profile: Record<string, unknown> | null | undefined): boolean {
+/** Basic profile gate: entity, legal name, ID, contact, address — no eKYC required. Email from account. */
+function isProfileComplete(
+  profile: Record<string, unknown> | null | undefined,
+  accountEmail: string
+): boolean {
   if (!profile) return false
+  if (!String(accountEmail || profile.email || '').trim()) return false
   const required = [
     'entityType',
     'legalName',
@@ -67,13 +72,6 @@ function isProfileComplete(profile: Record<string, unknown> | null | undefined):
     'address',
   ]
   return required.every((key) => String(profile[key] || '').trim() !== '')
-}
-
-function isProfileSelfVerified(profile: Record<string, unknown> | null | undefined): boolean {
-  if (!profile) return false
-  if (profile.profileIdentityVerified === true) return true
-  const v = profile.profileSelfVerifiedAt
-  return v != null && String(v).trim() !== ''
 }
 
 export default function ClientLayout({
@@ -132,9 +130,8 @@ export default function ClientLayout({
       try {
         const res = await fetchEmployeeProfileByEmail(email)
         const profile = (res?.profile || {}) as Record<string, unknown>
-        const complete = !!(res?.ok && isProfileComplete(profile))
-        const selfVerified = !!(res?.ok && isProfileSelfVerified(profile))
-        if ((!complete || !selfVerified) && !isProfileRoute) {
+        const complete = !!(res?.ok && isProfileComplete(profile, email))
+        if (!complete && !isProfileRoute) {
           router.replace('/client/profile?gate=required')
           return
         }

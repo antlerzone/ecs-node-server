@@ -137,7 +137,9 @@ async function getTenantByEmail(email) {
     profile,
     account,
     profileSelfVerifiedAt,
-    profileIdentityVerified
+    profileIdentityVerified,
+    /** Exposed for portal gate: layer 1 open only after Aliyun eKYC (matches employee/client portal). */
+    aliyunEkycLocked: portalAliyunEkycLocked
   };
 }
 

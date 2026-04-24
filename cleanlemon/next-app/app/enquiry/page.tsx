@@ -19,6 +19,13 @@ const INTERVAL_LABEL: Record<"month" | "quarter" | "year", string> = {
   year: "Yearly",
 };
 
+/** Same-origin when `getCleanlemonApiBase()` is "" (localhost + loopback API env → Next rewrites `/api/cleanlemon/*`). */
+function cleanlemonApiPath(path: string): string {
+  const base = String(getCleanlemonApiBase() || "").trim().replace(/\/$/, "");
+  const p = path.startsWith("/") ? path : `/${path}`;
+  return base ? `${base}${p}` : p;
+}
+
 type OnboardingEnquiryStatus = {
   ok?: boolean;
   companyExists?: boolean;
@@ -66,15 +73,9 @@ export default function EnquiryPage() {
         return;
       }
 
-      const apiBase = getCleanlemonApiBase();
-      if (!apiBase) {
-        setGateState("ready");
-        return;
-      }
-
       try {
         const r = await fetch(
-          `${apiBase}/api/cleanlemon/operator/onboarding-enquiry-status?email=${encodeURIComponent(loginEmail)}`
+          `${cleanlemonApiPath("/api/cleanlemon/operator/onboarding-enquiry-status")}?email=${encodeURIComponent(loginEmail)}`
         );
         const data = (await r.json().catch(() => ({}))) as OnboardingEnquiryStatus;
         if (cancelled) return;
@@ -120,8 +121,7 @@ export default function EnquiryPage() {
       billingInterval,
     };
     try {
-      const apiBase = getCleanlemonApiBase();
-      const profileRes = await fetch(`${apiBase}/api/cleanlemon/operator/onboarding-profile`, {
+      const profileRes = await fetch(cleanlemonApiPath("/api/cleanlemon/operator/onboarding-profile"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -172,6 +172,12 @@ export default function EnquiryPage() {
           <span className="text-xs font-semibold tracking-widest uppercase text-primary">Malaysia Only · MYR</span>
           <Link href="/pricing" className="text-xs font-semibold tracking-widest uppercase text-muted-foreground hover:text-primary transition-colors">
             Pricing
+          </Link>
+          <Link
+            href="/forgot-password"
+            className="text-xs font-semibold tracking-widest uppercase text-muted-foreground hover:text-primary transition-colors"
+          >
+            Forgot password
           </Link>
           <a href="https://portal.cleanlemons.com" className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors">
             <ArrowLeft size={14} /> Back to Portal
@@ -235,6 +241,9 @@ export default function EnquiryPage() {
                 required
                 readOnly
               />
+              <p className="text-xs text-red-600 leading-snug">
+                Don&apos;t use a company email — you may need to verify your identity.
+              </p>
             </div>
 
             <div className="space-y-2">

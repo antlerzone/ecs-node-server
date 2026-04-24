@@ -109,7 +109,11 @@ function normalizePremisesType(v) {
   return PREMISES_TYPES.has(s) ? s : null;
 }
 
-/** WGS84 pair for `propertydetail.latitude` / `longitude`; both null or both finite (aligned with `cln_property`). */
+/**
+ * WGS84 pair for `propertydetail.latitude` / `longitude` (aligned with `cln_property`).
+ * Returns `undefined` when coords are omitted or both empty — UPDATE skips lat/lng (does not wipe saved GPS).
+ * Returns `{ latitude, longitude }` only for a valid finite pair.
+ */
 function wgs84FromPayload(data) {
   if (!data || typeof data !== 'object') return undefined;
   const hasAny =
@@ -129,7 +133,7 @@ function wgs84FromPayload(data) {
         : undefined;
   const empty = (v) =>
     v === undefined || v === null || (typeof v === 'string' && String(v).trim() === '');
-  if (empty(laRaw) && empty(loRaw)) return { latitude: null, longitude: null };
+  if (empty(laRaw) && empty(loRaw)) return undefined;
   if (empty(laRaw) || empty(loRaw)) throw new Error('INVALID_LAT_LNG');
   const la = Number(laRaw);
   const lo = Number(loRaw);

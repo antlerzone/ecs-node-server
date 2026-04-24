@@ -171,11 +171,13 @@ function mapEmployeeJunctionToContact(eo, d, crm) {
     ];
     if (fromCrm.length) permOut = fromCrm;
   }
+  const legalName = String(d.legal_name || '').trim();
   return {
     id: String(eo.id),
     employeeDetailId: eo.employee_id != null ? String(eo.employee_id) : undefined,
     operatorId: eo.operator_id != null ? String(eo.operator_id) : undefined,
     name: String(d.full_name || '').trim() || String(d.email || ''),
+    legalName: legalName || undefined,
     email: String(d.email || ''),
     phone: (d.phone != null && String(d.phone).trim() !== '' ? String(d.phone) : '-') || '-',
     permissions: permOut,
@@ -243,7 +245,7 @@ async function loadEmployeeContactsForOperator(pool, operatorId) {
   try {
     const [rows] = await pool.query(
       `SELECT eo.id, eo.operator_id, eo.staff_role, eo.employee_id AS employee_id, ${crmSel},
-              d.email, d.full_name, d.phone, d.account, d.updated_at
+              d.email, d.full_name, d.legal_name, d.phone, d.account, d.updated_at
        FROM cln_employee_operator eo
        INNER JOIN cln_employeedetail d ON d.id = eo.employee_id
        WHERE eo.operator_id = ?

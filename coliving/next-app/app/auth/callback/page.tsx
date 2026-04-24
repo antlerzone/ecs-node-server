@@ -44,7 +44,18 @@ function AuthCallbackContent() {
         tryClosePopup(setShowCloseHint)
         return
       }
-      setMember({ email: demoEmail, roles: [{ type: "staff", staffId: "demo-staff", clientId: "demo-client", clientTitle: "Demo Client" }] })
+      setMember({
+        email: demoEmail,
+        roles: [
+          {
+            type: "staff",
+            staffSource: "coliving_client_user",
+            staffId: "demo-staff",
+            clientId: "demo-client",
+            clientTitle: "Demo Client",
+          },
+        ],
+      })
       router.replace("/portal")
       return
     }

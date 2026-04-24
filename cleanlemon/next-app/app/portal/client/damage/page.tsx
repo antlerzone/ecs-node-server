@@ -1,9 +1,8 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useState } from "react"
-import { Loader2, AlertTriangle, CheckCircle2, Eye, Search, Download, ListFilter } from "lucide-react"
+import { Loader2, AlertTriangle, CheckCircle2, Eye, Search, Download, ListFilter, ChevronLeft, ChevronRight } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { Badge } from "@/components/ui/badge"
 import {
   Dialog,
   DialogContent,
@@ -37,41 +36,14 @@ import {
 } from "@/lib/cleanlemon-api"
 import { toast } from "sonner"
 import { DamageMediaAttachments } from "@/components/shared/damage-media-attachments"
-
-function formatWhen(r: DamageReportItem): string {
-  const parts: string[] = []
-  if (r.jobDate) parts.push(r.jobDate)
-  if (r.jobStartTime) parts.push(`Start ${r.jobStartTime}`)
-  if (r.reportedAt) {
-    const d = new Date(r.reportedAt)
-    if (!Number.isNaN(d.getTime())) {
-      parts.push(`Reported ${d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}`)
-    }
-  }
-  return parts.length ? parts.join(" · ") : "—"
-}
-
-/** YYYY-MM-DD for date filters — job date first, else reported day (Malaysia display uses row as-is). */
-function reportSortYmd(r: DamageReportItem): string {
-  const jd = (r.jobDate || "").trim()
-  if (/^\d{4}-\d{2}-\d{2}/.test(jd)) return jd.slice(0, 10)
-  if (r.reportedAt) {
-    const d = new Date(r.reportedAt)
-    if (!Number.isNaN(d.getTime())) return d.toISOString().slice(0, 10)
-  }
-  return ""
-}
+import { damageReportDateYmd, damageReportDateLabel } from "@/lib/damage-report-dates"
 
 function propertyLabel(r: DamageReportItem): string {
   const u = r.unitNumber ? ` · ${r.unitNumber}` : ""
   return `${r.propertyName || "—"}${u}`
 }
 
-/** Row label — Pending vs Acknowledged; Complete is the same case in DB (filter “Complete” lists these too). */
-function damageStatusLabel(r: DamageReportItem): "Pending" | "Acknowledged" {
-  if (!r.acknowledgedAt) return "Pending"
-  return "Acknowledged"
-}
+const PAGE_SIZE_OPTIONS = [10, 20, 50, 100, 200] as const
 
 export default function ClientDamagePage() {
   const { user } = useAuth()
@@ -89,6 +61,8 @@ export default function ClientDamagePage() {
   const [dateFrom, setDateFrom] = useState("")
   const [dateTo, setDateTo] = useState("")
   const [filterExpanded, setFilterExpanded] = useState(false)
+  const [pageSize, setPageSize] = useState(20)
+  const [currentPage, setCurrentPage] = useState(1)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -98,9 +72,24 @@ export default function ClientDamagePage() {
         setItems([])
         return
       }
-      const r = await fetchClientDamageReports({ email, operatorId: operatorId || undefined, limit: 500 })
-      if (r?.ok && Array.isArray(r.items)) setItems(r.items)
-      else setItems([])
+      const r = await fetchClientDamageReports({ email, operatorId: operatorId || undefined, limit: 1000 })
+      if (r?.ok && Array.isArray(r.items)) {
+        setItems(r.items)
+      } else {
+        setItems([])
+        const reason = String(r?.reason || "").trim()
+        if (reason === "CLIENT_PORTAL_ACCESS_DENIED") {
+          toast.error(
+            "This email is not linked to your operator’s business client (Antlerzone). Log in with the email your operator saved for you, or ask them to add/link it."
+          )
+        } else if (reason === "CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL") {
+          toast.error("More than one client record uses this email. Ask your operator to fix the duplicate client entry.")
+        } else if (reason === "MISSING_EMAIL_OR_OPERATOR") {
+          toast.error("Please sign in again, or select your operator in the portal.")
+        } else if (reason) {
+          toast.error(`Could not load damage reports (${reason}).`)
+        }
+      }
     } finally {
       setLoading(false)
     }
@@ -144,7 +133,7 @@ export default function ClientDamagePage() {
         const key = String(r.propertyId || "").trim() || propertyLabel(r)
         if (key !== propertyFilter) return false
       }
-      const ymd = reportSortYmd(r)
+      const ymd = damageReportDateYmd(r)
       if (dateFrom && ymd && ymd < dateFrom) return false
       if (dateTo && ymd && ymd > dateTo) return false
       if ((dateFrom || dateTo) && !ymd) return false
@@ -155,13 +144,32 @@ export default function ClientDamagePage() {
         r.operatorName,
         r.staffEmail,
         r.remark,
-        formatWhen(r),
+        damageReportDateLabel(r),
       ]
         .join(" ")
         .toLowerCase()
       return hay.includes(q)
     })
   }, [items, search, operatorFilter, propertyFilter, ackFilter, dateFrom, dateTo])
+
+  useEffect(() => {
+    setCurrentPage(1)
+  }, [search, operatorFilter, propertyFilter, ackFilter, dateFrom, dateTo])
+
+  const totalPages = useMemo(
+    () => (filteredItems.length === 0 ? 1 : Math.max(1, Math.ceil(filteredItems.length / pageSize))),
+    [filteredItems.length, pageSize]
+  )
+
+  useEffect(() => {
+    if (totalPages < 1) return
+    setCurrentPage((p) => (p > totalPages ? totalPages : p))
+  }, [totalPages])
+
+  const paginatedItems = useMemo(
+    () => filteredItems.slice((currentPage - 1) * pageSize, currentPage * pageSize),
+    [filteredItems, currentPage, pageSize]
+  )
 
   const hasActiveFilters = useMemo(() => {
     return (
@@ -182,14 +190,12 @@ export default function ClientDamagePage() {
   }, [])
 
   const rowToExportCells = useCallback((r: DamageReportItem) => {
-    const statusLabel = damageStatusLabel(r)
     return {
       property: r.propertyName || "—",
       unit: r.unitNumber || "",
-      status: statusLabel,
       operator: r.operatorName || "—",
       staff: r.staffEmail || "—",
-      when: formatWhen(r),
+      when: damageReportDateLabel(r),
       remark: (r.remark || "").replace(/\r?\n/g, " "),
     }
   }, [])
@@ -205,7 +211,7 @@ export default function ClientDamagePage() {
       toast.error("No rows to export.")
       return
     }
-    const header = ["Property", "Unit", "Status", "Operator", "Staff email", "When", "Remark"]
+    const header = ["Property", "Unit", "Operator", "Staff email", "When", "Remark"]
     const lines = [header.join(",")]
     for (const r of filteredItems) {
       const c = rowToExportCells(r)
@@ -213,7 +219,6 @@ export default function ClientDamagePage() {
         [
           escapeCsvCell(c.property),
           escapeCsvCell(c.unit),
-          escapeCsvCell(c.status),
           escapeCsvCell(c.operator),
           escapeCsvCell(c.staff),
           escapeCsvCell(c.when),
@@ -247,22 +252,21 @@ export default function ClientDamagePage() {
       doc.text("Damage reports (filtered)", 8, 10)
       const body = filteredItems.map((r) => {
         const c = rowToExportCells(r)
-        return [c.property, c.unit || "—", c.status, c.operator, c.staff, c.when, c.remark]
+        return [c.property, c.unit || "—", c.operator, c.staff, c.when, c.remark]
       })
       autoTable(doc, {
         startY: 14,
-        head: [["Property", "Unit", "Status", "Operator", "Staff", "When", "Remark"]],
+        head: [["Property", "Unit", "Operator", "Staff", "When", "Remark"]],
         body,
         styles: { fontSize: 7, cellPadding: 1.5 },
         headStyles: { fillColor: [30, 64, 175] },
         columnStyles: {
-          0: { cellWidth: 38 },
-          1: { cellWidth: 18 },
-          2: { cellWidth: 24 },
-          3: { cellWidth: 32 },
-          4: { cellWidth: 38 },
-          5: { cellWidth: 42 },
-          6: { cellWidth: "auto" },
+          0: { cellWidth: 42 },
+          1: { cellWidth: 20 },
+          2: { cellWidth: 36 },
+          3: { cellWidth: 40 },
+          4: { cellWidth: 44 },
+          5: { cellWidth: "auto" },
         },
         margin: { left: 8, right: 8 },
       })
@@ -275,10 +279,6 @@ export default function ClientDamagePage() {
   }, [filteredItems, exportFileStem, rowToExportCells])
 
   const onAck = async (id: string) => {
-    if (!operatorId) {
-      toast.error("Missing operator context.")
-      return
-    }
     const email = String(user?.email || "").trim().toLowerCase()
     if (!email) {
       toast.error("Missing account email.")
@@ -286,7 +286,7 @@ export default function ClientDamagePage() {
     }
     setBusyId(id)
     try {
-      const r = await acknowledgeClientDamageReport(id, { email, operatorId })
+      const r = await acknowledgeClientDamageReport(id, { email, operatorId: operatorId || "" })
       if (!r?.ok) {
         toast.error(r?.reason || "Acknowledge failed")
         return
@@ -299,7 +299,7 @@ export default function ClientDamagePage() {
   }
 
   return (
-    <div className="w-full space-y-6 p-4 md:p-6">
+    <div className="w-full min-w-0 max-w-[100vw] space-y-6 overflow-x-hidden p-4 md:p-6">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <h1 className="text-2xl font-bold text-foreground flex items-center gap-2">
@@ -391,11 +391,11 @@ export default function ClientDamagePage() {
                 disabled={loading}
               >
                 <SelectTrigger className="w-full border-input lg:w-[180px]">
-                  <SelectValue placeholder="Status" />
+                  <SelectValue placeholder="Acknowledge" />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="all">All</SelectItem>
-                  <SelectItem value="pending">Pending</SelectItem>
+                  <SelectItem value="pending">Not acknowledged</SelectItem>
                   <SelectItem value="acknowledged">Acknowledged</SelectItem>
                   <SelectItem value="complete">Complete</SelectItem>
                 </SelectContent>
@@ -456,84 +456,209 @@ export default function ClientDamagePage() {
               {items.length === 0 ? "No damage reports yet." : "No reports match your filters."}
             </p>
           ) : (
-            <div className="overflow-x-auto rounded-md border">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Property</TableHead>
-                    <TableHead className="w-[120px]">Status</TableHead>
-                    <TableHead>Operator</TableHead>
-                    <TableHead>Submit by (staff)</TableHead>
-                    <TableHead>When</TableHead>
-                    <TableHead>Remark</TableHead>
-                    <TableHead className="w-[90px]">View</TableHead>
-                    <TableHead className="w-[140px]">Acknowledge</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {filteredItems.map((r) => {
-                    const acked = !!r.acknowledgedAt
-                    const statusLabel = damageStatusLabel(r)
-                    return (
-                      <TableRow key={r.id}>
-                        <TableCell className="font-medium">
-                          {r.propertyName}
+            <>
+              {/* Mobile: stacked cards — no wide table */}
+              <div className="md:hidden divide-y divide-border overflow-x-hidden rounded-md border border-border bg-card">
+                {paginatedItems.map((r) => {
+                  const acked = !!r.acknowledgedAt
+                  return (
+                    <div key={r.id} className="min-w-0 space-y-3 px-3 py-4">
+                      <div className="min-w-0 space-y-1">
+                        <h2 className="break-words text-base font-semibold leading-snug text-foreground">
+                          {r.propertyName || "—"}
                           {r.unitNumber ? (
-                            <span className="text-muted-foreground font-normal"> · {r.unitNumber}</span>
+                            <span className="font-normal text-muted-foreground"> · {r.unitNumber}</span>
                           ) : null}
-                        </TableCell>
-                        <TableCell>
-                          <Badge
-                            variant="outline"
-                            className={
-                              statusLabel === "Pending"
-                                ? "border-amber-300 bg-amber-50 text-amber-900"
-                                : "border-emerald-300 bg-emerald-50 text-emerald-900"
-                            }
+                        </h2>
+                        {acked ? (
+                          <span className="inline-flex items-center gap-1 text-xs font-medium text-green-700">
+                            <CheckCircle2 className="h-3.5 w-3.5" />
+                            Acknowledged
+                          </span>
+                        ) : null}
+                      </div>
+                      <div className="space-y-1.5 text-sm text-muted-foreground">
+                        <p className="min-w-0 break-words">
+                          <span className="font-medium text-foreground/80">Operator</span>{" "}
+                          {r.operatorName || "—"}
+                        </p>
+                        <p className="min-w-0 break-all">
+                          <span className="font-medium text-foreground/80">Staff</span>{" "}
+                          {r.staffEmail || "—"}
+                        </p>
+                        <p className="text-sm">
+                          <span className="font-medium text-foreground/80">When</span>{" "}
+                          {damageReportDateLabel(r)}
+                        </p>
+                      </div>
+                      {r.remark ? (
+                        <p className="line-clamp-4 text-sm text-foreground/90" title={r.remark}>
+                          {r.remark}
+                        </p>
+                      ) : (
+                        <p className="text-sm italic text-muted-foreground">No remark</p>
+                      )}
+                      <div className="flex flex-col gap-2 pt-1">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          className="h-10 w-full justify-center gap-2 sm:h-9"
+                          onClick={() => setPreview(r)}
+                        >
+                          <Eye className="h-4 w-4 shrink-0" />
+                          View photos & detail
+                        </Button>
+                        {acked ? (
+                          <p className="text-center text-xs text-green-700">No action needed</p>
+                        ) : (
+                          <Button
+                            type="button"
+                            className="h-10 w-full sm:h-9"
+                            disabled={busyId === r.id}
+                            onClick={() => onAck(r.id)}
                           >
-                            {statusLabel}
-                          </Badge>
-                        </TableCell>
-                        <TableCell className="text-sm">{r.operatorName || "—"}</TableCell>
-                        <TableCell className="text-sm">{r.staffEmail || "—"}</TableCell>
-                        <TableCell className="text-sm text-muted-foreground whitespace-nowrap max-w-[220px]">
-                          {formatWhen(r)}
-                        </TableCell>
-                        <TableCell className="text-sm max-w-[200px] truncate" title={r.remark}>
-                          {r.remark || "—"}
-                        </TableCell>
-                        <TableCell>
-                          <Button variant="outline" size="sm" onClick={() => setPreview(r)}>
-                            <Eye className="h-4 w-4" />
+                            {busyId === r.id ? (
+                              <Loader2 className="h-4 w-4 animate-spin" />
+                            ) : (
+                              "Acknowledge"
+                            )}
                           </Button>
-                        </TableCell>
-                        <TableCell>
-                          {acked ? (
-                            <span className="inline-flex items-center gap-1 text-sm text-green-700">
-                              <CheckCircle2 className="h-4 w-4" />
-                              Acknowledged
-                            </span>
-                          ) : (
-                            <Button
-                              size="sm"
-                              disabled={busyId === r.id}
-                              onClick={() => onAck(r.id)}
-                            >
-                              {busyId === r.id ? (
-                                <Loader2 className="h-4 w-4 animate-spin" />
-                              ) : (
-                                "Acknowledge"
-                              )}
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+
+              <div className="hidden overflow-x-auto rounded-md border md:block">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Property</TableHead>
+                      <TableHead>Operator</TableHead>
+                      <TableHead>Submit by (staff)</TableHead>
+                      <TableHead>When</TableHead>
+                      <TableHead>Remark</TableHead>
+                      <TableHead className="w-[90px]">View</TableHead>
+                      <TableHead className="w-[140px]">Acknowledge</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {paginatedItems.map((r) => {
+                      const acked = !!r.acknowledgedAt
+                      return (
+                        <TableRow key={r.id}>
+                          <TableCell className="font-medium">
+                            {r.propertyName}
+                            {r.unitNumber ? (
+                              <span className="text-muted-foreground font-normal"> · {r.unitNumber}</span>
+                            ) : null}
+                          </TableCell>
+                          <TableCell className="text-sm">{r.operatorName || "—"}</TableCell>
+                          <TableCell className="text-sm">{r.staffEmail || "—"}</TableCell>
+                          <TableCell className="text-sm text-muted-foreground whitespace-nowrap max-w-[220px]">
+                            {damageReportDateLabel(r)}
+                          </TableCell>
+                          <TableCell className="text-sm max-w-[200px] truncate" title={r.remark}>
+                            {r.remark || "—"}
+                          </TableCell>
+                          <TableCell>
+                            <Button variant="outline" size="sm" onClick={() => setPreview(r)}>
+                              <Eye className="h-4 w-4" />
                             </Button>
-                          )}
-                        </TableCell>
-                      </TableRow>
-                    )
-                  })}
-                </TableBody>
-              </Table>
-            </div>
+                          </TableCell>
+                          <TableCell>
+                            {acked ? (
+                              <span className="inline-flex items-center gap-1 text-sm text-green-700">
+                                <CheckCircle2 className="h-4 w-4" />
+                                Acknowledged
+                              </span>
+                            ) : (
+                              <Button
+                                size="sm"
+                                disabled={busyId === r.id}
+                                onClick={() => onAck(r.id)}
+                              >
+                                {busyId === r.id ? (
+                                  <Loader2 className="h-4 w-4 animate-spin" />
+                                ) : (
+                                  "Acknowledge"
+                                )}
+                              </Button>
+                            )}
+                          </TableCell>
+                        </TableRow>
+                      )
+                    })}
+                  </TableBody>
+                </Table>
+              </div>
+            </>
           )}
+          {!loading && filteredItems.length > 0 ? (
+            <div className="flex shrink-0 flex-col gap-3 border-t border-border pt-4 mt-4">
+              <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                <p className="text-sm text-muted-foreground order-2 lg:order-1">
+                  Showing {(currentPage - 1) * pageSize + 1} to{" "}
+                  {Math.min(currentPage * pageSize, filteredItems.length)} of {filteredItems.length} results
+                </p>
+                <div className="order-1 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end lg:order-2">
+                  <div className="flex items-center justify-center gap-2 sm:justify-end">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                      disabled={currentPage === 1 || totalPages <= 1}
+                      aria-label="Previous page"
+                    >
+                      <ChevronLeft className="h-4 w-4" />
+                    </Button>
+                    <span className="min-w-[7rem] text-center text-sm tabular-nums">
+                      Page {currentPage} of {totalPages}
+                    </span>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                      disabled={currentPage === totalPages || totalPages <= 1}
+                      aria-label="Next page"
+                    >
+                      <ChevronRight className="h-4 w-4" />
+                    </Button>
+                  </div>
+                  <div className="flex flex-wrap items-center justify-center gap-2 sm:justify-end">
+                    <Label htmlFor="client-damage-page-size" className="text-sm text-muted-foreground whitespace-nowrap">
+                      Show
+                    </Label>
+                    <Select
+                      value={String(pageSize)}
+                      onValueChange={(v) => {
+                        const n = Number(v)
+                        if (PAGE_SIZE_OPTIONS.includes(n as (typeof PAGE_SIZE_OPTIONS)[number])) {
+                          setPageSize(n)
+                          setCurrentPage(1)
+                        }
+                      }}
+                    >
+                      <SelectTrigger id="client-damage-page-size" className="h-9 w-[100px] border-input">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {PAGE_SIZE_OPTIONS.map((n) => (
+                          <SelectItem key={n} value={String(n)}>
+                            {n}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <span className="text-sm text-muted-foreground whitespace-nowrap">per page</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </CardContent>
       </Card>
 
@@ -556,12 +681,16 @@ export default function ClientDamagePage() {
                 <span className="text-muted-foreground">Staff: </span>
                 {preview.staffEmail || "—"}
               </p>
-              <p className="text-sm text-muted-foreground">{formatWhen(preview)}</p>
+              <p className="text-sm text-muted-foreground">{damageReportDateLabel(preview)}</p>
               <div>
                 <p className="text-sm font-medium mb-1">Remark</p>
                 <p className="text-sm whitespace-pre-wrap rounded-md bg-muted/50 p-3">{preview.remark || "—"}</p>
               </div>
-              <DamageMediaAttachments urls={preview.photoUrls} emptyLabel="No photos or videos." />
+              <DamageMediaAttachments
+                urls={preview.photoUrls}
+                attachments={preview.photoAttachments}
+                emptyLabel="No photos or videos."
+              />
             </div>
           ) : null}
         </DialogContent>

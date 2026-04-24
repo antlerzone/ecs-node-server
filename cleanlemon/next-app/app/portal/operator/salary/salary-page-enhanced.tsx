@@ -62,6 +62,7 @@ import {
   Plus,
   Settings,
   Trash2,
+  Undo2,
   XCircle,
 } from "lucide-react"
 import { toast } from "sonner"
@@ -73,6 +74,7 @@ import {
   fetchOperatorSalaries,
   fetchOperatorSalaryLines,
   fetchOperatorSalarySettings,
+  fetchOperatorSettings,
   patchOperatorSalaryRecord,
   postOperatorSalaryLine,
   postOperatorSalaryRecord,
@@ -100,7 +102,7 @@ import type {
 } from "@/lib/malaysia-flex-payroll.types"
 import { cn } from "@/lib/utils"
 
-type SalaryStatus = "pending_sync" | "complete" | "void" | "archived"
+type SalaryStatus = "pending_sync" | "partial_paid" | "complete" | "void" | "archived"
 type PaymentMethod = "bank_transfer" | "cash" | "duitnow" | "cheque"
 
 function recordHasAccrualJournal(r: { bukkuJournalId?: string; xeroManualJournalId?: string }) {
@@ -112,6 +114,10 @@ function recordHasAccrualJournal(r: { bukkuJournalId?: string; xeroManualJournal
 interface SalaryRecord {
   id: string
   employeeLabel: string
+  /** From linked employee row when payroll_inputs.sourceContactId is set */
+  contactLegalName?: string
+  contactFullName?: string
+  contactEmail?: string
   team: string
   baseSalary: number
   netSalary: number
@@ -208,6 +214,8 @@ function normalizeSalaryStatutory(
 type SalaryContactOption = {
   id: string
   name: string
+  /** From cln_employeedetail.legal_name when present */
+  legalName?: string
   email?: string
   team?: string
   salaryBasic?: number
@@ -230,6 +238,57 @@ function isSalaryEligibleContact(c: SalaryContactOption): boolean {
 function fmtRm(n: number): string {
   if (!Number.isFinite(n)) return "—"
   return `RM ${n.toLocaleString("en-MY", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+}
+
+/** Allowance / deduction record picker: legal name (email), with sensible fallbacks. */
+function salaryRecordPickerLabel(r: SalaryRecord): string {
+  const legal = String(r.contactLegalName || "").trim()
+  const full = String(r.contactFullName || "").trim()
+  const fallback = String(r.employeeLabel || "").trim()
+  const name = legal || full || fallback || "Staff"
+  const emailFromContact = String(r.contactEmail || "").trim()
+  const emailFromPi = String(r.payrollInputs?.sourceContactEmail || "").trim()
+  const email = emailFromContact || emailFromPi
+  return email ? `${name} (${email})` : name
+}
+
+/**
+ * Name shown before "(email)" in staff pickers.
+ * Prefer legal name, then CRM full name; when API only has email as `name`, use the part before @ so rows are not all "Staff".
+ */
+function salaryContactDisplayName(c: SalaryContactOption): string {
+  const legal = String(c.legalName || "").trim()
+  const nm = String(c.name || "").trim()
+  const em = String(c.email || "").trim()
+  const emailForParts = em || nm
+  if (legal) return legal
+  if (nm && (!emailForParts || nm.toLowerCase() !== emailForParts.toLowerCase())) return nm
+  if (emailForParts) {
+    const at = emailForParts.indexOf("@")
+    if (at > 0) {
+      const local = emailForParts.slice(0, at).trim()
+      if (local) return local.replace(/[._]+/g, " ")
+    }
+    return emailForParts
+  }
+  return "Staff"
+}
+
+function salaryContactPickerLabel(c: SalaryContactOption): string {
+  const display = salaryContactDisplayName(c)
+  const email = String(c.email || "").trim()
+  return email ? `${display} (${email})` : display
+}
+
+/** Stored on salary row: prefer legal / full name; if CRM only has email as name, keep email so rows stay distinct. */
+function salaryContactEmployeeLabelForRecord(c: SalaryContactOption): string {
+  const legal = String(c.legalName || "").trim()
+  const nm = String(c.name || "").trim()
+  const em = String(c.email || "").trim()
+  if (legal) return legal
+  if (nm && (!em || nm.toLowerCase() !== em.toLowerCase())) return nm
+  if (em) return em
+  return "Staff"
 }
 
 function lineApprovalStatus(meta: SalaryLineMetaJson | undefined): SalaryLineApprovalStatus {
@@ -266,6 +325,12 @@ function statusBadge(status: SalaryStatus) {
         <CheckCircle className="h-3 w-3 mr-1" /> Complete
       </Badge>
     )
+  if (status === "partial_paid")
+    return (
+      <Badge variant="secondary" className="bg-sky-100 text-sky-900 dark:bg-sky-950/50 dark:text-sky-100">
+        <Clock className="h-3 w-3 mr-1" /> Part paid
+      </Badge>
+    )
   if (status === "void")
     return (
       <Badge variant="secondary" className="bg-red-100 text-red-900 dark:bg-red-950/50 dark:text-red-100">
@@ -283,6 +348,15 @@ function statusBadge(status: SalaryStatus) {
       <Clock className="h-3 w-3 mr-1" /> Pending sync
     </Badge>
   )
+}
+
+function payoutReleasedSoFar(r: SalaryRecord): number {
+  return Math.max(0, Math.round(Number(r.payrollInputs?.payoutReleasedTotal ?? 0) * 100) / 100)
+}
+
+function netOutstandingForRecord(r: SalaryRecord): number {
+  const net = Number(r.netSalary || 0)
+  return Math.max(0, Math.round((net - payoutReleasedSoFar(r)) * 100) / 100)
 }
 
 export default function SalaryPageEnhanced() {
@@ -359,10 +433,14 @@ export default function SalaryPageEnhanced() {
   const [paidOpen, setPaidOpen] = useState(false)
   const [paidDate, setPaidDate] = useState(() => new Date().toISOString().slice(0, 10))
   const [paidMethod, setPaidMethod] = useState<PaymentMethod>("bank_transfer")
+  /** MYR string per record id — this payment run (default = remaining net). */
+  const [paidReleaseById, setPaidReleaseById] = useState<Record<string, string>>({})
   const [paidBusy, setPaidBusy] = useState(false)
   const [syncBusy, setSyncBusy] = useState(false)
   const [syncDialogOpen, setSyncDialogOpen] = useState(false)
   const [syncJournalDate, setSyncJournalDate] = useState("")
+  /** null = loading; false = no Bukku/Xero — Mark as paid is manual-only (no accrual sync). */
+  const [accountingConnected, setAccountingConnected] = useState<boolean | null>(null)
 
   const [editOpen, setEditOpen] = useState(false)
   const [editId, setEditId] = useState("")
@@ -383,6 +461,23 @@ export default function SalaryPageEnhanced() {
   const [payrollPreviewBusy, setPayrollPreviewBusy] = useState(false)
   const [editPayrollInputs, setEditPayrollInputs] = useState<PayrollInputsJson>({})
 
+  useEffect(() => {
+    if (!operatorId) {
+      setAccountingConnected(null)
+      return
+    }
+    let cancelled = false
+    void (async () => {
+      const r = await fetchOperatorSettings(operatorId)
+      if (cancelled) return
+      const s = (r as { settings?: { bukku?: boolean; xero?: boolean } })?.settings
+      setAccountingConnected(!!(s?.bukku || s?.xero))
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [operatorId])
+
   const loadRecords = useCallback(async () => {
     if (!operatorId) {
       setRecords([])
@@ -400,6 +495,18 @@ export default function SalaryPageEnhanced() {
       r.items.map((item: any) => ({
         id: String(item.id),
         employeeLabel: String(item.employeeLabel || ""),
+        contactLegalName:
+          item.contactLegalName != null && String(item.contactLegalName).trim() !== ""
+            ? String(item.contactLegalName).trim()
+            : undefined,
+        contactFullName:
+          item.contactFullName != null && String(item.contactFullName).trim() !== ""
+            ? String(item.contactFullName).trim()
+            : undefined,
+        contactEmail:
+          item.contactEmail != null && String(item.contactEmail).trim() !== ""
+            ? String(item.contactEmail).trim()
+            : undefined,
         team: String(item.team || ""),
         baseSalary: Number(item.baseSalary || 0),
         netSalary: Number(item.netSalary || 0),
@@ -525,6 +632,10 @@ export default function SalaryPageEnhanced() {
           .map((c) => ({
             id: String(c.id ?? ""),
             name: String(c.name ?? "").trim(),
+            legalName:
+              c.legalName != null && String(c.legalName).trim() !== ""
+                ? String(c.legalName).trim()
+                : undefined,
             email: c.email != null ? String(c.email) : "",
             team: c.team != null ? String(c.team) : "",
             salaryBasic: Number(
@@ -740,6 +851,7 @@ export default function SalaryPageEnhanced() {
   }, [addFlexPreview, addChkEpf, addChkSocso, addChkEis, addIllustrativeStatutory])
 
   const selectedEligibleSync = useMemo(() => {
+    if (accountingConnected !== true) return []
     return records.filter(
       (r) =>
         selectedIds.has(r.id) &&
@@ -747,16 +859,18 @@ export default function SalaryPageEnhanced() {
         !recordHasAccrualJournal(r) &&
         r.netSalary > 0
     )
-  }, [records, selectedIds])
+  }, [records, selectedIds, accountingConnected])
 
   const selectedEligiblePaid = useMemo(() => {
-    return records.filter(
-      (r) =>
-        selectedIds.has(r.id) &&
-        r.status === "pending_sync" &&
-        recordHasAccrualJournal(r)
-    )
-  }, [records, selectedIds])
+    if (accountingConnected === null) return []
+    return records.filter((r) => {
+      if (!selectedIds.has(r.id)) return false
+      if (r.status !== "pending_sync" && r.status !== "partial_paid") return false
+      if (netOutstandingForRecord(r) <= 0.009) return false
+      if (accountingConnected) return recordHasAccrualJournal(r)
+      return true
+    })
+  }, [records, selectedIds, accountingConnected])
 
   const openSyncDialog = () => {
     if (!selectedEligibleSync.length) {
@@ -796,32 +910,78 @@ export default function SalaryPageEnhanced() {
   }
 
   const openBulkPaid = () => {
-    const ids = selectedEligiblePaid.map((r) => r.id)
-    if (!ids.length) {
-      toast.error("Select synced rows still pending payment")
+    const rows = selectedEligiblePaid
+    if (!rows.length) {
+      toast.error(
+        accountingConnected
+          ? "Select synced rows still pending payment"
+          : "Select rows with a balance to pay"
+      )
       return
     }
+    const init: Record<string, string> = {}
+    for (const r of rows) {
+      const o = netOutstandingForRecord(r)
+      init[r.id] = o > 0 ? String(o) : ""
+    }
+    setPaidReleaseById(init)
     setPaidDate(new Date().toISOString().slice(0, 10))
     setPaidOpen(true)
   }
 
   const confirmBulkPaid = async () => {
     if (!operatorId) return
-    const ids = selectedEligiblePaid.map((r) => r.id)
+    const ids = Object.keys(paidReleaseById)
     if (!ids.length) return
+    const releaseAmounts: Record<string, number> = {}
+    for (const id of ids) {
+      const row = records.find((x) => x.id === id)
+      if (!row) {
+        toast.error("Record not found — refresh the page and try again")
+        return
+      }
+      if (accountingConnected && !recordHasAccrualJournal(row)) {
+        toast.error("Accrual journal required before payment")
+        return
+      }
+      if (row.status !== "pending_sync" && row.status !== "partial_paid") {
+        toast.error("This row cannot be paid in the current status")
+        return
+      }
+      const raw = String(paidReleaseById[id] ?? "").replace(/,/g, "").trim()
+      const n = Math.max(0, Number(raw))
+      if (!Number.isFinite(n) || n <= 0) {
+        toast.error("Enter a valid amount to release for each selected employee")
+        return
+      }
+      const max = netOutstandingForRecord(row)
+      if (n > max + 0.01) {
+        toast.error(
+          `Release amount cannot exceed balance (${fmtRm(max)}) for ${row.employeeLabel || "employee"}`
+        )
+        return
+      }
+      releaseAmounts[id] = Math.round(n * 100) / 100
+    }
+    if (!Object.keys(releaseAmounts).length) {
+      toast.error("Nothing to save")
+      return
+    }
     setPaidBusy(true)
+    const recordIdsOut = Object.keys(releaseAmounts)
     const r = await postOperatorSalariesMarkPaid({
       operatorId,
-      recordIds: ids,
+      recordIds: recordIdsOut,
       paymentDate: paidDate,
       paymentMethod: paidMethod,
+      releaseAmounts,
     })
     setPaidBusy(false)
     if (!r?.ok) {
       toast.error(typeof r?.reason === "string" ? r.reason : "Update failed")
       return
     }
-    toast.success("Marked as paid")
+    toast.success("Payment recorded")
     setPaidOpen(false)
     setSelectedIds(new Set())
     void loadRecords()
@@ -844,6 +1004,48 @@ export default function SalaryPageEnhanced() {
       return
     }
     toast.success("Archived")
+    void loadRecords()
+  }
+
+  const voidPaymentOnly = async (row: SalaryRecord) => {
+    const r = await patchOperatorSalaryRecord(row.id, { operatorId, action: "void_payment" })
+    if (!r?.ok) {
+      const reason = typeof r?.reason === "string" ? r.reason : ""
+      const detail = typeof (r as { detail?: unknown })?.detail === "string" ? (r as { detail: string }).detail : ""
+      let msg = reason || "Failed"
+      if (reason === "BUKKU_VOID_FAILED") {
+        msg = "Could not void the linked Bukku banking expense (money out). Fix in accounting or void there first."
+      } else if (reason === "VOID_XERO_SPEND_FAILED" || reason === "VOID_XERO_EXCEPTION") {
+        msg = "Could not void the linked Xero bank spend. Check accounting integration."
+      } else if (reason === "BUKKU_NOT_CONNECTED") {
+        msg = "Bukku is not connected; reconnect accounting or void the payout in Bukku manually."
+      } else if (detail && reason !== "INVALID_STATUS") {
+        msg = `${reason}: ${detail}`.slice(0, 280)
+      }
+      toast.error(msg)
+      return
+    }
+    toast.success("Payment cleared — record is payable again")
+    void loadRecords()
+  }
+
+  const unvoidRecord = async (row: SalaryRecord) => {
+    const r = await patchOperatorSalaryRecord(row.id, { operatorId, action: "unvoid" })
+    if (!r?.ok) {
+      toast.error(typeof r?.reason === "string" ? r.reason : "Failed")
+      return
+    }
+    toast.success("Restored from void")
+    void loadRecords()
+  }
+
+  const unarchiveRecord = async (row: SalaryRecord) => {
+    const r = await patchOperatorSalaryRecord(row.id, { operatorId, action: "unarchive" })
+    if (!r?.ok) {
+      toast.error(typeof r?.reason === "string" ? r.reason : "Failed")
+      return
+    }
+    toast.success("Restored from archive")
     void loadRecords()
   }
 
@@ -903,7 +1105,7 @@ export default function SalaryPageEnhanced() {
       operatorId,
       period,
       team: teamLabel,
-      employeeLabel: addSelectedContact.name.trim() || "Staff",
+      employeeLabel: salaryContactEmployeeLabelForRecord(addSelectedContact),
       baseSalary: base,
       netSalary: addSummaryTakeHome,
       payrollInputs: Object.keys(pi).length ? pi : undefined,
@@ -1193,6 +1395,16 @@ export default function SalaryPageEnhanced() {
       render: (v) => `RM ${Number(v).toLocaleString("en-MY", { minimumFractionDigits: 2 })}`,
     },
     {
+      key: "released",
+      label: "Released",
+      render: (_, row) => fmtRm(payoutReleasedSoFar(row)),
+    },
+    {
+      key: "outstanding",
+      label: "Balance",
+      render: (_, row) => fmtRm(netOutstandingForRecord(row)),
+    },
+    {
       key: "mtdTick",
       label: "MTD",
       sortable: true,
@@ -1223,25 +1435,55 @@ export default function SalaryPageEnhanced() {
       icon: <CheckCircle className="h-4 w-4 mr-2" />,
       onClick: (row) => {
         setSelectedIds(new Set([row.id]))
+        const o = netOutstandingForRecord(row)
+        setPaidReleaseById({ [row.id]: o > 0 ? String(o) : "" })
         setPaidDate(new Date().toISOString().slice(0, 10))
         setPaidOpen(true)
       },
-      visible: (row) =>
-        recordHasAccrualJournal(row) && row.status === "pending_sync",
+      visible: (row) => {
+        if (accountingConnected === null) return false
+        if (row.status !== "pending_sync" && row.status !== "partial_paid") return false
+        if (netOutstandingForRecord(row) <= 0.009) return false
+        if (accountingConnected) return recordHasAccrualJournal(row)
+        return true
+      },
+    },
+    {
+      label: "Void payment",
+      icon: <XCircle className="h-4 w-4 mr-2" />,
+      variant: "destructive",
+      onClick: (row) => void voidPaymentOnly(row),
+      visible: (row) => row.status === "complete" || row.status === "partial_paid",
     },
     {
       label: "Void",
       icon: <XCircle className="h-4 w-4 mr-2" />,
       variant: "destructive",
       onClick: (row) => void markVoid(row),
-      visible: (row) =>
-        recordHasAccrualJournal(row) && row.status !== "void" && row.status !== "archived",
+      visible: (row) => {
+        if (row.status === "void" || row.status === "archived") return false
+        if (accountingConnected === null) return false
+        if (accountingConnected) return recordHasAccrualJournal(row)
+        return true
+      },
     },
     {
       label: "Archive",
       icon: <Archive className="h-4 w-4 mr-2" />,
       onClick: (row) => void markArchived(row),
       visible: (row) => row.status !== "archived",
+    },
+    {
+      label: "Unvoid",
+      icon: <Undo2 className="h-4 w-4 mr-2" />,
+      onClick: (row) => void unvoidRecord(row),
+      visible: (row) => row.status === "void",
+    },
+    {
+      label: "Unarchive",
+      icon: <Undo2 className="h-4 w-4 mr-2" />,
+      onClick: (row) => void unarchiveRecord(row),
+      visible: (row) => row.status === "archived",
     },
   ]
 
@@ -1252,17 +1494,26 @@ export default function SalaryPageEnhanced() {
           <div>
             <h2 className="text-2xl font-bold tracking-tight">Salary</h2>
             <p className="text-muted-foreground text-sm">
-              Records, allowances & deductions, then accrual to your connected accounting (Bukku journal or Xero
-              manual journal — same GL mapping). See{" "}
-              <a
-                className="underline underline-offset-2"
-                href="https://intercom.help/bukku/en/articles/11983121-recording-employee-salaries-statutory-payments"
-                target="_blank"
-                rel="noreferrer"
-              >
-                Bukku payroll guide
-              </a>
-              . Choose pay period in each tab&apos;s Filter.
+              {accountingConnected === false ? (
+                <>
+                  Salary records, allowances & deductions, and mark payments without connecting accounting. When you
+                  connect Bukku or Xero in Company, you can also sync accrual and post payouts to the books.
+                </>
+              ) : (
+                <>
+                  Records, allowances & deductions, then accrual to your connected accounting (Bukku journal or Xero
+                  manual journal — same GL mapping). See{" "}
+                  <a
+                    className="underline underline-offset-2"
+                    href="https://intercom.help/bukku/en/articles/11983121-recording-employee-salaries-statutory-payments"
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Bukku payroll guide
+                  </a>
+                  . Choose pay period in each tab&apos;s Filter.
+                </>
+              )}
             </p>
           </div>
           <Button
@@ -1317,14 +1568,16 @@ export default function SalaryPageEnhanced() {
                       </Button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="start" className="w-52">
+                      {accountingConnected ? (
+                        <DropdownMenuItem
+                          disabled={syncBusy || !selectedEligibleSync.length}
+                          onClick={() => openSyncDialog()}
+                        >
+                          Sync to accounting
+                        </DropdownMenuItem>
+                      ) : null}
                       <DropdownMenuItem
-                        disabled={syncBusy || !selectedEligibleSync.length}
-                        onClick={() => openSyncDialog()}
-                      >
-                        Sync to accounting
-                      </DropdownMenuItem>
-                      <DropdownMenuItem
-                        disabled={!selectedEligiblePaid.length}
+                        disabled={accountingConnected === null || !selectedEligiblePaid.length}
                         onClick={() => openBulkPaid()}
                       >
                         Mark as paid
@@ -1414,6 +1667,7 @@ export default function SalaryPageEnhanced() {
                                 <SelectContent>
                                   <SelectItem value="all">All status</SelectItem>
                                   <SelectItem value="pending_sync">Pending sync</SelectItem>
+                                  <SelectItem value="partial_paid">Part paid</SelectItem>
                                   <SelectItem value="complete">Complete</SelectItem>
                                   <SelectItem value="void">Void</SelectItem>
                                   <SelectItem value="archived">Archived</SelectItem>
@@ -2087,8 +2341,11 @@ export default function SalaryPageEnhanced() {
                       className="justify-between font-normal"
                       disabled={addContactsLoading}
                     >
-                      {addSelectedContact?.name ||
-                        (addContactsLoading ? "Loading contacts…" : "Search and select staff…")}
+                      {addSelectedContact
+                        ? salaryContactPickerLabel(addSelectedContact)
+                        : addContactsLoading
+                          ? "Loading contacts…"
+                          : "Search and select staff…"}
                       <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
                     </Button>
                   </PopoverTrigger>
@@ -2101,7 +2358,7 @@ export default function SalaryPageEnhanced() {
                           {addContacts.map((c) => (
                             <CommandItem
                               key={c.id}
-                              value={`${c.name} ${c.email ?? ""}`}
+                              value={`${salaryContactPickerLabel(c)} ${c.name} ${c.legalName ?? ""} ${c.email ?? ""}`}
                               onSelect={() => {
                                 setAddContactId(c.id)
                                 setAddStaffComboOpen(false)
@@ -2114,12 +2371,7 @@ export default function SalaryPageEnhanced() {
                                   addContactId === c.id ? "opacity-100" : "opacity-0"
                                 )}
                               />
-                              <div className="flex flex-col">
-                                <span>{c.name}</span>
-                                {c.email ? (
-                                  <span className="text-xs text-muted-foreground">{c.email}</span>
-                                ) : null}
-                              </div>
+                              <span className="truncate">{salaryContactPickerLabel(c)}</span>
                             </CommandItem>
                           ))}
                         </CommandGroup>
@@ -2236,7 +2488,9 @@ export default function SalaryPageEnhanced() {
             <div className="grid gap-3 py-2 text-sm">
               <div className="flex justify-between gap-2">
                 <span className="text-muted-foreground">Staff</span>
-                <span className="font-medium text-right">{addSelectedContact?.name ?? "—"}</span>
+                <span className="font-medium text-right text-balance max-w-[70%]">
+                  {addSelectedContact ? salaryContactPickerLabel(addSelectedContact) : "—"}
+                </span>
               </div>
               <div className="flex justify-between gap-2">
                 <span className="text-muted-foreground">Employment</span>
@@ -2667,7 +2921,7 @@ export default function SalaryPageEnhanced() {
                   <SelectContent>
                     {records.map((r) => (
                       <SelectItem key={r.id} value={r.id}>
-                        {r.employeeLabel}
+                        {salaryRecordPickerLabel(r)}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -2754,7 +3008,11 @@ export default function SalaryPageEnhanced() {
             <DialogHeader>
               <DialogTitle>Edit {lineEditKind === "allowance" ? "allowance" : "deduction"}</DialogTitle>
               <DialogDescription>
-                {records.find((r) => r.id === lineEditRecordId)?.employeeLabel ?? "Staff"} · {period}
+                {((): string => {
+                  const rec = records.find((x) => x.id === lineEditRecordId)
+                  return rec ? salaryRecordPickerLabel(rec) : "Staff"
+                })()}{" "}
+                · {period}
               </DialogDescription>
             </DialogHeader>
             <div className="grid gap-3 py-2">
@@ -2948,12 +3206,22 @@ export default function SalaryPageEnhanced() {
         </Dialog>
 
         <Dialog open={paidOpen} onOpenChange={setPaidOpen}>
-          <DialogContent>
+          <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-lg">
             <DialogHeader>
               <DialogTitle>Mark as paid</DialogTitle>
               <DialogDescription>
-                Payment date and method. With Bukku, posts Money Out; with Xero, posts a bank spend — Salary
-                Control line, pay from Bank or Cash per method.
+                {accountingConnected === false ? (
+                  <>
+                    Record payment date, method, and amount in the portal (no Bukku/Xero posting). Default is the
+                    remaining net — change for advance pay; the next run pre-fills the balance.
+                  </>
+                ) : (
+                  <>
+                    After month-end accrual (journal), each run posts Money Out (Bukku) or bank spend (Xero) for the
+                    amount below. Default is the remaining net — change it for advance pay; the next run pre-fills the
+                    balance.
+                  </>
+                )}
               </DialogDescription>
             </DialogHeader>
             <div className="grid gap-3 py-2">
@@ -2975,6 +3243,32 @@ export default function SalaryPageEnhanced() {
                     ))}
                   </SelectContent>
                 </Select>
+              </div>
+              <div className="space-y-3 border-t pt-3">
+                <Label className="text-foreground">Amount to release (this payment)</Label>
+                {Object.keys(paidReleaseById).map((rid) => {
+                  const rec = records.find((x) => x.id === rid)
+                  if (!rec) return null
+                  const rel = payoutReleasedSoFar(rec)
+                  const bal = netOutstandingForRecord(rec)
+                  return (
+                    <div key={rid} className="grid gap-2 rounded-xl border border-border bg-muted/30 p-3">
+                      <p className="text-sm font-semibold">{rec.employeeLabel || "Employee"}</p>
+                      <p className="text-xs text-muted-foreground">
+                        Net {fmtRm(rec.netSalary)} · Released so far {fmtRm(rel)} · Balance before this run{" "}
+                        {fmtRm(bal)}
+                      </p>
+                      <Input
+                        inputMode="decimal"
+                        value={paidReleaseById[rid] ?? ""}
+                        onChange={(e) =>
+                          setPaidReleaseById((prev) => ({ ...prev, [rid]: e.target.value }))
+                        }
+                        placeholder={String(bal)}
+                      />
+                    </div>
+                  )
+                })}
               </div>
             </div>
             <DialogFooter>

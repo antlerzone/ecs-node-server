@@ -6,6 +6,7 @@ const {
   getOwnerPublicProfileById
 } = require('../tenancysetting/tenant-review.service');
 const cleanlemonSvc = require('../cleanlemon/cleanlemon.service');
+const clnReview = require('../cleanlemon/cleanlemon-review.service');
 const { getObjectStream } = require('../upload/oss.service');
 
 const OPERATOR_TUTORIAL_PDFS = new Set([
@@ -151,6 +152,34 @@ router.get('/homedemo-screenshot', async (req, res) => {
     else res.destroy(e);
   });
   stream.pipe(res);
+});
+
+/** Cleanlemons — public operator reputation (client_to_operator reviews). */
+router.get('/cleanlemon-operator-profile/:id', async (req, res, next) => {
+  try {
+    const id = req.params?.id != null ? String(req.params.id).trim() : '';
+    const result = await clnReview.getPublicOperatorProfile(id);
+    if (!result?.ok) {
+      const status = result?.reason === 'OPERATOR_NOT_FOUND' ? 404 : 400;
+      return res.status(status).json(result);
+    }
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Cleanlemons — directory of operator companies + review summary (no auth). */
+router.get('/cleanlemon-operator-directory', async (req, res, next) => {
+  try {
+    const result = await clnReview.getPublicOperatorDirectory({
+      limit: req.query.limit,
+      offset: req.query.offset,
+    });
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
 });
 
 /** Cleanlemons operator public pricing (no auth). portal.cleanlemons.com/{public_subdomain} */

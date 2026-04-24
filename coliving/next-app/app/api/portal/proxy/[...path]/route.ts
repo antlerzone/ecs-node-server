@@ -62,7 +62,20 @@ function demoMock(pathStr: string, body: unknown): unknown {
   const email = (b.email as string) || "demo@demo.com";
   const clientId = (b.clientId as string) || "demo-client";
   if (pathStr === "access/member-roles") {
-    return { ok: true, email: (b.email as string) || email, roles: [{ type: "staff", staffId: "demo-staff", clientId: "demo-client", clientTitle: "Demo Client" }], registered: true };
+    return {
+      ok: true,
+      email: (b.email as string) || email,
+      roles: [
+        {
+          type: "staff",
+          staffSource: "coliving_client_user",
+          staffId: "demo-staff",
+          clientId: "demo-client",
+          clientTitle: "Demo Client",
+        },
+      ],
+      registered: true,
+    };
   }
   if (pathStr === "access/context" || pathStr === "access/context/with-client") {
     return { ok: true, staff: { id: "demo-staff", email, permission: {} }, client: { id: clientId, title: "Demo Client", currency: "MYR" }, credit: { ok: true, balance: 0 } };

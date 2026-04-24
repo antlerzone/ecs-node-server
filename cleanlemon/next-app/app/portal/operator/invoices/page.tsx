@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { jsPDF } from 'jspdf'
 import autoTable from 'jspdf-autotable'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -20,12 +20,12 @@ import {
   fetchOperatorInvoices,
   updateOperatorInvoiceStatus,
   deleteOperatorInvoice,
+  sendOperatorInvoicePaymentReminder,
   fetchOperatorSettings,
   saveOperatorSettings,
   createOperatorInvoice,
   updateOperatorInvoice,
   fetchOperatorInvoiceFormOptions,
-  fetchOperatorAccountingMappings,
   fetchCleanlemonPricingConfig,
 } from '@/lib/cleanlemon-api'
 import { PRICING_SERVICES, type ServiceKey } from '@/lib/cleanlemon-pricing-services'
@@ -46,12 +46,18 @@ import {
   XCircle,
   AlertCircle,
   ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
   Trash2,
   ExternalLink,
   Mail,
   Settings2,
   Check,
   ChevronsUpDown,
+  ChevronsLeft,
+  ChevronsRight,
+  ChevronLeft,
+  ChevronRight,
   Building2,
   Calendar,
   LayoutList,
@@ -75,6 +81,12 @@ import {
 } from '@/components/ui/command'
 import { cn } from '@/lib/utils'
 
+type AccountingMetaShape = {
+  provider?: string
+  bukku?: { subdomain?: string | null; transactionId?: string | null; shortLink?: string | null }
+  xero?: { onlineInvoiceUrl?: string | null; invoiceId?: string | null }
+}
+
 interface Invoice {
   id: string
   invoiceNo: string
@@ -94,7 +106,34 @@ interface Invoice {
   pdfUrl?: string | null
   /** Latest payment receipt URL when set */
   receiptUrl?: string | null
+  /** Bukku / Xero provider invoice id (`cln_client_invoice.transaction_id`) */
+  accountingInvoiceId?: string | null
+  /** Parsed `accounting_meta_json` — subdomain / Xero online URL fallback (Coliving-style). */
+  accountingMeta?: AccountingMetaShape | null
   items: Array<{ description: string; quantity: number; rate: number; amount: number }>
+}
+
+/** Prefer `pdf_url`; else Xero online URL; else Bukku `https://{sub}.bukku.my/invoices/{id}` (align with Coliving operator invoice). */
+function resolveOperatorAccountingInvoiceHref(inv: {
+  pdfUrl?: string | null
+  accountingInvoiceId?: string | null
+  accountingMeta?: AccountingMetaShape | null
+}): string | undefined {
+  const u = String(inv.pdfUrl || '').trim()
+  if (u && /^https?:\/\//i.test(u)) return u
+  const meta = inv.accountingMeta
+  const xeroUrl = meta?.xero?.onlineInvoiceUrl != null ? String(meta.xero.onlineInvoiceUrl).trim() : ''
+  if (xeroUrl && /^https?:\/\//i.test(xeroUrl)) return xeroUrl
+  const short = meta?.bukku?.shortLink != null ? String(meta.bukku.shortLink).trim() : ''
+  if (short && /^https?:\/\//i.test(short)) return short
+  const sub = meta?.bukku?.subdomain != null ? String(meta.bukku.subdomain).trim() : ''
+  const id = String(
+    inv.accountingInvoiceId ||
+      (meta?.bukku?.transactionId != null ? String(meta.bukku.transactionId).trim() : '') ||
+      ''
+  ).trim()
+  if (sub && id) return `https://${sub}.bukku.my/invoices/${encodeURIComponent(id)}`.replace(/\/+/g, '/')
+  return undefined
 }
 
 interface PaymentRecord {
@@ -174,6 +213,19 @@ function invoiceDistrictGroupKey(p: InvoicePropertyRow): string {
   if (n) return normInvoiceDistrictKey(n)
   return `__row:${p.id}`
 }
+
+/** Display YYYY-MM-DD from API without UTC shifting the calendar day. */
+function formatInvoiceYmd(ymd: string | undefined | null): string {
+  const s = String(ymd ?? '')
+    .trim()
+    .slice(0, 10)
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return '—'
+  const d = new Date(`${s}T12:00:00`)
+  return Number.isNaN(d.getTime()) ? '—' : d.toLocaleDateString()
+}
+
+/** Radix Select must stay controlled; avoid `value={x || undefined}` toggling uncontrolled → controlled. */
+const CLN_INVOICE_LINE_SELECT_EMPTY = '__cln_invoice_line_unset__'
 
 function newCreateInvoiceLine(): CreateInvoiceLine {
   const id =
@@ -256,6 +308,60 @@ const statusConfig = {
   cancelled: { label: 'Cancelled', color: 'bg-gray-100 text-gray-500', icon: XCircle },
 }
 
+type InvoiceSortKey = 'invoiceNo' | 'client' | 'property' | 'total' | 'status' | 'dueDate' | 'issueDate'
+type InvoiceSortDir = 'asc' | 'desc'
+
+function parseInvoiceYmdMs(ymd: string | undefined | null): number | null {
+  const s = String(ymd ?? '')
+    .trim()
+    .slice(0, 10)
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null
+  const t = new Date(`${s}T12:00:00`).getTime()
+  return Number.isNaN(t) ? null : t
+}
+
+function compareInvoicesForSort(
+  a: Invoice,
+  b: Invoice,
+  key: InvoiceSortKey,
+  dir: InvoiceSortDir
+): number {
+  const asc = dir === 'asc'
+  const cmp = (n: number) => (asc ? n : -n)
+
+  switch (key) {
+    case 'invoiceNo':
+      return cmp(
+        a.invoiceNo.localeCompare(b.invoiceNo, undefined, { numeric: true, sensitivity: 'base' })
+      )
+    case 'client':
+      return cmp(a.client.localeCompare(b.client, undefined, { numeric: true, sensitivity: 'base' }))
+    case 'property':
+      return cmp(a.property.localeCompare(b.property, undefined, { numeric: true, sensitivity: 'base' }))
+    case 'total':
+      return cmp(a.total - b.total)
+    case 'status':
+      return cmp(
+        statusConfig[a.status].label.localeCompare(statusConfig[b.status].label, undefined, {
+          sensitivity: 'base',
+        })
+      )
+    case 'dueDate':
+    case 'issueDate': {
+      const fa = key === 'dueDate' ? a.dueDate : a.issueDate
+      const fb = key === 'dueDate' ? b.dueDate : b.issueDate
+      const ta = parseInvoiceYmdMs(fa)
+      const tb = parseInvoiceYmdMs(fb)
+      if (ta === null && tb === null) return 0
+      if (ta === null) return asc ? 1 : -1
+      if (tb === null) return asc ? -1 : 1
+      return cmp(ta - tb)
+    }
+    default:
+      return 0
+  }
+}
+
 export default function InvoicesPage() {
   const { user } = useAuth()
   const operatorId = useEffectiveOperatorId(user)
@@ -266,9 +372,22 @@ export default function InvoicesPage() {
   const [filterYear, setFilterYear] = useState('all')
   const [filterClientId, setFilterClientId] = useState('all')
   const [filterExpanded, setFilterExpanded] = useState(false)
+  const [invoicePage, setInvoicePage] = useState(1)
+  const [invoicePageSize, setInvoicePageSize] = useState(20)
+  const [invoiceSortKey, setInvoiceSortKey] = useState<InvoiceSortKey>('invoiceNo')
+  const [invoiceSortDir, setInvoiceSortDir] = useState<InvoiceSortDir>('asc')
   const [selectedInvoices, setSelectedInvoices] = useState<string[]>([])
   const [createInvoiceOpen, setCreateInvoiceOpen] = useState(false)
   const [viewInvoice, setViewInvoice] = useState<Invoice | null>(null)
+  const viewInvoiceDocUrl = useMemo(
+    () => (viewInvoice ? resolveOperatorAccountingInvoiceHref(viewInvoice) : undefined),
+    [viewInvoice]
+  )
+  const [paymentReminderSending, setPaymentReminderSending] = useState(false)
+  const [createInvoiceSubmitting, setCreateInvoiceSubmitting] = useState(false)
+  /** Prevents double submit in the same tick before React re-renders `createInvoiceSubmitting`. */
+  const createInvoiceFlightRef = useRef(false)
+  const [markAsPaidSubmitting, setMarkAsPaidSubmitting] = useState(false)
   const [markAsPaidInvoice, setMarkAsPaidInvoice] = useState<Invoice | null>(null)
   /** When set, "Mark as paid" dialog applies to all these rows */
   const [bulkMarkList, setBulkMarkList] = useState<Invoice[] | null>(null)
@@ -426,7 +545,9 @@ export default function InvoicesPage() {
   }, [])
 
   const loadInvoices = useCallback(async () => {
-    const r = await fetchOperatorInvoices()
+    const oid = String(operatorId || '').trim()
+    if (!oid) return
+    const r = await fetchOperatorInvoices(oid)
     if (!r?.ok) return
     const items: Invoice[] = (r.items || []).map((row: any) => {
       const st = String(row.status || '').toLowerCase()
@@ -451,6 +572,11 @@ export default function InvoicesPage() {
         paidDate: row.paidDate || undefined,
         pdfUrl: row.pdfUrl != null && String(row.pdfUrl).trim() !== '' ? String(row.pdfUrl).trim() : null,
         receiptUrl: row.receiptUrl != null && String(row.receiptUrl).trim() !== '' ? String(row.receiptUrl).trim() : null,
+        accountingInvoiceId:
+          row.accountingInvoiceId != null && String(row.accountingInvoiceId).trim() !== ''
+            ? String(row.accountingInvoiceId).trim()
+            : null,
+        accountingMeta: (row.accountingMeta ?? null) as AccountingMetaShape | null,
         items: [],
       }
     })
@@ -470,7 +596,7 @@ export default function InvoicesPage() {
           receiptUrl: inv.receiptUrl,
         }))
     )
-  }, [])
+  }, [operatorId])
 
   useEffect(() => {
     void loadInvoices()
@@ -552,6 +678,37 @@ export default function InvoicesPage() {
     filterClientId,
     invoiceClients,
   ])
+
+  const sortedInvoices = useMemo(() => {
+    return [...filteredInvoices].sort((a, b) =>
+      compareInvoicesForSort(a, b, invoiceSortKey, invoiceSortDir)
+    )
+  }, [filteredInvoices, invoiceSortKey, invoiceSortDir])
+
+  const invoiceTotalPages = Math.max(1, Math.ceil(sortedInvoices.length / invoicePageSize))
+
+  const pagedInvoices = useMemo(() => {
+    const start = (invoicePage - 1) * invoicePageSize
+    return sortedInvoices.slice(start, start + invoicePageSize)
+  }, [sortedInvoices, invoicePage, invoicePageSize])
+
+  const toggleInvoiceSort = useCallback((key: InvoiceSortKey) => {
+    if (key === invoiceSortKey) {
+      setInvoiceSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))
+    } else {
+      setInvoiceSortKey(key)
+      setInvoiceSortDir('asc')
+      setInvoicePage(1)
+    }
+  }, [invoiceSortKey])
+
+  useEffect(() => {
+    setInvoicePage((p) => Math.min(Math.max(1, p), invoiceTotalPages))
+  }, [invoiceTotalPages])
+
+  useEffect(() => {
+    setInvoicePage(1)
+  }, [searchQuery, activeTab, filterMonth, filterYear, filterClientId])
 
   const hasActiveFilters =
     filterClientId !== 'all' || filterMonth !== 'all' || filterYear !== 'all'
@@ -654,15 +811,16 @@ export default function InvoicesPage() {
 
   const selectedRows = useMemo(() => {
     return selectedInvoices
-      .map((id) => filteredInvoices.find((i) => i.id === id))
+      .map((id) => sortedInvoices.find((i) => i.id === id))
       .filter((i): i is Invoice => Boolean(i))
-  }, [selectedInvoices, filteredInvoices])
+  }, [selectedInvoices, sortedInvoices])
 
   const handleSelectAll = (checked: boolean) => {
+    const pageIds = pagedInvoices.map((inv) => inv.id)
     if (checked) {
-      setSelectedInvoices(filteredInvoices.map(inv => inv.id))
+      setSelectedInvoices((prev) => Array.from(new Set([...prev, ...pageIds])))
     } else {
-      setSelectedInvoices([])
+      setSelectedInvoices((prev) => prev.filter((id) => !pageIds.includes(id)))
     }
   }
 
@@ -724,6 +882,7 @@ export default function InvoicesPage() {
   }
 
   const handleConfirmMarkAsPaid = async () => {
+    if (markAsPaidSubmitting) return
     const list =
       bulkMarkList && bulkMarkList.length > 0
         ? bulkMarkList
@@ -731,59 +890,42 @@ export default function InvoicesPage() {
           ? [markAsPaidInvoice]
           : []
     if (list.length === 0) return
-    for (const inv of list) {
-      if (inv.status === 'paid') continue
-      const r = await updateOperatorInvoiceStatus(inv.id, 'paid', {
-        operatorId,
-        paymentMethod,
-        paymentDate,
-      })
-      if (!r?.ok) {
-        toast.error(r?.reason || `Failed: ${inv.invoiceNo}`)
-        return
+    setMarkAsPaidSubmitting(true)
+    try {
+      const oid = String(operatorId || '').trim()
+      for (const inv of list) {
+        if (inv.status === 'paid') continue
+        const r = await updateOperatorInvoiceStatus(inv.id, 'paid', {
+          operatorId: oid || undefined,
+          paymentMethod,
+          paymentDate,
+        })
+        if (!r?.ok) {
+          toast.error(r?.reason || `Failed: ${inv.invoiceNo}`)
+          return
+        }
       }
-      setInvoices((prev) =>
-        prev.map((i) => (i.id === inv.id ? { ...i, status: 'paid' as const, paidDate: paymentDate } : i))
+      await loadInvoices()
+      toast.success(
+        list.length > 1 ? `Marked ${list.length} invoices as paid` : `Invoice ${list[0].invoiceNo} marked as paid`
       )
-      const paymentRecord: PaymentRecord = {
-        id: `PAY-${inv.id}-${Date.now()}`,
-        invoiceId: inv.id,
-        invoiceNo: inv.invoiceNo,
-        client: inv.client,
-        amount: inv.total,
-        paymentMethod,
-        paymentDate,
-        status: 'completed',
-        receiptUrl: inv.receiptUrl ?? null,
-      }
-      setPayments((prev) => [paymentRecord, ...prev.filter((p) => p.invoiceId !== inv.id)])
+      setMarkAsPaidInvoice(null)
+      setBulkMarkList(null)
+      setSelectedInvoices([])
+    } finally {
+      setMarkAsPaidSubmitting(false)
     }
-    toast.success(
-      list.length > 1 ? `Marked ${list.length} invoices as paid` : `Invoice ${list[0].invoiceNo} marked as paid`
-    )
-    setMarkAsPaidInvoice(null)
-    setBulkMarkList(null)
-    setSelectedInvoices([])
   }
 
   const handleVoidPayment = async (invoice: Invoice) => {
     if (invoice.status !== 'paid') return
-    const r = await updateOperatorInvoiceStatus(invoice.id, 'overdue', { operatorId })
+    const oid = String(operatorId || '').trim()
+    const r = await updateOperatorInvoiceStatus(invoice.id, 'overdue', { operatorId: oid || undefined })
     if (!r?.ok) {
       toast.error(r?.reason || 'Failed to void payment in accounting')
       return
     }
-    const now = new Date().toISOString().split('T')[0]
-    setInvoices((prev) =>
-      prev.map((inv) => (inv.id === invoice.id ? { ...inv, status: 'overdue', paidDate: undefined } : inv))
-    )
-    setPayments((prev) =>
-      prev.map((payment) =>
-        payment.invoiceId === invoice.id
-          ? { ...payment, status: 'voided', voidedAt: now }
-          : payment
-      )
-    )
+    await loadInvoices()
     toast.success(`Payment for ${invoice.invoiceNo} has been voided`)
   }
 
@@ -812,8 +954,8 @@ export default function InvoicesPage() {
     payments.find((payment) => payment.invoiceId === invoiceId && payment.status === 'completed')
 
   const openInvoicePdf = (inv: Invoice) => {
-    const u = String(inv.pdfUrl || '').trim()
-    if (u && /^https?:\/\//i.test(u)) {
+    const u = resolveOperatorAccountingInvoiceHref(inv)
+    if (u) {
       window.open(u, '_blank', 'noopener,noreferrer')
       return
     }
@@ -863,24 +1005,9 @@ export default function InvoicesPage() {
     }
   }, [operatorId])
 
+  /** Invoice line "Product" = pricing service names only (never full chart: Bank / EPF / …). */
   useEffect(() => {
-    let cancelled = false
-    ;(async () => {
-      const r = await fetchOperatorAccountingMappings(operatorId)
-      if (cancelled) return
-      if (!r?.ok || !Array.isArray(r.items)) {
-        setAccountingProductOptions(fallbackAccountingProductLabels())
-        return
-      }
-      const titles = (r.items as Array<{ cleanlemonsAccount?: string; isProduct?: boolean }>)
-        .filter((row) => row.isProduct === true)
-        .map((row) => String(row.cleanlemonsAccount || '').trim())
-        .filter(Boolean)
-      setAccountingProductOptions(titles.length > 0 ? titles : fallbackAccountingProductLabels())
-    })()
-    return () => {
-      cancelled = true
-    }
+    setAccountingProductOptions(fallbackAccountingProductLabels())
   }, [operatorId])
 
   const handleSaveEditInvoice = () => {
@@ -917,8 +1044,10 @@ export default function InvoicesPage() {
         toast.error('Please select a product for each line item')
         return
       }
-      if (row.qty <= 0 || row.rate <= 0) {
-        toast.error('Quantity and rate must be greater than 0 for each line')
+      const qtyNum = Number(row.qty)
+      const rateNum = Number(row.rate)
+      if (!Number.isFinite(qtyNum) || qtyNum <= 0 || !Number.isFinite(rateNum) || rateNum <= 0) {
+        toast.error('Each line needs quantity and rate greater than 0 (fill Rate in RM).')
         return
       }
     }
@@ -939,58 +1068,53 @@ export default function InvoicesPage() {
         }
       }),
     })
-    const r = await createOperatorInvoice({
-      invoiceNo,
-      clientId: selectedClient.id,
-      clientName: selectedClient.name,
-      description,
-      amount,
-      issueDate: createInvoiceDate,
-      dueDate: createInvoiceDate,
-      operatorId,
-      lines: createLines.map((row) => {
-        const p = invoiceProperties.find((x) => x.id === row.propertyId)
-        const propLabel = invoicePropertyRowLabel(p)
-        const extra = propLabel && propLabel !== '—' ? `[${propLabel}] ` : ''
-        return {
-          product: row.product.trim(),
-          qty: row.qty,
-          rate: row.rate,
-          description: `${extra}${String(row.description || '').trim()}`.trim(),
-          propertyId: row.propertyId,
-        }
-      }),
-    })
-    if (!r?.ok) {
-      toast.error(r?.reason || 'Failed to create invoice')
+    const oid = String(operatorId || '').trim()
+    if (!oid) {
+      toast.error('Missing operator — refresh or sign in again.')
       return
     }
-    const finalNo = r.invoiceNo != null && String(r.invoiceNo).trim() !== '' ? String(r.invoiceNo).trim() : invoiceNo
-    const created: Invoice = {
-      id: String(r.id || invoiceNo),
-      invoiceNo: finalNo,
-      clientId: selectedClient.id,
-      client: selectedClient.name,
-      clientEmail: selectedClient.email,
-      property: description,
-      amount,
-      tax,
-      total,
-      status: 'pending',
-      issueDate: createInvoiceDate,
-      dueDate: createInvoiceDate,
-      pdfUrl: null,
-      receiptUrl: null,
-      items: createLines.map((row) => ({
-        description: row.product,
-        quantity: row.qty,
-        rate: row.rate,
-        amount: Number((row.qty * row.rate).toFixed(2)),
-      })),
+    if (createInvoiceFlightRef.current) return
+    createInvoiceFlightRef.current = true
+    setCreateInvoiceSubmitting(true)
+    try {
+      const r = await createOperatorInvoice({
+        invoiceNo,
+        clientId: selectedClient.id,
+        clientName: selectedClient.name,
+        description,
+        amount,
+        issueDate: createInvoiceDate,
+        dueDate: createInvoiceDate,
+        operatorId: oid,
+        lines: createLines.map((row) => {
+          const p = invoiceProperties.find((x) => x.id === row.propertyId)
+          const propLabel = invoicePropertyRowLabel(p)
+          const extra = propLabel && propLabel !== '—' ? `[${propLabel}] ` : ''
+          return {
+            product: row.product.trim(),
+            qty: row.qty,
+            rate: row.rate,
+            description: `${extra}${String(row.description || '').trim()}`.trim(),
+            propertyId: row.propertyId,
+          }
+        }),
+      })
+      if (!r?.ok) {
+        const detail =
+          typeof (r as { detail?: unknown }).detail === 'string' ? String((r as { detail: string }).detail) : ''
+        const code = typeof (r as { code?: unknown }).code === 'string' ? String((r as { code: string }).code) : ''
+        toast.error([code, r?.reason, detail].filter(Boolean).join(' — ') || 'Failed to create invoice')
+        return
+      }
+      setCreateInvoiceOpen(false)
+      await loadInvoices()
+      toast.success('Invoice created')
+    } catch {
+      toast.error('Failed to create invoice')
+    } finally {
+      createInvoiceFlightRef.current = false
+      setCreateInvoiceSubmitting(false)
     }
-    setInvoices((prev) => [created, ...prev])
-    setCreateInvoiceOpen(false)
-    toast.success('Invoice created')
   }
 
   const stats = {
@@ -1042,7 +1166,7 @@ export default function InvoicesPage() {
         Mark as paid
       </DropdownMenuItem>
       <DropdownMenuItem
-        disabled={!String(invoice.pdfUrl || '').trim()}
+        disabled={!resolveOperatorAccountingInvoiceHref(invoice)}
         onClick={() => openInvoicePdf(invoice)}
       >
         <ExternalLink className="h-4 w-4 mr-2" />
@@ -1074,15 +1198,38 @@ export default function InvoicesPage() {
     </>
   )
 
+  const invoiceSortTh = (key: InvoiceSortKey, label: string, thClassName?: string) => (
+    <TableHead className={thClassName}>
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        className="-ml-2 h-8 gap-1 px-2 font-medium hover:bg-transparent"
+        onClick={() => toggleInvoiceSort(key)}
+      >
+        {label}
+        {invoiceSortKey === key ? (
+          invoiceSortDir === 'asc' ? (
+            <ArrowUp className="h-3.5 w-3.5 shrink-0 text-primary" aria-hidden />
+          ) : (
+            <ArrowDown className="h-3.5 w-3.5 shrink-0 text-primary" aria-hidden />
+          )
+        ) : (
+          <ArrowUpDown className="h-3.5 w-3.5 shrink-0 opacity-35" aria-hidden />
+        )}
+      </Button>
+    </TableHead>
+  )
+
   return (
-    <div className="w-full space-y-6 p-4 md:p-6 pb-20 lg:pb-6">
+    <div className="w-full space-y-5 p-3 sm:space-y-6 sm:p-4 md:p-6 pb-20 lg:pb-6">
       {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-bold text-foreground">Invoices & Receipts</h1>
-          <p className="text-muted-foreground">Manage billing and payments</p>
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <h1 className="text-xl font-bold tracking-tight text-foreground sm:text-2xl">Invoices & Receipts</h1>
+          <p className="text-sm text-muted-foreground sm:text-base">Manage billing and payments</p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex w-full min-w-0 flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap sm:justify-end">
           <Dialog
             open={invoiceAutomationOpen}
             onOpenChange={(open) => {
@@ -1091,8 +1238,8 @@ export default function InvoicesPage() {
             }}
           >
             <DialogTrigger asChild>
-              <Button variant="outline">
-                <Settings2 className="h-4 w-4 mr-2" />
+              <Button variant="outline" className="h-11 w-full justify-center gap-2 sm:h-10 sm:w-auto sm:justify-start">
+                <Settings2 className="h-4 w-4 shrink-0" />
                 Invoice Automation
               </Button>
             </DialogTrigger>
@@ -1111,11 +1258,17 @@ export default function InvoicesPage() {
                 ) : (
                   invoiceAutomationServiceRows.map((svc) => {
                     const row = { ...defaultInvoiceAutomationRow(), ...invoiceAutomationByService[svc.key] }
+                    const modeSafe: AutomationMode =
+                      row.mode === 'after_work' || row.mode === 'monthly' ? row.mode : 'during_booking'
+                    const monthlyModeSafe: MonthlyScheduleMode =
+                      row.monthlyMode === 'last_day' || row.monthlyMode === 'specific_day'
+                        ? row.monthlyMode
+                        : 'first_day'
                     return (
                       <div key={svc.key} className="space-y-3 rounded-lg border p-4">
                         <h4 className="font-medium">{svc.label}</h4>
                         <Select
-                          value={row.mode}
+                          value={modeSafe}
                           onValueChange={(value: AutomationMode) => patchInvoiceAutomation(svc.key, { mode: value })}
                         >
                           <SelectTrigger>
@@ -1127,11 +1280,11 @@ export default function InvoicesPage() {
                             <SelectItem value="monthly">Invoice by monthly</SelectItem>
                           </SelectContent>
                         </Select>
-                        {row.mode === 'monthly' && (
+                        {modeSafe === 'monthly' && (
                           <div className="space-y-3 rounded-md bg-muted/40 p-3">
                             <Label>Monthly schedule</Label>
                             <Select
-                              value={row.monthlyMode}
+                              value={monthlyModeSafe}
                               onValueChange={(value: MonthlyScheduleMode) =>
                                 patchInvoiceAutomation(svc.key, { monthlyMode: value })
                               }
@@ -1145,14 +1298,14 @@ export default function InvoicesPage() {
                                 <SelectItem value="specific_day">Specific day of every month</SelectItem>
                               </SelectContent>
                             </Select>
-                            {row.monthlyMode === 'specific_day' && (
+                            {monthlyModeSafe === 'specific_day' && (
                               <div className="space-y-2">
                                 <Label>Day of month</Label>
                                 <Input
                                   type="number"
                                   min={1}
                                   max={31}
-                                  value={row.specificDay}
+                                  value={row.specificDay || '1'}
                                   onChange={(e) => patchInvoiceAutomation(svc.key, { specificDay: e.target.value })}
                                   placeholder="1 - 31"
                                 />
@@ -1193,8 +1346,12 @@ export default function InvoicesPage() {
             }}
           >
             <DialogTrigger asChild>
-              <Button variant="outline" type="button">
-                <Calendar className="h-4 w-4 mr-2" />
+              <Button
+                variant="outline"
+                type="button"
+                className="h-11 w-full justify-center gap-2 sm:h-10 sm:w-auto sm:justify-start"
+              >
+                <Calendar className="h-4 w-4 shrink-0" />
                 Payment deadline
               </Button>
             </DialogTrigger>
@@ -1388,21 +1545,22 @@ export default function InvoicesPage() {
             }}
           >
             <DialogTrigger asChild>
-              <Button>
-                <Plus className="h-4 w-4 mr-2" />
+              <Button className="h-11 w-full justify-center gap-2 font-semibold shadow-sm sm:h-10 sm:w-auto sm:justify-start">
+                <Plus className="h-4 w-4 shrink-0" />
                 Create Invoice
               </Button>
             </DialogTrigger>
             <DialogContent className="max-h-[90vh] gap-0 overflow-y-auto p-0 sm:max-w-5xl">
-            <DialogHeader className="space-y-1 border-b border-border/70 bg-muted/20 px-6 py-5 text-left">
-              <DialogTitle className="text-xl font-semibold tracking-tight">
+            <DialogHeader className="space-y-1 border-b border-border/70 bg-muted/20 px-4 py-4 text-left sm:px-6 sm:py-5">
+              <DialogTitle className="text-lg font-semibold tracking-tight sm:text-xl">
                 Create New Invoice
               </DialogTitle>
               <DialogDescription className="text-sm leading-relaxed">
-                Pick the bill-to client, then add lines — each line has its own property, unit, and amounts.
+                Pick the bill-to client, then add lines — each line has its own property, unit, service, quantity, and
+                rate.
               </DialogDescription>
             </DialogHeader>
-            <div className="space-y-5 px-6 py-5">
+            <div className="space-y-5 px-4 py-4 sm:px-6 sm:py-5">
               <div className="space-y-3 rounded-xl border border-border/80 bg-card p-4 shadow-sm">
                 <div className="flex items-center gap-2">
                   <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/10 text-primary">
@@ -1573,8 +1731,9 @@ export default function InvoicesPage() {
                                   />
                                 </div>
                                 <Select
-                                  value={line.districtKey || undefined}
+                                  value={line.districtKey ? line.districtKey : CLN_INVOICE_LINE_SELECT_EMPTY}
                                   onValueChange={(key) => {
+                                    if (key === CLN_INVOICE_LINE_SELECT_EMPTY) return
                                     const g = invoicePropertyGroups.find((x) => x.key === key)
                                     setCreateLines((prev) =>
                                       prev.map((l) => {
@@ -1600,6 +1759,13 @@ export default function InvoicesPage() {
                                     <SelectValue placeholder="Choose property title" />
                                   </SelectTrigger>
                                   <SelectContent className="max-h-[240px]">
+                                    <SelectItem
+                                      value={CLN_INVOICE_LINE_SELECT_EMPTY}
+                                      disabled
+                                      className="text-muted-foreground"
+                                    >
+                                      Choose property title
+                                    </SelectItem>
                                     {lineDistrictFiltered.map((g) => (
                                       <SelectItem key={g.key} value={g.key}>
                                         <span className="font-medium">{g.districtLabel}</span>
@@ -1690,20 +1856,28 @@ export default function InvoicesPage() {
                               Billing
                             </p>
                             <div className="grid grid-cols-12 gap-3 items-end">
-                              <div className="col-span-12 space-y-1.5 sm:col-span-5">
+                              <div className="col-span-12 min-w-0 space-y-1.5 sm:col-span-5">
                                 <span className="text-xs font-medium text-muted-foreground">Product</span>
                                 <Select
-                                  value={line.product || undefined}
-                                  onValueChange={(v) =>
+                                  value={line.product ? line.product : CLN_INVOICE_LINE_SELECT_EMPTY}
+                                  onValueChange={(v) => {
+                                    if (v === CLN_INVOICE_LINE_SELECT_EMPTY) return
                                     setCreateLines((prev) =>
                                       prev.map((l) => (l.id === line.id ? { ...l, product: v } : l))
                                     )
-                                  }
+                                  }}
                                 >
                                   <SelectTrigger className="h-10 border-border/80 bg-background shadow-none">
                                     <SelectValue placeholder="Select product" />
                                   </SelectTrigger>
                                   <SelectContent>
+                                    <SelectItem
+                                      value={CLN_INVOICE_LINE_SELECT_EMPTY}
+                                      disabled
+                                      className="text-muted-foreground"
+                                    >
+                                      Select product
+                                    </SelectItem>
                                     {accountingProductOptions.map((product) => (
                                       <SelectItem key={product} value={product}>
                                         {product}
@@ -1712,12 +1886,12 @@ export default function InvoicesPage() {
                                   </SelectContent>
                                 </Select>
                               </div>
-                              <div className="col-span-4 space-y-1.5 sm:col-span-2">
+                              <div className="col-span-6 min-w-0 space-y-1.5 sm:col-span-2">
                                 <span className="text-xs font-medium text-muted-foreground">Qty</span>
                                 <Input
                                   type="number"
                                   min={1}
-                                  className="h-10 border-border/80 shadow-none"
+                                  className="h-10 min-w-0 border-border/80 shadow-none"
                                   value={line.qty}
                                   onChange={(e) =>
                                     setCreateLines((prev) =>
@@ -1728,13 +1902,13 @@ export default function InvoicesPage() {
                                   }
                                 />
                               </div>
-                              <div className="col-span-4 space-y-1.5 sm:col-span-2">
+                              <div className="col-span-6 min-w-0 space-y-1.5 sm:col-span-2">
                                 <span className="text-xs font-medium text-muted-foreground">Rate</span>
                                 <Input
                                   type="number"
                                   min={0}
                                   step="0.01"
-                                  className="h-10 border-border/80 shadow-none"
+                                  className="h-10 min-w-0 border-border/80 shadow-none"
                                   value={line.rate || ''}
                                   onChange={(e) =>
                                     setCreateLines((prev) =>
@@ -1745,7 +1919,7 @@ export default function InvoicesPage() {
                                   }
                                 />
                               </div>
-                              <div className="col-span-4 flex flex-col justify-end pb-0.5 sm:col-span-3">
+                              <div className="col-span-12 flex flex-col justify-end pb-0.5 pt-1 sm:col-span-3 sm:pt-0">
                                 <span className="text-xs font-medium text-muted-foreground">Line total</span>
                                 <span className="text-base font-semibold tabular-nums text-primary">
                                   RM {(line.qty * line.rate).toFixed(2)}
@@ -1793,12 +1967,22 @@ export default function InvoicesPage() {
                 </div>
               </div>
             </div>
-              <DialogFooter className="gap-2 border-t border-border/70 bg-muted/10 px-6 py-4 sm:justify-end">
-                <Button variant="outline" onClick={() => setCreateInvoiceOpen(false)}>
+              <DialogFooter className="flex-col-reverse gap-2 border-t border-border/70 bg-muted/10 px-4 py-4 sm:flex-row sm:justify-end sm:px-6">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="h-11 w-full sm:h-10 sm:w-auto"
+                  onClick={() => setCreateInvoiceOpen(false)}
+                >
                   Cancel
                 </Button>
-                <Button className="min-w-[120px] font-semibold shadow-sm" onClick={() => void handleCreateInvoice()}>
-                  Create invoice
+                <Button
+                  type="button"
+                  className="h-11 w-full min-w-0 font-semibold shadow-sm sm:h-10 sm:min-w-[120px] sm:w-auto"
+                  disabled={createInvoiceSubmitting}
+                  onClick={() => void handleCreateInvoice()}
+                >
+                  {createInvoiceSubmitting ? 'Creating…' : 'Create invoice'}
                 </Button>
               </DialogFooter>
             </DialogContent>
@@ -1806,56 +1990,64 @@ export default function InvoicesPage() {
         </div>
       </div>
 
-      {/* Stats Cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <Card>
-          <CardContent className="pt-6">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-primary/10">
+      {/* Stats Cards — single column on narrow phones, 2-up on sm, 4-up on lg */}
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4 lg:grid-cols-4">
+        <Card className="min-w-0 overflow-hidden">
+          <CardContent className="p-4 pt-5 sm:p-6 sm:pt-6">
+            <div className="flex items-start gap-3">
+              <div className="shrink-0 rounded-lg bg-primary/10 p-2">
                 <Receipt className="h-5 w-5 text-primary" />
               </div>
-              <div>
-                <p className="text-sm text-muted-foreground">Total Invoiced</p>
-                <p className="text-xl font-bold">RM {stats.total.toLocaleString()}</p>
+              <div className="min-w-0 flex-1">
+                <p className="text-xs text-muted-foreground sm:text-sm">Total Invoiced</p>
+                <p className="break-words text-lg font-bold tabular-nums leading-snug sm:text-xl">
+                  RM {stats.total.toLocaleString()}
+                </p>
               </div>
             </div>
           </CardContent>
         </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-green-100">
+        <Card className="min-w-0 overflow-hidden">
+          <CardContent className="p-4 pt-5 sm:p-6 sm:pt-6">
+            <div className="flex items-start gap-3">
+              <div className="shrink-0 rounded-lg bg-green-100 p-2">
                 <CheckCircle2 className="h-5 w-5 text-green-600" />
               </div>
-              <div>
-                <p className="text-sm text-muted-foreground">Paid</p>
-                <p className="text-xl font-bold text-green-600">RM {stats.paid.toLocaleString()}</p>
+              <div className="min-w-0 flex-1">
+                <p className="text-xs text-muted-foreground sm:text-sm">Paid</p>
+                <p className="break-words text-lg font-bold tabular-nums leading-snug text-green-600 sm:text-xl">
+                  RM {stats.paid.toLocaleString()}
+                </p>
               </div>
             </div>
           </CardContent>
         </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-blue-100">
+        <Card className="min-w-0 overflow-hidden">
+          <CardContent className="p-4 pt-5 sm:p-6 sm:pt-6">
+            <div className="flex items-start gap-3">
+              <div className="shrink-0 rounded-lg bg-blue-100 p-2">
                 <Clock className="h-5 w-5 text-blue-600" />
               </div>
-              <div>
-                <p className="text-sm text-muted-foreground">Pending</p>
-                <p className="text-xl font-bold text-blue-600">RM {stats.pending.toLocaleString()}</p>
+              <div className="min-w-0 flex-1">
+                <p className="text-xs text-muted-foreground sm:text-sm">Pending</p>
+                <p className="break-words text-lg font-bold tabular-nums leading-snug text-blue-600 sm:text-xl">
+                  RM {stats.pending.toLocaleString()}
+                </p>
               </div>
             </div>
           </CardContent>
         </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-red-100">
+        <Card className="min-w-0 overflow-hidden">
+          <CardContent className="p-4 pt-5 sm:p-6 sm:pt-6">
+            <div className="flex items-start gap-3">
+              <div className="shrink-0 rounded-lg bg-red-100 p-2">
                 <AlertCircle className="h-5 w-5 text-red-600" />
               </div>
-              <div>
-                <p className="text-sm text-muted-foreground">Overdue</p>
-                <p className="text-xl font-bold text-red-600">RM {stats.overdue.toLocaleString()}</p>
+              <div className="min-w-0 flex-1">
+                <p className="text-xs text-muted-foreground sm:text-sm">Overdue</p>
+                <p className="break-words text-lg font-bold tabular-nums leading-snug text-red-600 sm:text-xl">
+                  RM {stats.overdue.toLocaleString()}
+                </p>
               </div>
             </div>
           </CardContent>
@@ -1863,15 +2055,23 @@ export default function InvoicesPage() {
       </div>
 
       {/* Filters & Table */}
-      <Card className="w-full">
-        <CardHeader className="space-y-4">
+      <Card className="w-full min-w-0 overflow-hidden">
+        <CardHeader className="space-y-4 px-3 sm:px-6">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-            <Tabs value={activeTab} onValueChange={setActiveTab}>
-              <TabsList>
-                <TabsTrigger value="all">All</TabsTrigger>
-                <TabsTrigger value="paid">Paid</TabsTrigger>
-                <TabsTrigger value="pending">Pending</TabsTrigger>
-                <TabsTrigger value="overdue">Overdue</TabsTrigger>
+            <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full min-w-0 sm:w-auto">
+              <TabsList className="grid h-auto w-full grid-cols-2 gap-2 sm:inline-flex sm:w-auto sm:gap-1">
+                <TabsTrigger value="all" className="min-h-10 flex-1 sm:flex-initial">
+                  All
+                </TabsTrigger>
+                <TabsTrigger value="paid" className="min-h-10 flex-1 sm:flex-initial">
+                  Paid
+                </TabsTrigger>
+                <TabsTrigger value="pending" className="min-h-10 flex-1 sm:flex-initial">
+                  Pending
+                </TabsTrigger>
+                <TabsTrigger value="overdue" className="min-h-10 flex-1 sm:flex-initial">
+                  Overdue
+                </TabsTrigger>
               </TabsList>
             </Tabs>
             <div className="flex flex-wrap items-center justify-end gap-2">
@@ -1884,10 +2084,10 @@ export default function InvoicesPage() {
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
-                    <DropdownMenuItem onClick={() => exportPdfRows(filteredInvoices)}>
+                    <DropdownMenuItem onClick={() => exportPdfRows(sortedInvoices)}>
                       Export as PDF (filtered)
                     </DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => exportCsvRows(filteredInvoices)}>
+                    <DropdownMenuItem onClick={() => exportCsvRows(sortedInvoices)}>
                       Export as CSV (filtered)
                     </DropdownMenuItem>
                   </DropdownMenuContent>
@@ -2023,7 +2223,7 @@ export default function InvoicesPage() {
             </div>
           ) : null}
         </CardHeader>
-        <CardContent>
+        <CardContent className="px-2 pb-4 pt-0 sm:px-6 sm:pb-6">
           {selectedInvoices.length > 0 ? (
             <div className="mb-4 hidden items-center gap-2 rounded-lg bg-muted p-3 md:flex">
               <span className="text-sm font-medium">{selectedInvoices.length} selected</span>
@@ -2040,8 +2240,46 @@ export default function InvoicesPage() {
             </div>
           ) : (
             <>
+              <div className="mb-3 flex flex-wrap items-center gap-2 md:hidden">
+                <span className="text-xs text-muted-foreground shrink-0">Sort</span>
+                <Select
+                  value={invoiceSortKey}
+                  onValueChange={(v) => {
+                    setInvoiceSortKey(v as InvoiceSortKey)
+                    setInvoiceSortDir('asc')
+                    setInvoicePage(1)
+                  }}
+                >
+                  <SelectTrigger className="h-9 min-w-0 flex-1 border-input sm:min-w-[160px]">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="invoiceNo">Invoice no.</SelectItem>
+                    <SelectItem value="issueDate">Issue date</SelectItem>
+                    <SelectItem value="client">Client</SelectItem>
+                    <SelectItem value="property">Description</SelectItem>
+                    <SelectItem value="total">Amount</SelectItem>
+                    <SelectItem value="status">Status</SelectItem>
+                    <SelectItem value="dueDate">Due date</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  className="h-9 w-9 shrink-0"
+                  onClick={() => setInvoiceSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))}
+                  aria-label={invoiceSortDir === 'asc' ? 'Descending' : 'Ascending'}
+                >
+                  {invoiceSortDir === 'asc' ? (
+                    <ArrowUp className="h-4 w-4" />
+                  ) : (
+                    <ArrowDown className="h-4 w-4" />
+                  )}
+                </Button>
+              </div>
               <div className="space-y-0 divide-y rounded-lg border md:hidden">
-                {filteredInvoices.map((invoice) => {
+                {pagedInvoices.map((invoice) => {
                   const StatusIcon = statusConfig[invoice.status].icon
                   return (
                     <div key={invoice.id} className="flex items-start gap-3 p-3">
@@ -2096,26 +2334,27 @@ export default function InvoicesPage() {
                     <TableRow>
                       <TableHead className="w-12">
                         <Checkbox
-                          checked={selectedInvoices.length === filteredInvoices.length && filteredInvoices.length > 0}
+                          checked={
+                            pagedInvoices.length > 0 &&
+                            pagedInvoices.every((inv) => selectedInvoices.includes(inv.id))
+                          }
                           onCheckedChange={handleSelectAll}
                         />
                       </TableHead>
-                      <TableHead>
-                        <Button variant="ghost" size="sm" className="h-auto p-0 font-medium">
-                          Invoice
-                          <ArrowUpDown className="h-3 w-3 ml-1" />
-                        </Button>
+                      {invoiceSortTh('invoiceNo', 'Invoice')}
+                      {invoiceSortTh('issueDate', 'Issue', 'hidden md:table-cell')}
+                      {invoiceSortTh('client', 'Client', 'hidden md:table-cell')}
+                      {invoiceSortTh('property', 'Property', 'hidden lg:table-cell')}
+                      {invoiceSortTh('total', 'Amount')}
+                      {invoiceSortTh('status', 'Status')}
+                      {invoiceSortTh('dueDate', 'Due', 'hidden sm:table-cell')}
+                      <TableHead className="w-[100px] text-right">
+                        <span className="text-sm font-medium text-foreground">Actions</span>
                       </TableHead>
-                      <TableHead className="hidden md:table-cell">Client</TableHead>
-                      <TableHead className="hidden lg:table-cell">Property</TableHead>
-                      <TableHead>Amount</TableHead>
-                      <TableHead>Status</TableHead>
-                      <TableHead className="hidden sm:table-cell">Due Date</TableHead>
-                      <TableHead className="w-[100px] text-right">Actions</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {filteredInvoices.map((invoice) => {
+                    {pagedInvoices.map((invoice) => {
                       const StatusIcon = statusConfig[invoice.status].icon
                       return (
                         <TableRow key={invoice.id}>
@@ -2140,6 +2379,9 @@ export default function InvoicesPage() {
                               {invoice.invoiceNo}
                             </button>
                           </TableCell>
+                          <TableCell className="hidden text-muted-foreground tabular-nums md:table-cell">
+                            {formatInvoiceYmd(invoice.issueDate)}
+                          </TableCell>
                           <TableCell className="hidden md:table-cell">{invoice.client}</TableCell>
                           <TableCell
                             className="hidden max-w-[220px] truncate align-top lg:table-cell"
@@ -2155,7 +2397,7 @@ export default function InvoicesPage() {
                             </Badge>
                           </TableCell>
                           <TableCell className="hidden text-muted-foreground sm:table-cell">
-                            {new Date(invoice.dueDate).toLocaleDateString()}
+                            {formatInvoiceYmd(invoice.dueDate)}
                           </TableCell>
                           <TableCell className="text-right">
                             <DropdownMenu>
@@ -2176,109 +2418,266 @@ export default function InvoicesPage() {
                   </TableBody>
                 </Table>
               </div>
+
+              <div className="mt-4 flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-sm text-muted-foreground">Show</span>
+                  <Select
+                    value={String(invoicePageSize)}
+                    onValueChange={(v) => {
+                      setInvoicePageSize(Number(v))
+                      setInvoicePage(1)
+                    }}
+                  >
+                    <SelectTrigger className="h-9 w-[88px] border-input" aria-label="Rows per page">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {[10, 20, 50, 100, 200].map((n) => (
+                        <SelectItem key={n} value={String(n)}>
+                          {n}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <span className="text-sm text-muted-foreground">per page</span>
+                  <span className="text-sm tabular-nums text-foreground">
+                    {(invoicePage - 1) * invoicePageSize + 1}–
+                    {Math.min(invoicePage * invoicePageSize, sortedInvoices.length)} of{' '}
+                    {sortedInvoices.length}
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-center justify-center gap-1 sm:justify-end">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    className="h-9 w-9 shrink-0"
+                    disabled={invoicePage <= 1}
+                    onClick={() => setInvoicePage(1)}
+                    aria-label="First page"
+                  >
+                    <ChevronsLeft className="h-4 w-4" />
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    className="h-9 w-9 shrink-0"
+                    disabled={invoicePage <= 1}
+                    onClick={() => setInvoicePage((p) => Math.max(1, p - 1))}
+                    aria-label="Previous page"
+                  >
+                    <ChevronLeft className="h-4 w-4" />
+                  </Button>
+                  <span className="min-w-[7rem] px-2 text-center text-sm tabular-nums text-muted-foreground">
+                    Page {invoicePage} / {invoiceTotalPages}
+                  </span>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    className="h-9 w-9 shrink-0"
+                    disabled={invoicePage >= invoiceTotalPages}
+                    onClick={() => setInvoicePage((p) => Math.min(invoiceTotalPages, p + 1))}
+                    aria-label="Next page"
+                  >
+                    <ChevronRight className="h-4 w-4" />
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    className="h-9 w-9 shrink-0"
+                    disabled={invoicePage >= invoiceTotalPages}
+                    onClick={() => setInvoicePage(invoiceTotalPages)}
+                    aria-label="Last page"
+                  >
+                    <ChevronsRight className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
             </>
           )}
         </CardContent>
       </Card>
 
-      {/* Invoice Preview Sheet */}
-      <Sheet open={!!viewInvoice} onOpenChange={() => setViewInvoice(null)}>
-        <SheetContent className="w-full sm:max-w-xl overflow-y-auto">
+      {/* Invoice detail — responsive sheet */}
+      <Sheet open={!!viewInvoice} onOpenChange={(open) => !open && setViewInvoice(null)}>
+        <SheetContent
+          side="right"
+          className="flex h-full w-full flex-col border-l bg-background p-0 sm:max-w-lg md:max-w-xl"
+        >
           {viewInvoice && (
             <>
-              <SheetHeader>
-                <SheetTitle>Invoice {viewInvoice.invoiceNo}</SheetTitle>
-                <SheetDescription>Invoice details and line items</SheetDescription>
-              </SheetHeader>
-              <div className="space-y-6 py-6">
-                {/* Status */}
-                <div className="flex items-center justify-between">
-                  <Badge className={statusConfig[viewInvoice.status].color}>
+              <SheetHeader className="shrink-0 space-y-1 border-b px-4 py-4 text-left sm:px-6">
+                <div className="flex items-start justify-between gap-3 pr-8">
+                  <div className="min-w-0">
+                    <SheetTitle className="text-lg leading-tight sm:text-xl">
+                      Invoice {viewInvoice.invoiceNo}
+                    </SheetTitle>
+                    <SheetDescription className="text-xs sm:text-sm">
+                      Bill to client · dates from accounting record
+                    </SheetDescription>
+                  </div>
+                  <Badge className={cn('shrink-0', statusConfig[viewInvoice.status].color)}>
                     {statusConfig[viewInvoice.status].label}
                   </Badge>
                 </div>
+              </SheetHeader>
 
-                {/* Client Info */}
-                <div className="space-y-2">
-                  <h4 className="font-medium text-sm text-muted-foreground">Bill To</h4>
-                  <div>
-                    <p className="font-medium">{viewInvoice.client}</p>
-                    <p className="text-sm text-muted-foreground">{viewInvoice.clientEmail}</p>
-                  </div>
-                </div>
+              <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-6 sm:py-5">
+                <div className="mx-auto flex max-w-full flex-col gap-5">
+                  <section className="rounded-xl border bg-card p-4 shadow-sm">
+                    <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Bill to</h4>
+                    <p className="mt-1 font-medium text-foreground">{viewInvoice.client || '—'}</p>
+                    <p className="mt-0.5 break-all text-sm text-muted-foreground">{viewInvoice.clientEmail || '—'}</p>
+                  </section>
 
-                <div className="space-y-2">
-                  <h4 className="font-medium text-sm text-muted-foreground">Accounting description</h4>
-                  <p className="text-sm whitespace-pre-wrap rounded-md border bg-muted/30 p-3">
-                    {viewInvoice.property || '—'}
-                  </p>
-                </div>
+                  <section className="rounded-xl border bg-card p-4 shadow-sm">
+                    <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      Description / memo
+                    </h4>
+                    <p className="mt-2 whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground">
+                      {viewInvoice.property?.trim() ? viewInvoice.property : '—'}
+                    </p>
+                  </section>
 
-                {/* Dates */}
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <p className="text-sm text-muted-foreground">Issue Date</p>
-                    <p className="font-medium">{new Date(viewInvoice.issueDate).toLocaleDateString()}</p>
-                  </div>
-                  <div>
-                    <p className="text-sm text-muted-foreground">Due Date</p>
-                    <p className="font-medium">{new Date(viewInvoice.dueDate).toLocaleDateString()}</p>
-                  </div>
-                </div>
-
-                {/* Line Items */}
-                <div className="space-y-2">
-                  <h4 className="font-medium text-sm text-muted-foreground">Line Items</h4>
-                  <div className="border rounded-lg divide-y">
-                    {viewInvoice.items.map((item, idx) => (
-                      <div key={idx} className="p-3 flex justify-between">
-                        <div>
-                          <p className="font-medium">{item.description}</p>
-                          <p className="text-sm text-muted-foreground">
-                            {item.quantity} x RM {item.rate.toFixed(2)}
-                          </p>
-                        </div>
-                        <p className="font-medium">RM {item.amount.toFixed(2)}</p>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Summary */}
-                <div className="bg-muted/50 rounded-lg p-4 space-y-2">
-                  {viewInvoice.tax > 0 ? (
-                    <>
-                      <div className="flex justify-between text-sm">
-                        <span>Subtotal</span>
-                        <span>RM {viewInvoice.amount.toFixed(2)}</span>
-                      </div>
-                      <div className="flex justify-between text-sm">
-                        <span>Tax</span>
-                        <span>RM {viewInvoice.tax.toFixed(2)}</span>
-                      </div>
-                    </>
-                  ) : null}
-                  <div className="flex justify-between font-semibold text-lg border-t pt-2">
-                    <span>Total</span>
-                    <span>RM {viewInvoice.total.toFixed(2)}</span>
-                  </div>
-                </div>
-
-                {viewInvoice.status === 'paid' && viewInvoice.paidDate && (
-                  <div className="bg-green-50 border border-green-200 rounded-lg p-4">
-                    <div className="flex items-center gap-2 text-green-700">
-                      <CheckCircle2 className="h-5 w-5" />
-                      <span className="font-medium">Paid on {new Date(viewInvoice.paidDate).toLocaleDateString()}</span>
+                  <section className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    <div className="rounded-xl border bg-muted/20 p-4">
+                      <p className="text-xs font-medium text-muted-foreground">Issue date</p>
+                      <p className="mt-1 text-base font-semibold">{formatInvoiceYmd(viewInvoice.issueDate)}</p>
                     </div>
-                  </div>
-                )}
+                    <div className="rounded-xl border bg-muted/20 p-4">
+                      <p className="text-xs font-medium text-muted-foreground">Due date</p>
+                      <p className="mt-1 text-base font-semibold">{formatInvoiceYmd(viewInvoice.dueDate)}</p>
+                    </div>
+                  </section>
 
-                {(viewInvoice.status === 'pending' || viewInvoice.status === 'overdue') && (
-                  <Button className="w-full">
-                    <Mail className="h-4 w-4 mr-2" />
-                    Send Payment Reminder
-                  </Button>
-                )}
+                  <section className="rounded-xl border bg-card p-4 shadow-sm">
+                    <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Line items</h4>
+                    <div className="mt-2 divide-y rounded-lg border">
+                      {(viewInvoice.items.length
+                        ? viewInvoice.items
+                        : [
+                            {
+                              description: viewInvoice.property?.trim() || 'Invoice (no line breakdown)',
+                              quantity: 1,
+                              rate: viewInvoice.total,
+                              amount: viewInvoice.total,
+                            },
+                          ]
+                      ).map((item, idx) => (
+                        <div key={idx} className="flex flex-col gap-1 p-3 sm:flex-row sm:items-center sm:justify-between">
+                          <div className="min-w-0 flex-1">
+                            <p className="font-medium leading-snug">{item.description}</p>
+                            <p className="text-sm text-muted-foreground">
+                              {item.quantity} × RM {item.rate.toFixed(2)}
+                            </p>
+                          </div>
+                          <p className="shrink-0 font-semibold sm:text-right">RM {item.amount.toFixed(2)}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+
+                  <section className="rounded-xl border bg-muted/40 p-4">
+                    {viewInvoice.tax > 0 ? (
+                      <div className="space-y-2 text-sm">
+                        <div className="flex justify-between">
+                          <span>Subtotal</span>
+                          <span>RM {viewInvoice.amount.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span>Tax</span>
+                          <span>RM {viewInvoice.tax.toFixed(2)}</span>
+                        </div>
+                      </div>
+                    ) : null}
+                    <div className="flex items-center justify-between border-t border-border/60 pt-3 text-lg font-bold">
+                      <span>Total</span>
+                      <span className="text-primary">RM {viewInvoice.total.toFixed(2)}</span>
+                    </div>
+                  </section>
+
+                  {(viewInvoiceDocUrl || viewInvoice.receiptUrl) && (
+                    <div className="flex flex-wrap gap-2">
+                      {viewInvoiceDocUrl ? (
+                        <Button variant="outline" size="sm" asChild>
+                          <a href={viewInvoiceDocUrl} target="_blank" rel="noopener noreferrer">
+                            <ExternalLink className="mr-2 h-4 w-4" />
+                            Open invoice PDF
+                          </a>
+                        </Button>
+                      ) : null}
+                      {viewInvoice.receiptUrl ? (
+                        <Button variant="outline" size="sm" asChild>
+                          <a href={viewInvoice.receiptUrl} target="_blank" rel="noopener noreferrer">
+                            <Receipt className="mr-2 h-4 w-4" />
+                            Receipt
+                          </a>
+                        </Button>
+                      ) : null}
+                    </div>
+                  )}
+
+                  {viewInvoice.status === 'paid' && viewInvoice.paidDate && (
+                    <div className="rounded-xl border border-green-200 bg-green-50/90 p-4 text-green-800">
+                      <div className="flex items-center gap-2">
+                        <CheckCircle2 className="h-5 w-5 shrink-0" />
+                        <span className="font-medium">Paid on {formatInvoiceYmd(viewInvoice.paidDate)}</span>
+                      </div>
+                    </div>
+                  )}
+
+                  {(viewInvoice.status === 'pending' || viewInvoice.status === 'overdue') && (
+                    <div className="space-y-2 rounded-xl border border-dashed bg-muted/15 p-4">
+                      <p className="text-xs text-muted-foreground">
+                        Sends one email from the Cleanlemons server (SMTP) to the Bill to address — same settings as
+                        portal password reset (<code className="text-[11px]">CLEANLEMON_SMTP_*</code>).
+                      </p>
+                      {String(viewInvoice.clientEmail || '').trim() ? (
+                        <Button
+                          className="w-full"
+                          type="button"
+                          disabled={paymentReminderSending || !String(operatorId || '').trim()}
+                          onClick={async () => {
+                            const oid = String(operatorId || '').trim()
+                            if (!oid || !viewInvoice) return
+                            setPaymentReminderSending(true)
+                            try {
+                              const out = await sendOperatorInvoicePaymentReminder(viewInvoice.id, oid)
+                              if (!out.ok) {
+                                const map: Record<string, string> = {
+                                  SMTP_NOT_CONFIGURED:
+                                    'Server email is not configured. Set CLEANLEMON_SMTP_* and from address on the API host.',
+                                  MISSING_CLIENT_EMAIL: 'Client has no email on file.',
+                                  INVOICE_NOT_FOUND: 'Invoice not found.',
+                                  FORBIDDEN_OPERATOR: 'You cannot send for this invoice.',
+                                  INVOICE_ALREADY_PAID: 'This invoice is already paid.',
+                                  REMINDER_NOT_APPLICABLE: 'Reminder is only for unpaid invoices.',
+                                }
+                                toast.error(map[out.reason || ''] || out.reason || 'Could not send reminder')
+                                return
+                              }
+                              toast.success('Payment reminder sent')
+                            } finally {
+                              setPaymentReminderSending(false)
+                            }
+                          }}
+                        >
+                          <Mail className="mr-2 h-4 w-4" />
+                          {paymentReminderSending ? 'Sending…' : 'Send payment reminder (email)'}
+                        </Button>
+                      ) : (
+                        <Button className="w-full" type="button" disabled variant="secondary">
+                          <Mail className="mr-2 h-4 w-4" />
+                          Add client email to send reminder
+                        </Button>
+                      )}
+                    </div>
+                  )}
+                </div>
               </div>
             </>
           )}
@@ -2328,10 +2727,19 @@ export default function InvoicesPage() {
             </div>
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setMarkAsPaidInvoice(null)}>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => {
+                setMarkAsPaidInvoice(null)
+                setBulkMarkList(null)
+              }}
+            >
               Cancel
             </Button>
-            <Button onClick={handleConfirmMarkAsPaid}>Confirm</Button>
+            <Button type="button" disabled={markAsPaidSubmitting} onClick={() => void handleConfirmMarkAsPaid()}>
+              {markAsPaidSubmitting ? 'Saving…' : 'Confirm'}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

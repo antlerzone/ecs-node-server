@@ -2336,14 +2336,19 @@ async function updatePortalBankFields(email, fields) {
 /**
  * Forgot password: create or overwrite reset code for email, send email. Only if email exists in portal_account.
  * @returns {{ ok: boolean, reason? }} reason: NO_EMAIL | NO_ACCOUNT | DB_ERROR
+ * @param {import('express').Request | null | undefined} [req] — used to pick Coliving vs Cleanlemons SMTP (Host / port 5001).
  */
-async function requestPasswordReset(email) {
+async function requestPasswordReset(email, req = null) {
   const normalized = normalizeEmail(email);
   if (!normalized) {
     return { ok: false, reason: 'NO_EMAIL' };
   }
   const [existing] = await pool.query('SELECT id FROM portal_account WHERE email = ? LIMIT 1', [normalized]);
   if (!existing.length) {
+    console.log(
+      '[portal-auth] forgot-password: email not in portal_account (no mail sent; API still returns ok for privacy):',
+      normalized
+    );
     return { ok: false, reason: 'NO_ACCOUNT' };
   }
   const code = String(Math.floor(100000 + Math.random() * 900000));
@@ -2356,7 +2361,8 @@ async function requestPasswordReset(email) {
       [normalized, code, RESET_CODE_EXPIRY_MINUTES, code, RESET_CODE_EXPIRY_MINUTES]
     );
     const sender = require('./portal-password-reset-sender');
-    await sender.sendPasswordResetCode(normalized, code);
+    const portalProduct = sender.getPortalProductFromRequest(req);
+    await sender.sendPasswordResetCode(normalized, code, { portalProduct });
   } catch (err) {
     console.error('[portal-auth] requestPasswordReset DB/send error:', err?.message || err);
     return { ok: false, reason: 'DB_ERROR' };

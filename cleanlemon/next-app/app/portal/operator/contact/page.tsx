@@ -48,7 +48,9 @@ import {
   Pencil,
   Search,
   MoreHorizontal,
+  MessageSquare,
 } from 'lucide-react'
+import { GiveReviewDialog } from '@/components/cleanlemons/give-review-dialog'
 import { toast } from 'sonner'
 import { useRouter } from 'next/navigation'
 import { useAuth } from '@/lib/auth-context'
@@ -121,6 +123,8 @@ type ContactRecord = {
   trainings: string[]
   remarkHistory: string[]
   account?: AccountEntry[]
+  /** Employee row: cln_employeedetail.id when API provides it. */
+  employeeDetailId?: string
 }
 
 function mergeAccountEntryLocal(
@@ -498,6 +502,8 @@ export default function ContactPage() {
   )
   const [contactSettingsSaving, setContactSettingsSaving] = useState(false)
   const [newTrainingNameInput, setNewTrainingNameInput] = useState('')
+  const [staffReviewOpen, setStaffReviewOpen] = useState(false)
+  const [staffReviewContact, setStaffReviewContact] = useState<ContactRecord | null>(null)
 
   const loadContacts = useCallback(async () => {
     setContactsLoading(true)
@@ -1042,6 +1048,15 @@ export default function ContactPage() {
   const actions: Action<ContactRecord>[] = [
     { label: 'Edit', icon: <Pencil className="h-4 w-4 mr-2" />, onClick: openEdit },
     { label: 'View Detail', icon: <Eye className="h-4 w-4 mr-2" />, onClick: viewDetail },
+    {
+      label: 'Give review',
+      icon: <MessageSquare className="h-4 w-4 mr-2" />,
+      onClick: (row) => {
+        setStaffReviewContact(row)
+        setStaffReviewOpen(true)
+      },
+      visible: (r) => !isClientContact(r) && r.status === 'active',
+    },
     {
       label: 'Create Offer Letter',
       icon: <Briefcase className="h-4 w-4 mr-2" />,
@@ -2121,6 +2136,18 @@ export default function ContactPage() {
       </Dialog>
 
       <Dialog open={isResignDialogOpen} onOpenChange={setIsResignDialogOpen}><DialogContent><DialogHeader><DialogTitle>Resign Confirmation</DialogTitle><DialogDescription>{resignContact ? `Set resign date and remark for ${resignContact.name}.` : 'Set resign details.'}</DialogDescription></DialogHeader><div className="space-y-4 py-2"><div className="space-y-2"><Label>Resign Date</Label><Input type="date" value={resignDate} onChange={(e) => setResignDate(e.target.value)} /></div><div className="space-y-2"><Label>Remark</Label><Textarea value={resignRemark} onChange={(e) => setResignRemark(e.target.value)} placeholder="Reason or notes" /></div></div><DialogFooter><Button variant="outline" onClick={() => setIsResignDialogOpen(false)}>Cancel</Button><Button onClick={submitResign}>Confirm Resign</Button></DialogFooter></DialogContent></Dialog>
+
+      <GiveReviewDialog
+        open={staffReviewOpen}
+        onOpenChange={(o) => {
+          setStaffReviewOpen(o)
+          if (!o) setStaffReviewContact(null)
+        }}
+        reviewKind="operator_to_staff"
+        operatorId={operatorId}
+        employeeContactId={String(staffReviewContact?.employeeDetailId || staffReviewContact?.id || '').trim() || undefined}
+        title={staffReviewContact ? `Rate ${staffReviewContact.name}` : 'Give review'}
+      />
     </div>
   )
 }

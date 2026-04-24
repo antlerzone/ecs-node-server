@@ -185,7 +185,8 @@ async function getOwnerByEmail(email) {
     client: clientIds,
     linkedOperators,
     profileSelfVerifiedAt,
-    profileIdentityVerified
+    profileIdentityVerified,
+    aliyunEkycLocked: portalAliyunEkycLocked
   };
 }
 

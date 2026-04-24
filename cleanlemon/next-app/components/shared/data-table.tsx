@@ -33,6 +33,8 @@ import {
   ChevronLeft,
   ChevronRight,
   Edit,
+  Check,
+  Minus,
 } from 'lucide-react'
 import { Checkbox } from '@/components/ui/checkbox'
 import { cn } from '@/lib/utils'
@@ -63,6 +65,8 @@ interface DataTableProps<T> {
   actions?: Action<T>[]
   /** Outline edit button before the ⋮ menu (matches operator property table UX). */
   onEditClick?: (row: T) => void
+  /** When set, hide the outline edit button for rows where this returns false. */
+  editVisible?: (row: T) => boolean
   searchKeys?: (keyof T)[]
   pageSize?: number
   emptyMessage?: string
@@ -110,6 +114,7 @@ export function DataTable<T extends { id: string }>({
   columns,
   actions,
   onEditClick,
+  editVisible,
   searchKeys = [],
   pageSize = 10,
   emptyMessage = 'No data found',
@@ -269,18 +274,55 @@ export function DataTable<T extends { id: string }>({
     [paginatedData, rowSelection]
   )
   const pageSelectableIds = useMemo(() => pageSelectableRows.map((r) => r.id), [pageSelectableRows])
-  const allPageSelectableSelected =
-    pageSelectableIds.length > 0 && pageSelectableIds.every((id) => rowSelection?.selectedIds.has(id))
-  const somePageSelectableSelected = pageSelectableIds.some((id) => rowSelection?.selectedIds.has(id))
 
-  const togglePageSelectable = () => {
+  /** All rows matching search/filters (every page) — drives header tri-state and "clear all" scope. */
+  const allFilteredSelectableRows = useMemo(
+    () =>
+      rowSelection
+        ? filteredData.filter((row) => !rowSelection.isRowSelectable || rowSelection.isRowSelectable(row))
+        : [],
+    [filteredData, rowSelection]
+  )
+  const allFilteredSelectableIds = useMemo(
+    () => allFilteredSelectableRows.map((r) => r.id),
+    [allFilteredSelectableRows]
+  )
+  const allFilteredSelectableSelected =
+    allFilteredSelectableIds.length > 0 &&
+    allFilteredSelectableIds.every((id) => rowSelection?.selectedIds.has(id))
+  const someFilteredSelectableSelected = allFilteredSelectableIds.some((id) =>
+    rowSelection?.selectedIds.has(id)
+  )
+  const allPageSelectableSelected =
+    pageSelectableIds.length > 0 &&
+    pageSelectableIds.every((id) => rowSelection?.selectedIds.has(id))
+
+  /**
+   * Header select-all: native `<button>` — Radix `Checkbox` can ignore the second click when fully checked.
+   *
+   * - Every filtered row selected → clear **entire** selection (not only this page / this table slice).
+   * - Only this page fully selected (whole list not selected) → same: clear **entire** selection.
+   * - No rows in current filter but selection non-empty → clear **entire** selection.
+   * - Else → add **this page** (multi-page stacking).
+   */
+  const toggleHeaderRowSelection = () => {
     if (!rowSelection) return
-    const next = new Set(rowSelection.selectedIds)
-    if (allPageSelectableSelected) {
-      pageSelectableIds.forEach((id) => next.delete(id))
-    } else {
-      pageSelectableIds.forEach((id) => next.add(id))
+    if (allFilteredSelectableIds.length === 0) {
+      if (rowSelection.selectedIds.size > 0) {
+        rowSelection.onSelectionChange(new Set())
+      }
+      return
     }
+    if (allFilteredSelectableSelected) {
+      rowSelection.onSelectionChange(new Set())
+      return
+    }
+    if (allPageSelectableSelected) {
+      rowSelection.onSelectionChange(new Set())
+      return
+    }
+    const next = new Set(rowSelection.selectedIds)
+    pageSelectableIds.forEach((id) => next.add(id))
     rowSelection.onSelectionChange(next)
   }
 
@@ -288,32 +330,33 @@ export function DataTable<T extends { id: string }>({
     columns.length + (rowSelection ? 1 : 0) + (actions && actions.length > 0 ? 1 : 0)
 
   const renderRowActions = (row: T) => {
+    const showOutlineEdit = !!(onEditClick && (!editVisible || editVisible(row)))
     if (!actions || actions.length === 0) {
-      return onEditClick ? (
+      return showOutlineEdit ? (
         <Button
           type="button"
           variant="outline"
           size="icon"
           className="h-8 w-8 shrink-0 rounded-lg"
           title="Edit"
-          onClick={() => onEditClick(row)}
+          onClick={() => onEditClick!(row)}
         >
           <Edit className="h-4 w-4" />
         </Button>
       ) : null
     }
     const visibleActions = actions.filter((action) => !action.visible || action.visible(row))
-    if (visibleActions.length === 0 && !onEditClick) return null
+    if (visibleActions.length === 0 && !showOutlineEdit) return null
     return (
       <div className="flex flex-wrap items-center justify-end gap-1">
-        {onEditClick ? (
+        {showOutlineEdit ? (
           <Button
             type="button"
             variant="outline"
             size="icon"
             className="h-8 w-8 shrink-0 rounded-lg"
             title="Edit"
-            onClick={() => onEditClick(row)}
+            onClick={() => onEditClick!(row)}
           >
             <Edit className="h-4 w-4" />
           </Button>
@@ -521,20 +564,42 @@ export function DataTable<T extends { id: string }>({
             <TableRow className="bg-muted/50">
               {rowSelection ? (
                 <TableHead className="w-10">
-                  <Checkbox
-                    checked={
-                      pageSelectableIds.length === 0
-                        ? false
-                        : allPageSelectableSelected
-                          ? true
-                          : somePageSelectableSelected
-                            ? 'indeterminate'
-                            : false
+                  <button
+                    type="button"
+                    role="checkbox"
+                    aria-checked={
+                      allFilteredSelectableIds.length === 0
+                        ? 'false'
+                        : allFilteredSelectableSelected
+                          ? 'true'
+                          : someFilteredSelectableSelected
+                            ? 'mixed'
+                            : 'false'
                     }
-                    onCheckedChange={() => togglePageSelectable()}
-                    disabled={pageSelectableIds.length === 0}
-                    aria-label="Select all on this page"
-                  />
+                    disabled={
+                      allFilteredSelectableIds.length === 0 && rowSelection.selectedIds.size === 0
+                    }
+                    aria-label="Select all rows on this page, or clear every selected row when unchecking"
+                    onClick={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      toggleHeaderRowSelection()
+                    }}
+                    className={cn(
+                      'flex size-4 shrink-0 items-center justify-center rounded-[4px] border shadow-xs transition-shadow outline-none',
+                      'border-input bg-background dark:bg-input/30',
+                      'focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50',
+                      'disabled:cursor-not-allowed disabled:opacity-50',
+                      allFilteredSelectableSelected &&
+                        'border-primary bg-primary text-primary-foreground dark:bg-primary',
+                    )}
+                  >
+                    {allFilteredSelectableSelected ? (
+                      <Check className="size-3.5" strokeWidth={3} aria-hidden />
+                    ) : someFilteredSelectableSelected ? (
+                      <Minus className="size-3.5" strokeWidth={3} aria-hidden />
+                    ) : null}
+                  </button>
                 </TableHead>
               ) : null}
               {columns.map((col) => (

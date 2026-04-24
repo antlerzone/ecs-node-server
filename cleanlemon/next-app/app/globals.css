@@ -223,3 +223,10 @@
     color: #1b2a41;
   }
 }
+
+/* Leaflet: map host in flex layouts must pass height into .leaflet-container (pins/tiles). */
+.leaflet-map-host .leaflet-container {
+  height: 100%;
+  width: 100%;
+  min-height: 280px;
+}

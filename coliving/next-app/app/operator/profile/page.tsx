@@ -1,16 +1,6 @@
-"use client"
+import { redirect } from 'next/navigation'
 
-import UnifiedProfilePage from "@/components/shared/unified-profile-page"
-import { useOperatorContext } from "@/contexts/operator-context"
-
-export default function OperatorProfilePage() {
-  const { refresh } = useOperatorContext()
-  return (
-    <UnifiedProfilePage
-      roleLabel="Operator"
-      uploadRole="operator"
-      localStorageKeyDemo="coliving_unified_profile_operator"
-      onBackendSaveSuccess={refresh}
-    />
-  )
+/** Operator staff no longer use a dedicated My Profile page — company data is under Company Settings. */
+export default function OperatorProfileRedirectPage() {
+  redirect('/operator')
 }

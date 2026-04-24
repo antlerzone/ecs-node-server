@@ -9,12 +9,13 @@ import { Button } from '@/components/ui/button'
 import { AlertTriangle, ArrowRight, Sparkles } from 'lucide-react'
 import { useClientBookingNav } from '@/components/portal/client/client-booking-overlay'
 import {
-  fetchOperatorInvoices,
+  fetchClientPortalInvoices,
   fetchOperatorProperties,
   fetchOperatorScheduleJobs,
   fetchClientDamageReports,
   type DamageReportItem,
 } from '@/lib/cleanlemon-api'
+import { damageReportDateLabel } from '@/lib/damage-report-dates'
 import { ClientDashboardSchedule } from '@/components/portal/client/client-dashboard-schedule'
 
 function ScrollToScheduleWhenTab() {
@@ -57,7 +58,9 @@ export default function ClientDashboardPage() {
         const [propRes, schRes, invRes, dmgRes] = await Promise.all([
           fetchOperatorProperties(operatorId || undefined),
           fetchOperatorScheduleJobs({ operatorId: operatorId || undefined, limit: 500 }),
-          fetchOperatorInvoices(),
+          email && operatorId
+            ? fetchClientPortalInvoices(email, operatorId, { limit: 200 })
+            : Promise.resolve({ ok: false as const, items: [] }),
           email
             ? fetchClientDamageReports({ email, operatorId: operatorId || undefined, limit: 5 })
             : Promise.resolve({ ok: false as const, items: [] as DamageReportItem[] }),
@@ -81,9 +84,7 @@ export default function ClientDashboardPage() {
 
         const pendingInvoices = invoices.filter((x: any) => {
           const st = String(x?.status || '').toLowerCase()
-          const em = String(x?.clientEmail || '').trim().toLowerCase()
-          const mine = !em || em === email
-          return mine && (st === 'pending' || st === 'overdue' || st === 'unpaid')
+          return st === 'pending' || st === 'overdue' || st === 'unpaid'
         }).length
 
         setSummary({
@@ -168,7 +169,7 @@ export default function ClientDashboardPage() {
                     <AlertTriangle className="h-5 w-5 text-amber-600" />
                     Recent damage reports
                   </CardTitle>
-                  <CardDescription>Property, operator, when reported</CardDescription>
+                  <CardDescription>Property, operator, date</CardDescription>
                 </div>
                 <Button variant="ghost" size="sm" asChild>
                   <Link href="/client/damage">
@@ -191,12 +192,7 @@ export default function ClientDashboardPage() {
                         </p>
                       </div>
                       <span className="text-xs text-muted-foreground whitespace-nowrap shrink-0">
-                        {d.reportedAt
-                          ? new Date(d.reportedAt).toLocaleString(undefined, {
-                              dateStyle: 'medium',
-                              timeStyle: 'short',
-                            })
-                          : '—'}
+                        {damageReportDateLabel(d)}
                       </span>
                     </div>
                   ))}

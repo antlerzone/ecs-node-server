@@ -67,6 +67,90 @@ function isMissingTable(err) {
   return c === 'ER_NO_SUCH_TABLE' || msg.includes("doesn't exist") || msg.includes('Unknown table');
 }
 
+const OPERATOR_AI_POLICY_ROW_ID = '00000000-0000-0000-0000-000000000001';
+const DEFAULT_OPERATOR_AI_SCOPES = ['cln_schedule'];
+/** Known scope keys for operator AI (extend when new surfaces ship). */
+const KNOWN_OPERATOR_AI_SCOPES = new Set(['cln_schedule']);
+
+function normalizeOperatorAiScopesJson(raw) {
+  let arr = [];
+  if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const p = JSON.parse(raw);
+      arr = Array.isArray(p) ? p : [];
+    } catch {
+      arr = [];
+    }
+  } else if (Array.isArray(raw)) {
+    arr = raw;
+  }
+  const out = [...new Set(arr.map((x) => String(x || '').trim()).filter((x) => KNOWN_OPERATOR_AI_SCOPES.has(x)))];
+  return out.length ? out : [...DEFAULT_OPERATOR_AI_SCOPES];
+}
+
+/**
+ * SaaS-wide gate for operator schedule AI (chat + suggest + cron). Singleton row in `cln_saasadmin_operator_ai_policy`.
+ * If the table is missing, behave as enabled (older DBs).
+ */
+async function getOperatorAiAccessPolicy() {
+  try {
+    const [rows] = await pool.query(
+      `SELECT operator_ai_access_enabled AS accessEnabled, allowed_data_scopes_json AS scopesJson, updated_at AS updatedAt
+       FROM cln_saasadmin_operator_ai_policy WHERE id = ? LIMIT 1`,
+      [OPERATOR_AI_POLICY_ROW_ID]
+    );
+    if (!rows?.length) {
+      return {
+        accessEnabled: true,
+        allowedDataScopes: [...DEFAULT_OPERATOR_AI_SCOPES],
+        updatedAt: null,
+      };
+    }
+    const r = rows[0];
+    const enabled = r.accessEnabled == null ? true : !!Number(r.accessEnabled);
+    const scopes = normalizeOperatorAiScopesJson(r.scopesJson);
+    return {
+      accessEnabled: enabled,
+      allowedDataScopes: scopes,
+      updatedAt: r.updatedAt != null ? String(r.updatedAt) : null,
+    };
+  } catch (err) {
+    if (isMissingTable(err)) {
+      return {
+        accessEnabled: true,
+        allowedDataScopes: [...DEFAULT_OPERATOR_AI_SCOPES],
+        updatedAt: null,
+      };
+    }
+    throw err;
+  }
+}
+
+/**
+ * SaaS admin only — updates singleton operator-AI policy.
+ * @param {{ accessEnabled?: boolean, allowedDataScopes?: string[] }} body
+ */
+async function updateOperatorAiAccessPolicy(body = {}) {
+  const current = await getOperatorAiAccessPolicy();
+  const enabled = body.accessEnabled !== undefined ? !!body.accessEnabled : current.accessEnabled;
+  let scopes = current.allowedDataScopes;
+  if (body.allowedDataScopes !== undefined) {
+    scopes = normalizeOperatorAiScopesJson(body.allowedDataScopes);
+  }
+  const en = enabled ? 1 : 0;
+  const sj = JSON.stringify(scopes);
+  await pool.query(
+    `INSERT INTO cln_saasadmin_operator_ai_policy (id, operator_ai_access_enabled, allowed_data_scopes_json, updated_at)
+     VALUES (?, ?, ?, CURRENT_TIMESTAMP(3))
+     ON DUPLICATE KEY UPDATE
+       operator_ai_access_enabled = ?,
+       allowed_data_scopes_json = ?,
+       updated_at = CURRENT_TIMESTAMP(3)`,
+    [OPERATOR_AI_POLICY_ROW_ID, en, sj, en, sj]
+  );
+  return getOperatorAiAccessPolicy();
+}
+
 /**
  * Prefix to prepend to every operator schedule-AI system prompt. Empty if no rows / table missing.
  */
@@ -235,4 +319,6 @@ module.exports = {
   updateSaasadminAiMd,
   deleteSaasadminAiMd,
   runSaasadminAiChat,
+  getOperatorAiAccessPolicy,
+  updateOperatorAiAccessPolicy,
 };

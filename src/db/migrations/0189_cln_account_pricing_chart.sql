@@ -1,5 +1,5 @@
 -- Replace canonical Cleanlemons chart with GL accounts + pricing-aligned service products.
--- GL: Bank, Cash, Sales Income, Cost of Sales, Salary & Wages, General Expenses.
+-- GL: Bank, Cash, Sales Income, Cost of Sales, Salaries & Wages, General Expenses.
 -- Products: same 8 labels as `PRICING_SERVICES` in cleanlemon/next-app/lib/cleanlemon-pricing-services.ts
 -- (order: general, deep, renovation, homestay, room-rental, commercial, office, dobi).
 -- Clears per-operator mappings (cln_account_client) via CASCADE when cln_account rows are removed.
@@ -22,7 +22,7 @@ VALUES
   ('e0c10001-0000-4000-8000-000000000010', 'Office Cleaning', 'income', 1, 100),
   ('e0c10001-0000-4000-8000-000000000011', 'Dobi Services', 'income', 1, 110),
   ('e0c10001-0000-4000-8000-000000000012', 'Cost of Sales', 'expense', 0, 120),
-  ('e0c10001-0000-4000-8000-000000000013', 'Salary & Wages', 'expense', 0, 130),
+  ('e0c10001-0000-4000-8000-000000000013', 'Salaries & Wages', 'expense', 0, 130),
   ('e0c10001-0000-4000-8000-000000000014', 'General Expenses', 'expense', 0, 140)
 ON DUPLICATE KEY UPDATE
   `title` = VALUES(`title`),

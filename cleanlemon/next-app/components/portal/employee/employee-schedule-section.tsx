@@ -25,6 +25,7 @@ import {
 } from '@/lib/cleanlemon-api'
 import { isProbablyVideoFile } from '@/lib/media-url-kind'
 import { useAuth } from '@/lib/auth-context'
+import { cn } from '@/lib/utils'
 import {
   Calendar,
   Check,
@@ -34,7 +35,6 @@ import {
   MoreHorizontal,
   QrCode,
   ShieldAlert,
-  Sparkles,
 } from 'lucide-react'
 
 interface Task {
@@ -43,7 +43,7 @@ interface Task {
   unitNumber: string
   property: string
   serviceProvider: string
-  status: 'pending-checkout' | 'ready-to-clean' | 'in-progress' | 'completed'
+  status: 'pending-checkout' | 'ready-to-clean' | 'in-progress' | 'completed' | 'cancelled'
   estimateKpi: number
   estimatedDuration: number
   completedPhotos: string[]
@@ -69,6 +69,7 @@ const statusConfig = {
   'ready-to-clean': { label: 'Ready to Clean', color: 'bg-blue-100 text-blue-700' },
   'in-progress': { label: 'In Progress', color: 'bg-orange-100 text-orange-700' },
   completed: { label: 'Completed', color: 'bg-green-100 text-green-700' },
+  cancelled: { label: 'Cancelled', color: 'bg-red-100 text-red-700' },
 }
 
 function malaysiaDateString(d = new Date()): string {
@@ -116,12 +117,16 @@ function jobMatchesEmployee(job: Task, keys: Set<string>): boolean {
 }
 
 function normalizeTaskStatus(status: string): Task['status'] {
-  const x = String(status || '').toLowerCase().replace(/_/g, '-').replace(/\s+/g, '-')
+  const raw = String(status ?? '').trim()
+  if (raw === '') return 'pending-checkout'
+  const x = raw.toLowerCase().replace(/_/g, '-').replace(/\s+/g, '-')
   if (x.includes('complete')) return 'completed'
   if (x.includes('progress')) return 'in-progress'
-  if (x.includes('checkout')) return 'pending-checkout'
-  if (x.includes('ready')) return 'ready-to-clean'
-  return 'ready-to-clean'
+  if (x.includes('cancel')) return 'cancelled'
+  if (x.includes('checkout') || x.includes('check-out')) return 'pending-checkout'
+  if (x.includes('customer') && x.includes('missing')) return 'pending-checkout'
+  if (x.includes('ready') && x.includes('clean')) return 'ready-to-clean'
+  return 'pending-checkout'
 }
 
 export default function EmployeeTaskPage() {
@@ -749,9 +754,24 @@ export default function EmployeeTaskPage() {
                       </TableCell>
                       <TableCell>{task.serviceProvider}</TableCell>
                       <TableCell>
-                        <Badge className={statusConfig[task.status].color}>
-                          {statusConfig[task.status].label}
-                        </Badge>
+                        {task.status === 'ready-to-clean' ? (
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            className={cn(
+                              'h-auto rounded-full px-2 py-0.5 text-xs font-semibold hover:opacity-90',
+                              statusConfig[task.status].color,
+                            )}
+                            onClick={() => openStartDialog(task)}
+                          >
+                            {statusConfig[task.status].label}
+                          </Button>
+                        ) : (
+                          <Badge className={statusConfig[task.status].color}>
+                            {statusConfig[task.status].label}
+                          </Badge>
+                        )}
                       </TableCell>
                       <TableCell className="text-right">
                         <Button
@@ -780,12 +800,6 @@ export default function EmployeeTaskPage() {
                               <ShieldAlert className="h-4 w-4 mr-2" />
                               Damage Report
                             </DropdownMenuItem>
-                            {task.status === 'ready-to-clean' ? (
-                              <DropdownMenuItem onClick={() => openStartDialog(task)}>
-                                <Sparkles className="h-4 w-4 mr-2" />
-                                Start Clean
-                              </DropdownMenuItem>
-                            ) : null}
                             {normalizeTaskStatus(task.status) === 'in-progress' ? (
                               <DropdownMenuItem onClick={() => openEndDialog(task)}>
                                 <CheckCircle2 className="h-4 w-4 mr-2" />

@@ -6,7 +6,6 @@ import {
   getAccessContext,
   getMyBillingInfo,
   getProfile,
-  getOperatorBankDetails,
   getAdminList,
   getTermsSaasOperator,
   getPaymentVerificationInvoices,
@@ -22,9 +21,7 @@ interface OperatorContextValue {
   creditOk: boolean
   clientTitle: string | null
   companyProfileComplete: boolean
-  /** True when operator My Profile has all mandatory fields (entity/id/nric, contact, address, docs, bank). */
-  personalProfileComplete: boolean
-  /** True when operator has signed SaaS–Operator Terms & Conditions (required after profile). */
+  /** True when operator has signed SaaS–Operator Terms & Conditions (required after company setup). */
   termsAccepted: boolean
   /** True when client has accounting plan/addon (show Accounting menu; else hide and redirect). */
   hasAccountingCapability: boolean
@@ -56,7 +53,6 @@ export function OperatorProvider({ children }: { children: React.ReactNode }) {
   const [creditOk, setCreditOk] = useState(true)
   const [clientTitle, setClientTitle] = useState<string | null>(null)
   const [companyProfileComplete, setCompanyProfileComplete] = useState(false)
-  const [personalProfileComplete, setPersonalProfileComplete] = useState(false)
   const [termsAccepted, setTermsAccepted] = useState(false)
   const [hasAccountingCapability, setHasAccountingCapability] = useState(false)
   const [hasThirdPartyIntegrationCapability, setHasThirdPartyIntegrationCapability] = useState(false)
@@ -115,66 +111,6 @@ export function OperatorProvider({ children }: { children: React.ReactNode }) {
       }
       setClientTitle(ctxRes.client?.title ?? null)
       setPermission((ctxRes.staff?.permission as StaffPermission) ?? DEFAULT_PERMISSION)
-      const staff = (ctxRes.staff as {
-        name?: string
-        /** portal_account.fullname — access merges; client_user.name may lag after profile save */
-        fullname?: string | null
-        nric?: string
-        phone?: string
-        address?: string
-        nricfront?: string
-        nricback?: string
-        bankname_id?: string | null
-        bankaccount?: string
-        accountholder?: string
-        /** Portal_account + access merge — may be on staff root, not only staffdetail.profile JSON */
-        entity_type?: string
-        reg_no_type?: string
-        id_type?: string
-        tax_id_no?: string
-        profile?: { entity_type?: string; reg_no_type?: string; id_type?: string; tax_id_no?: string }
-      } | undefined) ?? {}
-      const legalName = String(staff.name || staff.fullname || "").trim()
-      const nric = String(staff.nric || staff.tax_id_no || staff.profile?.tax_id_no || "").trim()
-      const entityType = String(staff.entity_type || staff.profile?.entity_type || "").trim()
-      const idType = String(
-        staff.id_type || staff.reg_no_type || staff.profile?.id_type || staff.profile?.reg_no_type || ""
-      ).trim()
-      const mobileNumber = String(staff.phone || "").trim()
-      const addressLine = String(staff.address || "").trim()
-      const nricFront = String(staff.nricfront || "").trim()
-      const nricBack = String(staff.nricback || "").trim()
-      let bankId = String(staff.bankname_id ?? "").trim()
-      let bankAccount = String(staff.bankaccount || "").trim()
-      let bankHolder = String(staff.accountholder || "").trim()
-      if (!bankId || !bankAccount || !bankHolder) {
-        try {
-          const bankRes = await getOperatorBankDetails(clientId ? { clientId } : undefined)
-          if ((bankRes as { ok?: boolean })?.ok !== false) {
-            const b = bankRes as { bankId?: string | null; bankaccount?: string; accountholder?: string }
-            bankId = bankId || (b.bankId != null && String(b.bankId).trim() ? String(b.bankId).trim() : "")
-            bankAccount = bankAccount || String(b.bankaccount || "").trim()
-            bankHolder = bankHolder || String(b.accountholder || "").trim()
-          }
-        } catch {
-          /* gate stays false */
-        }
-      }
-      const exemptEntity = entityType === "EXEMPTED_PERSON"
-      const isSingaporeEntity = entityType === "FOREIGN_INDIVIDUAL" || entityType === "FOREIGN_COMPANY"
-      const normalizedIdType = idType.toUpperCase()
-      const requiresBackImage = normalizedIdType !== "PASSPORT"
-      setPersonalProfileComplete(
-        Boolean(
-          legalName &&
-            entityType &&
-            idType &&
-            mobileNumber &&
-            addressLine &&
-            (isSingaporeEntity || (bankId && bankAccount && bankHolder)) &&
-            (exemptEntity || (nric && nricFront && (!requiresBackImage || nricBack)))
-        )
-      )
       const cap = ctxRes.capability as {
         accounting?: boolean
         thirdPartyIntegration?: boolean
@@ -219,7 +155,7 @@ export function OperatorProvider({ children }: { children: React.ReactNode }) {
         setCompanyProfileComplete(false)
       }
 
-      // Terms & Conditions: operator must sign SaaS–Operator terms after profile is complete
+      // Terms & Conditions: operator must sign SaaS–Operator terms after company profile is available
       try {
         const termsRes = await getTermsSaasOperator()
         setTermsAccepted(Boolean(termsRes?.ok && termsRes?.accepted))
@@ -286,7 +222,6 @@ export function OperatorProvider({ children }: { children: React.ReactNode }) {
     creditOk,
     clientTitle,
     companyProfileComplete,
-    personalProfileComplete,
     termsAccepted,
     hasAccountingCapability,
     hasThirdPartyIntegrationCapability,

@@ -137,6 +137,13 @@ export default function AccountingMappingPage() {
     }
   }, [operatorId, planGate])
 
+  /** Header check: only when every account line is mapped (not merely “integration connected”). */
+  const allAccountLinesMapped = useMemo(() => {
+    if (listLoad !== "ready") return false
+    if (mappings.length === 0) return false
+    return mappings.every((m) => m.mapped)
+  }, [listLoad, mappings])
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
     let rows = mappings.filter((m) => {
@@ -235,12 +242,16 @@ export default function AccountingMappingPage() {
             ) : accountingProvider === "bukku" ? (
               <>
                 <span className="text-2xl font-medium text-muted-foreground">| Bukku</span>
-                <Check className="size-6 text-emerald-600" aria-label="Accounting connected" />
+                {allAccountLinesMapped ? (
+                  <Check className="size-6 text-emerald-600" aria-label="All account mappings complete" />
+                ) : null}
               </>
             ) : accountingProvider === "xero" ? (
               <>
                 <span className="text-2xl font-medium text-muted-foreground">| Xero</span>
-                <Check className="size-6 text-emerald-600" aria-label="Accounting connected" />
+                {allAccountLinesMapped ? (
+                  <Check className="size-6 text-emerald-600" aria-label="All account mappings complete" />
+                ) : null}
               </>
             ) : (
               <>

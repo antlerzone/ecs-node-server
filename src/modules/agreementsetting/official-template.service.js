@@ -2,6 +2,7 @@
  * Official agreement templates – credit purchase per client; .docx via Drive export (SA must access Doc).
  */
 
+const fs = require('fs');
 const { google } = require('googleapis');
 const pool = require('../../config/db');
 const { deductClientCreditSpending } = require('../billing/deduction.service');
@@ -39,6 +40,8 @@ function buildPermission(permissionArray) {
   return permission;
 }
 
+let _warnedMissingGoogleApplicationCredentialsFile = false;
+
 function getGoogleAuth() {
   const keyJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
   if (keyJson) {
@@ -55,9 +58,20 @@ function getGoogleAuth() {
       return null;
     }
   }
-  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+  const keyPath = String(process.env.GOOGLE_APPLICATION_CREDENTIALS || '').trim();
+  if (keyPath) {
+    if (!fs.existsSync(keyPath)) {
+      if (!_warnedMissingGoogleApplicationCredentialsFile) {
+        _warnedMissingGoogleApplicationCredentialsFile = true;
+        console.warn(
+          '[official-template] GOOGLE_APPLICATION_CREDENTIALS file missing; ignoring:',
+          keyPath
+        );
+      }
+      return null;
+    }
     return new google.auth.GoogleAuth({
-      keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS,
+      keyFile: keyPath,
       scopes: [
         'https://www.googleapis.com/auth/drive.readonly',
         'https://www.googleapis.com/auth/drive'

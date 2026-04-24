@@ -242,15 +242,15 @@ export function EmployeeWorkingPayrollTable({
   const editRow = rows.find((r) => r.dateKey === editDateKey)
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-lg">OT, late &amp; early (vs company hours)</CardTitle>
-        <CardDescription>
+    <Card className="max-w-full overflow-hidden">
+      <CardHeader className="min-w-0 space-y-2">
+        <CardTitle className="text-lg break-words">OT, late &amp; early (vs company hours)</CardTitle>
+        <CardDescription className="break-words">
           Compared to Operator → Company <strong>Working hours</strong> ({whFrom || "—"} – {whTo || "—"}). Set
           rates below; amounts are illustrative until payroll is linked.
         </CardDescription>
       </CardHeader>
-      <CardContent className="space-y-4">
+      <CardContent className="min-w-0 space-y-4">
         {!whFrom || !whTo ? (
           <p className="text-sm text-amber-800 dark:text-amber-200 rounded-lg border border-amber-200 bg-amber-50/80 px-3 py-2">
             Company working hours are missing. Ask your operator to set <strong>Working hour from / to</strong>{" "}
@@ -258,7 +258,7 @@ export function EmployeeWorkingPayrollTable({
           </p>
         ) : null}
 
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <div className="grid gap-1">
             <Label className="text-xs">Early arrival bonus (RM / min)</Label>
             <Input
@@ -425,9 +425,9 @@ export function EmployeeWorkingPayrollTable({
                 </th>
                 <th className="px-2 py-2 text-left">Date</th>
                 <th className="px-2 py-2 text-left">In / Out</th>
-                <th className="px-2 py-2 text-right">早到+</th>
-                <th className="px-2 py-2 text-right">迟到−</th>
-                <th className="px-2 py-2 text-right">早退−</th>
+                <th className="px-2 py-2 text-right">Early +</th>
+                <th className="px-2 py-2 text-right">Late −</th>
+                <th className="px-2 py-2 text-right">Early leave −</th>
                 <th className="px-2 py-2 text-right">OT+</th>
                 <th className="px-2 py-2 text-right">Net adj.</th>
                 <th className="px-2 py-2 text-left">Status</th>
@@ -549,19 +549,19 @@ export function EmployeeWorkingPayrollTable({
                   </p>
                   <ul className="list-disc pl-5 space-y-1 text-muted-foreground">
                     <li>
-                      早到 (early): {editRow.dev.earlyArrivalMin} min × RM {rates.earlyArrivalPerMin}/min = +RM{" "}
+                      Early arrival: {editRow.dev.earlyArrivalMin} min × RM {rates.earlyArrivalPerMin}/min = +RM{" "}
                       {editRow.money.allowanceEarly.toFixed(2)}
                     </li>
                     <li>
-                      迟到 (late): {editRow.dev.lateMin} min × RM {rates.latePerMin}/min = −RM{" "}
+                      Late (check-in): {editRow.dev.lateMin} min × RM {rates.latePerMin}/min = −RM{" "}
                       {editRow.money.deductionLate.toFixed(2)}
                     </li>
                     <li>
-                      早退 (early leave): {editRow.dev.earlyLeaveMin} min × RM {rates.earlyLeavePerMin}/min = −RM{" "}
+                      Early leave: {editRow.dev.earlyLeaveMin} min × RM {rates.earlyLeavePerMin}/min = −RM{" "}
                       {editRow.money.deductionEarlyLeave.toFixed(2)}
                     </li>
                     <li>
-                      迟退 / OT: {editRow.dev.otMin} min ÷ 60 × RM {rates.otPerHour}/hr = +RM{" "}
+                      OT / late exit: {editRow.dev.otMin} min ÷ 60 × RM {rates.otPerHour}/hr = +RM{" "}
                       {editRow.money.allowanceOt.toFixed(2)}
                     </li>
                   </ul>

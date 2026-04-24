@@ -6,7 +6,14 @@
 
 const { randomUUID, createHash } = require('crypto');
 const pool = require('../../config/db');
-const { getAccessContextByEmail, getAccessContextByEmailAndClient, ACCOUNTING_PLAN_IDS } = require('../access/access.service');
+const {
+  getAccessContextByEmail,
+  getAccessContextByEmailAndClient,
+  ACCOUNTING_PLAN_IDS,
+  normalizeEmail
+} = require('../access/access.service');
+const { migratePortalAccountEmail } = require('../portal-auth/portal-contact-verify.service');
+const { sendPortalOtpEmail } = require('../portal-auth/portal-password-reset-sender');
 const { getClientUserLimitBreakdown, getClientMaxUserAllowed } = require('../billing/billing.service');
 const { ensureMasterAdminUserForClient } = require('../billing/indoor-admin.service');
 const { ensureClientCnyiotSubuser, getCnyiotIntegrationAny } = require('../cnyiot/lib/cnyiotSubuser');
@@ -601,14 +608,14 @@ async function getProfile(email, clientIdFromReq = null) {
   let clientRows;
   try {
     [clientRows] = await pool.query(
-      'SELECT id, title, currency, profilephoto, subdomain, profile AS profile_json FROM operatordetail WHERE id = ? LIMIT 1',
+      'SELECT id, title, currency, email, profilephoto, subdomain, profile AS profile_json FROM operatordetail WHERE id = ? LIMIT 1',
       [clientId]
     );
   } catch (e) {
     if (isProfilephotoBadFieldError(e)) {
       console.warn('[companysetting] getProfile: operatordetail.profilephoto missing — retry without column');
       [clientRows] = await pool.query(
-        'SELECT id, title, currency, subdomain, profile AS profile_json FROM operatordetail WHERE id = ? LIMIT 1',
+        'SELECT id, title, currency, email, subdomain, profile AS profile_json FROM operatordetail WHERE id = ? LIMIT 1',
         [clientId]
       );
       clientRows = clientRows.map((r) => ({ ...r, profilephoto: null }));
@@ -642,12 +649,19 @@ async function getProfile(email, clientIdFromReq = null) {
       };
     }
   }
+  const companyEmailStr = client.email != null ? String(client.email).trim() : '';
+  const loginNorm = normalizeEmail(email);
+  const companyNorm = normalizeEmail(companyEmailStr);
+  const canChangeCompanyEmail = !!(loginNorm && companyNorm && loginNorm === companyNorm);
+
   return {
     ok: true,
     client: {
       id: client.id,
       title: client.title,
       currency: client.currency,
+      companyEmail: companyEmailStr,
+      canChangeCompanyEmail,
       // Company logo / branding (not operator personal avatar — see client_user.profilephoto)
       profilephoto: client.profilephoto,
       subdomain: client.subdomain || profile.subdomain
@@ -1921,6 +1935,267 @@ async function getPaynowQrLog(email, clientIdFromReq = null) {
   };
 }
 
+/** Master only: operatordetail.email (normalized) must match login email. */
+async function requireMasterForCompanyEmail(email, clientIdFromReq = null) {
+  const { clientId } = await requireCtx(email, ['profilesetting', 'admin'], clientIdFromReq);
+  const [rows] = await pool.query('SELECT email FROM operatordetail WHERE id = ? LIMIT 1', [clientId]);
+  if (!rows.length) throw new Error('CLIENT_NOT_FOUND');
+  const loginNorm = normalizeEmail(email);
+  const companyNorm = normalizeEmail(rows[0].email);
+  if (!loginNorm || !companyNorm || loginNorm !== companyNorm) {
+    throw new Error('NOT_MASTER');
+  }
+  return { clientId };
+}
+
+/** Company email change: reject only if another operatordetail row already has this master email (not tenant/staff/portal-only). */
+async function isOperatordetailMasterEmailTakenByOtherClient(newEmailNorm, excludeClientId) {
+  const e = String(newEmailNorm || '').trim().toLowerCase();
+  if (!e) return false;
+  const [rows] = await pool.query(
+    'SELECT id FROM operatordetail WHERE LOWER(TRIM(email)) = ? AND id <> ? LIMIT 1',
+    [e, excludeClientId]
+  );
+  return rows.length > 0;
+}
+
+/**
+ * Request TAC to new email for scheduled company email change (7 days after confirm).
+ */
+async function requestOperatorCompanyEmailChange(email, newEmailRaw, clientIdFromReq = null) {
+  const newE = normalizeEmail(newEmailRaw);
+  const oldE = normalizeEmail(email);
+  if (!newE || !oldE) return { ok: false, reason: 'NO_EMAIL' };
+  if (newE === oldE) return { ok: false, reason: 'SAME_EMAIL' };
+
+  const { clientId } = await requireMasterForCompanyEmail(email, clientIdFromReq);
+
+  let existing;
+  try {
+    const [ex] = await pool.query(
+      'SELECT status, scheduled_effective_at FROM operator_company_email_change WHERE client_id = ? LIMIT 1',
+      [clientId]
+    );
+    existing = ex;
+  } catch (err) {
+    if (err?.code === 'ER_NO_SUCH_TABLE' || err?.errno === 1146) {
+      return { ok: false, reason: 'MIGRATION_REQUIRED' };
+    }
+    throw err;
+  }
+  if (existing && existing.length && existing[0].status === 'scheduled') {
+    return {
+      ok: false,
+      reason: 'ALREADY_SCHEDULED',
+      effectiveAt: existing[0].scheduled_effective_at
+        ? new Date(existing[0].scheduled_effective_at).toISOString()
+        : null
+    };
+  }
+
+  const [acct] = await pool.query('SELECT id FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1', [oldE]);
+  if (!acct.length) return { ok: false, reason: 'NO_ACCOUNT' };
+  if (await isOperatordetailMasterEmailTakenByOtherClient(newE, clientId)) {
+    return { ok: false, reason: 'EMAIL_TAKEN' };
+  }
+
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  try {
+    await pool.query(
+      `INSERT INTO operator_company_email_change (client_id, new_email, code, tac_expires_at, status, scheduled_effective_at)
+       VALUES (?, ?, ?, DATE_ADD(NOW(), INTERVAL 30 MINUTE), 'pending_tac', NULL)
+       ON DUPLICATE KEY UPDATE new_email = VALUES(new_email), code = VALUES(code), tac_expires_at = VALUES(tac_expires_at),
+         status = 'pending_tac', scheduled_effective_at = NULL, updated_at = CURRENT_TIMESTAMP`,
+      [clientId, newE, code]
+    );
+  } catch (err) {
+    console.error('[companysetting] requestOperatorCompanyEmailChange', err?.message || err);
+    return { ok: false, reason: 'DB_ERROR' };
+  }
+
+  await sendPortalOtpEmail(
+    newE,
+    'Verify your new Coliving company email',
+    `Your verification code is: ${code}\n\nThis code expires in 30 minutes. After you confirm, your company email will change in 7 days.`,
+    `<p>Your verification code is: <strong>${code}</strong></p><p>This code expires in 30 minutes.</p><p>After you confirm, your company email will change in <strong>7 days</strong>.</p>`
+  );
+  return { ok: true };
+}
+
+/**
+ * Confirm TAC and schedule email migration for +7 days (cron applies).
+ */
+async function confirmOperatorCompanyEmailChange(email, newEmailRaw, codeStr, clientIdFromReq = null) {
+  const newE = normalizeEmail(newEmailRaw);
+  const oldE = normalizeEmail(email);
+  const code = String(codeStr || '').trim();
+  if (!newE || !oldE || !code) return { ok: false, reason: 'NO_EMAIL' };
+
+  const { clientId } = await requireMasterForCompanyEmail(email, clientIdFromReq);
+
+  let pend;
+  try {
+    const [rows] = await pool.query(
+      `SELECT new_email FROM operator_company_email_change WHERE client_id = ? AND new_email = ? AND code = ? AND status = 'pending_tac'
+       AND tac_expires_at > NOW() LIMIT 1`,
+      [clientId, newE, code]
+    );
+    pend = rows;
+  } catch (err) {
+    if (err?.code === 'ER_NO_SUCH_TABLE' || err?.errno === 1146) {
+      return { ok: false, reason: 'MIGRATION_REQUIRED' };
+    }
+    throw err;
+  }
+  if (!pend || !pend.length) return { ok: false, reason: 'INVALID_OR_EXPIRED_CODE' };
+
+  const [acct] = await pool.query('SELECT id FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1', [oldE]);
+  if (!acct.length) return { ok: false, reason: 'NO_ACCOUNT' };
+  if (await isOperatordetailMasterEmailTakenByOtherClient(newE, clientId)) {
+    return { ok: false, reason: 'EMAIL_TAKEN' };
+  }
+
+  try {
+    await pool.query(
+      `UPDATE operator_company_email_change SET status = 'scheduled',
+       scheduled_effective_at = DATE_ADD(NOW(), INTERVAL 7 DAY),
+       updated_at = CURRENT_TIMESTAMP WHERE client_id = ? AND new_email = ?`,
+      [clientId, newE]
+    );
+  } catch (err) {
+    console.error('[companysetting] confirmOperatorCompanyEmailChange', err?.message || err);
+    return { ok: false, reason: 'DB_ERROR' };
+  }
+
+  const [[eff]] = await pool.query(
+    'SELECT scheduled_effective_at FROM operator_company_email_change WHERE client_id = ? LIMIT 1',
+    [clientId]
+  );
+  const effectiveAt = eff?.scheduled_effective_at
+    ? new Date(eff.scheduled_effective_at).toISOString()
+    : null;
+  return { ok: true, newEmail: newE, effectiveAt };
+}
+
+/** Status for UI (master only gets pending details). */
+async function getOperatorCompanyEmailChangeStatus(email, clientIdFromReq = null) {
+  const { clientId } = await requireCtx(email, ['profilesetting', 'admin'], clientIdFromReq);
+  const [od] = await pool.query('SELECT email FROM operatordetail WHERE id = ? LIMIT 1', [clientId]);
+  const companyEmail = od[0]?.email != null ? String(od[0].email).trim() : '';
+  const master =
+    normalizeEmail(email) &&
+    normalizeEmail(companyEmail) &&
+    normalizeEmail(email) === normalizeEmail(companyEmail);
+
+  let row;
+  try {
+    const [rows] = await pool.query(
+      `SELECT new_email, status, tac_expires_at, scheduled_effective_at FROM operator_company_email_change WHERE client_id = ? LIMIT 1`,
+      [clientId]
+    );
+    row = rows[0];
+  } catch (err) {
+    if (err?.code === 'ER_NO_SUCH_TABLE' || err?.errno === 1146) {
+      return { ok: true, master, pending: null };
+    }
+    throw err;
+  }
+
+  if (!master) {
+    return { ok: true, master: false, pending: null };
+  }
+  if (!row) {
+    return { ok: true, master: true, pending: null };
+  }
+  return {
+    ok: true,
+    master: true,
+    pending: {
+      newEmail: row.new_email,
+      status: row.status,
+      tacExpiresAt: row.tac_expires_at ? new Date(row.tac_expires_at).toISOString() : null,
+      effectiveAt: row.scheduled_effective_at ? new Date(row.scheduled_effective_at).toISOString() : null
+    }
+  };
+}
+
+/** Master only: remove pending row (cancels TAC-only or verified-but-not-yet-applied scheduled change). */
+async function cancelOperatorCompanyEmailChange(email, clientIdFromReq = null) {
+  const { clientId } = await requireMasterForCompanyEmail(email, clientIdFromReq);
+  try {
+    const [r] = await pool.query('DELETE FROM operator_company_email_change WHERE client_id = ?', [clientId]);
+    if (!r || Number(r.affectedRows) === 0) {
+      return { ok: false, reason: 'NOTHING_TO_CANCEL' };
+    }
+    return { ok: true };
+  } catch (err) {
+    if (err?.code === 'ER_NO_SUCH_TABLE' || err?.errno === 1146) {
+      return { ok: false, reason: 'MIGRATION_REQUIRED' };
+    }
+    console.error('[companysetting] cancelOperatorCompanyEmailChange', err?.message || err);
+    return { ok: false, reason: 'DB_ERROR' };
+  }
+}
+
+/**
+ * Cron: apply due scheduled company email changes. Safe to run repeatedly.
+ */
+async function runDueOperatorCompanyEmailChanges() {
+  const results = { applied: 0, errors: [] };
+  let rows;
+  try {
+    [rows] = await pool.query(
+      `SELECT client_id, new_email FROM operator_company_email_change
+       WHERE status = 'scheduled' AND scheduled_effective_at IS NOT NULL AND scheduled_effective_at <= NOW()`
+    );
+  } catch (err) {
+    if (err?.code === 'ER_NO_SUCH_TABLE' || err?.errno === 1146) {
+      return results;
+    }
+    throw err;
+  }
+  for (const row of rows) {
+    const clientId = row.client_id;
+    const newE = normalizeEmail(row.new_email);
+    try {
+      const [od] = await pool.query('SELECT email FROM operatordetail WHERE id = ? LIMIT 1', [clientId]);
+      if (!od.length) {
+        results.errors.push({ clientId, reason: 'CLIENT_NOT_FOUND' });
+        try {
+          await pool.query('DELETE FROM operator_company_email_change WHERE client_id = ?', [clientId]);
+        } catch (_) {
+          /* ignore */
+        }
+        continue;
+      }
+      const oldE = normalizeEmail(od[0].email);
+      if (!oldE || !newE || oldE === newE) {
+        await pool.query('DELETE FROM operator_company_email_change WHERE client_id = ?', [clientId]);
+        continue;
+      }
+      const [pa] = await pool.query('SELECT id FROM portal_account WHERE LOWER(TRIM(email)) = ? LIMIT 1', [oldE]);
+      if (!pa.length) {
+        results.errors.push({ clientId, reason: 'NO_ACCOUNT' });
+        continue;
+      }
+      if (await isOperatordetailMasterEmailTakenByOtherClient(newE, clientId)) {
+        results.errors.push({ clientId, reason: 'EMAIL_TAKEN_AT_APPLY' });
+        continue;
+      }
+      const mig = await migratePortalAccountEmail(oldE, newE, clientId);
+      if (!mig.ok) {
+        results.errors.push({ clientId, reason: mig.reason || 'MIGRATE_FAILED' });
+        continue;
+      }
+      await pool.query('DELETE FROM operator_company_email_change WHERE client_id = ?', [clientId]);
+      results.applied += 1;
+    } catch (err) {
+      results.errors.push({ clientId, reason: err?.message || 'DB_ERROR' });
+    }
+  }
+  return results;
+}
+
 module.exports = {
   getStaffList,
   createStaff,
@@ -1982,5 +2257,10 @@ module.exports = {
   ttlockDisconnect,
   getEmail,
   requireCtx,
-  upsertClientIntegration
+  upsertClientIntegration,
+  requestOperatorCompanyEmailChange,
+  confirmOperatorCompanyEmailChange,
+  cancelOperatorCompanyEmailChange,
+  getOperatorCompanyEmailChangeStatus,
+  runDueOperatorCompanyEmailChanges
 };

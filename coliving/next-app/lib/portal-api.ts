@@ -9,6 +9,8 @@ export type MemberRoleType = "staff" | "tenant" | "owner" | "saas_admin";
 
 export interface MemberRole {
   type: MemberRoleType;
+  /** Backend getMemberRoles: distinguishes Coliving vs Cleanlemons staff for portal Operator card */
+  staffSource?: string;
   staffId?: string;
   clientId?: string;
   clientTitle?: string;
@@ -57,7 +59,12 @@ function canUseBackendOnDemoPath(pathname: string): boolean {
     p === "/docs" ||
     p.startsWith("/docs/") ||
     p === "/demoprofile" ||
-    p.startsWith("/demoprofile/")
+    p.startsWith("/demoprofile/") ||
+    /** Tenant/owner profile + eKYC need real portal-auth + Aliyun — not mock-only. */
+    p === "/tenant/profile" ||
+    p.startsWith("/tenant/profile/") ||
+    p === "/owner/profile" ||
+    p.startsWith("/owner/profile/")
   );
 }
 
@@ -124,7 +131,13 @@ function getDemoMock(path: string, body: object): unknown {
       ok: true,
       email: email.trim(),
       roles: [
-        { type: "staff", staffId: "demo-staff", clientId: "demo-client", clientTitle: "Demo Client" },
+        {
+          type: "staff",
+          staffSource: "coliving_client_user",
+          staffId: "demo-staff",
+          clientId: "demo-client",
+          clientTitle: "Demo Client",
+        },
         { type: "tenant", tenantId: "demo-tenant", clientId: "demo-client" },
         { type: "owner", ownerId: "demo-owner", clientId: "demo-client" },
       ],

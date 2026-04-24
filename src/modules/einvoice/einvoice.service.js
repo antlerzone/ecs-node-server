@@ -64,6 +64,28 @@ function parseBukkuContactMyInvoisReady(res) {
   return { ok: true, ready };
 }
 
+/** Same contact extraction as {@link parseBukkuContactMyInvoisReady}. */
+function extractBukkuContactFromReadResponse(readRes) {
+  if (!readRes || readRes.ok !== true || readRes.data == null) return null;
+  const raw = readRes.data;
+  const c = raw.contact ?? raw.data?.contact ?? raw;
+  return c && typeof c === 'object' ? c : null;
+}
+
+/**
+ * Coliving rental / operator invoice rule: only treat as “e-invoice create” when Bukku says MyInvois-ready **and**
+ * core customer identity exists (name + NRIC/BRN/TIN). Otherwise POST plain sales invoice once — no second POST.
+ */
+function bukkuContactProfileCompleteForMyInvoisInvoiceCreate(c) {
+  if (!c || typeof c !== 'object') return false;
+  const flag = c.is_myinvois_ready;
+  const bukkuReady = flag === true || flag === 1 || String(flag).toLowerCase() === 'true';
+  if (!bukkuReady) return false;
+  const nm = [c.legal_name, c.display_name, c.company_name].map((x) => String(x || '').trim()).find(Boolean);
+  const idNo = [c.reg_no, c.tax_id_no].map((x) => (x != null ? String(x).trim() : '')).find((s) => s !== '');
+  return !!(nm && idNo);
+}
+
 /**
  * Bukku POST /sales/invoices: set myinvois_action only when Company Setting e-invoice is on AND contact is MyInvois-ready.
  * If not ready or read fails → omit field → plain sales invoice (still creates invoice).
@@ -94,6 +116,77 @@ async function resolveBukkuCreateInvoiceMyInvoisAction(req, contactId) {
   }
   if (!parsed.ready) {
     return { myinvois_action: undefined, meta: { reason: 'plain_invoice', myinvois_ready: false } };
+  }
+  const contact = extractBukkuContactFromReadResponse(readRes);
+  if (!bukkuContactProfileCompleteForMyInvoisInvoiceCreate(contact)) {
+    return {
+      myinvois_action: undefined,
+      meta: { reason: 'plain_invoice_contact_incomplete', myinvois_ready: false, myinvois_flag: contact?.is_myinvois_ready }
+    };
+  }
+  return { myinvois_action: 'NORMAL', meta: { reason: 'einvoice', myinvois_ready: true } };
+}
+
+/**
+ * Cleanlemons operator Bukku: `req.client.id` is `cln_operatordetail.id` (not Coliving `client_integration.client_id`).
+ * Same rules as {@link resolveBukkuCreateInvoiceMyInvoisAction} — avoids Bukku/MyInvois edge paths that return HTTP 500
+ * when company e-invoice is on but the create payload omits `myinvois_action`.
+ */
+async function getClnOperatorBukkuEinvoiceEnabled(operatorId) {
+  const oid = String(operatorId || '').trim();
+  if (!oid) return false;
+  try {
+    const [rows] = await pool.query(
+      `SELECT einvoice FROM cln_operator_integration
+       WHERE operator_id = ? AND \`key\` = 'addonAccount' AND provider = 'bukku' AND enabled = 1
+       LIMIT 1`,
+      [oid]
+    );
+    const r = rows[0];
+    if (!r) return false;
+    const ev = r.einvoice;
+    /** Only explicit “on” — avoid truthy strings / Buffer edge cases; no e-invoice ⇒ plain Bukku invoice only. */
+    return ev === true || ev === 1 || Number(ev) === 1;
+  } catch {
+    return false;
+  }
+}
+
+async function resolveBukkuCreateInvoiceMyInvoisActionForClnOperator(req, contactId) {
+  const operatorId = req?.client?.id;
+  const cid =
+    contactId != null && contactId !== ''
+      ? Number(typeof contactId === 'string' ? String(contactId).trim() : contactId)
+      : NaN;
+  if (!operatorId || Number.isNaN(cid)) {
+    return { myinvois_action: undefined, meta: { reason: 'missing_operator_or_contact' } };
+  }
+  const enabled = await getClnOperatorBukkuEinvoiceEnabled(operatorId);
+  if (!enabled) {
+    return { myinvois_action: undefined, meta: { reason: 'einvoice_disabled' } };
+  }
+  let readRes;
+  try {
+    readRes = await bukkuContact.read(req, cid);
+  } catch (err) {
+    return {
+      myinvois_action: undefined,
+      meta: { reason: 'contact_read_exception', detail: err?.message || String(err) }
+    };
+  }
+  const parsed = parseBukkuContactMyInvoisReady(readRes);
+  if (!parsed.ok) {
+    return { myinvois_action: undefined, meta: { reason: 'contact_read_failed', detail: parsed.reason } };
+  }
+  if (!parsed.ready) {
+    return { myinvois_action: undefined, meta: { reason: 'plain_invoice', myinvois_ready: false } };
+  }
+  const contact = extractBukkuContactFromReadResponse(readRes);
+  if (!bukkuContactProfileCompleteForMyInvoisInvoiceCreate(contact)) {
+    return {
+      myinvois_action: undefined,
+      meta: { reason: 'plain_invoice_contact_incomplete', myinvois_ready: false, myinvois_flag: contact?.is_myinvois_ready }
+    };
   }
   return { myinvois_action: 'NORMAL', meta: { reason: 'einvoice', myinvois_ready: true } };
 }
@@ -484,8 +577,10 @@ async function cancelEInvoiceIfEnabled(req, opts) {
 
 module.exports = {
   getClientEinvoiceEnabled,
+  getClnOperatorBukkuEinvoiceEnabled,
   parseBukkuContactMyInvoisReady,
   resolveBukkuCreateInvoiceMyInvoisAction,
+  resolveBukkuCreateInvoiceMyInvoisActionForClnOperator,
   submitEInvoiceAfterInvoiceCreatedIfEnabled,
   executeEInvoiceIfEnabled,
   createGeneralInvoice,

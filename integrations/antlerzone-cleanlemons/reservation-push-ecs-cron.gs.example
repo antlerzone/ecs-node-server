@@ -1,0 +1,174 @@
+/**
+ * Google Apps Script — 定时（cron）把 Reservation 未同步行 → ECS `google-sheet-schedule`
+ *
+ * 行为对齐旧版 `schedule.gs` + Wix `scheduleInsert`：从表尾往上找未发送行，每轮最多发几条；
+ * ECS：有 reservationId → 按 reservation + 物业 upsert；无 reservationId → 同一物业 + 吉隆坡同一日历日 upsert。
+ *
+ * 时区：workingDay 请固定传 `yyyy-MM-dd'T'00:00:00.000'+08:00'`（吉隆坡「那一天」的 0 点）；后端存 MySQL UTC+0，
+ * Portal/Next 按 UTC+8 显示。勿只传无偏移的日期串以免歧义。
+ *
+ * 触发器（Google 侧）：
+ *   触发器 → 时间驱动 → 每 5–15 分钟（或每小时）→ 选函数 sendReservationRowsToEcs
+ *   项目时区：Asia/Kuala_Lumpur（文件 → 项目设置）
+ *
+ * 脚本属性（项目设置 → 脚本属性）：
+ *   ECS_API_KEY = `cln_client_integration`（thirdPartyIntegration + static_token）里 `values_json.api_key`，
+ *   用于识别 B2B 客户与运营商（不是 Wix `googlekey`）。
+ *
+ * 列（1-based；表头第 1 行 M1 = ecs）：
+ *   C = Reservation ID（可空；空则 ECS 按「物业 + 吉隆坡同一日」去重）
+ *   E = Check Out（退房日 → workingDay 吉隆坡日历日 00:00 +08:00）
+ *   L = Listing UUID（→ body.property，对应 cln_property.source_id / homestay_source_id）
+ *   M = ecs（成功后写 Sent）
+ *
+ * 勿与同一项目里其它 .gs 重复声明同名全局变量。
+ */
+var KL_TZ = 'Asia/Kuala_Lumpur';
+
+var ECS_URL = 'https://api.cleanlemons.com/api/cleanlemon-sync/google-sheet-schedule';
+var ECS_API_KEY = PropertiesService.getScriptProperties().getProperty('ECS_API_KEY') || '';
+
+var RESERVATION_SHEET = 'Reservation';
+var COL_RESERVATION_ID = 3;
+var COL_CHECKOUT = 5;
+var COL_PROPERTY = 12;
+/** M = ecs；成功写 Sent */
+var COL_ECS = 13;
+
+var MAX_TO_SEND = 10;
+var MAX_CHECK_ROWS = 100;
+
+/** 仅发送吉隆坡日历日 > 此日的行；不需要过滤时改成 '1970-01-01' */
+var CUTOFF_YMD_KL = '1970-01-01';
+
+/**
+ * 时间驱动触发器绑这个函数（替代 Wix 的 sendNewRows）。
+ */
+function sendReservationRowsToEcs() {
+  if (!ECS_API_KEY || ECS_API_KEY === 'REPLACE_WITH_B2B_API_KEY') {
+    console.error('请设置脚本属性 ECS_API_KEY');
+    return;
+  }
+
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(RESERVATION_SHEET);
+  if (!sheet) {
+    console.error('找不到工作表: ' + RESERVATION_SHEET);
+    return;
+  }
+
+  var lastRow = sheet.getLastRow();
+  var realLastRow = sheet
+    .getRange('A:M')
+    .getValues()
+    .reduceRight(function (acc, row, i) {
+      return acc || (row.join('').trim() !== '' ? i + 1 : 0);
+    }, 0);
+  if (realLastRow > 0 && realLastRow < lastRow) {
+    lastRow = realLastRow;
+  }
+
+  if (lastRow < 2) {
+    console.log('无数据行');
+    return;
+  }
+
+  var rowsToSend = [];
+  var start = lastRow;
+  var minRow = Math.max(2, lastRow - MAX_CHECK_ROWS);
+
+  for (var i = start; i >= minRow; i--) {
+    var statusRaw = sheet.getRange(i, COL_ECS).getDisplayValue() || '';
+    var statusClean = statusRaw.replace(/\u200B|\u00A0/g, '').trim().toLowerCase();
+    if (!statusClean || statusClean !== 'sent') {
+      rowsToSend.push(i);
+      if (rowsToSend.length >= MAX_TO_SEND) break;
+    }
+  }
+
+  if (rowsToSend.length === 0) {
+    console.log('没有待发送行（M 列已为 Sent）');
+    return;
+  }
+
+  console.log('待发送行: ' + rowsToSend.join(', '));
+
+  var successCount = 0;
+  var failCount = 0;
+
+  for (var k = rowsToSend.length - 1; k >= 0; k--) {
+    var rowNum = rowsToSend[k];
+    var property = sheet.getRange(rowNum, COL_PROPERTY).getDisplayValue().trim();
+    var reservationId = sheet.getRange(rowNum, COL_RESERVATION_ID).getDisplayValue().trim();
+    var checkoutRaw = sheet.getRange(rowNum, COL_CHECKOUT).getValue();
+
+    if (!property) {
+      console.warn('第 ' + rowNum + ' 行缺少 property（L 列），跳过');
+      continue;
+    }
+
+    var workingDayDate = checkoutRaw instanceof Date ? checkoutRaw : parseSheetDate(checkoutRaw);
+    if (!workingDayDate || isNaN(workingDayDate.getTime())) {
+      console.warn('第 ' + rowNum + ' 行 Check Out 无法解析为日期，跳过');
+      continue;
+    }
+
+    var ymdKl = Utilities.formatDate(workingDayDate, KL_TZ, 'yyyy-MM-dd');
+    if (ymdKl <= CUTOFF_YMD_KL) {
+      console.log('第 ' + rowNum + ' 行早于截止日 ' + CUTOFF_YMD_KL + '，跳过');
+      continue;
+    }
+
+    var workingDay = Utilities.formatDate(workingDayDate, KL_TZ, "yyyy-MM-dd'T'00:00:00.000'+08:00'");
+    var dateFormatted = Utilities.formatDate(workingDayDate, KL_TZ, 'dd MMM yyyy');
+
+    var payload = { property: property, workingDay: workingDay, date: dateFormatted };
+    if (reservationId) payload.reservationId = reservationId;
+
+    var options = {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { Authorization: 'Bearer ' + ECS_API_KEY },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    };
+
+    try {
+      var response = UrlFetchApp.fetch(ECS_URL, options);
+      var code = response.getResponseCode();
+      var body = response.getContentText();
+      console.log('行 ' + rowNum + ' HTTP ' + code + ' ' + body);
+
+      if (code >= 200 && code < 300) {
+        sheet.getRange(rowNum, COL_ECS).setValue('Sent');
+        successCount++;
+      } else {
+        failCount++;
+      }
+    } catch (err) {
+      console.error('行 ' + rowNum + ' 错误: ' + err.message);
+      failCount++;
+    }
+  }
+
+  console.log('完成 — 成功: ' + successCount + ' 失败: ' + failCount);
+}
+
+/** Date、YYYY-MM-DD、M/D/YYYY 文本 */
+function parseSheetDate(v) {
+  if (v instanceof Date && !isNaN(v.getTime())) {
+    var ymd = Utilities.formatDate(v, KL_TZ, 'yyyy-MM-dd').split('-');
+    return new Date(Number(ymd[0]), Number(ymd[1]) - 1, Number(ymd[2]));
+  }
+  if (typeof v === 'string') {
+    var s = v.trim();
+    if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
+      var p = s.slice(0, 10).split('-');
+      return new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]));
+    }
+    var md = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(s);
+    if (md) {
+      return new Date(Number(md[3]), Number(md[1]) - 1, Number(md[2]));
+    }
+  }
+  return null;
+}

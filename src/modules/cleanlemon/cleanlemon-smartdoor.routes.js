@@ -163,6 +163,7 @@ router.post('/operator/smartdoorsetting/list', async (req, res, next) => {
       page: b.page,
       pageSize: b.pageSize,
       limit: b.limit,
+      clnClientOwnership: b.clnClientOwnership,
     });
     res.json(result);
   } catch (err) {
@@ -504,6 +505,7 @@ router.post('/operator/smartdoorsetting/delete-gateway', async (req, res, next) 
 
 router.post('/client/smartdoorsetting/list', async (req, res, next) => {
   try {
+    const { email } = clientPortalAuthFromRequest(req, req.body?.email);
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
     const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
@@ -516,6 +518,7 @@ router.post('/client/smartdoorsetting/list', async (req, res, next) => {
       page: b.page,
       pageSize: b.pageSize,
       limit: b.limit,
+      loginEmail: email || '',
     });
     res.json(result);
   } catch (err) {
@@ -525,10 +528,11 @@ router.post('/client/smartdoorsetting/list', async (req, res, next) => {
 
 router.post('/client/smartdoorsetting/filters', async (req, res, next) => {
   try {
+    const { email } = clientPortalAuthFromRequest(req, req.body?.email);
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
     const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
-    const result = await getSmartDoorFilters(sdScope);
+    const result = await getSmartDoorFilters(sdScope, { loginEmail: email || '' });
     res.json(result);
   } catch (err) {
     next(err);
@@ -537,12 +541,13 @@ router.post('/client/smartdoorsetting/filters', async (req, res, next) => {
 
 router.post('/client/smartdoorsetting/get-lock', async (req, res, next) => {
   try {
+    const { email } = clientPortalAuthFromRequest(req, req.body?.email);
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
     const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const id = req.body?.id;
     if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
-    const row = await getLock(sdScope, id);
+    const row = await getLock(sdScope, id, { loginEmail: email || '' });
     if (!row) return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
     res.json(row);
   } catch (err) {
@@ -552,12 +557,13 @@ router.post('/client/smartdoorsetting/get-lock', async (req, res, next) => {
 
 router.post('/client/smartdoorsetting/get-gateway', async (req, res, next) => {
   try {
+    const { email } = clientPortalAuthFromRequest(req, req.body?.email);
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
     const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const id = req.body?.id;
     if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
-    const row = await getGateway(sdScope, id);
+    const row = await getGateway(sdScope, id, { loginEmail: email || '' });
     if (!row) return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
     res.json(row);
   } catch (err) {
@@ -609,6 +615,7 @@ router.post('/client/smartdoorsetting/unlock', async (req, res, next) => {
     if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
     await remoteUnlockLock(sdScope, id, {
       actorEmail: email || '',
+      loginEmail: email || '',
       portalSource: 'cln_client_smartdoor',
     });
     res.json({ ok: true });
@@ -622,6 +629,7 @@ router.post('/client/smartdoorsetting/unlock', async (req, res, next) => {
 
 router.post('/client/smartdoorsetting/unlock-logs', async (req, res, next) => {
   try {
+    const { email } = clientPortalAuthFromRequest(req, req.body?.email);
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
     const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
@@ -633,6 +641,7 @@ router.post('/client/smartdoorsetting/unlock-logs', async (req, res, next) => {
       to: req.body?.to,
       page: req.body?.page,
       pageSize: req.body?.pageSize,
+      loginEmail: email || '',
     });
     res.json(result);
   } catch (err) {
@@ -680,12 +689,13 @@ router.post('/client/smartdoorsetting/sync-locks-from-ttlock', async (req, res, 
 
 router.post('/client/smartdoorsetting/sync-single-lock-from-ttlock', async (req, res, next) => {
   try {
+    const { email } = clientPortalAuthFromRequest(req, req.body?.email);
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
     const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const id = req.body?.id;
     if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
-    const result = await syncSingleLockStatusFromTtlock(sdScope, id);
+    const result = await syncSingleLockStatusFromTtlock(sdScope, id, { loginEmail: email || '' });
     if (result.ok === false) return res.status(result.reason === 'LOCK_NOT_FOUND' ? 404 : 400).json(result);
     res.json(result);
   } catch (err) {
@@ -695,12 +705,13 @@ router.post('/client/smartdoorsetting/sync-single-lock-from-ttlock', async (req,
 
 router.post('/client/smartdoorsetting/sync-single-gateway-from-ttlock', async (req, res, next) => {
   try {
+    const { email } = clientPortalAuthFromRequest(req, req.body?.email);
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
     const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const id = req.body?.id;
     if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
-    const result = await syncSingleGatewayStatusFromTtlock(sdScope, id);
+    const result = await syncSingleGatewayStatusFromTtlock(sdScope, id, { loginEmail: email || '' });
     if (result.ok === false) return res.status(result.reason === 'GATEWAY_NOT_FOUND' ? 404 : 400).json(result);
     res.json(result);
   } catch (err) {
@@ -710,6 +721,7 @@ router.post('/client/smartdoorsetting/sync-single-gateway-from-ttlock', async (r
 
 router.post('/client/smartdoorsetting/sync-name', async (req, res, next) => {
   try {
+    const { email } = clientPortalAuthFromRequest(req, req.body?.email);
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
     const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
@@ -717,9 +729,12 @@ router.post('/client/smartdoorsetting/sync-name', async (req, res, next) => {
     if (!type || !externalId || !name) {
       return res.status(400).json({ ok: false, reason: 'TYPE_EXTERNALID_NAME_REQUIRED' });
     }
-    await syncTTLockName(sdScope, { type, externalId, name });
+    await syncTTLockName(sdScope, { type, externalId, name }, { loginEmail: email || '' });
     res.json({ ok: true });
   } catch (err) {
+    if (err?.code === 'LOCK_NOT_FOUND' || err?.code === 'GATEWAY_NOT_FOUND') {
+      return res.status(404).json({ ok: false, reason: err.code });
+    }
     if (err.message && err.message.startsWith('TTLOCK_')) {
       return res.status(400).json({ ok: false, reason: err.message });
     }
@@ -729,12 +744,13 @@ router.post('/client/smartdoorsetting/sync-name', async (req, res, next) => {
 
 router.post('/client/smartdoorsetting/ids-by-property', async (req, res, next) => {
   try {
+    const { email } = clientPortalAuthFromRequest(req, req.body?.email);
     const clientId = await resolveClientTtlockClientId(req, res);
     if (clientId == null) return;
     const sdScope = clnClientScope(clientId, parseTtlockSlotFromRequest(req));
     const propertyId = req.body?.propertyId;
     if (!propertyId) return res.json({ ids: [] });
-    const ids = await getSmartDoorIdsByProperty(sdScope, propertyId);
+    const ids = await getSmartDoorIdsByProperty(sdScope, propertyId, { loginEmail: email || '' });
     res.json({ ids });
   } catch (err) {
     next(err);

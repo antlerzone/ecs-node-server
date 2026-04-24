@@ -13,7 +13,7 @@ VALUES
   ('e0c10001-0000-4000-8000-000000000021', 'EPF - Employer''s Contribution', 'expense', 0, 131),
   ('e0c10001-0000-4000-8000-000000000022', 'SOCSO - Employer''s Contribution', 'expense', 0, 132),
   ('e0c10001-0000-4000-8000-000000000023', 'EIS - Employer''s Contribution', 'expense', 0, 133),
-  ('e0c10001-0000-4000-8000-000000000024', 'MTD Expenses', 'expense', 0, 134)
+  ('e0c10001-0000-4000-8000-000000000024', 'MTD - Employer''s Contribution', 'expense', 0, 134)
 ON DUPLICATE KEY UPDATE
   `title` = VALUES(`title`),
   `type` = VALUES(`type`),

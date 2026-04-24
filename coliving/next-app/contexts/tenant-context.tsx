@@ -87,6 +87,8 @@ export interface TenantProfile {
   account?: Array<{ clientId?: string }>
   /** ISO from portal_account.profile_self_verified_at — gate requires this + complete fields */
   profileSelfVerifiedAt?: string | null
+  /** portal_account Aliyun eKYC — layer 1 gate requires this + complete fields (same bar as employee portal) */
+  aliyunEkycLocked?: boolean
 }
 
 const TENANT_SELECTED_TENANCY_KEY = "tenant_selected_tenancy_id"
@@ -270,12 +272,7 @@ export function TenantProvider({ children }: { children: ReactNode }) {
   const hasPendingOperatorInvite = useMemo(() => computeHasPendingOperatorInvite(tenant), [tenant])
 
   const profileFieldsComplete = useMemo(() => computeTenantProfileComplete(tenant), [tenant])
-  const profileSelfVerified = useMemo(
-    () =>
-      tenant?.profileIdentityVerified === true ||
-      (tenant?.profileSelfVerifiedAt != null && String(tenant.profileSelfVerifiedAt).trim() !== ""),
-    [tenant]
-  )
+  const profileSelfVerified = useMemo(() => tenant?.aliyunEkycLocked === true, [tenant?.aliyunEkycLocked])
   const profileComplete = profileFieldsComplete && profileSelfVerified
 
   const gateLayer = useMemo(

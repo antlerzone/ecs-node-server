@@ -29,7 +29,7 @@ interface PortalItem {
 // Portal 顯示規則（portal.colivingjb.com/portal）：
 // - Tenant Portal: 谁都可以登入，不 filter，一律顯示 card
 // - Owner Portal: 谁都可以登入，不 filter，一律顯示 card
-// - Operator: 只有 client（該公司 staff）看到 card，只有 operator 才能登入
+// - Operator card: 凡後端 getMemberRoles 中 Coliving 運營商 staff（staffSource 以 coliving_ 開頭）— 含 client_user、staffdetail、operatordetail 公司主郵箱；不含 cleanlemons_*
 // - SaaS Admin: 固定 3 個 email（saasadmin 表）
 // - API Docs: 只有有 API access 的才看到 card
 const allPortals: PortalItem[] = [
@@ -94,6 +94,15 @@ function isPostPaymentPortalReturn(sp: ReturnType<typeof useSearchParams>): bool
   return isBillplzPaidReturn(sp) || isXenditEnquiryPortalReturn(sp)
 }
 
+/** Coliving 運營商側任一 staff（Company client_user、Contact staffdetail、operatordetail 主郵箱）— 與 access.service getMemberRoles staffSource 一致。 */
+function rolesAllowColivingOperatorCard(roles: { type?: string; staffSource?: string }[]): boolean {
+  return (roles || []).some((r) => {
+    if (String(r?.type || "") !== "staff") return false
+    const s = String(r?.staffSource || "")
+    return s.startsWith("coliving_")
+  })
+}
+
 function memberRolesToUserData(email: string, roles: { type: string }[]): UserData {
   const mapped: UserRole[] = (roles || []).map((r) =>
     r.type === "staff" ? "operator" : (r.type as UserRole)
@@ -148,6 +157,23 @@ function PortalSelectionPageInner() {
     getApiDocsMyAccess(user.email).then((r) => setHasApiDocsAccess(r.hasAccess))
   }, [user?.email])
 
+  /** 進入 /portal 即時拉 member-roles（含 staffSource），避免舊 JWT / localStorage 缺欄位導致 Operator 卡片不顯示。 */
+  useEffect(() => {
+    if (!user?.email || isDemoSite()) return
+    let cancelled = false
+    const email = user.email
+    ;(async () => {
+      const r = await getMemberRoles(email)
+      if (cancelled || !r.ok) return
+      const roles = r.roles ?? []
+      setMember({ email, roles })
+      setUser(memberRolesToUserData(email, roles))
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [user?.email])
+
   useEffect(() => {
     if (!user?.email || isDemoSite()) return
     if (!isPostPaymentPortalReturn(searchParams)) return
@@ -164,10 +190,10 @@ function PortalSelectionPageInner() {
         const r = await getMemberRoles(email)
         if (cancelled) return
         const roles = r.roles ?? []
-        const hasStaff = roles.some((x) => x.type === "staff")
+        const hasOp = rolesAllowColivingOperatorCard(roles)
         setMember({ email, roles })
         setUser(memberRolesToUserData(email, roles))
-        if (hasStaff || i === maxAttempts - 1) {
+        if (hasOp || i === maxAttempts - 1) {
           const docs = await getApiDocsMyAccess(email)
           if (!cancelled) setHasApiDocsAccess(docs.hasAccess)
           break
@@ -191,11 +217,18 @@ function PortalSelectionPageInner() {
     router.push("/login")
   }
 
-  // Filter: showToAll → 顯示；apiDocsOnly → 僅 hasApiDocsAccess；否則僅當 user.roles 含該 role 時顯示
+  /** Operator card：任一 Coliving 運營商 staff（staffSource 以 coliving_ 開頭）。 */
+  const hasColivingOperatorPortalAccess = (() => {
+    const m = getMember()
+    return Array.isArray(m?.roles) && rolesAllowColivingOperatorCard(m.roles as { type?: string; staffSource?: string }[])
+  })()
+
+  // Filter: showToAll → 顯示；apiDocsOnly → 僅 hasApiDocsAccess；Operator → hasColivingOperatorPortalAccess；其餘看 user.roles
   const accessiblePortals = isDemoSite()
     ? allPortals.filter((portal) => portal.href !== "/saas-admin" && portal.href !== "/docs")
     : (user ? allPortals.filter(portal => {
         if (portal.apiDocsOnly) return hasApiDocsAccess
+        if (portal.href === "/operator") return hasColivingOperatorPortalAccess
         return portal.showToAll || user.roles.includes(portal.role)
       }) : [])
 

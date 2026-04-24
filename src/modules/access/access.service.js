@@ -973,6 +973,7 @@ async function getMemberRoles(email) {
           clientIdsSeen.add(row.clientId);
           roles.push({
             type: 'staff',
+            staffSource: 'coliving_client_user',
             staffId: row.staffId,
             clientId: row.clientId,
             clientTitle: row.clientTitle || ''
@@ -992,10 +993,39 @@ async function getMemberRoles(email) {
           clientIdsSeen.add(row.clientId);
           roles.push({
             type: 'staff',
+            staffSource: 'coliving_staffdetail',
             staffId: row.staffId,
             clientId: row.clientId,
             clientTitle: row.clientTitle || ''
           });
+        }
+      }
+
+      // Coliving: operatordetail company master email (same table as Operator master / Company)
+      try {
+        const [colivingOdByEmail] = await pool.query(
+          `SELECT o.id AS operatorId, o.title AS clientTitle
+           FROM \`${opTable}\` o
+           WHERE LOWER(TRIM(o.email)) = ?`,
+          [normalizedEmail]
+        );
+        for (const row of colivingOdByEmail || []) {
+          const oid = row.operatorId;
+          if (oid && !clientIdsSeen.has(oid)) {
+            clientIdsSeen.add(oid);
+            roles.push({
+              type: 'staff',
+              staffSource: 'coliving_operatordetail_email',
+              staffId: oid,
+              clientId: oid,
+              clientTitle: row.clientTitle != null ? String(row.clientTitle) : ''
+            });
+          }
+        }
+      } catch (e) {
+        const msg = String(e?.sqlMessage || e?.message || '');
+        if (!msg.includes("doesn't exist") && !msg.includes('Unknown table')) {
+          console.warn('[access] getMemberRoles coliving operatordetail by email:', msg);
         }
       }
 
@@ -1015,6 +1045,7 @@ async function getMemberRoles(email) {
             clientIdsSeen.add(row.clientId);
             roles.push({
               type: 'staff',
+              staffSource: 'cleanlemons_supervisor',
               staffId: row.staffId,
               clientId: row.clientId,
               clientTitle: row.clientTitle || ''
@@ -1041,6 +1072,7 @@ async function getMemberRoles(email) {
             clientIdsSeen.add(oid);
             roles.push({
               type: 'staff',
+              staffSource: 'cleanlemons_operatordetail_email',
               staffId: oid,
               clientId: oid,
               clientTitle: row.operatorName != null ? String(row.operatorName) : ''

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
+import { Switch } from '@/components/ui/switch'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -29,10 +30,14 @@ import {
   createSaasadminAiMdRule,
   deleteSaasadminAiMdRule,
   fetchSaasadminAiMdRules,
+  fetchSaasadminOperatorAiAccess,
   postSaasadminAiChat,
+  putSaasadminOperatorAiAccess,
   type SaasadminAiChatMessage,
   type SaasadminAiMdItem,
+  type PlatformOperatorAiPolicy,
 } from '@/lib/cleanlemon-api'
+import { OPERATOR_SCHEDULE_AI_DISPLAY_NAME } from '@/lib/cleanlemon-operator-ai-brand'
 import { Loader2, Send, Trash2 } from 'lucide-react'
 
 function guessTitleFromAssistantText(text: string): string {
@@ -75,6 +80,21 @@ export default function AdminAiRulesPage() {
   const [deleteId, setDeleteId] = useState<string | null>(null)
   const [deleting, setDeleting] = useState(false)
 
+  const [accessPolicy, setAccessPolicy] = useState<PlatformOperatorAiPolicy | null>(null)
+  const [policyLoading, setPolicyLoading] = useState(true)
+  const [policySaving, setPolicySaving] = useState(false)
+
+  const loadAccessPolicy = useCallback(async () => {
+    setPolicyLoading(true)
+    const r = await fetchSaasadminOperatorAiAccess()
+    if (r.ok && r.policy) {
+      setAccessPolicy(r.policy)
+    } else {
+      setAccessPolicy({ accessEnabled: true, allowedDataScopes: ['cln_schedule'], updatedAt: null })
+    }
+    setPolicyLoading(false)
+  }, [])
+
   const loadRules = useCallback(async () => {
     setLoadingRules(true)
     const r = await fetchSaasadminAiMdRules()
@@ -85,6 +105,10 @@ export default function AdminAiRulesPage() {
   useEffect(() => {
     void loadRules()
   }, [loadRules])
+
+  useEffect(() => {
+    void loadAccessPolicy()
+  }, [loadAccessPolicy])
 
   function openSaveFromAssistant(content: string) {
     const body = String(content || '').trim()
@@ -128,6 +152,19 @@ export default function AdminAiRulesPage() {
     }
   }
 
+  async function handleAccessToggle(checked: boolean) {
+    if (!accessPolicy || policySaving) return
+    setPolicySaving(true)
+    const scopes =
+      accessPolicy.allowedDataScopes?.length > 0 ? accessPolicy.allowedDataScopes : ['cln_schedule']
+    const r = await putSaasadminOperatorAiAccess({
+      accessEnabled: checked,
+      allowedDataScopes: scopes,
+    })
+    setPolicySaving(false)
+    if (r.ok && r.policy) setAccessPolicy(r.policy)
+  }
+
   async function confirmDelete() {
     if (!deleteId) return
     setDeleting(true)
@@ -140,11 +177,49 @@ export default function AdminAiRulesPage() {
   return (
     <div className="mx-auto max-w-5xl space-y-8 p-4 md:p-8">
       <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Operator AI — platform rules</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">
+          {OPERATOR_SCHEDULE_AI_DISPLAY_NAME} — platform rules
+        </h1>
         <p className="text-muted-foreground mt-1 text-sm">
-          Rules are added from AI replies below (saved to MySQL and injected into every operator schedule-AI call).
+          Rules are added from admin chat replies below (saved to MySQL and injected into every operator{' '}
+          {OPERATOR_SCHEDULE_AI_DISPLAY_NAME} call).
         </p>
       </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>{OPERATOR_SCHEDULE_AI_DISPLAY_NAME} access (operators)</CardTitle>
+          <CardDescription>
+            Master switch for all operators: {OPERATOR_SCHEDULE_AI_DISPLAY_NAME} chat, auto-assign, rebalance, and
+            related cron jobs. Each operator still needs their own model API key under Company → API Integration. Current
+            data scope: <code className="text-xs">cln_schedule</code> (jobs on the schedule board) only.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="space-y-1">
+            <p className="text-sm font-medium">Allow {OPERATOR_SCHEDULE_AI_DISPLAY_NAME} for operators</p>
+            <p className="text-muted-foreground text-xs">
+              When off, operators keep manual scheduling; platform rules below stay stored but models are not called.
+            </p>
+            {accessPolicy?.updatedAt ? (
+              <p className="text-muted-foreground text-xs">Last update: {formatRuleAddedAt(accessPolicy.updatedAt)}</p>
+            ) : null}
+          </div>
+          {policyLoading ? (
+            <Loader2 className="text-muted-foreground h-6 w-6 animate-spin shrink-0" />
+          ) : (
+            <div className="flex items-center gap-2 shrink-0">
+              <span className="text-muted-foreground text-xs">{accessPolicy?.accessEnabled ? 'On' : 'Off'}</span>
+              <Switch
+                checked={!!accessPolicy?.accessEnabled}
+                disabled={policySaving || !accessPolicy}
+                onCheckedChange={(c) => void handleAccessToggle(c === true)}
+                aria-label={`Allow ${OPERATOR_SCHEDULE_AI_DISPLAY_NAME} for operators`}
+              />
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader>

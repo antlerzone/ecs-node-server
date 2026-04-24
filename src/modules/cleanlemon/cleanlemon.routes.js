@@ -13,15 +13,44 @@ const clnInt = require('./cleanlemon-integration.service');
 const clnOpAi = require('./cln-operator-ai.service');
 const clnSaasAiMd = require('./cln-saasadmin-ai-md.service');
 const clnSalary = require('./cleanlemon-operator-salary.service');
+const clnOpCompanyEmail = require('./cln-operator-company-email.service');
 const clnDriverTrip = require('./cleanlemon-driver-trip.service');
 const clnDobi = require('./cleanlemon-dobi.service');
+const clnOpPropGroup = require('./cleanlemon-operator-property-group.service');
+const clnPropLock = require('./cleanlemon-property-lock.service');
 const accessSvc = require('../access/access.service');
 const { verifyPortalToken } = require('../portal-auth/portal-auth.service');
+const clnReview = require('./cleanlemon-review.service');
 
 function isMissingClnOperatorAiTable(err) {
   const msg = String(err?.message || '');
   const c = String(err?.code || '');
   return c === 'ER_NO_SUCH_TABLE' || msg.includes("doesn't exist") || msg.includes('Unknown table');
+}
+
+/** Operator invoice create: accounting / validation failures (not server bugs). */
+function isOperatorInvoiceClientError(err) {
+  const sc = Number(err?.statusCode);
+  if (sc === 400) return true;
+  const codeOnly = String(err?.code || '').trim();
+  if (codeOnly.startsWith('BUKKU_') || codeOnly.startsWith('XERO_')) return true;
+  const r = String(err?.message || err?.code || '').trim();
+  if (!r) return false;
+  if (r === 'OPERATOR_ID_REQUIRED') return true;
+  if (r === 'ACCOUNTING_INVOICE_FAILED') return true;
+  if (r === 'ACCOUNT_MAPPING_MISSING' || r === 'MISSING_CLIENT_ID' || r === 'INVALID_AMOUNT' || r === 'NO_LINE_ITEMS') {
+    return true;
+  }
+  if (r.startsWith('BUKKU_') || r.startsWith('XERO_')) return true;
+  return false;
+}
+
+/** MySQL pool or axios (Bukku/Xero) closed the socket mid-request — not a validation bug. */
+function isTransientNetworkError(err) {
+  const msg = [err?.message, err?.code, err?.cause?.message, err?.errors?.[0]?.message]
+    .map((x) => String(x || ''))
+    .join(' ');
+  return /ECONNRESET|ETIMEDOUT|socket hang up|ECONNREFUSED|EPIPE|ENETUNREACH/i.test(msg);
 }
 
 /**
@@ -51,6 +80,13 @@ function employeePortalEmailStrict(req) {
   return payload?.email ? String(payload.email).trim().toLowerCase() : null;
 }
 
+function portalJwtPayload(req) {
+  const auth = String(req.headers.authorization || '');
+  const m = /^Bearer\s+(\S+)/i.exec(auth);
+  if (!m) return null;
+  return verifyPortalToken(m[1].trim());
+}
+
 /** SaaS platform admin only — Cleanlemons admin API (JWT email in `saasadmin`). */
 async function ensureCleanlemonSaasAdmin(req, res) {
   const email = employeePortalEmailStrict(req);
@@ -70,6 +106,37 @@ async function ensureCleanlemonSaasAdmin(req, res) {
     return email;
   } catch (err) {
     console.error('[cleanlemon] ensureCleanlemonSaasAdmin', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+    return null;
+  }
+}
+
+/** Portal JWT email must be operator master or staff of `operatorId`. */
+async function requireOperatorStaffForPortal(req, res, operatorIdRaw) {
+  const email = employeePortalEmailStrict(req);
+  if (!email) {
+    res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    return null;
+  }
+  const operatorId = String(operatorIdRaw ?? '').trim();
+  if (!operatorId) {
+    res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    return null;
+  }
+  try {
+    await svc.assertClnOperatorStaffEmail(operatorId, email);
+    return { email, operatorId };
+  } catch (err) {
+    const code = String(err?.code || '');
+    if (
+      code === 'OPERATOR_ACCESS_DENIED' ||
+      code === 'OPERATORDETAIL_REQUIRED' ||
+      code === 'MISSING_OPERATOR_OR_EMAIL'
+    ) {
+      res.status(403).json({ ok: false, reason: code });
+      return null;
+    }
+    console.error('[cleanlemon] requireOperatorStaffForPortal', err);
     res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
     return null;
   }
@@ -1508,6 +1575,189 @@ router.post('/client/properties/detail', async (req, res) => {
   }
 });
 
+/** Operator portal — list native lock binds (`cln_property_lock`). */
+router.post('/operator/property-locks/list', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const propertyId = String(req.body?.propertyId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    if (!propertyId) return res.status(400).json({ ok: false, reason: 'MISSING_PROPERTY_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const items = await clnPropLock.listNativeLocksForOperatorPortal({ operatorId, propertyId });
+    return res.json({ ok: true, items });
+  } catch (err) {
+    const code = err?.code;
+    if (code === 'MISSING_IDS') return res.status(400).json({ ok: false, reason: code });
+    if (code === 'OPERATOR_MISMATCH') return res.status(403).json({ ok: false, reason: code });
+    if (code === 'UNSUPPORTED') return res.status(501).json({ ok: false, reason: code });
+    console.error('[cleanlemon] operator/property-locks/list', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+router.post('/operator/property-locks/bind', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const propertyId = String(req.body?.propertyId || '').trim();
+    const lockdetailId = String(req.body?.lockdetailId || '').trim();
+    const ttlockSlot = req.body?.ttlockSlot != null ? Number(req.body.ttlockSlot) : 0;
+    const integrationSource = String(req.body?.integrationSource || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    if (!propertyId) return res.status(400).json({ ok: false, reason: 'MISSING_PROPERTY_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const out = await clnPropLock.bindNativeLockOperator({
+      operatorId,
+      propertyId,
+      lockdetailId,
+      ttlockSlot,
+      integrationSource,
+    });
+    return res.json({ ok: true, bindId: out.bindId });
+  } catch (err) {
+    const code = err?.code;
+    if (code === 'MISSING_IDS' || code === 'MISSING_LOCK_ID') return res.status(400).json({ ok: false, reason: code });
+    if (code === 'OPERATOR_MISMATCH') return res.status(403).json({ ok: false, reason: code });
+    if (code === 'PROPERTY_COLIVING_LOCK_MANAGED') return res.status(409).json({ ok: false, reason: code });
+    if (code === 'LOCK_NOT_IN_SCOPE') return res.status(400).json({ ok: false, reason: code });
+    if (code === 'ALREADY_BOUND') return res.status(409).json({ ok: false, reason: code });
+    if (code === 'UNSUPPORTED') return res.status(501).json({ ok: false, reason: code });
+    console.error('[cleanlemon] operator/property-locks/bind', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+router.post('/operator/property-locks/unbind', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const propertyId = String(req.body?.propertyId || '').trim();
+    const lockdetailId = String(req.body?.lockdetailId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    if (!propertyId) return res.status(400).json({ ok: false, reason: 'MISSING_PROPERTY_ID' });
+    if (!lockdetailId) return res.status(400).json({ ok: false, reason: 'MISSING_LOCK_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    await clnPropLock.unbindNativeLockOperator({ operatorId, propertyId, lockdetailId });
+    return res.json({ ok: true });
+  } catch (err) {
+    const code = err?.code;
+    if (code === 'MISSING_IDS') return res.status(400).json({ ok: false, reason: code });
+    if (code === 'OPERATOR_MISMATCH') return res.status(403).json({ ok: false, reason: code });
+    if (code === 'UNSUPPORTED') return res.status(501).json({ ok: false, reason: code });
+    console.error('[cleanlemon] operator/property-locks/unbind', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+/** B2B client portal — native lock binds (same table; client TTLock scope). */
+router.post('/client/property-locks/list', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const propertyId = String(req.body?.propertyId || '').trim();
+    if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    if (!jwtVerified && !operatorId) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL_OR_OPERATOR' });
+    }
+    if (!propertyId) return res.status(400).json({ ok: false, reason: 'MISSING_PROPERTY_ID' });
+    const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
+      ensureClientdetailIfMissing: jwtVerified,
+    });
+    const items = await clnPropLock.listNativeLocksForClientPortal({ clientdetailId, propertyId });
+    return res.json({ ok: true, items });
+  } catch (err) {
+    if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
+      return res.status(409).json({ ok: false, reason: err.code });
+    }
+    const code = err?.code;
+    if (code === 'MISSING_IDS') return res.status(400).json({ ok: false, reason: code });
+    if (code === 'CLIENT_PROPERTY_MISMATCH') return res.status(403).json({ ok: false, reason: code });
+    if (code === 'UNSUPPORTED') return res.status(501).json({ ok: false, reason: code });
+    console.error('[cleanlemon] client/property-locks/list', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+router.post('/client/property-locks/bind', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const propertyId = String(req.body?.propertyId || '').trim();
+    const lockdetailId = String(req.body?.lockdetailId || '').trim();
+    const ttlockSlot = req.body?.ttlockSlot != null ? Number(req.body.ttlockSlot) : 0;
+    const integrationSource = String(req.body?.integrationSource || '').trim();
+    if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    if (!jwtVerified && !operatorId) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL_OR_OPERATOR' });
+    }
+    if (!propertyId) return res.status(400).json({ ok: false, reason: 'MISSING_PROPERTY_ID' });
+    const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
+      ensureClientdetailIfMissing: jwtVerified,
+    });
+    const out = await clnPropLock.bindNativeLockClient({
+      clientdetailId,
+      propertyId,
+      lockdetailId,
+      ttlockSlot,
+      integrationSource,
+    });
+    return res.json({ ok: true, bindId: out.bindId });
+  } catch (err) {
+    if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
+      return res.status(409).json({ ok: false, reason: err.code });
+    }
+    const code = err?.code;
+    if (code === 'MISSING_IDS' || code === 'MISSING_LOCK_ID') return res.status(400).json({ ok: false, reason: code });
+    if (code === 'CLIENT_PROPERTY_MISMATCH') return res.status(403).json({ ok: false, reason: code });
+    if (code === 'PROPERTY_COLIVING_LOCK_MANAGED') return res.status(409).json({ ok: false, reason: code });
+    if (code === 'LOCK_NOT_IN_SCOPE') return res.status(400).json({ ok: false, reason: code });
+    if (code === 'ALREADY_BOUND') return res.status(409).json({ ok: false, reason: code });
+    if (code === 'UNSUPPORTED') return res.status(501).json({ ok: false, reason: code });
+    console.error('[cleanlemon] client/property-locks/bind', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+router.post('/client/property-locks/unbind', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const propertyId = String(req.body?.propertyId || '').trim();
+    const lockdetailId = String(req.body?.lockdetailId || '').trim();
+    if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    if (!jwtVerified && !operatorId) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL_OR_OPERATOR' });
+    }
+    if (!propertyId) return res.status(400).json({ ok: false, reason: 'MISSING_PROPERTY_ID' });
+    if (!lockdetailId) return res.status(400).json({ ok: false, reason: 'MISSING_LOCK_ID' });
+    const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
+      ensureClientdetailIfMissing: jwtVerified,
+    });
+    await clnPropLock.unbindNativeLockClient({ clientdetailId, propertyId, lockdetailId });
+    return res.json({ ok: true });
+  } catch (err) {
+    if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
+      return res.status(409).json({ ok: false, reason: err.code });
+    }
+    const code = err?.code;
+    if (code === 'MISSING_IDS') return res.status(400).json({ ok: false, reason: code });
+    if (code === 'CLIENT_PROPERTY_MISMATCH') return res.status(403).json({ ok: false, reason: code });
+    if (code === 'UNSUPPORTED') return res.status(501).json({ ok: false, reason: code });
+    console.error('[cleanlemon] client/property-locks/unbind', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
 /** B2B client portal — patch cln_property (+ Coliving propertydetail when linked). */
 router.post('/client/properties/patch', async (req, res) => {
   try {
@@ -2020,6 +2270,133 @@ router.get('/client/invoices', async (req, res) => {
   }
 });
 
+/** Billplz server callback (form POST) — marks invoices paid when signature + amount match checkout row. */
+router.post(
+  '/client/invoices/billplz-callback',
+  express.urlencoded({ extended: true }),
+  async (req, res) => {
+    try {
+      const checkoutId = String(req.query?.checkout_id || req.body?.checkout_id || '').trim();
+      const out = await svc.handleB2bInvoiceBillplzCallback(checkoutId, { ...req.body, ...req.query });
+      if (!out.ok) {
+        const status =
+          out.reason === 'BILLPLZ_SIGNATURE_INVALID' || out.reason === 'BILLPLZ_NOT_CONFIGURED' ? 403 : 400;
+        return res.status(status).type('text/plain').send(String(out.reason || 'ERROR'));
+      }
+      return res.status(200).type('text/plain').send('OK');
+    } catch (err) {
+      console.error('[cleanlemon] client/invoices:billplz-callback', err);
+      return res.status(500).type('text/plain').send('SERVER_ERROR');
+    }
+  },
+);
+
+/** Xendit invoice webhook (JSON) — `X-Callback-Token` must match operator settings. */
+router.post('/client/invoices/xendit-webhook', async (req, res) => {
+  try {
+    const out = await svc.handleB2bInvoiceXenditWebhook({
+      headers: req.headers,
+      body: req.body || {},
+      query: req.query || {},
+    });
+    if (!out.ok) {
+      const status = out.reason === 'XENDIT_CALLBACK_TOKEN_INVALID' ? 403 : 400;
+      return res.status(status).json({ ok: false, reason: out.reason || 'ERROR' });
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('[cleanlemon] client/invoices:xendit-webhook', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+/** B2B client — same pattern as Coliving tenant `create-payment`: optional return/cancel URLs, auto gateway, `{ ok, type: 'redirect', url, provider }`. */
+router.post('/client/invoices/create-payment', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const invoiceIds = req.body?.invoiceIds;
+    const returnUrl = String(req.body?.returnUrl || '').trim();
+    const cancelUrl = String(req.body?.cancelUrl || '').trim();
+    if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    if (!jwtVerified && !operatorId) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL_OR_OPERATOR' });
+    }
+    if (!Array.isArray(invoiceIds) || !invoiceIds.length) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_INVOICE_IDS' });
+    }
+    const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
+      ensureClientdetailIfMissing: jwtVerified,
+    });
+    const paymentProvider = String(req.body?.paymentProvider || req.body?.provider || '').trim().toLowerCase();
+    const out = await svc.createClientPortalInvoicePayment({
+      clientdetailId,
+      operatorId,
+      invoiceIds,
+      email,
+      returnUrl: returnUrl || undefined,
+      cancelUrl: cancelUrl || undefined,
+      ...(paymentProvider ? { paymentProvider } : {}),
+    });
+    if (!out.ok) {
+      return res.status(400).json({ ok: false, reason: out.code || 'CREATE_PAYMENT_FAILED' });
+    }
+    return res.json({
+      ok: true,
+      type: 'redirect',
+      url: out.url,
+      sessionId: out.sessionId,
+      provider: out.provider,
+    });
+  } catch (err) {
+    if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
+      return res.status(409).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] client/invoices:create-payment', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+/** B2B client — after redirect (`success=1` + `session_id` / `bill_id` / `checkout_id`), same role as tenant `confirm-payment`. */
+router.post('/client/invoices/confirm-payment', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const b = req.body || {};
+    const sessionId = String(b.session_id || b.sessionId || '').trim();
+    const billId = String(b.bill_id || b.billId || '').trim();
+    const checkoutId = String(b.checkout_id || b.checkoutId || '').trim();
+    const provider = String(b.provider || '').trim().toLowerCase();
+    if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    if (!jwtVerified && !operatorId) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL_OR_OPERATOR' });
+    }
+    const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
+      ensureClientdetailIfMissing: jwtVerified,
+    });
+    const out = await svc.confirmClientPortalInvoicePayment({
+      clientdetailId,
+      provider: provider || undefined,
+      sessionId: sessionId || undefined,
+      billId: billId || undefined,
+      checkoutId: checkoutId || undefined,
+    });
+    return res.json(out);
+  } catch (err) {
+    if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
+      return res.status(409).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] client/invoices:confirm-payment', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
 /** B2B client — Stripe Checkout for one operator’s unpaid invoices (same operator only; Connect destination). */
 router.post('/client/invoices/checkout', async (req, res) => {
   try {
@@ -2041,6 +2418,9 @@ router.post('/client/invoices/checkout', async (req, res) => {
     const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
       ensureClientdetailIfMissing: jwtVerified,
     });
+    const paymentProvider = String(req.body?.paymentProvider || req.body?.provider || 'stripe')
+      .trim()
+      .toLowerCase();
     const out = await svc.createClientPortalInvoiceCheckoutSession({
       clientdetailId,
       operatorId,
@@ -2048,11 +2428,17 @@ router.post('/client/invoices/checkout', async (req, res) => {
       email,
       successUrl,
       cancelUrl,
+      paymentProvider,
     });
     if (!out.ok) {
       return res.status(400).json({ ok: false, reason: out.code || 'CHECKOUT_FAILED' });
     }
-    return res.json({ ok: true, url: out.url, sessionId: out.sessionId });
+    return res.json({
+      ok: true,
+      url: out.url,
+      sessionId: out.sessionId,
+      provider: out.provider || paymentProvider,
+    });
   } catch (err) {
     if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
       return res.status(403).json({ ok: false, reason: err.code });
@@ -2061,6 +2447,86 @@ router.post('/client/invoices/checkout', async (req, res) => {
       return res.status(409).json({ ok: false, reason: err.code });
     }
     console.error('[cleanlemon] client/invoices:checkout', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+/** B2B client — upload payment receipt (multipart: file, invoiceIds JSON array string, email, operatorId). */
+router.post('/client/invoices/receipt-upload', uploadMiddleware, async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    if (!jwtVerified && !operatorId) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL_OR_OPERATOR' });
+    }
+    if (!req.file || !req.file.buffer) return res.status(400).json({ ok: false, reason: 'FILE_REQUIRED' });
+    const invoiceIdsRaw = req.body?.invoiceIds ?? req.body?.invoice_ids;
+    let invoiceIds = [];
+    try {
+      invoiceIds =
+        typeof invoiceIdsRaw === 'string'
+          ? JSON.parse(invoiceIdsRaw)
+          : Array.isArray(invoiceIdsRaw)
+            ? invoiceIdsRaw
+            : [];
+    } catch {
+      invoiceIds = [];
+    }
+    invoiceIds = [...new Set(invoiceIds.map((x) => String(x).trim()).filter(Boolean))];
+    if (!invoiceIds.length) return res.status(400).json({ ok: false, reason: 'MISSING_INVOICE_IDS' });
+    const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
+      ensureClientdetailIfMissing: jwtVerified,
+    });
+    const oss = await uploadToOss(req.file.buffer, req.file.originalname || 'receipt', `cln-client-${clientdetailId}`);
+    if (!oss.ok) {
+      const status = oss.reason === 'OSS_CREDENTIAL_INVALID' ? 503 : 400;
+      return res.status(status).json({ ok: false, reason: oss.reason || 'UPLOAD_FAILED' });
+    }
+    const out = await svc.attachClientPortalInvoiceReceipt({
+      clientdetailId,
+      invoiceIds,
+      receiptUrl: oss.url,
+    });
+    if (!out.ok) return res.status(400).json({ ok: false, reason: out.code || 'ATTACH_FAILED' });
+    return res.json({ ok: true, url: oss.url, updated: out.updated });
+  } catch (err) {
+    if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
+      return res.status(409).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] client/invoices:receipt-upload', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+/** B2B client — operator bank transfer details from Company settings (for pay when Stripe Connect is off). */
+router.get('/client/operator/bank-transfer-info', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.query?.email);
+    const operatorId = String(req.query?.operatorId || '').trim();
+    if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    if (!jwtVerified && !operatorId) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL_OR_OPERATOR' });
+    }
+    await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
+      ensureClientdetailIfMissing: jwtVerified,
+    });
+    const out = await svc.getClientPortalOperatorBankTransferInfo(operatorId);
+    if (!out.ok) {
+      return res.status(400).json({ ok: false, reason: out.code || 'FAILED' });
+    }
+    return res.json({ ok: true, ...out });
+  } catch (err) {
+    if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
+      return res.status(409).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] client/operator/bank-transfer-info', err);
     return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
   }
 });
@@ -2121,6 +2587,7 @@ router.post('/client/schedule-jobs', async (req, res) => {
     const price = req.body?.price;
     const clientRemark = req.body?.clientRemark != null ? String(req.body.clientRemark) : undefined;
     const groupId = String(req.body?.groupId || '').trim();
+    const btob = req.body?.btob;
     if (!propertyId || !date) {
       return res.status(400).json({ ok: false, reason: 'MISSING_PROPERTY_OR_DATE' });
     }
@@ -2137,6 +2604,7 @@ router.post('/client/schedule-jobs', async (req, res) => {
       price,
       clientRemark,
       groupId: groupId || undefined,
+      btob,
     });
     return res.json({ ok: true, id });
   } catch (err) {
@@ -2178,6 +2646,9 @@ router.put('/client/schedule-jobs/:id', async (req, res) => {
     const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
     const operatorId = String(req.body?.operatorId || '').trim();
     if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    if (!jwtVerified && !operatorId) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL_OR_OPERATOR' });
+    }
     const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
       ensureClientdetailIfMissing: jwtVerified,
     });
@@ -2185,6 +2656,7 @@ router.put('/client/schedule-jobs/:id', async (req, res) => {
     const status = req.body?.status;
     const statusSetByEmail = req.body?.statusSetByEmail;
     const groupId = String(req.body?.groupId || '').trim();
+    const btob = req.body?.btob;
     await svc.updateClientPortalScheduleJob({
       clientdetailId,
       operatorId,
@@ -2193,6 +2665,8 @@ router.put('/client/schedule-jobs/:id', async (req, res) => {
       status,
       statusSetByEmail,
       groupId: groupId || undefined,
+      btob,
+      loginEmail: email,
     });
     return res.json({ ok: true });
   } catch (err) {
@@ -2222,6 +2696,49 @@ router.put('/client/schedule-jobs/:id', async (req, res) => {
   }
 });
 
+router.delete('/client/schedule-jobs/:id', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email || req.query?.email);
+    const operatorId = String(req.body?.operatorId || req.query?.operatorId || '').trim();
+    if (!email) return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    if (!jwtVerified && !operatorId) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL_OR_OPERATOR' });
+    }
+    const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
+      ensureClientdetailIfMissing: jwtVerified,
+    });
+    const groupId = String(req.body?.groupId || req.query?.groupId || '').trim();
+    const out = await svc.deleteClientPortalScheduleJob({
+      clientdetailId,
+      operatorId,
+      scheduleId: req.params.id,
+      groupId: groupId || undefined,
+      loginEmail: email,
+    });
+    return res.json(out);
+  } catch (err) {
+    if (err?.code === 'CLIENT_PORTAL_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'CLIENT_PORTAL_AMBIGUOUS_CLIENTDETAIL') {
+      return res.status(409).json({ ok: false, reason: err.code });
+    }
+    if (
+      err?.code === 'PROPERTY_OPERATOR_MISMATCH' ||
+      err?.code === 'NOT_FOUND' ||
+      err?.code === 'MISSING_IDS' ||
+      err?.code === 'GROUP_PROPERTY_MISMATCH'
+    ) {
+      return res.status(400).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'GROUP_PERMISSION_DENIED' || err?.code === 'GROUP_ACCESS_DENIED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] client/schedule-jobs:delete', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
 router.get('/client/damage-reports', async (req, res) => {
   try {
     const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.query?.email || req.body?.email);
@@ -2230,13 +2747,15 @@ router.get('/client/damage-reports', async (req, res) => {
     if (!jwtVerified && !operatorId) {
       return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL_OR_OPERATOR' });
     }
+    /** Do not auto-create `cln_clientdetail` on read — that UUID would not match properties bound to the real B2B client (e.g. Antlerzone). */
     const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
-      ensureClientdetailIfMissing: jwtVerified,
+      ensureClientdetailIfMissing: false,
     });
     const items = await svc.listClientPortalDamageReports({
       clientdetailId,
       operatorId,
       limit: req.query?.limit,
+      loginEmail: email,
     });
     return res.json({ ok: true, items });
   } catch (err) {
@@ -2260,7 +2779,7 @@ router.post('/client/damage-reports/:id/acknowledge', async (req, res) => {
       return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL_OR_OPERATOR' });
     }
     const clientdetailId = await svc.resolveClnClientdetailIdForClientPortal(email, operatorId, {
-      ensureClientdetailIfMissing: jwtVerified,
+      ensureClientdetailIfMissing: false,
     });
     const reportId = String(req.params.id || '').trim();
     const out = await svc.acknowledgeClientPortalDamageReport({
@@ -2268,6 +2787,7 @@ router.post('/client/damage-reports/:id/acknowledge', async (req, res) => {
       operatorId,
       reportId,
       acknowledgedByEmail: email,
+      loginEmail: email,
     });
     return res.json(out);
   } catch (err) {
@@ -2344,6 +2864,8 @@ router.get('/operator/property-link-requests', async (req, res) => {
   try {
     const operatorId = String(req.query?.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const kind = String(req.query?.kind || '').trim() || null;
     if (String(req.query?.counts || '').trim() === '1') {
       const counts = await plr.countPropertyLinkRequestsForOperator(operatorId, { kind });
@@ -2368,16 +2890,15 @@ router.post('/operator/property-link-requests/bulk-decide', async (req, res) => 
   try {
     const operatorId = String(req.body?.operatorId || '').trim();
     const decision = String(req.body?.decision || '').trim().toLowerCase();
-    const email = String(req.body?.email || '').trim().toLowerCase();
     const requestIds = Array.isArray(req.body?.requestIds) ? req.body.requestIds : [];
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
     if (!['approve', 'reject'].includes(decision)) {
       return res.status(400).json({ ok: false, reason: 'INVALID_DECISION' });
     }
     if (!requestIds.length) return res.status(400).json({ ok: false, reason: 'MISSING_REQUEST_IDS' });
-    if (email) {
-      await svc.assertClnOperatorStaffEmail(operatorId, email);
-    }
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const email = gate.email;
     const pool = require('../../config/db');
     const results = [];
     for (const rawId of requestIds) {
@@ -2435,14 +2956,13 @@ router.post('/operator/property-link-requests/:id/decide', async (req, res) => {
   try {
     const operatorId = String(req.body?.operatorId || '').trim();
     const decision = String(req.body?.decision || '').trim().toLowerCase();
-    const email = String(req.body?.email || '').trim().toLowerCase();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
     if (!['approve', 'reject'].includes(decision)) {
       return res.status(400).json({ ok: false, reason: 'INVALID_DECISION' });
     }
-    if (email) {
-      await svc.assertClnOperatorStaffEmail(operatorId, email);
-    }
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const email = gate.email;
     const rid = String(req.params.id || '').trim();
     const pool = require('../../config/db');
     const [[row]] = await pool.query('SELECT * FROM cln_property_link_request WHERE id = ? LIMIT 1', [rid]);
@@ -2618,6 +3138,8 @@ router.get('/pricing-config', async (req, res) => {
     if (!operatorId) {
       return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
     }
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const config = await svc.getPricingConfig(operatorId);
     res.json({ ok: true, config: config || null });
   } catch (err) {
@@ -2636,6 +3158,8 @@ router.put('/pricing-config', async (req, res) => {
     if (!config || typeof config !== 'object') {
       return res.status(400).json({ ok: false, reason: 'INVALID_CONFIG' });
     }
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     await svc.upsertPricingConfig(operatorId, config);
     res.json({ ok: true });
   } catch (err) {
@@ -2646,7 +3170,10 @@ router.put('/pricing-config', async (req, res) => {
 
 router.get('/operator/dashboard', async (req, res) => {
   try {
-    const body = await svc.operatorDashboard();
+    const operatorId = String(req.query.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const body = await svc.operatorDashboard({ operatorId: gate.operatorId });
     res.json({ ok: true, ...body });
   } catch (err) {
     console.error('[cleanlemon] operator/dashboard', err);
@@ -2657,6 +3184,8 @@ router.get('/operator/dashboard', async (req, res) => {
 router.get('/operator/properties', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const includeArchived =
       req.query.includeArchived === '1' ||
       req.query.includeArchived === 'true' ||
@@ -2678,6 +3207,8 @@ router.get('/operator/properties', async (req, res) => {
 router.get('/operator/properties/:id', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const property = await svc.getOperatorPropertyDetail({
       propertyId: req.params.id,
       operatorId,
@@ -2704,6 +3235,8 @@ router.get('/operator/properties/:id', async (req, res) => {
 router.get('/operator/property-names', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const items = await svc.listOperatorDistinctPropertyNames({ operatorId });
     res.json({ ok: true, items });
   } catch (err) {
@@ -2712,12 +3245,15 @@ router.get('/operator/property-names', async (req, res) => {
   }
 });
 
-/** All operators: distinct building names (optional `q` substring) for apartment combobox search. */
+/** Distinct building names for apartment combobox — scoped to one operator (`operatorId` required). */
 router.get('/operator/property-names-global', async (req, res) => {
   try {
+    const operatorId = String(req.query.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const q = String(req.query.q || '').trim();
     const limit = req.query.limit;
-    const items = await svc.listGlobalDistinctPropertyNames({ q, limit });
+    const items = await svc.listGlobalDistinctPropertyNames({ q, limit, operatorId: gate.operatorId });
     res.json({ ok: true, items });
   } catch (err) {
     console.error('[cleanlemon] operator/property-names-global:get', err);
@@ -2725,11 +3261,14 @@ router.get('/operator/property-names-global', async (req, res) => {
   }
 });
 
-/** Most-used address + Waze + Google Maps for a shared `property_name` (all `cln_property` rows). */
+/** Most-used address + Waze + Google Maps for a `property_name` within one operator (`operatorId` required). */
 router.get('/operator/property-name-defaults', async (req, res) => {
   try {
+    const operatorId = String(req.query.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const name = String(req.query.name || '').trim();
-    const body = await svc.getGlobalPropertyNameDefaults({ propertyName: name });
+    const body = await svc.getGlobalPropertyNameDefaults({ propertyName: name, operatorId: gate.operatorId });
     res.json({ ok: true, ...body });
   } catch (err) {
     console.error('[cleanlemon] operator/property-name-defaults:get', err);
@@ -2756,6 +3295,8 @@ router.get('/operator/address-search', async (req, res) => {
 router.get('/operator/linked-clientdetails', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const items = await svc.listOperatorLinkedClientdetails({ operatorId });
     res.json({ ok: true, items });
   } catch (err) {
@@ -2766,19 +3307,58 @@ router.get('/operator/linked-clientdetails', async (req, res) => {
 
 router.get('/operator/lookup', async (req, res) => {
   try {
+    if (!employeePortalEmailStrict(req)) {
+      return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    }
     const q = String(req.query.q || '').trim();
     const limit = req.query.limit;
     const items = await svc.listOperatorLookup({ q, limit });
-    res.json({ ok: true, items });
+    const enriched = await clnReview.enrichOperatorLookupItemsWithReviewStats(items);
+    res.json({ ok: true, items: enriched });
   } catch (err) {
     console.error('[cleanlemon] operator/lookup:get', err);
     res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
   }
 });
 
+/** Portal JWT — create cln_review (client_to_operator | operator_to_client | operator_to_staff). */
+router.post('/portal/reviews', async (req, res) => {
+  try {
+    const payload = portalJwtPayload(req);
+    if (!payload?.email) {
+      return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    }
+    const out = await clnReview.createClnReview({
+      jwtEmail: payload.email,
+      cleanlemonsJwt: payload.cleanlemons,
+      body: req.body || {},
+    });
+    if (!out?.ok) {
+      const st =
+        out?.reason === 'NOT_YOUR_PROPERTY' || out?.reason === 'OPERATOR_MISMATCH'
+          ? 403
+          : out?.reason === 'SCHEDULE_NOT_FOUND' || out?.reason === 'OPERATOR_NOT_FOUND'
+            ? 404
+            : 400;
+      return res.status(st).json(out);
+    }
+    res.json(out);
+  } catch (err) {
+    if (err && err.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ ok: false, reason: 'DUPLICATE_REVIEW' });
+    }
+    console.error('[cleanlemon] portal/reviews:post', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
 router.post('/operator/properties', async (req, res) => {
   try {
-    const out = await svc.createOperatorProperty(req.body || {});
+    const b = req.body || {};
+    const oid = String(b.operatorId || b.operator_id || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, oid);
+    if (!gate) return;
+    const out = await svc.createOperatorProperty(b);
     const id = out && typeof out === 'object' ? out.id : out;
     res.json({
       ok: true,
@@ -2797,7 +3377,11 @@ router.post('/operator/properties', async (req, res) => {
 
 router.put('/operator/properties/:id', async (req, res) => {
   try {
-    await svc.updateOperatorProperty(req.params.id, req.body || {});
+    const b = req.body || {};
+    const oid = String(b.operatorId || b.operator_id || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, oid);
+    if (!gate) return;
+    await svc.updateOperatorProperty(req.params.id, b);
     res.json({ ok: true });
   } catch (err) {
     console.error('[cleanlemon] operator/properties:put', err);
@@ -2829,6 +3413,8 @@ router.put('/operator/properties/:id', async (req, res) => {
 router.delete('/operator/properties/:id', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     await svc.deleteOperatorProperty(req.params.id, { operatorId });
     res.json({ ok: true });
   } catch (err) {
@@ -2846,9 +3432,140 @@ router.delete('/operator/properties/:id', async (req, res) => {
   }
 });
 
+/** Operator portal — property groups (independent of client `cln_property_group`). */
+router.post('/operator/property-groups/list', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const items = await clnOpPropGroup.listGroupsForOperatorPortal(operatorId);
+    return res.json({ ok: true, items });
+  } catch (err) {
+    console.error('[cleanlemon] operator/property-groups/list', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+router.post('/operator/property-groups/create', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const name = String(req.body?.name || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const group = await clnOpPropGroup.createOperatorPropertyGroup({ operatorId, name });
+    return res.json({ ok: true, group });
+  } catch (err) {
+    if (err?.code === 'MISSING_FIELDS' || err?.code === 'GROUP_FEATURE_UNAVAILABLE') {
+      return res.status(400).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] operator/property-groups/create', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+router.post('/operator/property-groups/detail', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const groupId = String(req.body?.groupId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    if (!groupId) return res.status(400).json({ ok: false, reason: 'MISSING_GROUP_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const group = await clnOpPropGroup.getGroupDetailForOperator({ operatorId, groupId });
+    return res.json({ ok: true, group });
+  } catch (err) {
+    if (err?.code === 'GROUP_NOT_FOUND' || err?.code === 'MISSING_FIELDS') {
+      return res.status(404).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] operator/property-groups/detail', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+router.post('/operator/property-groups/add-properties', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const groupId = String(req.body?.groupId || '').trim();
+    const propertyIds = Array.isArray(req.body?.propertyIds) ? req.body.propertyIds : [];
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    if (!groupId) return res.status(400).json({ ok: false, reason: 'MISSING_GROUP_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    await clnOpPropGroup.addPropertiesToOperatorGroup({ operatorId, groupId, propertyIds });
+    return res.json({ ok: true });
+  } catch (err) {
+    if (
+      err?.code === 'MISSING_FIELDS' ||
+      err?.code === 'GROUP_FEATURE_UNAVAILABLE' ||
+      err?.code === 'OPERATOR_PROPERTY_MISMATCH'
+    ) {
+      return res.status(400).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'GROUP_NOT_FOUND') {
+      return res.status(404).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] operator/property-groups/add-properties', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+router.post('/operator/property-groups/remove-property', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const groupId = String(req.body?.groupId || '').trim();
+    const propertyId = String(req.body?.propertyId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    if (!groupId) return res.status(400).json({ ok: false, reason: 'MISSING_GROUP_ID' });
+    if (!propertyId) return res.status(400).json({ ok: false, reason: 'MISSING_PROPERTY_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    await clnOpPropGroup.removePropertyFromOperatorGroup({ operatorId, groupId, propertyId });
+    return res.json({ ok: true });
+  } catch (err) {
+    if (err?.code === 'MISSING_FIELDS' || err?.code === 'GROUP_FEATURE_UNAVAILABLE') {
+      return res.status(400).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'GROUP_NOT_FOUND') {
+      return res.status(404).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] operator/property-groups/remove-property', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+router.post('/operator/property-groups/delete', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const groupId = String(req.body?.groupId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    if (!groupId) return res.status(400).json({ ok: false, reason: 'MISSING_GROUP_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    await clnOpPropGroup.deleteOperatorPropertyGroup({ operatorId, groupId });
+    return res.json({ ok: true });
+  } catch (err) {
+    if (err?.code === 'MISSING_FIELDS' || err?.code === 'GROUP_FEATURE_UNAVAILABLE') {
+      return res.status(400).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'GROUP_NOT_FOUND') {
+      return res.status(404).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] operator/property-groups/delete', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
 router.get('/operator/invoices', async (req, res) => {
   try {
-    const items = await svc.listOperatorInvoices({ limit: req.query.limit });
+    const operatorId = String(req.query?.operatorId || req.query?.operator_id || '').trim();
+    if (!operatorId) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    }
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const items = await svc.listOperatorInvoices({ limit: req.query.limit, operatorId });
     res.json({ ok: true, items });
   } catch (err) {
     console.error('[cleanlemon] operator/invoices:get', err);
@@ -2860,7 +3577,9 @@ router.put('/operator/invoices/:id/status', async (req, res) => {
   try {
     const status = String(req.body?.status || '').trim();
     if (!status) return res.status(400).json({ ok: false, reason: 'MISSING_STATUS' });
-    const operatorId = String(req.body?.operatorId || '').trim();
+    const operatorId = String(req.body?.operatorId || req.query?.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     await svc.updateInvoiceStatus(req.params.id, status, {
       operatorId,
       paymentMethod: req.body?.paymentMethod,
@@ -2873,9 +3592,125 @@ router.put('/operator/invoices/:id/status', async (req, res) => {
   }
 });
 
+/** Operator — payment reminder to client bill-to email via CLEANLEMON_SMTP_* (server). */
+router.post('/operator/invoices/:id/send-payment-reminder', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || req.query?.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const out = await svc.sendOperatorInvoicePaymentReminder(req, {
+      invoiceId: req.params.id,
+      operatorId,
+    });
+    if (!out?.ok) {
+      const reason = String(out?.reason || 'FAILED');
+      if (['MISSING_OPERATOR_ID', 'MISSING_INVOICE_ID', 'MISSING_CLIENT_EMAIL'].includes(reason)) {
+        return res.status(400).json({ ok: false, reason });
+      }
+      if (['INVOICE_NOT_FOUND', 'FORBIDDEN_OPERATOR'].includes(reason)) {
+        return res.status(404).json({ ok: false, reason });
+      }
+      if (['INVOICE_ALREADY_PAID', 'REMINDER_NOT_APPLICABLE'].includes(reason)) {
+        return res.status(400).json({ ok: false, reason });
+      }
+      if (reason === 'SMTP_NOT_CONFIGURED') {
+        return res.status(503).json({ ok: false, reason });
+      }
+      return res.status(502).json({ ok: false, reason });
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('[cleanlemon] operator/invoices:send-payment-reminder', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+/** Operator — client invoice payments (Stripe / manual) for Approval → Payment tab. */
+router.get('/operator/payment-queue', async (req, res) => {
+  try {
+    const operatorId = String(req.query.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const out = await svc.listOperatorClientPaymentQueue({
+      operatorId,
+      limit: req.query.limit != null ? Number(req.query.limit) : undefined,
+    });
+    return res.json({ ok: true, items: out.items });
+  } catch (err) {
+    console.error('[cleanlemon] operator/payment-queue:get', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+router.post('/operator/payment-queue/:paymentId/acknowledge', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || req.query.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const out = await svc.acknowledgeOperatorClientPayment({
+      operatorId,
+      paymentId: req.params.paymentId,
+    });
+    if (!out.ok) return res.status(400).json({ ok: false, reason: out.reason || 'FAILED' });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('[cleanlemon] operator/payment-queue:ack', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+router.post('/operator/payment-queue/:paymentId/reject-client-receipt', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || req.query.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const out = await svc.rejectOperatorClientPortalReceipt({
+      operatorId,
+      paymentId: req.params.paymentId,
+    });
+    if (!out.ok) {
+      const st = out.reason === 'NOT_FOUND' ? 404 : 400;
+      return res.status(st).json({ ok: false, reason: out.reason || 'FAILED' });
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('[cleanlemon] operator/payment-queue:reject-client-receipt', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
+router.post('/operator/payment-queue/reject-client-receipt-batch', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || req.query.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const receiptBatchId = req.body?.receiptBatchId != null ? String(req.body.receiptBatchId).trim() : '';
+    const paymentIds = Array.isArray(req.body?.paymentIds) ? req.body.paymentIds : [];
+    const out = await svc.rejectOperatorClientPortalReceiptBatch({
+      operatorId,
+      receiptBatchId: receiptBatchId || undefined,
+      paymentIds,
+    });
+    if (!out.ok) {
+      const st = out.reason === 'NOT_FOUND' ? 404 : 400;
+      return res.status(st).json({ ok: false, reason: out.reason || 'FAILED' });
+    }
+    return res.json({ ok: true, deleted: out.deleted });
+  } catch (err) {
+    console.error('[cleanlemon] operator/payment-queue:reject-client-receipt-batch', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'SERVER_ERROR' });
+  }
+});
+
 router.delete('/operator/invoices/:id', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     await svc.deleteInvoice(req.params.id, operatorId);
     res.json({ ok: true });
   } catch (err) {
@@ -2886,19 +3721,67 @@ router.delete('/operator/invoices/:id', async (req, res) => {
 
 router.post('/operator/invoices', async (req, res) => {
   try {
-    const out = await svc.createOperatorInvoice(req.body || {});
+    const b = req.body || {};
+    const oid = String(b.operatorId || b.operator_id || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, oid);
+    if (!gate) return;
+    const out = await svc.createOperatorInvoice(b);
     const id = typeof out === 'object' && out?.id ? out.id : out;
     const invoiceNo = typeof out === 'object' && out?.invoiceNo != null ? out.invoiceNo : undefined;
-    res.json({ ok: true, id, ...(invoiceNo != null ? { invoiceNo } : {}) });
+    const pdfUrl =
+      typeof out === 'object' && out?.pdfUrl != null && String(out.pdfUrl).trim() !== ''
+        ? String(out.pdfUrl).trim()
+        : undefined;
+    const accountingMeta = typeof out === 'object' && out?.accountingMeta != null ? out.accountingMeta : undefined;
+    res.json({
+      ok: true,
+      id,
+      ...(invoiceNo != null ? { invoiceNo } : {}),
+      ...(pdfUrl ? { pdfUrl } : {}),
+      ...(accountingMeta ? { accountingMeta } : {})
+    });
   } catch (err) {
+    if (isOperatorInvoiceClientError(err)) {
+      const body400 = {
+        ok: false,
+        code: String(err?.code || err?.message || 'FAILED').slice(0, 120),
+        reason: String(err?.message || 'FAILED'),
+        ...(err?.detail ? { detail: err.detail } : {}),
+      };
+      console.warn('[cleanlemon] operator/invoices:post → 400', JSON.stringify(body400));
+      return res.status(400).json(body400);
+    }
     console.error('[cleanlemon] operator/invoices:post', err);
-    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+    if (isTransientNetworkError(err)) {
+      return res.status(503).json({
+        ok: false,
+        code: 'UPSTREAM_UNAVAILABLE',
+        reason:
+          'Connection to accounting (Bukku/Xero) or database was interrupted. Check API host can reach MySQL and api.bukku.my, then retry.',
+        detail: String(err?.message || '').slice(0, 300),
+      });
+    }
+    const reason500 =
+      (err && typeof err === 'object' && err.message != null && String(err.message).trim() !== ''
+        ? String(err.message)
+        : typeof err === 'string' && err.trim() !== ''
+          ? err
+          : '') || 'DB_ERROR';
+    res.status(500).json({
+      ok: false,
+      code: String(err?.code || 'SERVER_ERROR').slice(0, 120),
+      reason: reason500.slice(0, 2000),
+    });
   }
 });
 
 router.put('/operator/invoices/:id', async (req, res) => {
   try {
-    await svc.updateOperatorInvoice(req.params.id, req.body || {});
+    const b = req.body || {};
+    const oid = String(b.operatorId || b.operator_id || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, oid);
+    if (!gate) return;
+    await svc.updateOperatorInvoice(req.params.id, b);
     res.json({ ok: true });
   } catch (err) {
     console.error('[cleanlemon] operator/invoices:put', err);
@@ -2909,6 +3792,8 @@ router.put('/operator/invoices/:id', async (req, res) => {
 router.get('/operator/invoice-form-options', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const body = await svc.listOperatorInvoiceFormOptions(operatorId);
     res.json({ ok: true, ...body });
   } catch (err) {
@@ -2920,6 +3805,8 @@ router.get('/operator/invoice-form-options', async (req, res) => {
 router.get('/operator/agreements', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const items = await svc.listAgreements(operatorId);
     res.json({ ok: true, items });
   } catch (err) {
@@ -2930,7 +3817,11 @@ router.get('/operator/agreements', async (req, res) => {
 
 router.post('/operator/agreements', async (req, res) => {
   try {
-    const id = await svc.createAgreement(req.body || {});
+    const b = req.body || {};
+    const oid = String(b.operatorId || b.operator_id || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, oid);
+    if (!gate) return;
+    const id = await svc.createAgreement(b);
     res.json({ ok: true, id });
   } catch (err) {
     const msg = String(err?.message || '');
@@ -2948,9 +3839,39 @@ router.post('/operator/agreements', async (req, res) => {
   }
 });
 
+/** Re-generate final merged PDF + upload to template Drive folder (complete agreements only). */
+router.post('/operator/agreements/:id/finalize-pdf', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    }
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const result = await svc.retryFinalizeClnOperatorAgreementPdf(operatorId, req.params.id);
+    if (!result?.ok) {
+      const r = String(result?.reason || '').toUpperCase();
+      const code = r === 'NOT_FOUND' ? 404 : r === 'FORBIDDEN' ? 403 : 400;
+      return res.status(code).json({ ok: false, reason: result.reason || 'FINALIZE_FAILED' });
+    }
+    res.json({ ok: true, finalAgreementUrl: result.finalAgreementUrl });
+  } catch (err) {
+    console.error('[cleanlemon] operator/agreements/:id/finalize-pdf', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
 router.put('/operator/agreements/:id/sign', async (req, res) => {
   try {
-    const result = await svc.signAgreement(req.params.id, req.body || {});
+    const { email } = clientPortalAuthFromRequest(req, req.body?.email);
+    const payload = { ...(req.body || {}) };
+    if (String(payload.signedFrom || '').trim() === 'client_portal') {
+      if (!email) {
+        return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+      }
+      payload.portalClientEmail = email;
+    }
+    const result = await svc.signAgreement(req.params.id, payload);
     if (!result?.ok) {
       const code = result?.reason === 'AGREEMENT_NOT_FOUND' ? 404 : 400;
       return res.status(code).json({ ok: false, reason: result?.reason || 'SIGN_FAILED' });
@@ -2959,6 +3880,108 @@ router.put('/operator/agreements/:id/sign', async (req, res) => {
   } catch (err) {
     console.error('[cleanlemon] operator/agreements:sign', err);
     res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+/** Operator portal — filled agreement PDF; sets hash_draft on first successful generation. */
+router.post('/operator/agreements/:id/preview-pdf', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || req.query.operatorId || '').trim();
+    if (!operatorId) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    }
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const buffer = await svc.previewClnAgreementInstancePdfForOperator(operatorId, req.params.id);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'inline; filename="agreement-preview.pdf"');
+    res.send(buffer);
+  } catch (err) {
+    const msg = String(err?.message || '');
+    console.error('[cleanlemon] operator/agreements/:id/preview-pdf', err);
+    if (msg === 'NOT_FOUND') return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
+    if (msg === 'FORBIDDEN') return res.status(403).json({ ok: false, reason: 'FORBIDDEN' });
+    if (msg === 'MISSING_TEMPLATE' || msg === 'INVALID_TEMPLATE_URL') {
+      return res.status(400).json({ ok: false, reason: msg });
+    }
+    if (msg === 'GOOGLE_DRIVE_NOT_CONNECTED' || msg === 'GOOGLE_CREDENTIALS_NOT_CONFIGURED') {
+      return res.status(503).json({ ok: false, reason: 'PDF_UNAVAILABLE' });
+    }
+    if (err?.code === 'ENOENT' || /ENOENT/i.test(msg)) {
+      return res.status(503).json({ ok: false, reason: 'PDF_UNAVAILABLE' });
+    }
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+/** Delete agreement when not finalized (no hash_final / final URL / complete). Body: { operatorId }. */
+router.post('/operator/agreements/:id/delete', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    }
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const result = await svc.deleteClnOperatorAgreement(operatorId, req.params.id);
+    if (!result?.ok) {
+      const r = String(result?.reason || '').toUpperCase();
+      const code = r === 'NOT_FOUND' ? 404 : 400;
+      return res.status(code).json({ ok: false, reason: result.reason || 'DELETE_FAILED' });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[cleanlemon] operator/agreements/:id/delete', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+/**
+ * B2B client — list operator–client agreements for this login email (same auth pattern as `client/properties/list`).
+ */
+router.post('/client/agreements/list', async (req, res) => {
+  try {
+    const { email } = clientPortalAuthFromRequest(req, req.body?.email);
+    if (!email) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    }
+    const items = await svc.listAgreementsForClientPortal(email);
+    res.json({ ok: true, items });
+  } catch (err) {
+    console.error('[cleanlemon] client/agreements/list', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/client/agreements/:id/preview-pdf', async (req, res) => {
+  try {
+    const { email } = clientPortalAuthFromRequest(req, req.body?.email);
+    if (!email) {
+      return res.status(400).json({ ok: false, reason: 'MISSING_EMAIL' });
+    }
+    const buffer = await svc.previewClnAgreementInstancePdfForRecipient(req.params.id, email);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'inline; filename="agreement-preview.pdf"');
+    res.send(buffer);
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (msg === 'NOT_FOUND') {
+      return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
+    }
+    if (msg === 'FORBIDDEN') {
+      return res.status(403).json({ ok: false, reason: 'FORBIDDEN' });
+    }
+    if (msg === 'MISSING_TEMPLATE' || msg === 'INVALID_TEMPLATE_URL') {
+      return res.status(400).json({ ok: false, reason: msg });
+    }
+    if (msg === 'GOOGLE_DRIVE_NOT_CONNECTED' || msg === 'GOOGLE_CREDENTIALS_NOT_CONFIGURED') {
+      return res.status(503).json({ ok: false, reason: 'PDF_UNAVAILABLE' });
+    }
+    if (err?.code === 'ENOENT' || /ENOENT/i.test(msg)) {
+      return res.status(503).json({ ok: false, reason: 'PDF_UNAVAILABLE' });
+    }
+    console.error('[cleanlemon] client/agreements/:id/preview-pdf', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'PDF_FAILED' });
   }
 });
 
@@ -2979,6 +4002,8 @@ router.get('/operator/agreement-variables-reference.docx', async (req, res) => {
 router.get('/operator/agreement-templates', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const items = await svc.listAgreementTemplates(operatorId);
     res.json({ ok: true, items });
   } catch (err) {
@@ -2989,7 +4014,11 @@ router.get('/operator/agreement-templates', async (req, res) => {
 
 router.post('/operator/agreement-templates', async (req, res) => {
   try {
-    const id = await svc.createAgreementTemplate(req.body || {});
+    const b = req.body || {};
+    const oid = String(b.operatorId || b.operator_id || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, oid);
+    if (!gate) return;
+    const id = await svc.createAgreementTemplate(b);
     res.json({ ok: true, id });
   } catch (err) {
     const msg = String(err?.message || '');
@@ -3007,6 +4036,15 @@ router.post('/operator/agreement-templates/preview-pdf', async (req, res) => {
   const operatorId = String(body.operatorId || req.query?.operatorId || '').trim();
   const templateId = String(body.templateId || body.id || '').trim();
   try {
+    if (!operatorId) {
+      return res.status(400).json({
+        ok: false,
+        reason: 'MISSING_OPERATOR_ID',
+        message: 'operatorId is required for template preview.',
+      });
+    }
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     if (!templateId) {
       return res.status(400).json({ ok: false, reason: 'NO_TEMPLATE_ID', message: 'templateId is required' });
     }
@@ -3066,6 +4104,8 @@ router.post('/operator/agreement-templates/preview-pdf', async (req, res) => {
 router.get('/operator/kpi', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const items = await svc.listKpi(operatorId);
     res.json({ ok: true, items });
   } catch (err) {
@@ -3077,6 +4117,8 @@ router.get('/operator/kpi', async (req, res) => {
 router.get('/operator/notifications', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const items = await svc.listNotifications(operatorId);
     res.json({ ok: true, items });
   } catch (err) {
@@ -3087,27 +4129,41 @@ router.get('/operator/notifications', async (req, res) => {
 
 router.put('/operator/notifications/:id/read', async (req, res) => {
   try {
-    await svc.markNotificationRead(req.params.id);
+    const operatorId = String(req.query.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    await svc.markNotificationRead(req.params.id, gate.operatorId);
     res.json({ ok: true });
   } catch (err) {
     console.error('[cleanlemon] operator/notifications:read', err);
+    if (err && err.code === 'NOT_FOUND') {
+      return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
+    }
     res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
   }
 });
 
 router.delete('/operator/notifications/:id', async (req, res) => {
   try {
-    await svc.dismissNotification(req.params.id);
+    const operatorId = String(req.query.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    await svc.dismissNotification(req.params.id, gate.operatorId);
     res.json({ ok: true });
   } catch (err) {
     console.error('[cleanlemon] operator/notifications:delete', err);
+    if (err && err.code === 'NOT_FOUND') {
+      return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
+    }
     res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
   }
 });
 
 router.get('/operator/settings', async (req, res) => {
   try {
-    const operatorId = String(req.query.operatorId || 'op_demo_001');
+    const operatorId = String(req.query.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const settings = await svc.getOperatorSettings(operatorId);
     res.json({ ok: true, settings: settings || {} });
   } catch (err) {
@@ -3120,6 +4176,12 @@ router.get('/operator/setup-status', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
     const email = String(req.query.email || '').trim();
+    const jwtEmail = employeePortalEmailStrict(req);
+    if (!jwtEmail || jwtEmail !== String(email || '').trim().toLowerCase()) {
+      return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    }
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const out = await svc.getOperatorPortalSetupStatus(operatorId, email);
     if (!out.ok) {
       return res.status(400).json(out);
@@ -3133,9 +4195,20 @@ router.get('/operator/setup-status', async (req, res) => {
 
 router.get('/operator/subscription', async (req, res) => {
   try {
+    const jwtEmail = employeePortalEmailStrict(req);
+    if (!jwtEmail) {
+      return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    }
     const operatorId = String(req.query.operatorId || '').trim();
     const email = String(req.query.email || '').trim().toLowerCase();
-    const item = await svc.getOperatorSubscription(operatorId, email);
+    if (email && email !== jwtEmail) {
+      return res.status(403).json({ ok: false, reason: 'EMAIL_MISMATCH' });
+    }
+    if (operatorId) {
+      const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+      if (!gate) return;
+    }
+    const item = await svc.getOperatorSubscription(operatorId, email || jwtEmail);
     return res.json({ ok: true, item: item || null });
   } catch (err) {
     if (err?.code === 'MISSING_OPERATOR_ID_OR_EMAIL') {
@@ -3177,6 +4250,8 @@ router.get('/operator/saas-billing-history', async (req, res) => {
     if (!billingOperatorId) {
       return res.json({ ok: true, items: [] });
     }
+    const gate = await requireOperatorStaffForPortal(req, res, billingOperatorId);
+    if (!gate) return;
     const items = await svc.listOperatorSaasBillingHistory(billingOperatorId);
     return res.json({ ok: true, items });
   } catch (err) {
@@ -3191,6 +4266,8 @@ router.put('/operator/settings', async (req, res) => {
     if (!operatorId) {
       return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
     }
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const settings = req.body?.settings || {};
     await svc.upsertOperatorSettings(operatorId, settings);
     res.json({ ok: true });
@@ -3211,11 +4288,84 @@ router.put('/operator/settings', async (req, res) => {
   }
 });
 
+/** Master operator: TAC to new company email → schedule +7 days (cln_operatordetail.email + portal_account). */
+router.post('/operator/company-email-change/request', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    if (!jwtVerified) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId || !email) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_OR_EMAIL' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const r = await clnOpCompanyEmail.requestClnOperatorCompanyEmailChange(email, req.body?.newEmail, operatorId, req);
+    return res.json(r);
+  } catch (err) {
+    console.error('[cleanlemon] operator/company-email-change/request', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/operator/company-email-change/confirm', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    if (!jwtVerified) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId || !email) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_OR_EMAIL' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const r = await clnOpCompanyEmail.confirmClnOperatorCompanyEmailChange(
+      email,
+      req.body?.newEmail,
+      req.body?.code,
+      operatorId,
+      req
+    );
+    return res.json(r);
+  } catch (err) {
+    console.error('[cleanlemon] operator/company-email-change/confirm', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/operator/company-email-change/status', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    if (!jwtVerified) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId || !email) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_OR_EMAIL' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const r = await clnOpCompanyEmail.getClnOperatorCompanyEmailChangeStatus(email, operatorId);
+    return res.json(r);
+  } catch (err) {
+    console.error('[cleanlemon] operator/company-email-change/status', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/operator/company-email-change/cancel', async (req, res) => {
+  try {
+    const { email, jwtVerified } = clientPortalAuthFromRequest(req, req.body?.email);
+    if (!jwtVerified) return res.status(401).json({ ok: false, reason: 'UNAUTHORIZED' });
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId || !email) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_OR_EMAIL' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const r = await clnOpCompanyEmail.cancelClnOperatorCompanyEmailChange(email, operatorId);
+    return res.json(r);
+  } catch (err) {
+    console.error('[cleanlemon] operator/company-email-change/cancel', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
 /** Bukku: secret + subdomain (same as Coliving companysetting). */
 router.post('/operator/bukku-connect', async (req, res) => {
   try {
     const operatorId = String(req.body?.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     await clnInt.bukkuConnect(operatorId, {
       token: req.body?.token,
       subdomain: req.body?.subdomain,
@@ -3236,6 +4386,8 @@ router.get('/operator/bukku-credentials', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const data = await clnInt.getBukkuCredentials(operatorId);
     res.json(data);
   } catch (err) {
@@ -3248,6 +4400,8 @@ router.post('/operator/bukku-disconnect', async (req, res) => {
   try {
     const operatorId = String(req.body?.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     await clnInt.bukkuDisconnect(operatorId);
     res.json({ ok: true });
   } catch (err) {
@@ -3261,6 +4415,8 @@ router.get('/operator/ttlock/onboard-status', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const st = await clnInt.getTtlockOnboardStatusClnOperator(operatorId);
     return res.json({ ok: true, ...st });
   } catch (err) {
@@ -3273,6 +4429,8 @@ router.get('/operator/ttlock/credentials', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const slotRaw = req.query?.ttlockSlot ?? req.query?.ttlock_slot;
     const slot = slotRaw != null && slotRaw !== '' ? Number(slotRaw) : 0;
     const sl = Number.isFinite(slot) && slot >= 0 ? slot : 0;
@@ -3292,6 +4450,8 @@ router.post('/operator/ttlock/connect', async (req, res) => {
     const accountName = req.body?.accountName;
     const slotRaw = req.body?.ttlockSlot ?? req.body?.ttlock_slot;
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const result = await clnInt.ttlockConnectClnOperator(operatorId, {
       username,
       password,
@@ -3310,6 +4470,8 @@ router.post('/operator/ttlock/disconnect', async (req, res) => {
   try {
     const operatorId = String(req.body?.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const slot = Number(req.body?.ttlockSlot ?? req.body?.ttlock_slot ?? 0) || 0;
     await clnInt.ttlockDisconnectClnOperator(operatorId, slot);
     return res.json({ ok: true });
@@ -3324,6 +4486,8 @@ router.post('/operator/xero-connect', async (req, res) => {
   try {
     const operatorId = String(req.body?.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const result = await clnInt.xeroConnect(operatorId, req.body || {});
     res.json(result);
   } catch (err) {
@@ -3350,6 +4514,8 @@ router.post('/operator/xero-disconnect', async (req, res) => {
   try {
     const operatorId = String(req.body?.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     await clnInt.xeroDisconnect(operatorId);
     res.json({ ok: true });
   } catch (err) {
@@ -3365,6 +4531,8 @@ router.post('/operator/ai-agent/connect', async (req, res) => {
     const provider = String(req.body?.provider || '').trim().toLowerCase();
     const apiKey = String(req.body?.apiKey ?? req.body?.api_key ?? '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     await clnInt.aiAgentConnect(operatorId, { provider, apiKey });
     return res.json({ ok: true });
   } catch (err) {
@@ -3390,6 +4558,8 @@ router.post('/operator/ai-agent/disconnect', async (req, res) => {
   try {
     const operatorId = String(req.body?.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     await clnInt.aiAgentDisconnect(operatorId);
     return res.json({ ok: true });
   } catch (err) {
@@ -3403,9 +4573,17 @@ router.get('/operator/schedule/ai-settings', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const data = await clnOpAi.getOperatorAiSettingsForApi(operatorId);
     return res.json({ ok: true, data });
   } catch (err) {
+    if (err?.code === 'OPERATOR_ACCESS_DENIED' || err?.code === 'OPERATORDETAIL_REQUIRED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'MISSING_OPERATOR_OR_EMAIL') {
+      return res.status(400).json({ ok: false, reason: err.code });
+    }
     if (isMissingClnOperatorAiTable(err)) {
       return res.status(503).json({ ok: false, reason: 'CLN_OPERATOR_AI_MIGRATION_REQUIRED' });
     }
@@ -3418,11 +4596,19 @@ router.put('/operator/schedule/ai-settings', async (req, res) => {
   try {
     const operatorId = String(req.body?.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const patch = { ...(req.body || {}) };
     delete patch.operatorId;
     const data = await clnOpAi.saveOperatorAiSettingsFromApi(operatorId, patch);
     return res.json({ ok: true, data });
   } catch (err) {
+    if (err?.code === 'OPERATOR_ACCESS_DENIED' || err?.code === 'OPERATORDETAIL_REQUIRED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'MISSING_OPERATOR_OR_EMAIL') {
+      return res.status(400).json({ ok: false, reason: err.code });
+    }
     if (isMissingClnOperatorAiTable(err)) {
       return res.status(503).json({ ok: false, reason: 'CLN_OPERATOR_AI_MIGRATION_REQUIRED' });
     }
@@ -3435,10 +4621,32 @@ router.get('/operator/schedule/ai-chat', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const limit = req.query.limit ? Number(req.query.limit) : 40;
     const items = await clnOpAi.listChatMessages(operatorId, limit);
-    return res.json({ ok: true, items });
+    const itemsForPortal = (items || []).map((row) => {
+      const base = {
+        id: row.id,
+        role: row.role,
+        content: row.content,
+        createdAt: row.createdAt,
+      };
+      if (String(row.role) !== 'assistant') return base;
+      const raw = String(base.content || '');
+      return {
+        ...base,
+        content: clnOpAi.shortenVerboseEnglishConsentFooter(clnOpAi.stripJarvisChineseConsentTokens(raw)),
+      };
+    });
+    return res.json({ ok: true, items: itemsForPortal });
   } catch (err) {
+    if (err?.code === 'OPERATOR_ACCESS_DENIED' || err?.code === 'OPERATORDETAIL_REQUIRED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'MISSING_OPERATOR_OR_EMAIL') {
+      return res.status(400).json({ ok: false, reason: err.code });
+    }
     if (isMissingClnOperatorAiTable(err)) {
       return res.status(503).json({ ok: false, reason: 'CLN_OPERATOR_AI_MIGRATION_REQUIRED' });
     }
@@ -3452,19 +4660,70 @@ router.post('/operator/schedule/ai-chat', async (req, res) => {
     const operatorId = String(req.body?.operatorId || '').trim();
     const message = String(req.body?.message || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     if (!message) return res.status(400).json({ ok: false, reason: 'EMPTY_MESSAGE' });
     const mergeExtractedConstraints = !!req.body?.mergeExtractedConstraints;
-    const out = await clnOpAi.runOperatorAiChat({ operatorId, userMessage: message, mergeExtractedConstraints });
+    const contextWorkingDay = String(req.body?.contextWorkingDay || '').trim().slice(0, 10);
+    let out = await clnOpAi.runOperatorAiChat({
+      operatorId,
+      userMessage: message,
+      mergeExtractedConstraints,
+      contextWorkingDay: contextWorkingDay || undefined,
+      portalEmail: gate.email,
+    });
+    if (out && typeof out.reply === 'string' && !/[\u4e00-\u9fff]/u.test(message)) {
+      out = {
+        ...out,
+        reply: clnOpAi.shortenVerboseEnglishConsentFooter(clnOpAi.stripJarvisChineseConsentTokens(out.reply)),
+      };
+    }
     return res.json({ ok: true, ...out });
   } catch (err) {
-    const msg = String(err?.message || '');
-    if (msg === 'AI_NOT_CONFIGURED') {
-      return res.status(400).json({ ok: false, reason: msg });
+    if (err?.code === 'OPERATOR_ACCESS_DENIED' || err?.code === 'OPERATORDETAIL_REQUIRED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'MISSING_OPERATOR_OR_EMAIL') {
+      return res.status(400).json({ ok: false, reason: err.code });
     }
     if (isMissingClnOperatorAiTable(err)) {
       return res.status(503).json({ ok: false, reason: 'CLN_OPERATOR_AI_MIGRATION_REQUIRED' });
     }
     console.error('[cleanlemon] operator/schedule/ai-chat:post', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/operator/schedule/bulk-create-homestay-by-name', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    const workingDay = String(req.body?.workingDay || '').trim().slice(0, 10);
+    const nameContains = String(req.body?.nameContains || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(workingDay)) {
+      return res.status(400).json({ ok: false, reason: 'INVALID_WORKING_DAY' });
+    }
+    const out = await svc.bulkCreateHomestayJobsByPropertyNameSubstring({
+      operatorId,
+      dateYmd: workingDay,
+      nameContains,
+      createdByEmail: gate.email,
+    });
+    return res.json({ ok: true, ...out });
+  } catch (err) {
+    if (err?.code === 'OPERATOR_ACCESS_DENIED' || err?.code === 'OPERATORDETAIL_REQUIRED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'MISSING_OPERATOR_OR_EMAIL') {
+      return res.status(400).json({ ok: false, reason: err.code });
+    }
+    const c = String(err?.code || '');
+    if (c === 'BAD_DATE' || c === 'NAME_TOO_SHORT' || c === 'MISSING_OPERATOR_ID' || c === 'PAST_DAY') {
+      return res.status(400).json({ ok: false, reason: c });
+    }
+    console.error('[cleanlemon] operator/schedule/bulk-create-homestay-by-name:post', err);
     return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
   }
 });
@@ -3476,6 +4735,8 @@ router.post('/operator/schedule/ai-suggest', async (req, res) => {
     const apply = !!req.body?.apply;
     const mode = String(req.body?.mode || 'full').toLowerCase();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     if (!/^\d{4}-\d{2}-\d{2}$/.test(workingDay)) {
       return res.status(400).json({ ok: false, reason: 'INVALID_WORKING_DAY' });
     }
@@ -3493,9 +4754,18 @@ router.post('/operator/schedule/ai-suggest', async (req, res) => {
     }
     return res.json({ ok: out.ok !== false, ...out });
   } catch (err) {
+    if (err?.code === 'OPERATOR_ACCESS_DENIED' || err?.code === 'OPERATORDETAIL_REQUIRED') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'MISSING_OPERATOR_OR_EMAIL') {
+      return res.status(400).json({ ok: false, reason: err.code });
+    }
     const msg = String(err?.message || '');
     if (msg === 'AI_NOT_CONFIGURED' || msg === 'INVALID_PARAMS') {
       return res.status(400).json({ ok: false, reason: msg });
+    }
+    if (err?.code === 'OPERATOR_AI_DISABLED_BY_PLATFORM' || err?.code === 'OPERATOR_AI_SCOPE_SCHEDULE_DISABLED') {
+      return res.status(403).json({ ok: false, reason: err.code });
     }
     if (isMissingClnOperatorAiTable(err)) {
       return res.status(503).json({ ok: false, reason: 'CLN_OPERATOR_AI_MIGRATION_REQUIRED' });
@@ -3510,6 +4780,8 @@ router.post('/operator/google-drive/oauth-url', async (req, res) => {
   try {
     const operatorId = String(req.body?.operatorId || req.query.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const result = await clnInt.getGoogleDriveOAuthAuthUrl(operatorId);
     if (!result.ok) return res.status(400).json(result);
     res.json(result);
@@ -3544,6 +4816,8 @@ router.post('/operator/google-drive/disconnect', async (req, res) => {
   try {
     const operatorId = String(req.body?.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     await clnInt.disconnectGoogleDrive(operatorId);
     res.json({ ok: true });
   } catch (err) {
@@ -3557,6 +4831,8 @@ router.post('/operator/stripe-connect/oauth-url', async (req, res) => {
   try {
     const operatorId = String(req.body?.operatorId || req.query.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const result = await clnInt.getStripeConnectOAuthAuthUrl(operatorId);
     if (!result.ok) return res.status(400).json(result);
     res.json({ ok: true, url: result.url });
@@ -3596,6 +4872,8 @@ router.post('/operator/stripe-connect/disconnect', async (req, res) => {
   try {
     const operatorId = String(req.body?.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     await clnInt.disconnectStripeConnect(operatorId);
     res.json({ ok: true });
   } catch (err) {
@@ -3604,9 +4882,52 @@ router.post('/operator/stripe-connect/disconnect', async (req, res) => {
   }
 });
 
+/** Client-invoice Xendit (operator’s own key + callback token), same UX model as Coliving Payex direct. */
+router.post('/operator/client-invoice-xendit-credentials', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const operatorId = String(body.operatorId || '').trim();
+    const secretKey = Object.prototype.hasOwnProperty.call(body, 'secretKey') ? body.secretKey : undefined;
+    const callbackToken = Object.prototype.hasOwnProperty.call(body, 'callbackToken') ? body.callbackToken : undefined;
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    await svc.saveClnOperatorClientInvoiceXenditCredentials(operatorId, { secretKey, callbackToken });
+    return res.json({ ok: true });
+  } catch (err) {
+    if (err?.code === 'MISSING_KEYS') {
+      return res.status(400).json({ ok: false, reason: 'MISSING_KEYS' });
+    }
+    if (err?.code === 'MISSING_OPERATOR_ID') {
+      return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    }
+    console.error('[cleanlemon] operator/client-invoice-xendit-credentials', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.post('/operator/client-invoice-xendit-disconnect', async (req, res) => {
+  try {
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    await svc.clearClnOperatorClientInvoiceXenditCredentials(operatorId);
+    return res.json({ ok: true });
+  } catch (err) {
+    if (err?.code === 'MISSING_OPERATOR_ID') {
+      return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    }
+    console.error('[cleanlemon] operator/client-invoice-xendit-disconnect', err);
+    return res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
 router.get('/operator/salaries', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const period = String(req.query.period || '').trim();
     const items = await svc.listOperatorSalaries(operatorId, period || undefined);
     res.json({ ok: true, items });
@@ -3620,6 +4941,8 @@ router.get('/operator/salary-settings', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const settings = await clnSalary.getSalarySettings(operatorId);
     res.json({ ok: true, settings });
   } catch (err) {
@@ -3632,6 +4955,8 @@ router.put('/operator/salary-settings', async (req, res) => {
   try {
     const operatorId = String(req.body?.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const payDays = Array.isArray(req.body?.payDays) ? req.body.payDays : [];
     const payrollDefaults =
       req.body?.payrollDefaults !== undefined ? req.body.payrollDefaults : undefined;
@@ -3654,6 +4979,8 @@ router.get('/operator/salary-lines', async (req, res) => {
     if (!operatorId || !/^\d{4}-\d{2}$/.test(period)) {
       return res.status(400).json({ ok: false, reason: 'MISSING_PARAMS' });
     }
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const items = await clnSalary.listSalaryLines(operatorId, period);
     res.json({ ok: true, items });
   } catch (err) {
@@ -3666,6 +4993,8 @@ router.post('/operator/salary-lines', async (req, res) => {
   try {
     const operatorId = String(req.body?.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const item = await clnSalary.addSalaryLine(operatorId, req.body || {});
     res.json({ ok: true, item });
   } catch (err) {
@@ -3682,6 +5011,8 @@ router.delete('/operator/salary-lines/:id', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const ok = await clnSalary.deleteSalaryLine(operatorId, req.params.id);
     res.json({ ok, deleted: ok });
   } catch (err) {
@@ -3694,6 +5025,8 @@ router.patch('/operator/salary-lines/:id', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const item = await clnSalary.updateSalaryLine(operatorId, req.params.id, req.body || {});
     res.json({ ok: true, item });
   } catch (err) {
@@ -3710,6 +5043,8 @@ router.post('/operator/salaries/compute-preview', async (req, res) => {
   try {
     const operatorId = String(req.body?.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const result = await clnSalary.previewFlexiblePayroll(operatorId, req.body || {});
     res.json({ ok: true, result });
   } catch (err) {
@@ -3733,6 +5068,8 @@ router.post('/operator/salaries/sync-from-contacts', async (req, res) => {
     if (!operatorId || !/^\d{4}-\d{2}$/.test(period)) {
       return res.status(400).json({ ok: false, reason: 'INVALID_PARAMS' });
     }
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const items = await svc.listOperatorContacts(operatorId);
     const result = await clnSalary.syncSalaryRecordsFromContacts(operatorId, period, items);
     res.json(result);
@@ -3750,6 +5087,8 @@ router.post('/operator/salaries', async (req, res) => {
   try {
     const operatorId = String(req.body?.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const item = await clnSalary.createSalaryRecord(operatorId, req.body || {});
     res.json({ ok: true, item });
   } catch (err) {
@@ -3766,6 +5105,21 @@ router.patch('/operator/salaries/:id', async (req, res) => {
   try {
     const operatorId = String(req.body?.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const action = String(req.body?.action || '').trim().toLowerCase();
+    if (action === 'void_payment') {
+      const item = await clnSalary.voidSalaryRecordPayment(operatorId, req.params.id);
+      return res.json({ ok: true, item });
+    }
+    if (action === 'unvoid') {
+      const item = await clnSalary.restoreSalaryRecordFromVoid(operatorId, req.params.id);
+      return res.json({ ok: true, item });
+    }
+    if (action === 'unarchive') {
+      const item = await clnSalary.restoreSalaryRecordFromArchive(operatorId, req.params.id);
+      return res.json({ ok: true, item });
+    }
     const status = String(req.body?.status || '').trim();
     if (status === 'void' || status === 'archived') {
       const item = await clnSalary.patchSalaryRecordStatus(operatorId, req.params.id, status);
@@ -3781,9 +5135,15 @@ router.patch('/operator/salaries/:id', async (req, res) => {
       code === 'SALARY_TABLES_MISSING' ||
       code === 'RECORD_NOT_FOUND' ||
       code === 'RECORD_LOCKED' ||
-      code === 'MISSING_PARAMS'
+      code === 'MISSING_PARAMS' ||
+      code === 'BUKKU_NOT_CONNECTED' ||
+      code === 'BUKKU_VOID_FAILED' ||
+      code === 'VOID_BUKKU_EXCEPTION' ||
+      code === 'VOID_XERO_SPEND_FAILED' ||
+      code === 'VOID_XERO_EXCEPTION' ||
+      code === 'ACCOUNTING_VOID_FAILED'
     ) {
-      return res.status(400).json({ ok: false, reason: code });
+      return res.status(400).json({ ok: false, reason: code, detail: err?.detail });
     }
     console.error('[cleanlemon] operator/salaries:patch', err);
     res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
@@ -3796,6 +5156,8 @@ router.post('/operator/salaries/sync-accounting', async (req, res) => {
     const recordIds = Array.isArray(req.body?.recordIds) ? req.body.recordIds : [];
     const journalDate = String(req.body?.journalDate || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const result = await clnSalary.syncSalaryRecordsToAccounting(
       operatorId,
       recordIds,
@@ -3815,6 +5177,8 @@ router.post('/operator/salaries/sync-bukku', async (req, res) => {
     const recordIds = Array.isArray(req.body?.recordIds) ? req.body.recordIds : [];
     const journalDate = String(req.body?.journalDate || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const result = await clnSalary.syncSalaryRecordsToAccounting(
       operatorId,
       recordIds,
@@ -3833,8 +5197,20 @@ router.post('/operator/salaries/mark-paid', async (req, res) => {
     const recordIds = Array.isArray(req.body?.recordIds) ? req.body.recordIds : [];
     const paymentDate = String(req.body?.paymentDate || '').trim();
     const paymentMethod = String(req.body?.paymentMethod || '').trim();
+    const releaseAmounts =
+      req.body?.releaseAmounts != null && typeof req.body.releaseAmounts === 'object' && !Array.isArray(req.body.releaseAmounts)
+        ? req.body.releaseAmounts
+        : null;
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
-    const result = await clnSalary.markSalaryRecordsPaid(operatorId, recordIds, paymentDate, paymentMethod);
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const result = await clnSalary.markSalaryRecordsPaid(
+      operatorId,
+      recordIds,
+      paymentDate,
+      paymentMethod,
+      releaseAmounts
+    );
     res.json(result);
   } catch (err) {
     console.error('[cleanlemon] operator/salaries/mark-paid', err);
@@ -3845,6 +5221,8 @@ router.post('/operator/salaries/mark-paid', async (req, res) => {
 router.get('/operator/contacts', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const items = await svc.listOperatorContacts(operatorId || undefined);
     res.json({ ok: true, items });
   } catch (err) {
@@ -3861,6 +5239,8 @@ router.post('/operator/contacts/sync-all', async (req, res) => {
     if (!operatorId) {
       return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
     }
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const result = await svc.syncClnOperatorContactsWithAccounting(operatorId, direction);
     res.json(result);
   } catch (err) {
@@ -3874,7 +5254,11 @@ router.post('/operator/contacts/sync-all', async (req, res) => {
 
 router.post('/operator/contacts', async (req, res) => {
   try {
-    const id = await svc.createOperatorContact(req.body || {});
+    const b = req.body || {};
+    const oid = String(b.operatorId || b.operator_id || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, oid);
+    if (!gate) return;
+    const id = await svc.createOperatorContact(b);
     res.json({ ok: true, id });
   } catch (err) {
     if (err?.code === 'SINGLE_ROLE_REQUIRED') {
@@ -3912,7 +5296,11 @@ router.post('/operator/contacts', async (req, res) => {
 
 router.put('/operator/contacts/:id', async (req, res) => {
   try {
-    await svc.updateOperatorContact(req.params.id, req.body || {});
+    const b = req.body || {};
+    const oid = String(b.operatorId || b.operator_id || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, oid);
+    if (!gate) return;
+    await svc.updateOperatorContact(req.params.id, b);
     res.json({ ok: true });
   } catch (err) {
     if (err?.code === 'CONTACT_NOT_FOUND') {
@@ -3953,6 +5341,9 @@ router.put('/operator/contacts/:id', async (req, res) => {
 
 router.delete('/operator/contacts/:id', async (req, res) => {
   try {
+    const operatorId = String(req.query.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     await svc.deleteOperatorContact(req.params.id);
     res.json({ ok: true });
   } catch (err) {
@@ -3974,6 +5365,8 @@ router.delete('/operator/contacts/:id', async (req, res) => {
 router.get('/operator/teams', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim() || undefined;
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId || '');
+    if (!gate) return;
     const items = await svc.listOperatorTeams(operatorId);
     res.json({ ok: true, items });
   } catch (err) {
@@ -3984,7 +5377,11 @@ router.get('/operator/teams', async (req, res) => {
 
 router.post('/operator/teams', async (req, res) => {
   try {
-    const id = await svc.createOperatorTeam(req.body || {});
+    const b = req.body || {};
+    const oid = String(b.operatorId || b.operator_id || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, oid);
+    if (!gate) return;
+    const id = await svc.createOperatorTeam(b);
     res.json({ ok: true, id });
   } catch (err) {
     if (err?.code === 'MISSING_OPERATOR_ID') {
@@ -3997,7 +5394,11 @@ router.post('/operator/teams', async (req, res) => {
 
 router.put('/operator/teams/:id', async (req, res) => {
   try {
-    await svc.updateOperatorTeam(req.params.id, req.body || {});
+    const b = req.body || {};
+    const oid = String(b.operatorId || b.operator_id || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, oid);
+    if (!gate) return;
+    await svc.updateOperatorTeam(req.params.id, b);
     res.json({ ok: true });
   } catch (err) {
     if (err?.code === 'TEAM_NOT_FOUND') {
@@ -4014,6 +5415,8 @@ router.put('/operator/teams/:id', async (req, res) => {
 router.delete('/operator/teams/:id', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     await svc.deleteOperatorTeam(req.params.id, operatorId);
     res.json({ ok: true });
   } catch (err) {
@@ -4031,9 +5434,13 @@ router.delete('/operator/teams/:id', async (req, res) => {
 router.get('/operator/schedule-jobs', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim() || undefined;
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId || '');
+    if (!gate) return;
     const items = await svc.listOperatorScheduleJobs({
       limit: req.query.limit,
       operatorId,
+      dateFrom: req.query.dateFrom,
+      dateTo: req.query.dateTo,
     });
     res.json({ ok: true, items });
   } catch (err) {
@@ -4047,6 +5454,8 @@ router.get('/operator/pending-client-booking-requests', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const items = await svc.listOperatorPendingClientBookingRequests({
       operatorId,
       limit: req.query.limit,
@@ -4063,6 +5472,8 @@ router.post('/operator/pending-client-booking-requests/:id/decide', async (req, 
     const operatorId = String(req.body?.operatorId || req.query?.operatorId || '').trim();
     const decision = String(req.body?.decision || '').trim().toLowerCase();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     if (decision !== 'approve' && decision !== 'reject') {
       return res.status(400).json({ ok: false, reason: 'INVALID_DECISION' });
     }
@@ -4093,6 +5504,8 @@ router.get('/operator/damage-reports', async (req, res) => {
   try {
     const operatorId = String(req.query.operatorId || '').trim();
     if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const items = await svc.listOperatorDamageReports({
       operatorId,
       limit: req.query.limit,
@@ -4106,7 +5519,11 @@ router.get('/operator/damage-reports', async (req, res) => {
 
 router.put('/operator/schedule-jobs/:id', async (req, res) => {
   try {
-    await svc.updateOperatorScheduleJob(req.params.id, req.body || {});
+    const b = req.body || {};
+    const oid = String(b.operatorId || b.operator_id || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, oid);
+    if (!gate) return;
+    await svc.updateOperatorScheduleJob(req.params.id, b);
     res.json({ ok: true });
   } catch (err) {
     if (err?.code === 'OPERATOR_MISMATCH') {
@@ -4120,11 +5537,36 @@ router.put('/operator/schedule-jobs/:id', async (req, res) => {
   }
 });
 
+router.delete('/operator/schedule-jobs/:id', async (req, res) => {
+  try {
+    const operatorId = String(req.query.operatorId || req.body?.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    await svc.deleteOperatorScheduleJob({ scheduleId: req.params.id, operatorId });
+    res.json({ ok: true });
+  } catch (err) {
+    if (err?.code === 'MISSING_PARAMS') {
+      return res.status(400).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'OPERATOR_MISMATCH') {
+      return res.status(403).json({ ok: false, reason: err.code });
+    }
+    if (err?.code === 'NOT_FOUND') {
+      return res.status(404).json({ ok: false, reason: err.code });
+    }
+    console.error('[cleanlemon] operator/schedule-jobs:delete', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
 router.post('/operator/schedule-jobs', async (req, res) => {
   try {
     const body = req.body || {};
-    const id = await svc.createCleaningScheduleJobUnified(body);
     const operatorId = String(body.operatorId || '').trim();
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    const id = await svc.createCleaningScheduleJobUnified(body);
     const date = String(body.date || '').slice(0, 10);
     if (operatorId && id) {
       clnOpAi.maybeRunIncrementalAfterJobCreate(operatorId, date, id);
@@ -4141,7 +5583,10 @@ router.post('/operator/schedule-jobs', async (req, res) => {
 
 router.get('/operator/accounting-mappings', async (req, res) => {
   try {
-    const operatorId = String(req.query.operatorId || 'op_demo_001');
+    const operatorId = String(req.query.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const items = await svc.listOperatorAccountingMappings(operatorId);
     res.json({ ok: true, items });
   } catch (err) {
@@ -4152,7 +5597,10 @@ router.get('/operator/accounting-mappings', async (req, res) => {
 
 router.put('/operator/accounting-mappings', async (req, res) => {
   try {
-    const operatorId = String(req.body?.operatorId || 'op_demo_001');
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const item = req.body?.item || {};
     await svc.upsertOperatorAccountingMapping(operatorId, item);
     res.json({ ok: true });
@@ -4164,7 +5612,10 @@ router.put('/operator/accounting-mappings', async (req, res) => {
 
 router.post('/operator/accounting-mappings/sync', async (req, res) => {
   try {
-    const operatorId = String(req.body?.operatorId || req.query?.operatorId || 'op_demo_001');
+    const operatorId = String(req.body?.operatorId || req.query?.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const result = await svc.syncOperatorAccountingMappings(operatorId);
     if (!result?.ok) {
       return res.status(400).json({ ok: false, ...result });
@@ -4178,7 +5629,10 @@ router.post('/operator/accounting-mappings/sync', async (req, res) => {
 
 router.get('/operator/calendar-adjustments', async (req, res) => {
   try {
-    const operatorId = String(req.query.operatorId || 'op_demo_001');
+    const operatorId = String(req.query.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const items = await svc.listOperatorCalendarAdjustments(operatorId);
     res.json({ ok: true, items });
   } catch (err) {
@@ -4189,7 +5643,10 @@ router.get('/operator/calendar-adjustments', async (req, res) => {
 
 router.post('/operator/calendar-adjustments', async (req, res) => {
   try {
-    const operatorId = String(req.body?.operatorId || 'op_demo_001');
+    const operatorId = String(req.body?.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const payload = req.body?.payload || {};
     const id = await svc.createOperatorCalendarAdjustment(operatorId, payload);
     res.json({ ok: true, id });
@@ -4201,10 +5658,17 @@ router.post('/operator/calendar-adjustments', async (req, res) => {
 
 router.put('/operator/calendar-adjustments/:id', async (req, res) => {
   try {
+    const operatorId = String(req.body?.operatorId || req.query?.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
     const payload = req.body?.payload || {};
-    await svc.updateOperatorCalendarAdjustment(req.params.id, payload);
+    await svc.updateOperatorCalendarAdjustment(req.params.id, operatorId, payload);
     res.json({ ok: true });
   } catch (err) {
+    if (err?.code === 'NOT_FOUND') {
+      return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
+    }
     console.error('[cleanlemon] operator/calendar-adjustments:put', err);
     res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
   }
@@ -4212,9 +5676,16 @@ router.put('/operator/calendar-adjustments/:id', async (req, res) => {
 
 router.delete('/operator/calendar-adjustments/:id', async (req, res) => {
   try {
-    await svc.deleteOperatorCalendarAdjustment(req.params.id);
+    const operatorId = String(req.query.operatorId || req.body?.operatorId || '').trim();
+    if (!operatorId) return res.status(400).json({ ok: false, reason: 'MISSING_OPERATOR_ID' });
+    const gate = await requireOperatorStaffForPortal(req, res, operatorId);
+    if (!gate) return;
+    await svc.deleteOperatorCalendarAdjustment(req.params.id, operatorId);
     res.json({ ok: true });
   } catch (err) {
+    if (err?.code === 'NOT_FOUND') {
+      return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
+    }
     console.error('[cleanlemon] operator/calendar-adjustments:delete', err);
     res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
   }
@@ -4597,6 +6068,31 @@ router.post('/admin/saasadmin-ai-chat', async (req, res) => {
       return res.status(503).json({ ok: false, reason: 'SAASADMIN_AI_NOT_CONFIGURED' });
     }
     console.error('[cleanlemon] admin/saasadmin-ai-chat:post', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+/** Singleton: allow operator schedule AI + optional scope list (`cln_saasadmin_operator_ai_policy`). SaaS admin JWT. */
+router.get('/admin/operator-ai-access', async (req, res) => {
+  try {
+    const allowed = await ensureCleanlemonSaasAdmin(req, res);
+    if (!allowed) return;
+    const policy = await clnSaasAiMd.getOperatorAiAccessPolicy();
+    res.json({ ok: true, policy });
+  } catch (err) {
+    console.error('[cleanlemon] admin/operator-ai-access:get', err);
+    res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
+  }
+});
+
+router.put('/admin/operator-ai-access', async (req, res) => {
+  try {
+    const allowed = await ensureCleanlemonSaasAdmin(req, res);
+    if (!allowed) return;
+    const policy = await clnSaasAiMd.updateOperatorAiAccessPolicy(req.body || {});
+    res.json({ ok: true, policy });
+  } catch (err) {
+    console.error('[cleanlemon] admin/operator-ai-access:put', err);
     res.status(500).json({ ok: false, reason: err?.message || 'DB_ERROR' });
   }
 });

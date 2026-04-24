@@ -1852,6 +1852,28 @@ async function handleCheckoutSessionCompleted(session) {
     return { handled: true, result: applied.result || applied };
   }
 
+  if (type === 'cleanlemon_client_invoices') {
+    console.log('[stripe] checkout.session.completed cleanlemon_client_invoices', {
+      id: session.id,
+      payment_status: session.payment_status,
+      amount_total: session.amount_total,
+      metadata: session.metadata
+    });
+    if (session.payment_status !== 'paid') {
+      return {
+        handled: true,
+        result: { type: 'cleanlemon_client_invoices', reason: 'payment_not_paid', payment_status: session.payment_status }
+      };
+    }
+    try {
+      const applied = await cleanlemonService.applyCleanlemonClientInvoicesFromCheckoutSession(session);
+      return { handled: true, result: { type: 'cleanlemon_client_invoices', ...applied } };
+    } catch (e) {
+      console.error('[stripe] cleanlemon_client_invoices apply failed', e?.message || e);
+      return { handled: true, result: { type: 'cleanlemon_client_invoices', ok: false, reason: e?.message || 'APPLY_FAILED' } };
+    }
+  }
+
   if (type === 'TenantMeter') {
     console.log('[stripe] checkout.session.completed TenantMeter payload', { id: session.id, payment_status: session.payment_status, amount_total: session.amount_total, currency: session.currency, metadata: session.metadata });
     if (session.payment_status !== 'paid') {

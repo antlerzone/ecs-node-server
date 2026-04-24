@@ -1,7 +1,7 @@
 "use client"
 
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { useRouter } from 'next/navigation'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { usePathname, useRouter } from 'next/navigation'
 import { formatGovIdErrorReason } from '@/lib/gov-id-callback-messages'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
@@ -80,10 +80,15 @@ type Props = {
   showViewMyProfileButton?: boolean
   /** Wix/CMS tenant UUID for the public profile route (required when showViewMyProfileButton is true). */
   publicProfileTenantId?: string | null
-  /** Singpass / MyDigital verification row + avatar badge — only `/demoprofile` (not tenant/owner/operator profile). */
+  /** Singpass / MyDigital + same verification row as demo — also used on `/tenant/profile` & `/owner/profile` when enabled. */
   showGovVerification?: boolean
   /** Tenant/owner portal: user must confirm profile (writes profile_self_verified_at) — no Gov OIDC. */
   selfVerifyMode?: boolean
+  /**
+   * When `selfVerifyMode`: if false (tenant/owner), only self-attestation is required — no Aliyun MyKad/passport eKYC.
+   * If true (default), eKYC or self-attest timestamp counts as verified.
+   */
+  selfVerifyRequiresEkyc?: boolean
 }
 
 type PhoneCountryOption = {
@@ -244,34 +249,57 @@ export default function UnifiedProfilePage({
   publicProfileTenantId = null,
   showGovVerification = false,
   selfVerifyMode = false,
+  selfVerifyRequiresEkyc = true,
 }: Props) {
   const router = useRouter()
+  const pathname = usePathname() || ''
   const member = getMember()
   const email = String(member?.email || '').trim()
   const currentRole = getCurrentRole()
   const staffRole = member?.roles?.find((r) => r.type === 'staff') as { clientId?: string } | undefined
   const clientId = String(currentRole?.clientId || staffRole?.clientId || 'op_demo_001')
 
-  const [backendProfile, setBackendProfile] = useState(false)
+  /** Self-verify + Aliyun eKYC locks (tenant/owner can disable eKYC via `selfVerifyRequiresEkyc={false}`). */
+  const selfVerifyEkycActive = selfVerifyMode && selfVerifyRequiresEkyc
+  /** Same bar as Cleanlemons employee/client: Coliving tenant/owner must pass Aliyun eKYC (self-attest alone does not open the portal). */
+  const mandatoryColivingTenantOwnerEkyc =
+    selfVerifyMode &&
+    selfVerifyRequiresEkyc &&
+    (uploadRole === 'tenant' || uploadRole === 'owner')
+
+  const [backendProfileState, setBackendProfile] = useState(false)
   const [localStorageKey, setLocalStorageKey] = useState<string | undefined>(undefined)
 
-  useEffect(() => {
-    let cancelled = false
+  /** Sync with portal session before paint so Verify / 蓝勾 do not depend on async useEffect (was one frame behind). */
+  const portalSessionReady = !shouldUseDemoMock() && !!email
+  /** Prefer sync `portalSessionReady`; keep OR with state for edge cases after storage writes. */
+  const portalApisActive = portalSessionReady || backendProfileState
+
+  useLayoutEffect(() => {
     const apply = () => {
-      if (cancelled) return
       const demo = shouldUseDemoMock()
       const em = String(getMember()?.email || '').trim()
       setBackendProfile(!demo && !!em)
       setLocalStorageKey(demo ? localStorageKeyDemo : undefined)
     }
     apply()
-    /** Same-tab login can write `portal_member` after the first effect tick; re-read once tasks flush. */
     const t = typeof window !== 'undefined' ? window.setTimeout(apply, 0) : undefined
     return () => {
-      cancelled = true
       if (t != null) window.clearTimeout(t)
     }
-    /** Re-sync when `email` appears (session / portal_member hydrates). Previously only [localStorageKeyDemo] ran once with empty email → backendProfile stayed false and Gov row never mounted. */
+  }, [localStorageKeyDemo, email])
+
+  /** Same-tab login can write `portal_member` after paint — microtask follow-up. */
+  useEffect(() => {
+    const t = typeof window !== 'undefined' ? window.setTimeout(() => {
+      const demo = shouldUseDemoMock()
+      const em = String(getMember()?.email || '').trim()
+      setBackendProfile(!demo && !!em)
+      setLocalStorageKey(demo ? localStorageKeyDemo : undefined)
+    }, 0) : undefined
+    return () => {
+      if (t != null) window.clearTimeout(t)
+    }
   }, [localStorageKeyDemo, email])
 
   const userNameHint = useMemo(() => {
@@ -450,6 +478,7 @@ export default function UnifiedProfilePage({
   const [bankOptions, setBankOptions] = useState<Array<{ id: string; name: string }>>([])
   const [isInitializing, setIsInitializing] = useState(true)
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+  const [selfAttestSubmitting, setSelfAttestSubmitting] = useState(false)
   const [hasPassword, setHasPassword] = useState(!!userHasPasswordHint)
   const [pwdDialogOpen, setPwdDialogOpen] = useState(false)
   const [pwdCodeSent, setPwdCodeSent] = useState(false)
@@ -601,7 +630,7 @@ export default function UnifiedProfilePage({
   }, [bankId])
 
   useEffect(() => {
-    if (!backendProfile || !email) return
+    if (!portalApisActive || !email) return
     let cancelled = false
     ;(async () => {
       const st = await fetchPortalPasswordStatus(email)
@@ -615,10 +644,10 @@ export default function UnifiedProfilePage({
       cancelled = true
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [backendProfile, email])
+  }, [portalApisActive, email])
 
   useEffect(() => {
-    if (!localStorageKey || backendProfile) return
+    if (!localStorageKey || portalApisActive) return
     const raw = localStorage.getItem(localStorageKey)
     if (!raw) return
     try {
@@ -645,10 +674,10 @@ export default function UnifiedProfilePage({
       // ignore broken local data
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [localStorageKey, backendProfile])
+  }, [localStorageKey, portalApisActive])
 
   useEffect(() => {
-    if (!backendProfile || !email) {
+    if (!portalApisActive || !email) {
       setIsInitializing(false)
       return
     }
@@ -722,7 +751,7 @@ export default function UnifiedProfilePage({
       cancelled = true
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [backendProfile, email, showGovVerification])
+  }, [portalApisActive, email, showGovVerification])
 
   const buildProfilePayload = (nextAvatarUrl?: string) => ({
     clientId,
@@ -771,7 +800,7 @@ export default function UnifiedProfilePage({
   ])
 
   useEffect(() => {
-    if (isInitializing || !backendProfile) return
+    if (isInitializing || !portalApisActive) return
     if (aliyunEkycVerified && !prevAliyunVerifiedForSnapshotRef.current) {
       lastSavedPayloadRef.current = JSON.stringify(buildProfilePayload())
     }
@@ -780,7 +809,7 @@ export default function UnifiedProfilePage({
   }, [
     aliyunEkycVerified,
     isInitializing,
-    backendProfile,
+    portalApisActive,
     clientId,
     email,
     fullName,
@@ -810,7 +839,7 @@ export default function UnifiedProfilePage({
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
     setSaveState('saving')
     saveTimerRef.current = setTimeout(async () => {
-      if (backendProfile) {
+      if (portalApisActive) {
         const result = await savePortalProfile(payload, {
           govIdentityLocked,
           aliyunEkycVerified,
@@ -874,7 +903,7 @@ export default function UnifiedProfilePage({
     avatarUrl,
     nricFrontUrl,
     nricBackUrl,
-    backendProfile,
+    portalApisActive,
     localStorageKey,
     govIdentityLocked,
     aliyunEkycVerified,
@@ -889,7 +918,7 @@ export default function UnifiedProfilePage({
 
   /** Opening the verification dialog: refresh profile + Gov flags so button disabled states match DB (fixes stale client state). */
   useEffect(() => {
-    if (!govDialogOpen || !email || !backendProfile || shouldUseDemoMock()) return
+    if (!govDialogOpen || !email || !portalApisActive || shouldUseDemoMock()) return
     let cancelled = false
     void (async () => {
       try {
@@ -918,19 +947,19 @@ export default function UnifiedProfilePage({
     return () => {
       cancelled = true
     }
-  }, [govDialogOpen, email, backendProfile])
+  }, [govDialogOpen, email, portalApisActive])
 
   /** Aliyun eKYC_PRO: MyKad — lock identity + address + both NRIC images. */
   const aliyunMykadEkycLocked =
-    (showGovVerification || selfVerifyMode) &&
-    backendProfile &&
+    (showGovVerification || selfVerifyEkycActive) &&
+    portalApisActive &&
     !shouldUseDemoMock() &&
     aliyunEkycVerified &&
     idTypeU === 'NRIC'
   /** Aliyun passport — lock identity + passport photo (front slot); address stays editable. */
   const aliyunPassportEkycLocked =
-    (showGovVerification || selfVerifyMode) &&
-    backendProfile &&
+    (showGovVerification || selfVerifyEkycActive) &&
+    portalApisActive &&
     !shouldUseDemoMock() &&
     aliyunEkycVerified &&
     idTypeU === 'PASSPORT'
@@ -939,8 +968,8 @@ export default function UnifiedProfilePage({
   const aliyunAddressLocked = govIdentityLocked || aliyunMykadEkycLocked
   /** Passport expiry ≤30 days: allow starting passport eKYC again from Verification Status dialog (main form stays locked until success). */
   const passportRenewalEligible =
-    (showGovVerification || selfVerifyMode) &&
-    backendProfile &&
+    (showGovVerification || selfVerifyEkycActive) &&
+    portalApisActive &&
     !shouldUseDemoMock() &&
     aliyunEkycVerified &&
     idTypeU === 'PASSPORT' &&
@@ -950,36 +979,41 @@ export default function UnifiedProfilePage({
   const govIdProviderLinked = govSingpass || govMydigital
   const govIdVerifiedForUi =
     showGovVerification &&
-    backendProfile &&
+    portalApisActive &&
     !shouldUseDemoMock() &&
     (govIdProviderLinked || govIdentityLocked || aliyunEkycVerified)
 
-  /** Tenant/owner profile (no Gov row): verified when self-attested or Aliyun completed. */
+  /** Tenant/owner: Aliyun eKYC only. Other self-verify paths may still use self-attest + optional eKYC. */
   const selfVerifyVerifiedForUi =
     selfVerifyMode &&
-    backendProfile &&
+    portalApisActive &&
     !shouldUseDemoMock() &&
-    (profileSelfVerifiedAt.trim() !== '' || aliyunEkycVerified)
+    (mandatoryColivingTenantOwnerEkyc
+      ? aliyunEkycVerified
+      : selfVerifyRequiresEkyc
+        ? profileSelfVerifiedAt.trim() !== '' || aliyunEkycVerified
+        : profileSelfVerifiedAt.trim() !== '')
 
   const showVerifiedBadgeByName =
     (showGovVerification && govIdVerifiedForUi) || (selfVerifyMode && selfVerifyVerifiedForUi)
 
-  /** Tenant/owner self-verify: block closing dialog until MyKad/passport eKYC (or legacy self-attest) completes. */
+  /** Tenant/owner self-verify with eKYC path: block closing dialog until verified. No-eKYC path uses explicit Confirm only. */
   const selfVerifyIdentityLockedUntilVerified =
     selfVerifyMode &&
-    backendProfile &&
+    selfVerifyRequiresEkyc &&
+    portalApisActive &&
     !shouldUseDemoMock() &&
     !showGovVerification &&
     !selfVerifyVerifiedForUi
 
   const identityLockedUntilVerified =
-    showGovVerification && backendProfile && !shouldUseDemoMock() && !govIdVerifiedForUi
+    showGovVerification && portalApisActive && !shouldUseDemoMock() && !govIdVerifiedForUi
 
   const idFrontUploadLocked =
     aliyunMykadEkycLocked || aliyunPassportEkycLocked || identityLockedUntilVerified
   const idBackUploadLocked = aliyunMykadEkycLocked || (requiresBackImage && identityLockedUntilVerified)
 
-  const selfVerifyAliyunDone = selfVerifyMode && aliyunEkycVerified
+  const selfVerifyAliyunDone = selfVerifyEkycActive && aliyunEkycVerified
   const disableVerificationDialogMyKad =
     shouldUseDemoMock() || (showGovVerification ? govIdVerifiedForUi : selfVerifyAliyunDone)
   const disableVerificationDialogPassport =
@@ -989,16 +1023,24 @@ export default function UnifiedProfilePage({
   /** `/demoprofile`: open verification dialog until identity is verified. */
   useEffect(() => {
     if (isInitializing) return
-    if (!showGovVerification || shouldUseDemoMock() || !backendProfile) return
+    if (!showGovVerification || shouldUseDemoMock() || !portalApisActive) return
     if (!govIdVerifiedForUi) setGovDialogOpen(true)
-  }, [isInitializing, showGovVerification, backendProfile, govIdVerifiedForUi])
+  }, [isInitializing, showGovVerification, portalApisActive, govIdVerifiedForUi])
 
-  /** Tenant/owner self-verify: same as demoprofile — show dialog until verified. */
+  /** Tenant/owner self-verify (eKYC path only): show dialog until verified. Self-attest-only uses in-page Confirm. */
   useEffect(() => {
     if (isInitializing) return
-    if (!selfVerifyMode || showGovVerification || shouldUseDemoMock() || !backendProfile) return
+    if (!selfVerifyMode || !selfVerifyRequiresEkyc || showGovVerification || shouldUseDemoMock() || !portalApisActive)
+      return
     if (!selfVerifyVerifiedForUi) setGovDialogOpen(true)
-  }, [isInitializing, selfVerifyMode, showGovVerification, backendProfile, selfVerifyVerifiedForUi])
+  }, [
+    isInitializing,
+    selfVerifyMode,
+    selfVerifyRequiresEkyc,
+    showGovVerification,
+    portalApisActive,
+    selfVerifyVerifiedForUi,
+  ])
 
   useEffect(() => {
     const wasUnverified = prevGovIdVerifiedForUiRef.current === false
@@ -1009,7 +1051,7 @@ export default function UnifiedProfilePage({
   }, [govIdVerifiedForUi])
 
   useEffect(() => {
-    if (!selfVerifyMode || showGovVerification || shouldUseDemoMock() || !backendProfile) {
+    if (!selfVerifyMode || showGovVerification || shouldUseDemoMock() || !portalApisActive) {
       prevSelfVerifyVerifiedForUiRef.current = null
       return
     }
@@ -1018,10 +1060,10 @@ export default function UnifiedProfilePage({
       setGovDialogOpen(false)
     }
     prevSelfVerifyVerifiedForUiRef.current = selfVerifyVerifiedForUi
-  }, [selfVerifyMode, showGovVerification, backendProfile, selfVerifyVerifiedForUi])
+  }, [selfVerifyMode, showGovVerification, portalApisActive, selfVerifyVerifiedForUi])
 
   useEffect(() => {
-    if (!selfVerifyMode || showGovVerification || shouldUseDemoMock() || !backendProfile) return
+    if (!selfVerifyMode || showGovVerification || shouldUseDemoMock() || !portalApisActive) return
     if (typeof window === 'undefined') return
     const onPageShow = (e: PageTransitionEvent) => {
       if (!e.persisted) return
@@ -1042,13 +1084,24 @@ export default function UnifiedProfilePage({
         const psva = String((p as { profileSelfVerifiedAt?: string }).profileSelfVerifiedAt || '').trim()
         setProfileSelfVerifiedAt(psva)
         setAliyunEkycVerified(!!gl.aliyunEkycLocked)
-        const verified = psva !== '' || !!gl.aliyunEkycLocked
-        if (!verified) setGovDialogOpen(true)
+        const verified = mandatoryColivingTenantOwnerEkyc
+          ? !!gl.aliyunEkycLocked
+          : selfVerifyRequiresEkyc
+            ? psva !== '' || !!gl.aliyunEkycLocked
+            : psva !== ''
+        if (!verified && selfVerifyRequiresEkyc) setGovDialogOpen(true)
       })()
     }
     window.addEventListener('pageshow', onPageShow)
     return () => window.removeEventListener('pageshow', onPageShow)
-  }, [selfVerifyMode, showGovVerification, backendProfile, email])
+  }, [
+    selfVerifyMode,
+    selfVerifyRequiresEkyc,
+    showGovVerification,
+    portalApisActive,
+    email,
+    mandatoryColivingTenantOwnerEkyc,
+  ])
 
   const profileGateIncomplete = useMemo(() => {
     if (!colivingProfileGateModel) return new Set<TenantGateIncompleteField>()
@@ -1064,7 +1117,7 @@ export default function UnifiedProfilePage({
     ]
     const omitIdScansAfterVerify =
       showGovVerification &&
-      backendProfile &&
+      portalApisActive &&
       !shouldUseDemoMock() &&
       govIdVerifiedForUi &&
       (govSingpass || govMydigital || aliyunEkycVerified)
@@ -1078,7 +1131,7 @@ export default function UnifiedProfilePage({
     colivingProfileGateModel,
     identityLockedUntilVerified,
     showGovVerification,
-    backendProfile,
+    portalApisActive,
     govIdVerifiedForUi,
     govSingpass,
     govMydigital,
@@ -1104,7 +1157,7 @@ export default function UnifiedProfilePage({
 
   const handleSave = async () => {
     const payload = buildProfilePayload()
-    if (backendProfile) {
+    if (portalApisActive) {
       const result = await savePortalProfile(payload, {
         govIdentityLocked,
         aliyunEkycVerified,
@@ -1135,6 +1188,43 @@ export default function UnifiedProfilePage({
       avatar: avatarUrl || userAvatarHint || '',
     })
     toast.success('Profile saved')
+  }
+
+  const handleSelfAttestConfirm = async () => {
+    if (!portalApisActive || shouldUseDemoMock() || selfVerifyRequiresEkyc) return
+    if (colivingProfileGateModel && getTenantProfileIncompleteFields(colivingProfileGateModel).length > 0) {
+      toast.error('Complete all required fields (red outline) before confirming.')
+      return
+    }
+    setSelfAttestSubmitting(true)
+    try {
+      const payload = buildProfilePayload()
+      const result = await savePortalProfile(payload, {
+        govIdentityLocked,
+        aliyunEkycVerified,
+        selfVerify: true,
+      })
+      if (!result.ok) {
+        toast.error(result.reason || 'Could not confirm profile')
+        return
+      }
+      const em = String(email || '').trim()
+      if (em) {
+        const pr = await fetchPortalProfileByEmail(em)
+        if (pr?.ok && pr.profile) {
+          const psva = String(
+            (pr.profile as { profileSelfVerifiedAt?: string }).profileSelfVerifiedAt || ''
+          ).trim()
+          setProfileSelfVerifiedAt(psva)
+        }
+      }
+      void onBackendSaveSuccess?.()
+      setGovDialogOpen(false)
+      toast.success('Profile confirmed')
+      lastSavedPayloadRef.current = JSON.stringify(buildProfilePayload())
+    } finally {
+      setSelfAttestSubmitting(false)
+    }
   }
 
   const handleNricFile = async (side: 'front' | 'back', file: File | null) => {
@@ -1290,7 +1380,7 @@ export default function UnifiedProfilePage({
   }
 
   const startAliyunEkycFlow = async (docType: 'MYS01001' | 'GLB03002') => {
-    if (shouldUseDemoMock() || !backendProfile) {
+    if (shouldUseDemoMock() || !portalApisActive) {
       toast.error('Use the live portal with a signed-in account (demo is mock-only).')
       return
     }
@@ -1551,25 +1641,27 @@ export default function UnifiedProfilePage({
             <p className="text-xs font-medium text-destructive mt-2">{profileGateHint}</p>
           ) : null}
         </div>
-        {showViewMyProfileButton ? (
-          <Button
-            type="button"
-            variant="outline"
-            className="shrink-0 gap-2 rounded-xl border-border font-semibold"
-            disabled={!publicProfilePath}
-            title={!publicProfilePath ? 'Public profile link is not available yet' : undefined}
-            onClick={() => {
-              if (!publicProfilePath) {
-                toast.error('Public profile link is not available yet')
-                return
-              }
-              setProfilePreviewOpen(true)
-            }}
-          >
-            <Eye className="h-4 w-4" />
-            View my profile
-          </Button>
-        ) : null}
+        <div className="flex flex-wrap items-center justify-end gap-2 shrink-0">
+          {showViewMyProfileButton ? (
+            <Button
+              type="button"
+              variant="outline"
+              className="shrink-0 gap-2 rounded-xl border-border font-semibold"
+              disabled={!publicProfilePath}
+              title={!publicProfilePath ? 'Public profile link is not available yet' : undefined}
+              onClick={() => {
+                if (!publicProfilePath) {
+                  toast.error('Public profile link is not available yet')
+                  return
+                }
+                setProfilePreviewOpen(true)
+              }}
+            >
+              <Eye className="h-4 w-4" />
+              View my profile
+            </Button>
+          ) : null}
+        </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -1644,9 +1736,9 @@ export default function UnifiedProfilePage({
                 <User size={16} style={{ color: 'var(--brand)' }} />
                 <h2 className="font-bold text-foreground">Personal Information</h2>
               </div>
-              {selfVerifyMode && backendProfile && !shouldUseDemoMock() && !showGovVerification && (
+              {selfVerifyMode && portalApisActive && !showGovVerification && (
                 <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto sm:justify-end">
-                  {aliyunEkycVerified ? (
+                  {selfVerifyRequiresEkyc && aliyunEkycVerified ? (
                     <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 text-primary px-2.5 py-1 text-xs font-semibold">
                       <ShieldCheck className="h-3.5 w-3.5" />
                       eKYC (MyKad / passport)
@@ -1667,11 +1759,13 @@ export default function UnifiedProfilePage({
                       ? 'Re-verify passport'
                       : selfVerifyVerifiedForUi
                         ? 'Verified'
-                        : 'Verify'}
+                        : selfVerifyRequiresEkyc
+                          ? 'Verify'
+                          : 'Confirm profile'}
                   </Button>
                 </div>
               )}
-              {showGovVerification && backendProfile && !shouldUseDemoMock() && (
+              {showGovVerification && portalApisActive && !shouldUseDemoMock() && (
                 <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto sm:max-w-[min(100%,28rem)] sm:justify-end">
                   {(govSingpass || govMydigital) && (
                     <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 text-primary px-2.5 py-1 text-xs font-semibold">
@@ -1705,6 +1799,23 @@ export default function UnifiedProfilePage({
                 </div>
               )}
             </div>
+            {mandatoryColivingTenantOwnerEkyc &&
+            portalApisActive &&
+            !showGovVerification &&
+            !selfVerifyVerifiedForUi ? (
+              <div className="mb-5 flex flex-col gap-3 rounded-xl border border-primary/35 bg-primary/5 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+                <p className="text-sm font-medium text-foreground">
+                  Complete MyKad or passport eKYC — required before using the rest of the portal.
+                </p>
+                <Button
+                  type="button"
+                  className="h-11 w-full min-w-[12rem] shrink-0 px-8 text-base font-semibold sm:w-auto"
+                  onClick={() => setGovDialogOpen(true)}
+                >
+                  Verify identity
+                </Button>
+              </div>
+            ) : null}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <Label className="text-[10px] font-semibold tracking-[0.2em] uppercase text-muted-foreground mb-1.5 block">
@@ -1825,7 +1936,7 @@ export default function UnifiedProfilePage({
                   Email Address
                 </Label>
                 <input value={email} disabled className={`${inputCls} opacity-80 cursor-not-allowed`} />
-                {backendProfile && !shouldUseDemoMock() ? (
+                {portalApisActive && !shouldUseDemoMock() ? (
                   <button
                     type="button"
                     className="text-xs font-semibold text-primary hover:underline mt-1.5 block text-left"
@@ -1846,7 +1957,7 @@ export default function UnifiedProfilePage({
                   <Label className="text-[10px] font-semibold tracking-[0.2em] uppercase text-muted-foreground">
                     Phone Number
                   </Label>
-                  {backendProfile && !shouldUseDemoMock() && phoneVerified ? (
+                  {portalApisActive && !shouldUseDemoMock() && phoneVerified ? (
                     <span
                       className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-[#1877F2] text-white"
                       title="Phone verified"
@@ -1855,7 +1966,7 @@ export default function UnifiedProfilePage({
                       <BadgeCheck className="h-3 w-3" strokeWidth={2.5} />
                     </span>
                   ) : null}
-                  {backendProfile && !shouldUseDemoMock() && govIdentityLocked && !phoneVerified ? (
+                  {portalApisActive && !shouldUseDemoMock() && govIdentityLocked && !phoneVerified ? (
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <button
@@ -1875,17 +1986,17 @@ export default function UnifiedProfilePage({
                 <input
                   value={phone}
                   onChange={(e) => setPhone(normalizePhoneDigits(e.target.value))}
-                  disabled={!!(backendProfile && !shouldUseDemoMock() && phoneVerified)}
+                  disabled={!!(portalApisActive && !shouldUseDemoMock() && phoneVerified)}
                   className={cn(
                     inputCls,
                     gateErr('phone') && 'ring-2 ring-destructive border-destructive',
-                    backendProfile && !shouldUseDemoMock() && phoneVerified && 'opacity-80 cursor-not-allowed',
+                    portalApisActive && !shouldUseDemoMock() && phoneVerified && 'opacity-80 cursor-not-allowed',
                   )}
                   inputMode="numeric"
                   autoComplete="tel"
                   placeholder="e.g. 60123456789"
                 />
-                {backendProfile && !shouldUseDemoMock() ? (
+                {portalApisActive && !shouldUseDemoMock() ? (
                   phoneVerified ? (
                     <button
                       type="button"
@@ -2167,14 +2278,26 @@ export default function UnifiedProfilePage({
           }}
         >
           <DialogHeader>
-            <DialogTitle>{showGovVerification ? 'Government ID verification' : 'Identity verification'}</DialogTitle>
-            <DialogDescription className="sr-only">Choose a verification method.</DialogDescription>
+            <DialogTitle>
+              {showGovVerification
+                ? 'Government ID verification'
+                : selfVerifyMode && !selfVerifyRequiresEkyc
+                  ? 'Confirm your profile'
+                  : 'Identity verification'}
+            </DialogTitle>
+            <DialogDescription className="sr-only">
+              {selfVerifyMode && !selfVerifyRequiresEkyc
+                ? 'Confirm that your details are correct.'
+                : 'Choose a verification method.'}
+            </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-3 py-2">
             {showGovVerification ? (
               <>
                 <GovIdConnectButtons
-                  returnPath={showGovVerification ? '/demoprofile' : '/demologin'}
+                  returnPath={
+                    showGovVerification ? (pathname.trim() || '/demoprofile') : '/demologin'
+                  }
                   variant="solo"
                   appearance="fill"
                   singpassLinked={!!govSingpass}
@@ -2189,34 +2312,61 @@ export default function UnifiedProfilePage({
                   </div>
                 </div>
               </>
+            ) : selfVerifyMode && !selfVerifyRequiresEkyc ? (
+              <p className="text-sm text-muted-foreground">
+                Review your details on this page. When everything is correct and required fields are filled, confirm below.
+                We do not require MyKad/passport eKYC for this portal.
+              </p>
             ) : (
               <p className="text-sm text-muted-foreground">
-                Choose Malaysian MyKad (NRIC) or passport. After verification you can finish your profile here.
+                {mandatoryColivingTenantOwnerEkyc
+                  ? uploadRole === 'owner'
+                    ? 'Choose Malaysian MyKad (NRIC) or passport. Required for Coliving owner portal — complete before using other pages.'
+                    : 'Choose Malaysian MyKad (NRIC) or passport. Required for Coliving tenant portal — complete before using other pages.'
+                  : 'Choose Malaysian MyKad (NRIC) or passport. After verification you can finish your profile here.'}
               </p>
             )}
-            <Button
-              type="button"
-              variant="outline"
-              className="w-full justify-center"
-              disabled={aliyunEkycStarting || disableVerificationDialogMyKad}
-              onClick={() => void startAliyunEkycFlow('MYS01001')}
-            >
-              {aliyunEkycStarting ? 'Starting…' : 'Verification by Malaysian MyKad (NRIC)'}
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              className="w-full justify-center"
-              disabled={aliyunEkycStarting || disableVerificationDialogPassport}
-              onClick={() => void startAliyunEkycFlow('GLB03002')}
-            >
-              {aliyunEkycStarting ? 'Starting…' : 'Verification by passport'}
-            </Button>
-            {passportRenewalEligible ? (
-              <p className="text-xs text-center text-muted-foreground">
-                Passport expires within one month — you can re-verify with a new document above.
-              </p>
-            ) : null}
+            {!(selfVerifyMode && !showGovVerification && !selfVerifyRequiresEkyc) ? (
+              <>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full justify-center"
+                  disabled={aliyunEkycStarting || disableVerificationDialogMyKad}
+                  onClick={() => void startAliyunEkycFlow('MYS01001')}
+                >
+                  {aliyunEkycStarting ? 'Starting…' : 'Verification by Malaysian MyKad (NRIC)'}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full justify-center"
+                  disabled={aliyunEkycStarting || disableVerificationDialogPassport}
+                  onClick={() => void startAliyunEkycFlow('GLB03002')}
+                >
+                  {aliyunEkycStarting ? 'Starting…' : 'Verification by passport'}
+                </Button>
+                {passportRenewalEligible ? (
+                  <p className="text-xs text-center text-muted-foreground">
+                    Passport expires within one month — you can re-verify with a new document above.
+                  </p>
+                ) : null}
+              </>
+            ) : (
+              <Button
+                type="button"
+                className="w-full justify-center"
+                disabled={
+                  selfAttestSubmitting ||
+                  selfVerifyVerifiedForUi ||
+                  (colivingProfileGateModel != null &&
+                    getTenantProfileIncompleteFields(colivingProfileGateModel).length > 0)
+                }
+                onClick={() => void handleSelfAttestConfirm()}
+              >
+                {selfAttestSubmitting ? 'Saving…' : 'Confirm profile details'}
+              </Button>
+            )}
           </div>
           {!govVerificationDialogMandatory ? (
             <DialogFooter>

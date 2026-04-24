@@ -68,7 +68,15 @@ export function SlidingSignInPanel({
     if (isDemoSite()) {
       setMember({
         email: email.trim(),
-        roles: [{ type: "staff", staffId: "demo-staff", clientId: "demo-client", clientTitle: "Demo Client" }],
+        roles: [
+          {
+            type: "staff",
+            staffSource: "coliving_client_user",
+            staffId: "demo-staff",
+            clientId: "demo-client",
+            clientTitle: "Demo Client",
+          },
+        ],
       })
       setCurrentRole({
         type: "staff",
@@ -141,7 +149,15 @@ export function SlidingSignInPanel({
       const demoEmail = email?.trim() || "demo@demo.com"
       setMember({
         email: demoEmail,
-        roles: [{ type: "staff", staffId: "demo-staff", clientId: "demo-client", clientTitle: "Demo Client" }],
+        roles: [
+          {
+            type: "staff",
+            staffSource: "coliving_client_user",
+            staffId: "demo-staff",
+            clientId: "demo-client",
+            clientTitle: "Demo Client",
+          },
+        ],
       })
       setCurrentRole({
         type: "staff",
@@ -283,6 +299,10 @@ export function SlidingSignInPanel({
           Sign in with Facebook
         </Button>
       </form>
+
+      <p className="text-xs text-red-600 text-center leading-snug px-1">
+        Don&apos;t use a company email — you may need to verify your identity.
+      </p>
 
     </div>
   )

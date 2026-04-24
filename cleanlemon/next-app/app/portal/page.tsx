@@ -18,6 +18,11 @@ import { pickFirstClientIdFromMemberRoles, type CleanlemonsJwtContext } from '@/
 import { fetchOperatorSubscription, fetchPortalMemberRoles } from '@/lib/cleanlemon-api'
 import { isPortalOfflineDemo } from '@/lib/portal-auth-mock'
 
+const CLEANLEMONS_OPERATOR_STAFF_SOURCES = new Set([
+  'cleanlemons_supervisor',
+  'cleanlemons_operatordetail_email',
+])
+
 export default function PortalSelectionPage() {
   const { user, isLoading, setUserRole, logout, updateUser } = useAuth()
   const router = useRouter()
@@ -28,6 +33,7 @@ export default function PortalSelectionPage() {
   /** Until both calls finish, portal count/cards can jump (e.g. 2→3 when SaaS Admin appears). */
   const [subscriptionReady, setSubscriptionReady] = useState(offlineDemo)
   const [memberRolesReady, setMemberRolesReady] = useState(offlineDemo)
+  const [portalMemberRoles, setPortalMemberRoles] = useState<Array<{ type?: string; staffSource?: string }>>([])
   const email = String(user?.email || '').trim().toLowerCase()
   /** Member-roles effect must not depend on full `user` — updateUser() would retrigger and clear SaaS from state. */
   const userRef = useRef(user)
@@ -47,6 +53,7 @@ export default function PortalSelectionPage() {
   /** New login email → drop previous account’s SaaS flag until member-roles returns. */
   useEffect(() => {
     setIsSaasAdmin(false)
+    setPortalMemberRoles([])
   }, [email])
 
   const handleSelectPortal = (role: UserRole) => {
@@ -119,6 +126,7 @@ export default function PortalSelectionPage() {
         const r = await fetchPortalMemberRoles()
         if (cancelled) return
         const rows = Array.isArray(r?.roles) ? r.roles : []
+        setPortalMemberRoles(rows)
         const hasSaasRow = rows.some(
           (row) => String(row?.type || '').trim().toLowerCase() === 'saas_admin'
         )
@@ -193,11 +201,22 @@ export default function PortalSelectionPage() {
     return isSaasAdmin
   }, [user?.role, isSaasAdmin])
 
+  /** Operator card：supervisor 或 cln 公司主 email，不含 Coliving-only staff / field staff。 */
+  const canAccessCleanlemonsOperatorPortal = useMemo(() => {
+    if (offlineDemo) return true
+    return portalMemberRoles.some(
+      (row) =>
+        String(row?.type || '').trim().toLowerCase() === 'staff' &&
+        CLEANLEMONS_OPERATOR_STAFF_SOURCES.has(String(row?.staffSource || ''))
+    )
+  }, [offlineDemo, portalMemberRoles])
+
   const visiblePortals = useMemo(() => {
     if (offlineDemo) return portals
     return portals.filter((portal) => {
       if (portal.role === 'client') return true
-      if (portal.role === 'operator') return hasActiveOperatorSubscription
+      if (portal.role === 'operator')
+        return hasActiveOperatorSubscription && canAccessCleanlemonsOperatorPortal
       if (portal.role === 'saas-admin') return canAccessSaasAdmin
       if (portal.role === 'api-user') return hasApiPortalAddon
       if (portal.role === 'employee') {
@@ -205,7 +224,14 @@ export default function PortalSelectionPage() {
       }
       return false
     })
-  }, [offlineDemo, portals, hasActiveOperatorSubscription, hasApiPortalAddon, canAccessSaasAdmin])
+  }, [
+    offlineDemo,
+    portals,
+    hasActiveOperatorSubscription,
+    hasApiPortalAddon,
+    canAccessSaasAdmin,
+    canAccessCleanlemonsOperatorPortal,
+  ])
 
   const portalListReady = offlineDemo || (subscriptionReady && memberRolesReady)
 

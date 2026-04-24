@@ -4,6 +4,7 @@
  * All operations scoped by client_id from access context (staff email → client).
  */
 
+const fs = require('fs');
 const path = require('path');
 const { randomUUID } = require('crypto');
 const pool = require('../../config/db');
@@ -27,6 +28,8 @@ function extractFolderId(urlOrId) {
   return m ? m[0] : null;
 }
 
+let _warnedMissingGoogleApplicationCredentialsFile = false;
+
 function getServiceAccountDriveAuth() {
   const keyJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
   if (keyJson) {
@@ -40,9 +43,20 @@ function getServiceAccountDriveAuth() {
       return null;
     }
   }
-  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+  const keyPath = String(process.env.GOOGLE_APPLICATION_CREDENTIALS || '').trim();
+  if (keyPath) {
+    if (!fs.existsSync(keyPath)) {
+      if (!_warnedMissingGoogleApplicationCredentialsFile) {
+        _warnedMissingGoogleApplicationCredentialsFile = true;
+        console.warn(
+          '[generatereport] GOOGLE_APPLICATION_CREDENTIALS file missing; ignoring:',
+          keyPath
+        );
+      }
+      return null;
+    }
     return new google.auth.GoogleAuth({
-      keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS,
+      keyFile: keyPath,
       scopes: ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/drive.file']
     });
   }

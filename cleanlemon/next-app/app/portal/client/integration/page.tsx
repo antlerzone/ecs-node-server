@@ -100,7 +100,6 @@ export default function ClientIntegrationPage() {
         if (keyRes?.ok && keyRes.apiKey) {
           setIntegrationApiKey(String(keyRes.apiKey))
           setClientIdDisplay(String(keyRes.clientId || operatorId || '').trim())
-          if (keyRes.created) toast.success('Integration API key ready — copy and store it securely.')
         } else {
           setIntegrationApiKey('')
           setClientIdDisplay('')
@@ -390,7 +389,7 @@ export default function ClientIntegrationPage() {
                   <div className="space-y-2">
                     <Label className="text-xs font-semibold">Cleanlemons operators</Label>
                     {linkedOperators.length === 0 ? (
-                      <p className="text-sm text-muted-foreground">No operator link found for this profile.</p>
+                      <p className="text-sm text-muted-foreground">No integration yet.</p>
                     ) : (
                       <ul className="space-y-2">
                         {linkedOperators.map((o) => (
@@ -408,12 +407,12 @@ export default function ClientIntegrationPage() {
                       </ul>
                     )}
                   </div>
-                  <div className="space-y-2">
-                    <div className="flex items-center gap-2">
-                      <Link2 className="h-4 w-4 text-muted-foreground" />
-                      <Label className="text-xs font-semibold">Coliving integration</Label>
-                    </div>
-                    {colivingInfo?.linked ? (
+                  {colivingInfo?.linked ? (
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2">
+                        <Link2 className="h-4 w-4 text-muted-foreground" />
+                        <Label className="text-xs font-semibold">Coliving integration</Label>
+                      </div>
                       <div className="rounded-lg border border-border px-3 py-2 text-sm">
                         <div className="flex flex-wrap items-center gap-2">
                           <span className="font-medium text-foreground">
@@ -432,13 +431,8 @@ export default function ClientIntegrationPage() {
                           </p>
                         ) : null}
                       </div>
-                    ) : (
-                      <p className="text-sm text-muted-foreground">
-                        Not linked from Coliving yet. When your operator completes Coliving → Cleanlemons linking, the
-                        Coliving company name will appear here.
-                      </p>
-                    )}
-                  </div>
+                    </div>
+                  ) : null}
                 </>
               )}
             </div>
@@ -559,22 +553,22 @@ export default function ClientIntegrationPage() {
       </Dialog>
 
       <Dialog open={ttlockMethodDialogOpen} onOpenChange={setTtlockMethodDialogOpen}>
-        <DialogContent className="sm:max-w-md">
+        <DialogContent className="max-h-[min(90dvh,720px)] overflow-y-auto sm:max-w-2xl">
           <DialogHeader>
             <DialogTitle>Connect TTLock</DialogTitle>
             <DialogDescription>Choose how you want to connect this TTLock login.</DialogDescription>
           </DialogHeader>
-          <div className="grid gap-2 py-2">
+          <div className="grid gap-3 py-2 sm:grid-cols-2 sm:gap-3">
             <Button
               type="button"
               variant="outline"
-              className="h-auto justify-start gap-3 py-3 text-left"
+              className="h-auto min-h-[7.5rem] justify-start gap-3 py-4 text-left sm:min-h-[8.5rem]"
               disabled={accessDeniedOrMissing || loading}
               onClick={() => chooseTtlockAddMethod('register')}
             >
-              <span className="flex min-w-0 flex-col items-start gap-0.5">
+              <span className="flex min-w-0 flex-col items-start gap-1">
                 <span className="font-medium text-foreground">Register</span>
-                <span className="text-xs font-normal text-muted-foreground">
+                <span className="text-xs font-normal leading-snug text-muted-foreground">
                   Create a new TTLock account first, then enter the details in the next step
                 </span>
               </span>
@@ -582,13 +576,13 @@ export default function ClientIntegrationPage() {
             <Button
               type="button"
               variant="outline"
-              className="h-auto justify-start gap-3 py-3 text-left"
+              className="h-auto min-h-[7.5rem] justify-start gap-3 py-4 text-left sm:min-h-[8.5rem]"
               disabled={accessDeniedOrMissing || loading}
               onClick={() => chooseTtlockAddMethod('existing')}
             >
-              <span className="flex min-w-0 flex-col items-start gap-0.5">
+              <span className="flex min-w-0 flex-col items-start gap-1">
                 <span className="font-medium text-foreground">Add existing account</span>
-                <span className="text-xs font-normal text-muted-foreground">
+                <span className="text-xs font-normal leading-snug text-muted-foreground">
                   You already have a TTLock username and password
                 </span>
               </span>

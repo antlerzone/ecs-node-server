@@ -639,6 +639,10 @@ function mapDbAccountTypeToBukkuApi(typeFromDb) {
   const tl = t.toLowerCase();
   // Legacy DB tokens (see migration 0163); must match POST /accounts enum for sync + create.
   if (tl === 'asset' || tl === 'assets') return 'current_assets';
+  // cln_account uses singular `expense`; Bukku chart type is `expenses` (see account.validator typeEnum).
+  if (tl === 'expense' || tl === 'expenses') return 'expenses';
+  // Payroll control lines in DB are `liability`; Bukku uses current_liabilities for typical AP/statutory rows.
+  if (tl === 'liability' || tl === 'liabilities') return 'current_liabilities';
   return t;
 }
 
@@ -689,6 +693,167 @@ function buildBukkuProductCreateBody(title, saleAccountId) {
   return body;
 }
 
+/**
+ * Map GET /products/{id} shape to PUT /products/{id} body (Bukku update schema).
+ * Preserves units (with ids when present), booleans, and optional fields from the read payload.
+ */
+function buildBukkuProductPutPayloadFromRead(product, saleAccountId) {
+  const name = String(product?.name ?? product?.Name ?? '').trim();
+  if (!name) {
+    throw new Error('BUKKU_PRODUCT_NAME_MISSING');
+  }
+  const sid =
+    saleAccountId != null && String(saleAccountId).trim() !== '' ? Number(saleAccountId) : NaN;
+  if (Number.isNaN(sid)) {
+    throw new Error('BUKKU_SALE_ACCOUNT_ID_MISSING');
+  }
+
+  const rawUnits = product.units ?? product.Units;
+  let units;
+  if (Array.isArray(rawUnits) && rawUnits.length) {
+    units = rawUnits.map((u) => {
+      const out = {
+        label: String(u.label ?? u.Label ?? 'unit').slice(0, 8),
+        rate: u.rate != null ? Number(u.rate) : u.Rate != null ? Number(u.Rate) : 1
+      };
+      const uid = u.id ?? u.Id;
+      if (uid != null && !Number.isNaN(Number(uid))) {
+        out.id = Number(uid);
+      }
+      if (u.sale_price != null) out.sale_price = Number(u.sale_price);
+      else if (u.salePrice != null) out.sale_price = Number(u.salePrice);
+      if (u.purchase_price != null) out.purchase_price = Number(u.purchase_price);
+      else if (u.purchasePrice != null) out.purchase_price = Number(u.purchasePrice);
+      if (u.is_base != null) out.is_base = Boolean(u.is_base);
+      else if (u.isBase != null) out.is_base = Boolean(u.isBase);
+      if (u.is_sale_default != null) out.is_sale_default = Boolean(u.is_sale_default);
+      else if (u.isSaleDefault != null) out.is_sale_default = Boolean(u.isSaleDefault);
+      if (u.is_purchase_default != null) out.is_purchase_default = Boolean(u.is_purchase_default);
+      else if (u.isPurchaseDefault != null) out.is_purchase_default = Boolean(u.isPurchaseDefault);
+      return out;
+    });
+  } else {
+    units = [
+      {
+        label: 'unit',
+        rate: 1,
+        sale_price: 0,
+        is_base: true,
+        is_sale_default: true,
+        is_purchase_default: false
+      }
+    ];
+  }
+
+  const body = {
+    name,
+    is_selling: true,
+    is_buying: Boolean(product.is_buying ?? product.isBuying ?? false),
+    track_inventory: Boolean(product.track_inventory ?? product.trackInventory ?? false),
+    sale_account_id: sid,
+    units
+  };
+
+  const sku = product.sku ?? product.Sku;
+  if (sku != null && String(sku).trim() !== '') body.sku = String(sku).slice(0, 50);
+
+  const cc = product.classification_code ?? product.classificationCode;
+  if (cc !== undefined && cc !== null) body.classification_code = cc === '' ? null : String(cc).slice(0, 3);
+
+  const sd = product.sale_description ?? product.saleDescription;
+  if (sd != null && String(sd).trim() !== '') body.sale_description = String(sd);
+
+  const stax = product.sale_tax_code_id ?? product.saleTaxCodeId;
+  if (stax != null && !Number.isNaN(Number(stax))) body.sale_tax_code_id = Number(stax);
+
+  const pd = product.purchase_description ?? product.purchaseDescription;
+  if (pd != null && String(pd).trim() !== '') body.purchase_description = String(pd);
+
+  const pac = product.purchase_account_id ?? product.purchaseAccountId;
+  if (pac != null && !Number.isNaN(Number(pac))) body.purchase_account_id = Number(pac);
+
+  const ptax = product.purchase_tax_code_id ?? product.purchaseTaxCodeId;
+  if (ptax != null && !Number.isNaN(Number(ptax))) body.purchase_tax_code_id = Number(ptax);
+
+  const inv = product.inventory_account_id ?? product.inventoryAccountId;
+  if (inv != null && !Number.isNaN(Number(inv))) body.inventory_account_id = Number(inv);
+
+  const qla = product.quantity_low_alert ?? product.quantityLowAlert;
+  if (qla != null && !Number.isNaN(Number(qla))) body.quantity_low_alert = Number(qla);
+
+  const bin = product.bin_location ?? product.binLocation;
+  if (bin != null && String(bin).trim() !== '') body.bin_location = String(bin).slice(0, 60);
+
+  if (product.remarks != null && String(product.remarks).trim() !== '') body.remarks = String(product.remarks);
+
+  const gids = product.group_ids ?? product.groupIds;
+  if (Array.isArray(gids) && gids.length) {
+    const nums = gids.map((x) => Number(x)).filter((n) => !Number.isNaN(n));
+    if (nums.length) body.group_ids = nums;
+  }
+
+  return body;
+}
+
+/**
+ * When sync reuses an existing Bukku product, ensure it is selling and tied to the intended sale GL (PUT /products/{id}).
+ * @returns {{ ok: boolean, skipped?: boolean, updated?: boolean }}
+ */
+async function ensureBukkuProductSelling(req, productId, saleAccountId, warn) {
+  const pid = productId != null ? String(productId).trim() : '';
+  if (!pid) {
+    if (typeof warn === 'function') warn('Bukku product: missing id for is_selling update');
+    return { ok: false };
+  }
+  const sid =
+    saleAccountId != null && String(saleAccountId).trim() !== '' ? Number(saleAccountId) : NaN;
+  if (Number.isNaN(sid)) {
+    if (typeof warn === 'function') {
+      warn(`Bukku product ${pid}: cannot set is_selling — sale account id missing`);
+    }
+    return { ok: false };
+  }
+
+  const readRes = await productWrapper.read(req, pid);
+  if (!readRes.ok) {
+    if (typeof warn === 'function') {
+      warn(`Bukku product ${pid}: read failed — ${JSON.stringify(readRes.error || readRes).slice(0, 220)}`);
+    }
+    return { ok: false };
+  }
+
+  const product = readRes.data?.product ?? readRes.data;
+  if (!product || (product.id == null && product.Id == null)) {
+    if (typeof warn === 'function') warn(`Bukku product ${pid}: unexpected read response`);
+    return { ok: false };
+  }
+
+  const curSelling = Boolean(product.is_selling ?? product.isSelling);
+  const curSaleAcc = Number(product.sale_account_id ?? product.saleAccountId ?? NaN);
+  if (curSelling && !Number.isNaN(curSaleAcc) && curSaleAcc === sid) {
+    return { ok: true, skipped: true };
+  }
+
+  let payload;
+  try {
+    payload = buildBukkuProductPutPayloadFromRead(product, sid);
+  } catch (e) {
+    if (typeof warn === 'function') {
+      warn(`Bukku product ${pid}: build PUT body failed — ${e.message || e}`);
+    }
+    return { ok: false };
+  }
+
+  const putRes = await productWrapper.update(req, pid, payload);
+  if (!putRes.ok) {
+    if (typeof warn === 'function') {
+      warn(`Bukku product ${pid}: update is_selling failed — ${JSON.stringify(putRes.error || putRes).slice(0, 280)}`);
+    }
+    return { ok: false };
+  }
+  return { ok: true, updated: true };
+}
+
 function bukkuRemoteId(entity) {
   if (entity == null) return null;
   const id = entity.id ?? entity.Id;
@@ -703,6 +868,21 @@ function bukkuAccountTitleAliases(title) {
   const t = normalize(title);
   if (t === 'bank' || t === 'cash') {
     return [];
+  }
+  const mtdNew = normalize("MTD - Employer's Contribution");
+  const mtdOld = normalize('MTD Expenses');
+  if (t === mtdNew || t === mtdOld) {
+    return [t, mtdNew, mtdOld];
+  }
+  const salNew = normalize('Salaries & Wages');
+  const salOld = normalize('Salary & Wages');
+  if (t === salNew || t === salOld) {
+    return [t, salNew, salOld];
+  }
+  const genPl = normalize('General Expenses');
+  const genSg = normalize('General Expense');
+  if (t === genPl || t === genSg) {
+    return [t, genPl, genSg];
   }
   return [t];
 }
@@ -930,6 +1110,8 @@ async function syncBukkuAccounts(email) {
     let createdProducts = 0;
     /** Reused existing remote product (no create). */
     let linkedProducts = 0;
+    /** Existing Bukku product rows updated via PUT (e.g. is_selling). */
+    let patchedBukkuProducts = 0;
     let saveMappingFailed = 0;
     /** Short human messages for operator (capped). */
     const warnings = [];
@@ -994,6 +1176,20 @@ async function syncBukkuAccounts(email) {
           }
         } else {
           linkedProducts++;
+          if (platformSaleAccountId != null) {
+            const ens = await ensureBukkuProductSelling(
+              req,
+              bukkuRemoteId(existingProduct),
+              platformSaleAccountId,
+              warn
+            );
+            if (ens.updated) patchedBukkuProducts += 1;
+            if (!ens.ok) saveMappingFailed += 1;
+          } else {
+            warn(
+              `Product "${title}": linked existing Bukku product — skipped is_selling update (Platform Collection account missing)`
+            );
+          }
         }
         if (existingProduct) {
           productId = String(existingProduct.id);
@@ -1082,6 +1278,10 @@ async function syncBukkuAccounts(email) {
           }
         } else {
           linkedProducts++;
+          const saleAccId = bukkuRemoteId(existingAccount);
+          const ens = await ensureBukkuProductSelling(req, bukkuRemoteId(existingProduct), saleAccId, warn);
+          if (ens.updated) patchedBukkuProducts += 1;
+          if (!ens.ok) saveMappingFailed += 1;
         }
         if (existingProduct) {
           productId = String(existingProduct.id);
@@ -1108,6 +1308,7 @@ async function syncBukkuAccounts(email) {
       linkedAccounts,
       createdProducts,
       linkedProducts,
+      patchedBukkuProducts,
       saveMappingFailed,
       warnings: warnings.length ? warnings : undefined
     };
@@ -1561,6 +1762,7 @@ async function syncClnBukkuOperatorAccounts(operatorId) {
   let linkedAccounts = 0;
   let createdProducts = 0;
   let linkedProducts = 0;
+  let patchedBukkuProducts = 0;
   let saveMappingFailed = 0;
   const warnings = [];
   function warn(msg) {
@@ -1600,6 +1802,14 @@ async function syncClnBukkuOperatorAccounts(operatorId) {
         }
       } else {
         linkedProducts++;
+        const ens = await ensureBukkuProductSelling(
+          req,
+          bukkuRemoteId(existingProduct),
+          salesIncomeRemoteId,
+          warn
+        );
+        if (ens.updated) patchedBukkuProducts += 1;
+        if (!ens.ok) saveMappingFailed += 1;
       }
       const productId = existingProduct ? String(existingProduct.id) : null;
       if (productId) {
@@ -1676,6 +1886,7 @@ async function syncClnBukkuOperatorAccounts(operatorId) {
     linkedAccounts,
     createdProducts,
     linkedProducts,
+    patchedBukkuProducts,
     saveMappingFailed,
     warnings: warnings.length ? warnings : undefined,
     syncedAt: new Date().toISOString()

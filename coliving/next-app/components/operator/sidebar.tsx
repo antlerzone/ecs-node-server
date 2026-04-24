@@ -5,7 +5,7 @@ import { usePathname } from "next/navigation"
 import {
   Building2, DoorOpen, Users,
   BookOpen, Receipt, BarChart3, Settings, LogOut, X,
-  Zap, Lock, FileText, TrendingDown, Mail, CheckCircle, ClipboardList, User, Banknote, LayoutDashboard,
+  Zap, Lock, FileText, TrendingDown, Mail, CheckCircle, ClipboardList, Banknote, LayoutDashboard,
   ChevronDown,
   Percent,
   PanelLeftClose,
@@ -24,10 +24,7 @@ type NavItem = { href: string; label: string; icon: typeof Settings; permission:
 const navGroups: { label: string; items: NavItem[] }[] = [
   {
     label: "Overview",
-    items: [
-      { href: "/operator", label: "Dashboard", icon: LayoutDashboard, permission: "" },
-      { href: "/operator/profile", label: "My Profile", icon: User, permission: "profilesetting" },
-    ],
+    items: [{ href: "/operator", label: "Dashboard", icon: LayoutDashboard, permission: "" }],
   },
   {
     label: "Property Setup",

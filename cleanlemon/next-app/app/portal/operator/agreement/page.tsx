@@ -19,6 +19,16 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog'
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -53,8 +63,12 @@ import {
   fetchOperatorSettings,
   saveOperatorSettings,
   fetchOperatorContacts,
+  fetchOperatorLinkedClientdetails,
   signOperatorAgreement,
   downloadClnAgreementVariablesReferenceDocx,
+  fetchOperatorAgreementInstancePdfBlob,
+  deleteOperatorAgreement,
+  finalizeOperatorAgreementPdf,
 } from '@/lib/cleanlemon-api'
 import { clnGeneralVariableTags } from '@/lib/cln-agreement-variable-reference'
 import { useAuth } from '@/lib/auth-context'
@@ -67,7 +81,7 @@ import {
   CommandItem,
   CommandList,
 } from '@/components/ui/command'
-import { cn } from '@/lib/utils'
+import { cn, portalHttpsAssetUrl, toDrivePreviewUrl } from '@/lib/utils'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 
@@ -96,6 +110,10 @@ interface Agreement {
   signedAt?: string
   signedMeta?: unknown
   finalAgreementUrl?: string
+  /** SHA-256 hex of first materialized filled PDF body */
+  hashDraft?: string
+  /** SHA-256 hex of merged main + audit PDF */
+  hashFinal?: string
 }
 
 interface Template {
@@ -175,6 +193,25 @@ function operatorNeedsToSign(agr: Agreement | null, meta: unknown): boolean {
   return true
 }
 
+function agreementRowLooksFinalized(row: Agreement): boolean {
+  const st = String(row.status || '')
+    .trim()
+    .toLowerCase()
+  if (st === 'complete' || st === 'signed') return true
+  if (String(row.finalAgreementUrl || '').trim()) return true
+  return false
+}
+
+function canDeleteOperatorAgreement(row: Agreement): boolean {
+  if (String(row.hashFinal || '').trim()) return false
+  if (String(row.finalAgreementUrl || '').trim()) return false
+  const st = String(row.status || '')
+    .trim()
+    .toLowerCase()
+  if (st === 'complete' || st === 'signed') return false
+  return true
+}
+
 function AgreementPageContent() {
   const router = useRouter()
   const searchParams = useSearchParams()
@@ -211,6 +248,9 @@ function AgreementPageContent() {
   const [selectedClientId, setSelectedClientId] = useState('')
   const [clientComboOpen, setClientComboOpen] = useState(false)
   const [previewingTemplateId, setPreviewingTemplateId] = useState<string | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<Agreement | null>(null)
+  const [deleteBusy, setDeleteBusy] = useState(false)
+  const [agreementPreviewLoadingId, setAgreementPreviewLoadingId] = useState<string | null>(null)
   const opSignCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const opSignWrapRef = useRef<HTMLDivElement | null>(null)
   const opDrawingRef = useRef(false)
@@ -220,6 +260,13 @@ function AgreementPageContent() {
   const [opSignSaving, setOpSignSaving] = useState(false)
   /** Offer letters export to Google Drive — same flag as Company → Integration. */
   const [googleDriveConnected, setGoogleDriveConnected] = useState<boolean | null>(null)
+  /** One automatic finalize attempt per agreement id per page session (safety net if server async missed). */
+  const finalizeAttemptedIdsRef = useRef<Set<string>>(new Set())
+
+  const ecsBase = useMemo(
+    () => (process.env.NEXT_PUBLIC_CLEANLEMON_API_URL || '').trim().replace(/\/$/, ''),
+    [],
+  )
 
   const loadStaffForOffer = useCallback(async () => {
     const r = await fetchOperatorContacts(operatorId)
@@ -266,6 +313,34 @@ function AgreementPageContent() {
       cancelled = true
     }
   }, [operatorId])
+
+  useEffect(() => {
+    if (!operatorId) return
+    const pending = agreements.filter((row) => {
+      const st = String(row.status || '').toLowerCase()
+      if (st !== 'complete' && st !== 'signed') return false
+      if (String(row.finalAgreementUrl || '').trim()) return false
+      if (finalizeAttemptedIdsRef.current.has(row.id)) return false
+      return true
+    })
+    if (pending.length === 0) return
+    let cancelled = false
+    void (async () => {
+      for (const row of pending) {
+        if (cancelled) return
+        finalizeAttemptedIdsRef.current.add(row.id)
+        const res = await finalizeOperatorAgreementPdf(row.id, operatorId)
+        if (cancelled) return
+        if (res?.ok) {
+          const r = await fetchOperatorAgreements(operatorId)
+          if (r?.ok) setAgreements(r.items || [])
+        }
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [agreements, operatorId])
 
   useEffect(() => {
     const openCreate =
@@ -397,6 +472,24 @@ function AgreementPageContent() {
     setSigningAgreement(null)
     const r = await fetchOperatorAgreements(operatorId)
     if (r?.ok) setAgreements(r.items || [])
+  }
+
+  const confirmDeleteAgreement = async () => {
+    if (!deleteTarget?.id) return
+    setDeleteBusy(true)
+    try {
+      const res = await deleteOperatorAgreement(deleteTarget.id, operatorId)
+      if (!res?.ok) {
+        toast.error(String(res?.reason || '') || 'Delete failed')
+        return
+      }
+      toast.success('Agreement removed')
+      setDeleteTarget(null)
+      const r = await fetchOperatorAgreements(operatorId)
+      if (r?.ok) setAgreements(r.items || [])
+    } finally {
+      setDeleteBusy(false)
+    }
   }
 
   const contactIdFromUrl = searchParams.get('contactId')
@@ -538,6 +631,31 @@ function AgreementPageContent() {
         )
       },
     },
+    {
+      key: 'hashDraft',
+      label: 'SHA-256',
+      render: (_, row) => {
+        const d = String(row.hashDraft || '').trim()
+        const f = String(row.hashFinal || '').trim()
+        if (!d && !f) {
+          return <span className="text-xs text-muted-foreground">—</span>
+        }
+        return (
+          <div className="text-[10px] font-mono text-muted-foreground max-w-[160px] space-y-0.5 leading-tight">
+            {d ? (
+              <div className="truncate" title={d}>
+                Draft: {d.slice(0, 10)}…{d.slice(-6)}
+              </div>
+            ) : null}
+            {f ? (
+              <div className="truncate" title={f}>
+                Final: {f.slice(0, 10)}…{f.slice(-6)}
+              </div>
+            ) : null}
+          </div>
+        )
+      },
+    },
   ]
 
   const agreementActions: Action<Agreement>[] = [
@@ -549,6 +667,7 @@ function AgreementPageContent() {
     {
       label: 'Signing',
       icon: <FileSignature className="h-4 w-4 mr-2" />,
+      visible: (row) => operatorNeedsToSign(row, row.signedMeta),
       onClick: (row) => setSigningAgreement(row),
     },
     {
@@ -557,22 +676,22 @@ function AgreementPageContent() {
       onClick: (row) => toast.success(`Agreement sent to ${row.recipientEmail}`),
     },
     {
-      label: 'Download PDF',
+      label: 'Open final agreement',
       icon: <Download className="h-4 w-4 mr-2" />,
+      visible: (row) => !!String(row.finalAgreementUrl || '').trim(),
       onClick: (row) => {
         const url = row.finalAgreementUrl?.trim()
-        if (url) {
-          window.open(url, '_blank', 'noopener,noreferrer')
-          return
-        }
-        toast.info('Final PDF is available after all parties have signed and Google Drive export finishes.')
+        if (!url) return
+        const openUrl = toDrivePreviewUrl(portalHttpsAssetUrl(url, ecsBase))
+        window.open(openUrl, '_blank', 'noopener,noreferrer')
       },
     },
     {
       label: 'Delete',
       icon: <Trash2 className="h-4 w-4 mr-2" />,
       variant: 'destructive',
-      onClick: (row) => toast.error(`Delete agreement for ${row.recipientName}?`),
+      visible: (row) => canDeleteOperatorAgreement(row),
+      onClick: (row) => setDeleteTarget(row),
     },
   ]
 
@@ -692,10 +811,12 @@ function AgreementPageContent() {
         toast.error('Please select a staff recipient from the list')
         return
       }
-      if (!newAgreement.recipientEmail.trim() || !newAgreement.recipientType || !newAgreement.template) {
-        toast.error('Please complete email, role type, and template')
+      if (!newAgreement.recipientEmail.trim() || !newAgreement.template) {
+        toast.error('Please complete email and template')
         return
       }
+      const staffPick = staffContacts.find((s) => s.id === selectedStaffId)
+      const recipientTypeForCreate = staffPick?.recipientType || 'employee'
       if (!staffTemplates.some((t) => t.id === newAgreement.template)) {
         toast.error('Choose a staff (operator & staff) template')
         return
@@ -705,7 +826,7 @@ function AgreementPageContent() {
         templateId: newAgreement.template,
         recipientName: newAgreement.recipientName,
         recipientEmail: newAgreement.recipientEmail,
-        recipientType: newAgreement.recipientType,
+        recipientType: recipientTypeForCreate,
         templateName: staffTemplates.find((t) => t.id === newAgreement.template)?.name || 'Template',
         salary: Number(newAgreement.salary || 0),
         startDate: newAgreement.startDate,
@@ -914,10 +1035,10 @@ function AgreementPageContent() {
                         Connect Google Drive under Company → Integration to create staff agreements.
                       </p>
                     )}
-                    <div className="grid grid-cols-2 gap-4">
-                      <div className="col-span-2 space-y-2">
+                    <div className="space-y-4">
+                      <div className="space-y-2">
                         <Label>Recipient (staff)</Label>
-                        <Popover open={staffComboOpen} onOpenChange={setStaffComboOpen}>
+                        <Popover open={staffComboOpen} onOpenChange={setStaffComboOpen} modal={false}>
                           <PopoverTrigger asChild>
                             <Button
                               type="button"
@@ -968,22 +1089,6 @@ function AgreementPageContent() {
                           placeholder="email@example.com"
                         />
                       </div>
-                      <div className="space-y-2">
-                        <Label>Role Type</Label>
-                        <Select
-                          value={newAgreement.recipientType}
-                          onValueChange={(value) => setNewAgreement({ ...newAgreement, recipientType: value })}
-                        >
-                          <SelectTrigger>
-                            <SelectValue placeholder="Select type" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="employee">Employee</SelectItem>
-                            <SelectItem value="driver">Driver</SelectItem>
-                            <SelectItem value="dobi">Dobi</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </div>
                     </div>
                     <div className="space-y-2">
                       <Label>Template (operator &amp; staff)</Label>
@@ -1032,7 +1137,7 @@ function AgreementPageContent() {
                   <>
                     <div className="col-span-2 space-y-2">
                       <Label>Client (B2B)</Label>
-                      <Popover open={clientComboOpen} onOpenChange={setClientComboOpen}>
+                      <Popover open={clientComboOpen} onOpenChange={setClientComboOpen} modal={false}>
                         <PopoverTrigger asChild>
                           <Button
                             type="button"
@@ -1401,9 +1506,15 @@ function AgreementPageContent() {
       <Dialog open={!!previewAgreement} onOpenChange={(open) => !open && setPreviewAgreement(null)}>
         <DialogContent className="max-w-lg">
           <DialogHeader>
-            <DialogTitle>Agreement Preview</DialogTitle>
+            <DialogTitle>
+              {previewAgreement && agreementRowLooksFinalized(previewAgreement)
+                ? 'View agreement'
+                : 'Agreement preview'}
+            </DialogTitle>
             <DialogDescription>
-              Preview generated agreement before signing.
+              {previewAgreement && agreementRowLooksFinalized(previewAgreement)
+                ? 'Filled copy with signatures when recorded. For the uploaded executed PDF, use Open final agreement when that link is available.'
+                : 'Preview the filled draft while signing is still in progress, or before all parties have signed.'}
             </DialogDescription>
           </DialogHeader>
           {previewAgreement ? (
@@ -1417,16 +1528,59 @@ function AgreementPageContent() {
           <DialogFooter>
             <Button variant="outline" onClick={() => setPreviewAgreement(null)}>Close</Button>
             <Button
+              disabled={!previewAgreement?.id || agreementPreviewLoadingId === previewAgreement.id}
               onClick={() => {
-                toast.info('Opening PDF preview...')
+                const row = previewAgreement
+                if (!row?.id) return
+                void (async () => {
+                  setAgreementPreviewLoadingId(row.id)
+                  try {
+                    const out = await fetchOperatorAgreementInstancePdfBlob(row.id, operatorId)
+                    if (!out.ok || !out.blob) {
+                      toast.error(out.reason || 'Preview failed')
+                      return
+                    }
+                    const url = URL.createObjectURL(out.blob)
+                    window.open(url, '_blank', 'noopener,noreferrer')
+                    setTimeout(() => URL.revokeObjectURL(url), 60_000)
+                  } finally {
+                    setAgreementPreviewLoadingId(null)
+                  }
+                })()
               }}
             >
               <Eye className="h-4 w-4 mr-2" />
-              Open Preview
+              {agreementPreviewLoadingId === previewAgreement?.id ? 'Opening…' : 'Open Preview'}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <AlertDialog open={!!deleteTarget} onOpenChange={(open) => !open && !deleteBusy && setDeleteTarget(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete agreement?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {deleteTarget
+                ? `This will permanently remove the agreement for ${deleteTarget.recipientName}. You cannot delete after a final PDF exists.`
+                : ''}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleteBusy}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              disabled={deleteBusy}
+              onClick={(e) => {
+                e.preventDefault()
+                void confirmDeleteAgreement()
+              }}
+            >
+              {deleteBusy ? 'Deleting…' : 'Delete'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <Dialog
         open={!!signingAgreement}

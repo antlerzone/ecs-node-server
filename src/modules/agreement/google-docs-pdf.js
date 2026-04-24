@@ -36,6 +36,8 @@ const SIGNATURE_IMAGE_PLACEHOLDER_KEYS = new Set([
 const IMAGE_MAX_WIDTH_PT = 270;
 const IMAGE_MAX_HEIGHT_PT = 120;
 
+let _warnedMissingGoogleApplicationCredentialsFile = false;
+
 function getAuth() {
   const keyJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
   if (keyJson) {
@@ -49,9 +51,20 @@ function getAuth() {
       return null;
     }
   }
-  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+  const keyPath = String(process.env.GOOGLE_APPLICATION_CREDENTIALS || '').trim();
+  if (keyPath) {
+    if (!fs.existsSync(keyPath)) {
+      if (!_warnedMissingGoogleApplicationCredentialsFile) {
+        _warnedMissingGoogleApplicationCredentialsFile = true;
+        console.warn(
+          '[google-docs-pdf] GOOGLE_APPLICATION_CREDENTIALS points to a missing file; ignoring (e.g. Linux path on Windows). Path:',
+          keyPath
+        );
+      }
+      return null;
+    }
     return new google.auth.GoogleAuth({
-      keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS,
+      keyFile: keyPath,
       scopes: ['https://www.googleapis.com/auth/documents', 'https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/drive.file']
     });
   }

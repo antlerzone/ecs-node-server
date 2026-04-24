@@ -39,6 +39,8 @@ export interface OwnerProfile {
   profileSelfVerifiedAt?: string | null
   /** Server: self-attest or Aliyun eKYC */
   profileIdentityVerified?: boolean
+  /** portal_account Aliyun eKYC — profile gate (same as tenant / employee) */
+  aliyunEkycLocked?: boolean
 }
 
 function ownerAddressLine(o: OwnerProfile): string {
@@ -153,12 +155,7 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
     )
   }, [owner])
 
-  const profileSelfVerified = useMemo(
-    () =>
-      owner?.profileIdentityVerified === true ||
-      (owner?.profileSelfVerifiedAt != null && String(owner.profileSelfVerifiedAt).trim() !== ""),
-    [owner]
-  )
+  const profileSelfVerified = useMemo(() => owner?.aliyunEkycLocked === true, [owner?.aliyunEkycLocked])
 
   const profileComplete = profileFieldsComplete && profileSelfVerified
 

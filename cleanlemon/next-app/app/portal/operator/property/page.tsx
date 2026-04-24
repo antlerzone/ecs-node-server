@@ -108,6 +108,7 @@ import {
 import { Checkbox } from '@/components/ui/checkbox'
 import { DataTable, Column, Action } from '@/components/shared/data-table'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
   Command,
   CommandEmpty,
@@ -130,7 +131,7 @@ import {
   Eye,
   Archive,
   RotateCcw,
-  Map,
+  Map as MapIcon,
   List,
   Search,
   ListFilter,
@@ -144,6 +145,8 @@ import {
   ChevronLeft,
   ChevronRight,
   DoorOpen,
+  Users,
+  ExternalLink,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import {
@@ -158,9 +161,23 @@ import {
   fetchOperatorLinkedClientdetails,
   fetchOperatorPropertyDetail,
   clnUnlockSmartDoor,
+  fetchCleanlemonPricingConfig,
+  fetchOperatorPropertyGroups,
+  fetchOperatorPropertyGroupDetail,
+  createOperatorPropertyGroup,
+  addPropertiesToOperatorGroup,
+  removePropertyFromOperatorGroup,
+  deleteOperatorPropertyGroup,
+  fetchOperatorTeams,
+  type CleanlemonPricingConfig,
+  type CleanlemonSmartdoorBindingsDetail,
+  type OperatorPropertyGroupRow,
 } from '@/lib/cleanlemon-api'
+import { PRICING_SERVICES, type ServiceKey } from '@/lib/cleanlemon-pricing-services'
 import { useAuth } from '@/lib/auth-context'
 import { CleanlemonDoorOpenDialog } from '@/components/cleanlemons/cleanlemon-door-open-dialog'
+import { CleanlemonPropertyNativeLocksPanel } from '@/components/cleanlemons/cleanlemon-property-native-locks-panel'
+import { normalizeDamageAttachmentUrl } from '@/lib/media-url-kind'
 
 interface Property {
   id: string
@@ -189,7 +206,6 @@ interface Property {
   googleMapsUrl?: string
   wazeUrl?: string
   securitySystem: SecuritySystemIdOption
-  securityUsername?: string
   cleaningTypes: string[]
   keyCollection: {
     mailboxPassword: string
@@ -197,12 +213,34 @@ interface Property {
     smartdoorToken: string
   }
   remark?: string
+  /** Estimated job duration in whole minutes (same as DB `min_value`). */
   estimatedTime?: string
+  /** Display line for table / detail (derived). */
   cleaningPriceSummary: string
+  operatorCleaningPricingLine?: string
+  operatorCleaningPriceMyr?: number | null
+  /** Pricing "Services provider" key (general, homestay, …). */
+  operatorCleaningPricingService?: string
+  /** Saved multi-row cleaning prices (when API returns them). */
+  operatorCleaningPricingRows?: Array<{ service: string; line: string; myr: number | null }>
+  /** Operator-only group name (separate from client groups). */
+  operatorPropertyGroupName?: string
+  /** `cln_property.team` — default cleaning team (name matches `cln_operator_team.name`). */
+  team?: string
+  operatorDoorAccessMode?: string
   afterCleanPhotoSample?: string
   keyPhoto?: string
   checklist: ChecklistItem[]
   lastCleaned?: string
+  bedCount?: number | null
+  roomCount?: number | null
+  bathroomCount?: number | null
+  kitchen?: number | null
+  livingRoom?: number | null
+  balcony?: number | null
+  staircase?: number | null
+  liftLevel?: string | null
+  specialAreaCount?: number | null
 }
 
 interface ChecklistItem {
@@ -222,9 +260,160 @@ const SITE_KIND_OPTIONS: { value: SiteKind; label: string }[] = [
   { value: 'other', label: 'Other' },
 ]
 
+/** Map overview popups — escape user text for innerHTML. */
+function escapeHtmlForMapPopup(s: string): string {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+/**
+ * List / map label: building name → unit → id snippet (DB `property_name` can be empty after bulk/import;
+ * confirm pin does not set names).
+ */
+function propertyDisplayName(p: { id?: string; name?: string; unitNumber?: string }): string {
+  const n = String(p.name ?? '').trim()
+  if (n) return n
+  const u = String(p.unitNumber ?? '').trim()
+  if (u) return u
+  const id = String(p.id ?? '').trim()
+  if (id) return id.length > 14 ? `${id.slice(0, 10)}…` : id
+  return '—'
+}
+
+/** Red when there is a building name or unit but no address (id-only label stays neutral). */
+function propertyNameWarnMissingAddress(p: { name?: string; unitNumber?: string; address?: string }): boolean {
+  const hasBuildingOrUnit = !!String(p.name ?? '').trim() || !!String(p.unitNumber ?? '').trim()
+  return hasBuildingOrUnit && !String(p.address ?? '').trim()
+}
+
+/** Group list row: show name, or id when name is empty. */
+function propertyGroupMemberLabel(p: { id: string; name?: string }): string {
+  const n = String(p.name ?? '').trim()
+  return n || p.id
+}
+
+/** Group list row: red only when a real name exists but address is missing. */
+function propertyGroupMemberNameWarn(p: { name?: string; address?: string }): boolean {
+  return !!String(p.name ?? '').trim() && !String(p.address ?? '').trim()
+}
+
+/** MySQL / JSON sometimes delivers DECIMAL as string — `Number.isFinite('1.2')` is false without this. */
+function toOverviewMapNumber(v: unknown): number {
+  if (typeof v === 'number' && Number.isFinite(v)) return v
+  const n = Number(String(v ?? '').trim())
+  return Number.isFinite(n) ? n : NaN
+}
+
+/**
+ * Map overview: saved WGS84 on the row, else lat/lng embedded in Waze/Google URLs (`ll=` / `@lat,lng`).
+ * Search-only links (`?q=address`) do not count — returns null so we do not fake pins (matches Coliving list/map).
+ */
+function overviewLatLngForProperty(p: Pick<Property, 'lat' | 'lng' | 'wazeUrl' | 'googleMapsUrl'>): {
+  lat: number
+  lng: number
+} | null {
+  const lat = toOverviewMapNumber(p.lat)
+  const lng = toOverviewMapNumber(p.lng)
+  if (
+    Number.isFinite(lat) &&
+    Number.isFinite(lng) &&
+    Math.abs(lat) <= 90 &&
+    Math.abs(lng) <= 180 &&
+    !(lat === 0 && lng === 0)
+  ) {
+    return { lat, lng }
+  }
+  return parseLatLngFromNavigationUrls(String(p.wazeUrl || ''), String(p.googleMapsUrl || ''))
+}
+
+/** Group units that share the same saved WGS84 (e.g. many apartments at one pin). */
+function overviewCoordGroupKey(lat: number, lng: number): string {
+  return `${Number(lat).toFixed(6)},${Number(lng).toFixed(6)}`
+}
+
+function overviewMapPinColorForProperties(properties: Property[]): string {
+  const act = properties.filter((p) => p.status === 'active').length
+  const inact = properties.length - act
+  if (inact === 0) return '#16a34a'
+  if (act === 0) return '#94a3b8'
+  return '#d97706'
+}
+
+function buildCleanlemonOverviewMapPopupHtml(
+  properties: Property[],
+  googleHref: (p: Property) => string
+): string {
+  const cardHtml = (p: Property, isLast: boolean) => {
+    const gm = escapeHtmlForMapPopup(googleHref(p))
+    const wz = String(p.wazeUrl || '').trim()
+    const wazeLink = wz ? `<a href="${escapeHtmlForMapPopup(wz)}" target="_blank" rel="noopener noreferrer">Waze</a> · ` : ''
+    const st = p.status === 'active' ? 'Active' : 'Inactive'
+    const stColor = p.status === 'active' ? '#16a34a' : '#64748b'
+    const sep = isLast ? '' : 'border-bottom:1px solid #e5e7eb;margin-bottom:8px;padding-bottom:8px;'
+    return `<div style="${sep}"><strong>${escapeHtmlForMapPopup(propertyDisplayName(p))}</strong><br/><span style="color:#666;font-size:12px">${escapeHtmlForMapPopup(p.address || '—')}</span><br/><span style="font-size:11px;color:#64748b">Unit ${escapeHtmlForMapPopup(p.unitNumber || '—')} · <span style="color:${stColor}">${st}</span></span><br/><span style="display:block;margin-top:6px;font-size:12px">${wazeLink}<a href="${gm}" target="_blank" rel="noopener noreferrer">Google Maps</a></span></div>`
+  }
+  const inner = properties.map((p, i) => cardHtml(p, i === properties.length - 1)).join('')
+  if (properties.length <= 1) {
+    return `<div style="min-width:180px;font-size:13px">${inner}</div>`
+  }
+  return `<div style="min-width:200px;max-width:300px;font-size:13px"><div style="max-height:260px;overflow-y:auto;overflow-x:hidden;padding-right:6px;-webkit-overflow-scrolling:touch">${inner}</div></div>`
+}
+
+/**
+ * Apartment "Property name" is building / condo only. Strip trailing " (…)" from DB rows that stored unit/room labels.
+ * e.g. "Aliff Residences (… Balcony Room)" → "Aliff Residences"
+ */
+function apartmentBuildingDisplayName(raw: string): string {
+  const s = String(raw ?? '').trim()
+  if (!s) return ''
+  const i = s.indexOf(' (')
+  if (i === -1) return s
+  const left = s.slice(0, i).trim()
+  return left || s
+}
+
+/** `cln_property.id` is UUID-shaped; never use that as a human-readable building/property name in bulk flows. */
+function looksLikeClnPropertyIdString(s: string): boolean {
+  const t = String(s ?? '').trim()
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(t)
+}
+
+/** Seed / patch: drop id-shaped garbage so bulk edit does not overwrite every row with a UUID. */
+function sanitizedOperatorPropertyDisplayNameForBulk(
+  raw: string,
+  opts?: { rowId?: string; selectedIds?: Set<string> }
+): string {
+  const t = String(raw ?? '').trim()
+  if (!t) return ''
+  const rowId = String(opts?.rowId ?? '').trim()
+  if (rowId && t === rowId) return ''
+  if (opts?.selectedIds?.size && opts.selectedIds.has(t)) return ''
+  if (looksLikeClnPropertyIdString(t)) return ''
+  return t
+}
+
+function filterDistinctPropertyNameList(items: unknown[]): string[] {
+  return items
+    .map((x: unknown) => String(x).trim())
+    .filter(Boolean)
+    .filter((n) => !looksLikeClnPropertyIdString(n))
+}
+
 function inferSiteKind(property: Property, apartmentNames: string[]): SiteKind {
   const n = String(property.name || '').trim()
-  if (n && apartmentNames.some((x) => String(x).trim() === n)) return 'apartment'
+  const nBuilding = apartmentBuildingDisplayName(n)
+  if (
+    n &&
+    apartmentNames.some((x) => {
+      const x0 = String(x).trim()
+      return x0 === n || x0 === nBuilding
+    })
+  ) {
+    return 'apartment'
+  }
   if (property.type === 'office') return 'office'
   if (property.type === 'commercial') return 'commercial'
   if (property.type === 'apartment') return 'apartment'
@@ -253,6 +442,73 @@ function apartmentNamesStorageKey(operatorId: string) {
   return `cleanlemon-apartment-names:${operatorId}`
 }
 
+function normalizeOperatorDoorAccessMode(raw: string | undefined): string {
+  const modeRaw = String(raw || '')
+    .trim()
+    .toLowerCase()
+  return ['full_access', 'temporary_password_only', 'working_date_only', 'fixed_password'].includes(modeRaw)
+    ? modeRaw
+    : 'temporary_password_only'
+}
+
+/** One row in the cleaning price dialog (service + MYR; `line` is unused and always cleared for API). */
+interface CleaningPricingRowForm {
+  service: string
+  line: string
+  myr: string
+}
+
+function defaultCleaningPricingRow(): CleaningPricingRowForm {
+  return { service: 'general', line: '', myr: '' }
+}
+
+function normalizeCleaningRowsFromProperty(property: Property): CleaningPricingRowForm[] {
+  const raw = property.operatorCleaningPricingRows
+  const stripLine = (rows: CleaningPricingRowForm[]) => rows.map((r) => ({ ...r, line: '' }))
+  if (Array.isArray(raw) && raw.length > 0) {
+    return stripLine(
+      raw.map((r) => ({
+        service: String(r.service || 'general').trim() || 'general',
+        line: String(r.line || '').trim(),
+        myr: r.myr != null && Number.isFinite(Number(r.myr)) ? String(r.myr) : '',
+      }))
+    )
+  }
+  const opSvc = String(property.operatorCleaningPricingService || '').trim()
+  const opPrice =
+    property.operatorCleaningPriceMyr != null && Number.isFinite(Number(property.operatorCleaningPriceMyr))
+      ? String(property.operatorCleaningPriceMyr)
+      : ''
+  return [{ service: opSvc || 'general', line: '', myr: opPrice }]
+}
+
+function withSyncedLegacyFromCleaningRows(prev: PropertyFormState, nextRows: CleaningPricingRowForm[]): PropertyFormState {
+  const sanitized = nextRows.map((r) => ({ ...r, line: '' }))
+  const first = sanitized[0]
+  return {
+    ...prev,
+    operatorCleaningPricingRows: sanitized,
+    operatorCleaningPricingService: first?.service || 'general',
+    operatorCleaningPricingLine: '',
+    operatorCleaningPriceMyr: first?.myr ?? '',
+  }
+}
+
+function buildOperatorCleaningPricingRowsApiPayload(
+  rows: CleaningPricingRowForm[]
+): Array<{ service: string; line: string; myr: number | null }> {
+  return rows.map((r) => {
+    const t = String(r.myr || '').trim()
+    const n = Number(t)
+    const myr = t === '' ? null : Number.isFinite(n) && n >= 0 ? n : null
+    return {
+      service: String(r.service || 'general').trim() || 'general',
+      line: '',
+      myr,
+    }
+  })
+}
+
 interface PropertyFormState {
   name: string
   siteKind: SiteKind
@@ -271,21 +527,52 @@ interface PropertyFormState {
   mailboxPasswordValue: string
   smartdoorPasswordValue: string
   securitySystem: SecuritySystemIdOption
-  securityUsername: string
   afterCleanPhotoSample?: string
-  cleaningPriceByType: Record<string, { defaultPrice: string; adjustAmount: string }>
+  /** full_access | temporary_password_only | working_date_only | fixed_password */
+  operatorDoorAccessMode: string
+  /** Multi-row editing; legacy single fields below mirror row 0 for saves/API compatibility. */
+  operatorCleaningPricingRows: CleaningPricingRowForm[]
+  operatorCleaningPricingLine: string
+  operatorCleaningPriceMyr: string
+  operatorCleaningPricingService: string
   estimatedTime: string
   keyPhoto?: string
   latitude: string
   longitude: string
   checklist: ChecklistItem[]
+  bedCount: string
+  roomCount: string
+  bathroomCount: string
+  kitchen: string
+  livingRoom: string
+  balcony: string
+  staircase: string
+  liftLevel: string
+  specialAreaCount: string
+  /** `cln_operator_team.id`; empty = unassigned. */
+  bindingTeamId: string
 }
-
-/** Single row in Cleaning Price Summary (no per–cleaning-type picker on this form). */
-const PRICE_SUMMARY_LABEL = 'Cleaning'
 
 /** Smartdoor (Token) is checkbox-only (no text field); non-empty marks enabled in `Property.keyCollection`. */
 const SMARTDOOR_TOKEN_ENABLED_MARKER = '1'
+
+/** Coliving Operator portal — Property → Edit utility (smart door binding lives on `propertydetail`). */
+const COLIVING_PORTAL_ORIGIN = (
+  process.env.NEXT_PUBLIC_COLIVING_PORTAL_ORIGIN || 'https://portal.colivingjb.com'
+).replace(/\/$/, '')
+
+function detailNumToForm(v: unknown): string {
+  if (v == null || v === '') return ''
+  const n = Number(v)
+  return Number.isFinite(n) ? String(n) : ''
+}
+
+function formDetailOptInt(s: string): number | undefined {
+  const t = String(s ?? '').trim()
+  if (t === '') return undefined
+  const n = parseInt(t, 10)
+  return Number.isFinite(n) && n >= 0 ? n : undefined
+}
 
 /** Old hard-coded map placeholder (Kuala Lumpur). Replaced for display logic so we can detect bad seed data. */
 const LEGACY_KL_PLACEHOLDER_LAT = 3.139
@@ -371,6 +658,41 @@ function isLegacyKualaLumpurPlaceholder(latStr: string, lngStr: string): boolean
   )
 }
 
+/** Initial pin for the post-save map dialog (saved coords → nav URLs → JB default). */
+function resolveMapConfirmInitialCoordsFromForm(form: PropertyFormState): { lat: number; lng: number } {
+  const laS = String(form.latitude || '').trim()
+  const loS = String(form.longitude || '').trim()
+  if (laS && loS && !isLegacyKualaLumpurPlaceholder(laS, loS)) {
+    const la = Number(laS)
+    const lo = Number(loS)
+    if (Number.isFinite(la) && Number.isFinite(lo) && Math.abs(la) <= 90 && Math.abs(lo) <= 180) {
+      return { lat: la, lng: lo }
+    }
+  }
+  const parsed = parseLatLngFromNavigationUrls(form.wazeUrl, form.googleMapsUrl)
+  if (parsed) return parsed
+  return { lat: DEFAULT_PROPERTY_MAP_LAT, lng: DEFAULT_PROPERTY_MAP_LNG }
+}
+
+/** Bulk-edit map seed: explicit OSM pick → else nav links from address text → JB default. */
+function resolveMapConfirmInitialCoordsFromBulkFields(
+  address: string,
+  latStr: string,
+  lngStr: string
+): { lat: number; lng: number } {
+  const la = Number(String(latStr || '').trim())
+  const lo = Number(String(lngStr || '').trim())
+  if (Number.isFinite(la) && Number.isFinite(lo) && Math.abs(la) <= 90 && Math.abs(lo) <= 180) {
+    return { lat: la, lng: lo }
+  }
+  const nav = navigationUrlsFromPlainAddress(String(address || '').trim())
+  if (nav) {
+    const p = parseLatLngFromNavigationUrls(nav.wazeUrl, nav.googleMapsUrl)
+    if (p) return p
+  }
+  return { lat: DEFAULT_PROPERTY_MAP_LAT, lng: DEFAULT_PROPERTY_MAP_LNG }
+}
+
 const typeIcons = {
   office: Building,
   commercial: Warehouse,
@@ -388,6 +710,94 @@ const typeColors = {
 }
 
 const PROPERTY_LIST_PAGE_SIZES = [10, 20, 50, 100, 200] as const
+
+/**
+ * Parse legacy estimate strings (`2h 30m`, plain digits) into minutes — mirrors
+ * `parseClnEstimateTimeInputToMinutes` in cleanlemon.service.js.
+ */
+function parseEstimateTextToMinutes(raw: string): number | null {
+  const s = String(raw ?? '').trim().toLowerCase()
+  if (!s) return null
+  if (/^\d+$/.test(s)) {
+    const n = parseInt(s, 10)
+    return Number.isFinite(n) && n >= 0 ? n : null
+  }
+  let total = 0
+  const hMatch = s.match(/(\d+)\s*h/)
+  const mMatch = s.match(/(\d+)\s*m/)
+  if (hMatch) total += parseInt(hMatch[1], 10) * 60
+  if (mMatch) total += parseInt(mMatch[1], 10)
+  if (hMatch || mMatch) return total
+  const n = Number(s)
+  if (Number.isFinite(n) && n >= 0) return Math.floor(n)
+  return null
+}
+
+/** List row: show + edit as integer minutes (`min_value` or legacy API label). */
+function estimateTimeMinutesFromRow(row: Record<string, unknown>): string {
+  const mv = row.minValue
+  if (mv != null && mv !== '') {
+    const mins = Math.floor(Number(mv))
+    if (Number.isFinite(mins) && mins > 0) return String(mins)
+  }
+  const et = String(row.estimatedTime ?? '').trim()
+  if (!et) return ''
+  const p = parseEstimateTextToMinutes(et)
+  return p != null && p > 0 ? String(p) : ''
+}
+
+/** GET detail → form field (minutes only). */
+function estimateTimeMinutesFromDetail(rp: { estimatedTime?: unknown; min_value?: unknown; minValue?: unknown }): string {
+  const rawMin = rp.minValue ?? rp.min_value
+  if (rawMin != null && String(rawMin).trim() !== '') {
+    const mins = Math.floor(Number(rawMin))
+    if (Number.isFinite(mins) && mins > 0) return String(mins)
+  }
+  const p = parseEstimateTextToMinutes(String(rp.estimatedTime ?? ''))
+  return p != null && p > 0 ? String(p) : ''
+}
+
+/** PUT/POST: minutes as digits, or empty string to clear `min_value`. */
+function coerceEstimatedTimeMinutesForApi(formVal: string): string {
+  const t = String(formVal ?? '').trim()
+  if (!t) return ''
+  const n = parseInt(t, 10)
+  return Number.isFinite(n) && n >= 0 ? String(n) : ''
+}
+
+function teamIdFromPropertyTeamName(
+  teamName: string | undefined,
+  teams: { id: string; name: string }[]
+): string {
+  const t = String(teamName ?? '').trim()
+  if (!t || teams.length === 0) return ''
+  const hit = teams.find((x) => String(x.name ?? '').trim() === t)
+  return hit ? String(hit.id) : ''
+}
+
+/** Add Wix legacy columns as pricing rows when missing (same order as API merge). */
+function mergeWixLegacyCleaningPriceRows(
+  rows: Array<{ service: string; line: string; myr: number | null }>,
+  row: Record<string, unknown>
+) {
+  const out = [...rows]
+  const seen = new Set(out.map((r) => String(r.service || '').trim().toLowerCase()).filter(Boolean))
+  const add = (service: string, raw: unknown) => {
+    const sk = String(service || '').trim().toLowerCase()
+    if (!sk || seen.has(sk)) return
+    if (raw == null || raw === '') return
+    const n = Number(raw)
+    if (!Number.isFinite(n) || n < 0) return
+    out.push({ service: sk, line: '', myr: n })
+    seen.add(sk)
+  }
+  add('warm', row.warmCleaning)
+  add('deep', row.deepCleaning)
+  add('general', row.generalCleaning)
+  add('renovation', row.renovationCleaning)
+  add('homestay', row.cleaningFees)
+  return out
+}
 
 function mapApiRowToProperty(row: Record<string, unknown>): Property {
   const securitySystem = parseSecuritySystemFromDb(String(row.securitySystem ?? ''))
@@ -407,11 +817,12 @@ function mapApiRowToProperty(row: Record<string, unknown>): Property {
               : 'other'
   return {
     id: String(row.id),
-    name: String(row.name || 'Property'),
+    name: String(row.name ?? '').trim(),
     address: String(row.address || ''),
     unitNumber: String(row.unitNumber || ''),
     type: tableType,
     client: String(row.client || ''),
+    team: String(row.team ?? '').trim(),
     clientdetailId: String(row.clientdetailId || '').trim(),
     clientPortalOwned: Number(row.clientPortalOwned) === 1,
     linkedOperatorId: String(row.operatorId ?? row.operator_id ?? '').trim(),
@@ -419,34 +830,106 @@ function mapApiRowToProperty(row: Record<string, unknown>): Property {
     operatorPortalArchived: Number(row.operatorPortalArchived) === 1,
     status: (Number(row.operatorPortalArchived) === 1 ? 'inactive' : 'active') as Property['status'],
     ...(() => {
-      const dbLat = row.latitude != null ? Number(row.latitude) : NaN
-      const dbLng = row.longitude != null ? Number(row.longitude) : NaN
-      if (Number.isFinite(dbLat) && Number.isFinite(dbLng)) {
-        return { lat: dbLat, lng: dbLng }
+      const rawLat =
+        row.latitude ??
+        (row as { Latitude?: unknown }).Latitude ??
+        (row as { lat?: unknown }).lat
+      const rawLng =
+        row.longitude ??
+        (row as { Longitude?: unknown }).Longitude ??
+        (row as { lng?: unknown }).lng
+      const dbLat = rawLat != null && rawLat !== '' ? Number(rawLat) : NaN
+      const dbLng = rawLng != null && rawLng !== '' ? Number(rawLng) : NaN
+      if (
+        Number.isFinite(dbLat) &&
+        Number.isFinite(dbLng) &&
+        Math.abs(dbLat) <= 90 &&
+        Math.abs(dbLng) <= 180 &&
+        !(dbLat === 0 && dbLng === 0)
+      ) {
+        return { lat: Number(dbLat), lng: Number(dbLng) }
       }
       const wz = String(row.wazeUrl ?? (row as { waze_url?: unknown }).waze_url ?? '').trim()
       const gz = String(row.googleMapsUrl ?? (row as { google_maps_url?: unknown }).google_maps_url ?? '').trim()
       const parsed = parseLatLngFromNavigationUrls(wz, gz)
-      return {
-        lat: parsed?.lat ?? DEFAULT_PROPERTY_MAP_LAT,
-        lng: parsed?.lng ?? DEFAULT_PROPERTY_MAP_LNG,
+      if (parsed && !(parsed.lat === 0 && parsed.lng === 0)) {
+        return { lat: parsed.lat, lng: parsed.lng }
       }
+      return { lat: NaN, lng: NaN }
     })(),
     securitySystem,
-    securityUsername: String(row.securityUsername || '').trim(),
     cleaningTypes: [] as string[],
     keyCollection: {
       mailboxPassword: String(row.mailboxPassword || ''),
       smartdoorPassword: String(row.smartdoorPassword || ''),
       smartdoorToken: tokenOn ? SMARTDOOR_TOKEN_ENABLED_MARKER : '',
     },
-    cleaningPriceSummary: '',
+    ...(() => {
+      const rowsJson = (row as { operatorCleaningPricingRows?: unknown }).operatorCleaningPricingRows
+      let rows: Array<{ service: string; line: string; myr: number | null }> = []
+      if (Array.isArray(rowsJson) && rowsJson.length) {
+        rows = rowsJson.map((x: { service?: unknown; line?: unknown; myr?: unknown }) => {
+          const svc = String(x?.service ?? '').trim() || 'general'
+          const line = String(x?.line ?? '').trim()
+          const n = Number(x?.myr)
+          const myr = x?.myr != null && Number.isFinite(n) && n >= 0 ? n : null
+          return { service: svc, line, myr }
+        })
+      } else {
+        const opSvc = String(row.operatorCleaningPricingService ?? '').trim()
+        const opLine = String(row.operatorCleaningPricingLine ?? '').trim()
+        const opPriceRaw = row.operatorCleaningPriceMyr
+        const opPrice = opPriceRaw != null ? Number(opPriceRaw) : NaN
+        const hasPrice = Number.isFinite(opPrice) && opPrice >= 0
+        if (opSvc || opLine || hasPrice) {
+          rows = [{ service: opSvc || 'general', line: opLine, myr: hasPrice ? opPrice : null }]
+        }
+      }
+      if (!rows.length) {
+        const cf = row.cleaningFees
+        const n = cf != null && cf !== '' ? Number(cf) : NaN
+        if (Number.isFinite(n) && n >= 0) {
+          rows = [{ service: 'homestay', line: '', myr: n }]
+        }
+      }
+      rows = mergeWixLegacyCleaningPriceRows(rows, row).map((r) => ({ ...r, line: '' }))
+      const rowSummaries = rows
+        .map((r) => {
+          const svcLabel = r.service
+            ? PRICING_SERVICES.find((s) => s.key === (r.service as ServiceKey))?.label || r.service
+            : ''
+          const parts = [svcLabel, r.myr != null ? `RM ${r.myr}` : ''].filter(Boolean)
+          return parts.join(' · ')
+        })
+        .filter(Boolean)
+      const cleaningPriceSummary = rowSummaries.length ? rowSummaries.join(' | ') : ''
+      const first = rows[0]
+      return {
+        cleaningPriceSummary,
+        operatorCleaningPricingRows: rows,
+        operatorCleaningPricingLine: '',
+        operatorCleaningPriceMyr: first?.myr != null ? first.myr : null,
+        operatorCleaningPricingService: first?.service ?? '',
+        operatorPropertyGroupName: String(row.operatorPropertyGroupName ?? '').trim(),
+      }
+    })(),
     checklist: [],
     afterCleanPhotoSample: String(row.afterCleanPhotoUrl || ''),
     keyPhoto: String(row.keyPhotoUrl || ''),
     lastCleaned: (row.updated_at || row.created_at) as string | undefined,
     googleMapsUrl: String(row.googleMapsUrl || '').trim(),
     wazeUrl: String(row.wazeUrl || '').trim(),
+    bedCount: row.bedCount != null && row.bedCount !== '' ? Number(row.bedCount) : null,
+    roomCount: row.roomCount != null && row.roomCount !== '' ? Number(row.roomCount) : null,
+    bathroomCount: row.bathroomCount != null && row.bathroomCount !== '' ? Number(row.bathroomCount) : null,
+    kitchen: row.kitchen != null && row.kitchen !== '' ? Number(row.kitchen) : null,
+    livingRoom: row.livingRoom != null && row.livingRoom !== '' ? Number(row.livingRoom) : null,
+    balcony: row.balcony != null && row.balcony !== '' ? Number(row.balcony) : null,
+    staircase: row.staircase != null && row.staircase !== '' ? Number(row.staircase) : null,
+    liftLevel: row.liftLevel != null ? String(row.liftLevel).trim() : null,
+    specialAreaCount:
+      row.specialAreaCount != null && row.specialAreaCount !== '' ? Number(row.specialAreaCount) : null,
+    estimatedTime: estimateTimeMinutesFromRow(row),
   }
 }
 
@@ -456,7 +939,6 @@ function bulkUpdateBasePatch(p: Property): Record<string, unknown> {
     address: p.address,
     unitNumber: p.unitNumber,
     client: p.client,
-    team: '',
     wazeUrl: p.wazeUrl ?? '',
     googleMapsUrl: p.googleMapsUrl ?? '',
   }
@@ -483,10 +965,32 @@ export default function PropertyPage() {
   const [isChecklistOpen, setIsChecklistOpen] = useState(false)
   const [isOwnerProfileOpen, setIsOwnerProfileOpen] = useState(false)
   const [isMapConfirmOpen, setIsMapConfirmOpen] = useState(false)
-  const [pendingSubmitMode, setPendingSubmitMode] = useState<'add' | 'edit' | null>(null)
+  const [isPropertyDetailSaving, setIsPropertyDetailSaving] = useState(false)
+  const [mapConfirmPinLabel, setMapConfirmPinLabel] = useState<{ lat: number; lng: number }>({
+    lat: DEFAULT_PROPERTY_MAP_LAT,
+    lng: DEFAULT_PROPERTY_MAP_LNG,
+  })
+  const [mapConfirmPatching, setMapConfirmPatching] = useState(false)
+  /** Bulk edit with address: nothing is written until user confirms the map pin. */
+  const [mapConfirmBulkDeferred, setMapConfirmBulkDeferred] = useState(false)
+  const mapConfirmContainerRef = useRef<HTMLDivElement | null>(null)
+  const mapConfirmLeafletMapRef = useRef<any>(null)
+  const mapConfirmMarkerRef = useRef<any>(null)
+  const mapConfirmInitialRef = useRef<{ lat: number; lng: number }>({
+    lat: DEFAULT_PROPERTY_MAP_LAT,
+    lng: DEFAULT_PROPERTY_MAP_LNG,
+  })
+  const pendingCoordsTargetRef = useRef<
+    | null
+    | { variant: 'single'; propertyId: string }
+    | { variant: 'bulk'; propertyIds: string[]; deferredFullPatch?: Record<string, unknown> }
+  >(null)
   const mapContainerRef = useRef<HTMLDivElement | null>(null)
   const leafletMapRef = useRef<any>(null)
-  const leafletLibRef = useRef<any>(null)
+  /** Property id → Leaflet marker (grouped pins share one marker). */
+  const overviewMarkersByPropertyIdRef = useRef<Record<string, any>>({})
+  const [mapSidebarSearch, setMapSidebarSearch] = useState('')
+  const [selectedMapListPropertyId, setSelectedMapListPropertyId] = useState<string | null>(null)
   const [bookingClients, setBookingClients] = useState<Array<{ id: string; name: string; email: string }>>([])
   const [apartmentPropertyNames, setApartmentPropertyNames] = useState<string[]>([])
   /** Distinct `cln_property.property_name` from API (per operator). */
@@ -500,6 +1004,52 @@ export default function PropertyPage() {
   const [bulkDisconnectOpen, setBulkDisconnectOpen] = useState(false)
   const [bulkRemoveOperatorOpen, setBulkRemoveOperatorOpen] = useState(false)
   const [bulkWorking, setBulkWorking] = useState(false)
+  const [operatorPortalMainTab, setOperatorPortalMainTab] = useState<'properties' | 'groups'>('properties')
+  const [operatorPropertyGroups, setOperatorPropertyGroups] = useState<OperatorPropertyGroupRow[]>([])
+  /** Group view: multi-select (same pattern as client /portal/client/properties). */
+  const [selectedOperatorGroupIds, setSelectedOperatorGroupIds] = useState<Set<string>>(new Set())
+  const [opGroupExpandedId, setOpGroupExpandedId] = useState<string | null>(null)
+  const [opGroupDetailById, setOpGroupDetailById] = useState<
+    Record<
+      string,
+      {
+        loading: boolean
+        detail: {
+          id: string
+          name: string
+          properties: Array<{ id: string; name: string; address: string }>
+        } | null
+      }
+    >
+  >({})
+  const [operatorGroupCreateOpen, setOperatorGroupCreateOpen] = useState(false)
+  const [operatorNewGroupName, setOperatorNewGroupName] = useState('')
+  const [operatorGroupCreating, setOperatorGroupCreating] = useState(false)
+  const [addToOperatorGroupOpen, setAddToOperatorGroupOpen] = useState(false)
+  const [addToOperatorGroupPickId, setAddToOperatorGroupPickId] = useState('')
+  const [addToOperatorGroupBusy, setAddToOperatorGroupBusy] = useState(false)
+  const [bulkEditOpen, setBulkEditOpen] = useState(false)
+  const [bulkEditWorking, setBulkEditWorking] = useState(false)
+  const [bulkEditUsePropertySection, setBulkEditUsePropertySection] = useState(false)
+  const [bulkEditSiteKind, setBulkEditSiteKind] = useState<SiteKind>('landed')
+  const [bulkEditName, setBulkEditName] = useState('')
+  const [bulkEditPropertyAddress, setBulkEditPropertyAddress] = useState('')
+  const [bulkEditLatitude, setBulkEditLatitude] = useState('')
+  const [bulkEditLongitude, setBulkEditLongitude] = useState('')
+  const [bulkBuildingComboOpen, setBulkBuildingComboOpen] = useState(false)
+  const [bulkBuildingNameInput, setBulkBuildingNameInput] = useState('')
+  const [bulkAddressSuggestOpen, setBulkAddressSuggestOpen] = useState(false)
+  const [bulkAddressSearchItems, setBulkAddressSearchItems] = useState<
+    Array<{ displayName: string; lat: string; lon: string; placeId: string }>
+  >([])
+  const [bulkAddressSearchLoading, setBulkAddressSearchLoading] = useState(false)
+  const bulkAddressSearchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const bulkAddressFieldWrapRef = useRef<HTMLDivElement | null>(null)
+  const [bulkEditService, setBulkEditService] = useState('general')
+  const [bulkEditPrice, setBulkEditPrice] = useState('')
+  const [bulkEditUsePricing, setBulkEditUsePricing] = useState(false)
+  const [bulkEditUseTeam, setBulkEditUseTeam] = useState(false)
+  const [bulkEditTeamId, setBulkEditTeamId] = useState('')
   /** Two-step delete (archived operator rows only). */
   const [deletePropertyDialogOpen, setDeletePropertyDialogOpen] = useState(false)
   const [deletePropertyPhase, setDeletePropertyPhase] = useState<1 | 2>(1)
@@ -521,6 +1071,9 @@ export default function PropertyPage() {
     smartdoorGatewayReady: boolean
     hasBookingToday: boolean
   } | null>(null)
+  /** Add-property flow: credentials chosen before create (same idea as Coliving operator property). */
+  const [insertSecurityCredentials, setInsertSecurityCredentials] = useState<Record<string, unknown> | null>(null)
+  const [secCredModalFromAdd, setSecCredModalFromAdd] = useState(false)
   const [persistedSecurityCredentials, setPersistedSecurityCredentials] = useState<Record<
     string,
     unknown
@@ -551,6 +1104,15 @@ export default function PropertyPage() {
   const addressFieldWrapRef = useRef<HTMLDivElement | null>(null)
   /** When edit dialog opens: resolved clientdetail id (same as form). Save compares to this — address-only edits do not trigger defer binding. */
   const bindingClientIdBaselineRef = useRef<string>('')
+  /** `cln_property.team` name at open — save sends `teamId` only when the chosen team name differs. */
+  const teamNameBaselineRef = useRef<string>('')
+  /** Only send `operatorDoorAccessMode` on update when changed — avoids gateway validation when editing cleaning price only. */
+  const operatorDoorAccessModeBaselineRef = useRef<string>('')
+
+  const [operatorPricingConfig, setOperatorPricingConfig] = useState<CleanlemonPricingConfig | null>(null)
+  const [editDialogSmartdoorBindings, setEditDialogSmartdoorBindings] =
+    useState<CleanlemonSmartdoorBindingsDetail | null>(null)
+  const [editDialogGatewayReady, setEditDialogGatewayReady] = useState(false)
 
   const [propertyForm, setPropertyForm] = useState<PropertyFormState>({
     name: '',
@@ -570,13 +1132,19 @@ export default function PropertyPage() {
     mailboxPasswordValue: '',
     smartdoorPasswordValue: '',
     securitySystem: 'icare',
-    securityUsername: '',
-    cleaningPriceByType: {},
+    operatorDoorAccessMode: 'temporary_password_only',
+    operatorCleaningPricingRows: [defaultCleaningPricingRow()],
+    operatorCleaningPricingLine: '',
+    operatorCleaningPriceMyr: '',
+    operatorCleaningPricingService: 'general',
     estimatedTime: '',
     latitude: '',
     longitude: '',
     checklist: [],
+    bindingTeamId: '',
   })
+
+  const [operatorTeamsList, setOperatorTeamsList] = useState<Array<{ id: string; name: string }>>([])
 
   const reloadProperties = useCallback(async () => {
     const includeArchived = propertyArchiveFilter !== 'active'
@@ -585,9 +1153,49 @@ export default function PropertyPage() {
     setProperties((r.items || []).map((row: Record<string, unknown>) => mapApiRowToProperty(row)))
   }, [operatorId, propertyArchiveFilter])
 
+  const loadOperatorPropertyGroups = useCallback(async () => {
+    const r = await fetchOperatorPropertyGroups(operatorId)
+    if (r?.ok && Array.isArray(r.items)) setOperatorPropertyGroups(r.items)
+  }, [operatorId])
+
+  const loadOperatorTeamsList = useCallback(async () => {
+    const r = await fetchOperatorTeams(operatorId)
+    if (!r?.ok || !Array.isArray(r.items)) {
+      setOperatorTeamsList([])
+      return
+    }
+    setOperatorTeamsList(
+      r.items.map((t: { id?: string; name?: string }) => ({
+        id: String(t.id || '').trim(),
+        name: String(t.name || '').trim(),
+      })).filter((t: { id: string }) => !!t.id)
+    )
+  }, [operatorId])
+
   useEffect(() => {
     void reloadProperties()
   }, [reloadProperties])
+
+  useEffect(() => {
+    void loadOperatorPropertyGroups()
+  }, [loadOperatorPropertyGroups])
+
+  useEffect(() => {
+    void loadOperatorTeamsList()
+  }, [loadOperatorTeamsList])
+
+  useEffect(() => {
+    if (!isAddDialogOpen || !operatorId) return
+    let cancelled = false
+    void (async () => {
+      const r = await fetchCleanlemonPricingConfig(operatorId)
+      if (cancelled || !r?.ok) return
+      setOperatorPricingConfig(r.config ?? null)
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [isAddDialogOpen, operatorId])
 
   useEffect(() => {
     const ids = new Set(properties.map((p) => p.id))
@@ -608,6 +1216,22 @@ export default function PropertyPage() {
     }
     return properties
   }, [properties, propertyArchiveFilter])
+
+  const mapSidebarFilteredProperties = useMemo(() => {
+    const q = mapSidebarSearch.trim().toLowerCase()
+    if (!q) return visibleListProperties
+    return visibleListProperties.filter((p) =>
+      [p.name, p.address, p.client, p.unitNumber].some((x) =>
+        String(x || '').toLowerCase().includes(q)
+      )
+    )
+  }, [visibleListProperties, mapSidebarSearch])
+
+  /** Saved WGS84 or URL-embedded coords — same rule as map markers. */
+  const propertiesWithMapCoordinatesCount = useMemo(
+    () => visibleListProperties.filter((p) => overviewLatLngForProperty(p) !== null).length,
+    [visibleListProperties]
+  )
 
   /** Stage 1 — your properties only: clear B2B client binding / label (operator row stays). */
   const selectedBulkDisconnectClientCount = useMemo(
@@ -631,7 +1255,7 @@ export default function PropertyPage() {
     ;(async () => {
       const r = await fetchOperatorDistinctPropertyNames(operatorId)
       if (cancelled || !r?.ok || !Array.isArray(r.items)) return
-      setDbDistinctPropertyNames(r.items.map((x: unknown) => String(x).trim()).filter(Boolean))
+      setDbDistinctPropertyNames(filterDistinctPropertyNameList(r.items))
     })()
     return () => {
       cancelled = true
@@ -644,7 +1268,7 @@ export default function PropertyPage() {
     ;(async () => {
       const r = await fetchOperatorDistinctPropertyNames(operatorId)
       if (cancelled || !r?.ok || !Array.isArray(r.items)) return
-      setDbDistinctPropertyNames(r.items.map((x: unknown) => String(x).trim()).filter(Boolean))
+      setDbDistinctPropertyNames(filterDistinctPropertyNameList(r.items))
     })()
     return () => {
       cancelled = true
@@ -700,25 +1324,23 @@ export default function PropertyPage() {
 
   const apartmentNameChoices = useMemo(() => {
     const s = new Set<string>()
-    dbDistinctPropertyNames.forEach((n) => {
-      const t = String(n).trim()
+    const add = (raw: string) => {
+      const t = apartmentBuildingDisplayName(String(raw).trim())
       if (t) s.add(t)
-    })
-    apartmentPropertyNames.forEach((n) => {
-      const t = String(n).trim()
-      if (t) s.add(t)
-    })
+    }
+    dbDistinctPropertyNames.forEach(add)
+    apartmentPropertyNames.forEach(add)
     return Array.from(s).sort((a, b) => a.localeCompare(b))
   }, [dbDistinctPropertyNames, apartmentPropertyNames])
 
   const mergedBuildingNames = useMemo(() => {
     const s = new Set<string>()
     apartmentNameChoices.forEach((n) => {
-      const t = String(n).trim()
+      const t = apartmentBuildingDisplayName(String(n).trim())
       if (t) s.add(t)
     })
-    globalBuildingHints.forEach((n) => {
-      const t = String(n).trim()
+    globalBuildingHints.forEach((raw) => {
+      const t = apartmentBuildingDisplayName(String(raw).trim())
       if (t) s.add(t)
     })
     return Array.from(s).sort((a, b) => a.localeCompare(b))
@@ -730,27 +1352,59 @@ export default function PropertyPage() {
     return mergedBuildingNames.filter((n) => n.toLowerCase().includes(q))
   }, [mergedBuildingNames, buildingNameInput])
 
+  const filteredBulkBuildingNames = useMemo(() => {
+    const q = bulkBuildingNameInput.trim().toLowerCase()
+    if (!q) return mergedBuildingNames
+    return mergedBuildingNames.filter((n) => n.toLowerCase().includes(q))
+  }, [mergedBuildingNames, bulkBuildingNameInput])
+
   useEffect(() => {
     if (!buildingComboOpen) return
     setBuildingNameInput(propertyForm.name)
   }, [buildingComboOpen, propertyForm.name])
 
   useEffect(() => {
+    if (!bulkBuildingComboOpen) return
+    setBulkBuildingNameInput(bulkEditName)
+  }, [bulkBuildingComboOpen, bulkEditName])
+
+  useEffect(() => {
     if (propertyForm.siteKind !== 'apartment' || !buildingComboOpen) return
+    const oid = String(operatorId || '').trim()
+    if (!oid) return
     const t = buildingNameInput.trim()
     let cancelled = false
     const id = window.setTimeout(() => {
       void (async () => {
-        const r = await fetchGlobalPropertyNames({ q: t, limit: 80 })
+        const r = await fetchGlobalPropertyNames({ operatorId: oid, q: t, limit: 80 })
         if (cancelled || !r?.ok || !Array.isArray(r.items)) return
-        setGlobalBuildingHints(r.items.map((x: unknown) => String(x).trim()).filter(Boolean))
+        setGlobalBuildingHints(filterDistinctPropertyNameList(r.items))
       })()
     }, 380)
     return () => {
       cancelled = true
       window.clearTimeout(id)
     }
-  }, [buildingNameInput, propertyForm.siteKind, buildingComboOpen])
+  }, [buildingNameInput, propertyForm.siteKind, buildingComboOpen, operatorId])
+
+  useEffect(() => {
+    if (bulkEditSiteKind !== 'apartment' || !bulkBuildingComboOpen) return
+    const oid = String(operatorId || '').trim()
+    if (!oid) return
+    const t = bulkBuildingNameInput.trim()
+    let cancelled = false
+    const id = window.setTimeout(() => {
+      void (async () => {
+        const r = await fetchGlobalPropertyNames({ operatorId: oid, q: t, limit: 80 })
+        if (cancelled || !r?.ok || !Array.isArray(r.items)) return
+        setGlobalBuildingHints(filterDistinctPropertyNameList(r.items))
+      })()
+    }, 380)
+    return () => {
+      cancelled = true
+      window.clearTimeout(id)
+    }
+  }, [bulkBuildingNameInput, bulkEditSiteKind, bulkBuildingComboOpen, operatorId])
 
   useEffect(() => {
     const el = addressFieldWrapRef.current
@@ -765,6 +1419,18 @@ export default function PropertyPage() {
   }, [addressSuggestOpen])
 
   useEffect(() => {
+    const el = bulkAddressFieldWrapRef.current
+    if (!el) return
+    const onDoc = (e: MouseEvent) => {
+      if (!bulkAddressSuggestOpen) return
+      const t = e.target
+      if (t instanceof Node && !el.contains(t)) setBulkAddressSuggestOpen(false)
+    }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+  }, [bulkAddressSuggestOpen])
+
+  useEffect(() => {
     if (!propertyForm.bindingClient || propertyForm.bindingClientId) return
     const m = bookingClients.find((c) => c.name === propertyForm.bindingClient)
     if (!m) return
@@ -772,14 +1438,249 @@ export default function PropertyPage() {
   }, [bookingClients, propertyForm.bindingClient, propertyForm.bindingClientId])
 
   const cleaningPriceSummaryText = useMemo(() => {
-    const priceRow = propertyForm.cleaningPriceByType[PRICE_SUMMARY_LABEL] || { defaultPrice: '0', adjustAmount: '0' }
-    return `${PRICE_SUMMARY_LABEL}: Default RM${priceRow.defaultPrice || '0'} + adjusted RM${priceRow.adjustAmount || '0'}`
-  }, [propertyForm.cleaningPriceByType])
+    const rows = propertyForm.operatorCleaningPricingRows || []
+    if (rows.length === 0) return '—'
+    const summaries = rows
+      .map((row) => {
+        const svcKey = String(row.service || '').trim()
+        const svcLabel = svcKey
+          ? PRICING_SERVICES.find((s) => s.key === (svcKey as ServiceKey))?.label || svcKey
+          : ''
+        const raw = String(row.myr || '').trim()
+        const n = Number(raw)
+        const priceOk = raw !== '' && Number.isFinite(n) && n >= 0
+        if (!svcLabel && !priceOk) return ''
+        const parts: string[] = []
+        if (svcLabel) parts.push(svcLabel)
+        if (priceOk) parts.push(`RM ${n}`)
+        return parts.join(' · ')
+      })
+      .filter(Boolean)
+    if (summaries.length === 0) return '—'
+    return summaries.join(' | ')
+  }, [propertyForm.operatorCleaningPricingRows])
+
+  const pricingServiceSelectOptions = useMemo(() => {
+    const cfg = operatorPricingConfig
+    if (!cfg?.serviceConfigs || typeof cfg.serviceConfigs !== 'object') return PRICING_SERVICES
+    const keys =
+      Array.isArray(cfg.selectedServices) && cfg.selectedServices.length > 0
+        ? cfg.selectedServices.map((x) => String(x))
+        : Object.keys(cfg.serviceConfigs as Record<string, unknown>)
+    const set = new Set(keys)
+    return PRICING_SERVICES.filter((s) => set.has(s.key))
+  }, [operatorPricingConfig])
+
+  const refreshOpGroupDetail = useCallback(
+    async (groupId: string) => {
+      const gid = String(groupId || '').trim()
+      if (!gid) return
+      setOpGroupDetailById((prev) => ({
+        ...prev,
+        [gid]: { loading: true, detail: prev[gid]?.detail ?? null },
+      }))
+      const r = await fetchOperatorPropertyGroupDetail(operatorId, gid)
+      if (r?.ok && r.group) {
+        setOpGroupDetailById((prev) => ({
+          ...prev,
+          [gid]: { loading: false, detail: r.group! },
+        }))
+      } else {
+        setOpGroupDetailById((prev) => ({
+          ...prev,
+          [gid]: { loading: false, detail: null },
+        }))
+      }
+    },
+    [operatorId]
+  )
+
+  const toggleOpGroupRow = useCallback(
+    (groupId: string) => {
+      const gid = String(groupId || '').trim()
+      setOpGroupExpandedId((prev) => {
+        if (prev === gid) return null
+        void refreshOpGroupDetail(gid)
+        return gid
+      })
+    },
+    [refreshOpGroupDetail]
+  )
+
+  const runCreateOperatorGroup = async () => {
+    const name = operatorNewGroupName.trim()
+    if (!name) {
+      toast.error('Enter a group name')
+      return
+    }
+    setOperatorGroupCreating(true)
+    const r = await createOperatorPropertyGroup(operatorId, name)
+    setOperatorGroupCreating(false)
+    if (!r?.ok || !r.group) {
+      toast.error(typeof r?.reason === 'string' ? r.reason : 'Create failed')
+      return
+    }
+    setOperatorPropertyGroups((prev) => [...prev, r.group!])
+    setOperatorNewGroupName('')
+    setOperatorGroupCreateOpen(false)
+    toast.success('Group created')
+  }
+
+  const runAddSelectedToOperatorGroup = async () => {
+    if (!addToOperatorGroupPickId || selectedPropertyIds.size === 0) return
+    setAddToOperatorGroupBusy(true)
+    const gid = addToOperatorGroupPickId
+    const r = await addPropertiesToOperatorGroup(operatorId, gid, [...selectedPropertyIds])
+    setAddToOperatorGroupBusy(false)
+    if (!r?.ok) {
+      toast.error(typeof r?.reason === 'string' ? r.reason : 'Add failed')
+      return
+    }
+    setAddToOperatorGroupOpen(false)
+    setAddToOperatorGroupPickId('')
+    await reloadProperties()
+    await loadOperatorPropertyGroups()
+    if (opGroupExpandedId === gid) void refreshOpGroupDetail(gid)
+    toast.success('Properties added to group')
+  }
+
+  const removePropFromOpGroup = async (groupId: string, propertyId: string) => {
+    const r = await removePropertyFromOperatorGroup(operatorId, groupId, propertyId)
+    if (!r?.ok) {
+      toast.error(typeof r?.reason === 'string' ? r.reason : 'Remove failed')
+      return
+    }
+    await reloadProperties()
+    await loadOperatorPropertyGroups()
+    void refreshOpGroupDetail(groupId)
+  }
+
+  const deleteOpGroup = async (groupId: string) => {
+    const r = await deleteOperatorPropertyGroup(operatorId, groupId)
+    if (!r?.ok) {
+      toast.error(typeof r?.reason === 'string' ? r.reason : 'Delete failed')
+      return
+    }
+    setOperatorPropertyGroups((prev) => prev.filter((g) => g.id !== groupId))
+    setSelectedOperatorGroupIds((prev) => {
+      const next = new Set(prev)
+      next.delete(groupId)
+      return next
+    })
+    if (opGroupExpandedId === groupId) setOpGroupExpandedId(null)
+    await reloadProperties()
+    toast.success('Group removed')
+  }
+
+  const openManageOperatorGroup = useCallback(
+    (groupId: string) => {
+      const gid = String(groupId || '').trim()
+      if (!gid) return
+      setOpGroupExpandedId(gid)
+      void refreshOpGroupDetail(gid)
+    },
+    [refreshOpGroupDetail]
+  )
+
+  const runBulkEditApply = async () => {
+    if (selectedPropertyIds.size === 0) {
+      toast.error('Select one or more properties first')
+      return
+    }
+    if (!bulkEditUsePropertySection && !bulkEditUsePricing && !bulkEditUseTeam) {
+      toast.error('Turn on property details, pricing, and/or team to apply changes')
+      return
+    }
+    const ids = [...selectedPropertyIds]
+    const bulkAddressForMap = bulkEditPropertyAddress.trim()
+    const deferUntilMapPin = bulkEditUsePropertySection && !!bulkAddressForMap
+
+    const buildBulkEditPatch = (): Record<string, unknown> => {
+      const patch: Record<string, unknown> = { operatorId }
+      if (bulkEditUsePropertySection) {
+        patch.premisesType = bulkEditSiteKind
+        const bulkNm = sanitizedOperatorPropertyDisplayNameForBulk(bulkEditName, { selectedIds: selectedPropertyIds })
+        if (bulkNm) patch.name = bulkNm
+        const addr = bulkEditPropertyAddress.trim()
+        if (addr) {
+          patch.address = addr
+          const nav = navigationUrlsFromPlainAddress(addr)
+          if (nav) {
+            patch.wazeUrl = nav.wazeUrl
+            patch.googleMapsUrl = nav.googleMapsUrl
+          }
+        }
+      }
+      if (bulkEditUsePricing) {
+        const tp = bulkEditPrice.trim()
+        const myr = tp === '' ? null : Number.isFinite(Number(tp)) && Number(tp) >= 0 ? Number(tp) : null
+        patch.operatorCleaningPricingRows = [
+          {
+            service: bulkEditService.trim() || 'general',
+            line: '',
+            myr,
+          },
+        ]
+      }
+      if (bulkEditUseTeam) {
+        patch.teamId = String(bulkEditTeamId || '').trim()
+      }
+      return patch
+    }
+
+    if (deferUntilMapPin) {
+      setBulkEditWorking(true)
+      try {
+        const deferredFullPatch = buildBulkEditPatch()
+        const seed = resolveMapConfirmInitialCoordsFromBulkFields(
+          bulkEditPropertyAddress,
+          bulkEditLatitude,
+          bulkEditLongitude
+        )
+        mapConfirmInitialRef.current = seed
+        setMapConfirmPinLabel(seed)
+        pendingCoordsTargetRef.current = {
+          variant: 'bulk',
+          propertyIds: ids,
+          deferredFullPatch,
+        }
+        setMapConfirmBulkDeferred(true)
+        setBulkEditOpen(false)
+        setIsMapConfirmOpen(true)
+        toast.success(
+          `Nothing saved yet — confirm the map pin to apply to ${ids.length} propert${ids.length === 1 ? 'y' : 'ies'}.`
+        )
+      } finally {
+        setBulkEditWorking(false)
+      }
+      return
+    }
+
+    setBulkEditWorking(true)
+    let ok = 0
+    let fail = 0
+    const patch = buildBulkEditPatch()
+    for (const id of ids) {
+      const r = await updateOperatorProperty(id, patch)
+      if (r?.ok) ok += 1
+      else fail += 1
+    }
+    setBulkEditWorking(false)
+    setBulkEditOpen(false)
+    await reloadProperties()
+    if (fail) {
+      toast.error(`Updated ${ok}, failed ${fail}`)
+    } else {
+      toast.success(`Updated ${ok} propert${ok === 1 ? 'y' : 'ies'}`)
+    }
+  }
 
   const applyBuildingDefaults = useCallback(async (name: string) => {
     const n = String(name || '').trim()
     if (!n) return
-    const r = await fetchPropertyNameDefaults(n)
+    const oid = String(operatorId || '').trim()
+    if (!oid) return
+    const r = await fetchPropertyNameDefaults(n, oid)
     if (!r?.ok) {
       toast.error('Could not load saved hints for this building')
       return
@@ -792,7 +1693,24 @@ export default function PropertyPage() {
       wazeUrl: String(r.wazeUrl ?? '').trim(),
       googleMapsUrl: String(r.googleMapsUrl ?? '').trim(),
     }))
-  }, [])
+  }, [operatorId])
+
+  const applyBulkBuildingDefaults = useCallback(async (name: string) => {
+    const n = String(name || '').trim()
+    if (!n) return
+    const oid = String(operatorId || '').trim()
+    if (!oid) return
+    const r = await fetchPropertyNameDefaults(n, oid)
+    if (!r?.ok) {
+      toast.error('Could not load saved hints for this building')
+      return
+    }
+    const addr = String(r.address ?? '').trim()
+    setBulkEditName(n)
+    setBulkEditPropertyAddress(addr)
+    setBulkEditLatitude('')
+    setBulkEditLongitude('')
+  }, [operatorId])
 
   const scheduleAddressSearch = useCallback((raw: string, buildingNameForFallback?: string) => {
     if (addressSearchTimerRef.current) clearTimeout(addressSearchTimerRef.current)
@@ -840,14 +1758,59 @@ export default function PropertyPage() {
     []
   )
 
+  const scheduleBulkAddressSearch = useCallback((raw: string, buildingNameForFallback?: string) => {
+    if (bulkAddressSearchTimerRef.current) clearTimeout(bulkAddressSearchTimerRef.current)
+    const q = raw.trim()
+    if (q.length < 3) {
+      setBulkAddressSearchItems([])
+      setBulkAddressSearchLoading(false)
+      return
+    }
+    setBulkAddressSearchLoading(true)
+    const propertyName = String(buildingNameForFallback ?? '').trim()
+    bulkAddressSearchTimerRef.current = setTimeout(() => {
+      void (async () => {
+        const r = await fetchAddressSearch({
+          q,
+          limit: 8,
+          propertyName: propertyName || undefined,
+        })
+        setBulkAddressSearchLoading(false)
+        if (!r?.ok || !Array.isArray(r.items)) {
+          setBulkAddressSearchItems([])
+          return
+        }
+        setBulkAddressSearchItems(r.items)
+        if (r.items.length > 0) setBulkAddressSuggestOpen(true)
+      })()
+    }, 450)
+  }, [])
+
+  const pickBulkAddressSuggestion = useCallback(
+    (item: { displayName: string; lat: string; lon: string }) => {
+      setBulkEditPropertyAddress(item.displayName)
+      setBulkEditLatitude(item.lat && String(item.lat).trim() ? String(item.lat) : '')
+      setBulkEditLongitude(item.lon && String(item.lon).trim() ? String(item.lon) : '')
+      setBulkAddressSuggestOpen(false)
+      setBulkAddressSearchItems([])
+    },
+    []
+  )
+
   const resetForm = () => {
     bindingClientIdBaselineRef.current = ''
+    teamNameBaselineRef.current = ''
+    operatorDoorAccessModeBaselineRef.current = ''
+    setEditDialogSmartdoorBindings(null)
+    setEditDialogGatewayReady(false)
     setAddressSuggestOpen(false)
     setAddressSearchItems([])
     setAddressSearchLoading(false)
     setGlobalBuildingHints([])
     setBuildingNameInput('')
     setBuildingComboOpen(false)
+    setInsertSecurityCredentials(null)
+    setSecCredModalFromAdd(false)
     setPropertyForm({
       name: '',
       siteKind: 'landed',
@@ -866,16 +1829,30 @@ export default function PropertyPage() {
       mailboxPasswordValue: '',
       smartdoorPasswordValue: '',
       securitySystem: 'icare',
-      securityUsername: '',
-      cleaningPriceByType: {},
+      operatorDoorAccessMode: 'temporary_password_only',
+      operatorCleaningPricingRows: [defaultCleaningPricingRow()],
+      operatorCleaningPricingLine: '',
+      operatorCleaningPriceMyr: '',
+      operatorCleaningPricingService: 'general',
       estimatedTime: '',
       latitude: '',
       longitude: '',
       checklist: [],
+      bedCount: '',
+      roomCount: '',
+      bathroomCount: '',
+      kitchen: '',
+      livingRoom: '',
+      balcony: '',
+      staircase: '',
+      liftLevel: '',
+      specialAreaCount: '',
+      bindingTeamId: '',
     })
   }
 
-  const seedFormFromProperty = (property: Property) => {
+  const seedFormFromProperty = (property: Property, teamsOverride?: Array<{ id: string; name: string }>) => {
+    const teams = teamsOverride ?? operatorTeamsList
     const siteKind = property.premisesType
       ? premisesTypeToSiteKind(property.premisesType)
       : inferSiteKind(property, apartmentNameChoices)
@@ -890,12 +1867,14 @@ export default function PropertyPage() {
           String(c.name || '').trim().toLowerCase() === clientLabel ||
           String(c.email || '').trim().toLowerCase() === clientLabel
       )
-    const dp = property.cleaningPriceSummary.match(/Default RM(\d+)/)?.[1] || '0'
-    const ap = property.cleaningPriceSummary.match(/adjusted RM(\d+)/)?.[1] || '0'
     const resolvedBindingId = String(property.clientdetailId || matchClient?.id || '').trim()
     bindingClientIdBaselineRef.current = resolvedBindingId
+    teamNameBaselineRef.current = String(property.team ?? '').trim()
+    operatorDoorAccessModeBaselineRef.current = normalizeOperatorDoorAccessMode(property.operatorDoorAccessMode)
+    const pricingRows = normalizeCleaningRowsFromProperty(property)
+    const first = pricingRows[0]
     setPropertyForm({
-      name: property.name,
+      name: siteKind === 'apartment' ? apartmentBuildingDisplayName(property.name) : property.name,
       siteKind,
       bindingClient: matchByDetailId?.name || property.client,
       bindingClientId: resolvedBindingId,
@@ -912,16 +1891,29 @@ export default function PropertyPage() {
       mailboxPasswordValue: property.keyCollection.mailboxPassword,
       smartdoorPasswordValue: property.keyCollection.smartdoorPassword,
       securitySystem: parseSecuritySystemFromDb(String(property.securitySystem ?? '')),
-      securityUsername: property.securityUsername || '',
       afterCleanPhotoSample: property.afterCleanPhotoSample,
-      cleaningPriceByType: {
-        [PRICE_SUMMARY_LABEL]: { defaultPrice: dp, adjustAmount: ap },
-      },
+      operatorDoorAccessMode: normalizeOperatorDoorAccessMode(property.operatorDoorAccessMode),
+      operatorCleaningPricingRows: pricingRows,
+      operatorCleaningPricingLine: '',
+      operatorCleaningPriceMyr: first?.myr ?? '',
+      operatorCleaningPricingService: first?.service || 'general',
       estimatedTime: property.estimatedTime || '',
-      latitude: String(property.lat),
-      longitude: String(property.lng),
+      latitude:
+        Number.isFinite(property.lat) && !(property.lat === 0 && property.lng === 0) ? String(property.lat) : '',
+      longitude:
+        Number.isFinite(property.lng) && !(property.lat === 0 && property.lng === 0) ? String(property.lng) : '',
       keyPhoto: property.keyPhoto,
       checklist: property.checklist,
+      bedCount: detailNumToForm(property.bedCount),
+      roomCount: detailNumToForm(property.roomCount),
+      bathroomCount: detailNumToForm(property.bathroomCount),
+      kitchen: detailNumToForm(property.kitchen),
+      livingRoom: detailNumToForm(property.livingRoom),
+      balcony: detailNumToForm(property.balcony),
+      staircase: detailNumToForm(property.staircase),
+      liftLevel: String(property.liftLevel ?? '').trim(),
+      specialAreaCount: detailNumToForm(property.specialAreaCount),
+      bindingTeamId: teamIdFromPropertyTeamName(property.team, teams),
     })
   }
 
@@ -932,7 +1924,16 @@ export default function PropertyPage() {
   const resolveGoogleMapsLink = (p: Pick<Property, 'googleMapsUrl' | 'googleMapUrl' | 'lat' | 'lng'>) => {
     const stored = String(p.googleMapsUrl || '').trim()
     if (stored) return stored
-    return p.googleMapUrl || getGoogleMapUrl(String(p.lat), String(p.lng))
+    if (
+      Number.isFinite(p.lat) &&
+      Number.isFinite(p.lng) &&
+      !(p.lat === 0 && p.lng === 0) &&
+      Math.abs(p.lat) <= 90 &&
+      Math.abs(p.lng) <= 180
+    ) {
+      return p.googleMapUrl || getGoogleMapUrl(String(p.lat), String(p.lng))
+    }
+    return String(p.googleMapUrl || '').trim()
   }
 
   const handleImageUpload = (e: ChangeEvent<HTMLInputElement>, field: 'afterCleanPhotoSample' | 'keyPhoto') => {
@@ -954,25 +1955,25 @@ export default function PropertyPage() {
     [bookingClients, propertyForm.bindingClientId]
   )
 
-  const bindingLocked = useMemo(() => {
+  /** Client-created unit: binding client cannot be changed here (backend keeps clientdetail_id). */
+  const clientBindingLocked = useMemo(() => {
     if (!editingPropertyId) return false
     const row = properties.find((p) => p.id === editingPropertyId)
     return !!row?.clientPortalOwned
   }, [editingPropertyId, properties])
 
-  /** Client-registered unit: operator cannot edit identity / access (matches backend). */
-  const canEditCorePropertyFields = !bindingLocked
+  /** Client portal–owned unit: only the client may set mailbox / smart door / operator door / security login (API enforces). */
+  const operatorDoorSettingsLocked = clientBindingLocked
+
+  const canEditCorePropertyFields = true
 
   useEffect(() => {
     if (!isAddDialogOpen || !editingPropertyId) {
       setPersistedSecurityCredentials(null)
       setOperatorEditColivingPdId('')
-      return
-    }
-    const row = properties.find((p) => p.id === editingPropertyId)
-    if (row?.clientPortalOwned) {
-      setPersistedSecurityCredentials(null)
-      setOperatorEditColivingPdId('')
+      setEditDialogSmartdoorBindings(null)
+      setEditDialogGatewayReady(false)
+      operatorDoorAccessModeBaselineRef.current = ''
       return
     }
     let cancelled = false
@@ -983,7 +1984,58 @@ export default function PropertyPage() {
       setPersistedSecurityCredentials(
         c && typeof c === 'object' ? { ...(c as Record<string, unknown>) } : null
       )
-      setOperatorEditColivingPdId(String(r.property.colivingPropertydetailId || '').trim())
+      const pd = String(r.property.colivingPropertydetailId || '').trim()
+      setOperatorEditColivingPdId(pd)
+      const mode = normalizeOperatorDoorAccessMode(r.property.operatorDoorAccessMode)
+      operatorDoorAccessModeBaselineRef.current = mode
+      setEditDialogGatewayReady(!!r.property.smartdoorGatewayReady)
+      setEditDialogSmartdoorBindings(
+        r.property.smartdoorBindings ?? { property: null, rooms: [] }
+      )
+      const rp = r.property
+      const detailRows =
+        Array.isArray(rp.operatorCleaningPricingRows) && rp.operatorCleaningPricingRows.length > 0
+          ? rp.operatorCleaningPricingRows.map((row: { service?: unknown; line?: unknown; myr?: unknown }) => ({
+              service: String(row?.service || 'general').trim() || 'general',
+              line: '',
+              myr:
+                row?.myr != null && Number.isFinite(Number(row.myr)) ? String(row.myr) : '',
+            }))
+          : null
+      const priceMyr = rp.operatorCleaningPriceMyr
+      const svc = String(rp.operatorCleaningPricingService || '').trim()
+      setPropertyForm((prev) => {
+        const nextRows =
+          detailRows ||
+          (() => {
+            const opPrice =
+              priceMyr != null && Number.isFinite(Number(priceMyr)) && Number(priceMyr) >= 0
+                ? String(priceMyr)
+                : ''
+            return [{ service: svc || 'general', line: '', myr: opPrice }]
+          })()
+        const first = nextRows[0]
+        return {
+          ...prev,
+          operatorDoorAccessMode: mode,
+          operatorCleaningPricingRows: nextRows,
+          operatorCleaningPricingLine: '',
+          operatorCleaningPriceMyr: first?.myr ?? prev.operatorCleaningPriceMyr,
+          operatorCleaningPricingService: first?.service || prev.operatorCleaningPricingService || 'general',
+          estimatedTime: estimateTimeMinutesFromDetail(
+            rp as { estimatedTime?: unknown; min_value?: unknown; minValue?: unknown }
+          ),
+          bedCount: rp.bedCount != null ? String(rp.bedCount) : prev.bedCount,
+          roomCount: rp.roomCount != null ? String(rp.roomCount) : prev.roomCount,
+          bathroomCount: rp.bathroomCount != null ? String(rp.bathroomCount) : prev.bathroomCount,
+          kitchen: rp.kitchen != null ? String(rp.kitchen) : prev.kitchen,
+          livingRoom: rp.livingRoom != null ? String(rp.livingRoom) : prev.livingRoom,
+          balcony: rp.balcony != null ? String(rp.balcony) : prev.balcony,
+          staircase: rp.staircase != null ? String(rp.staircase) : prev.staircase,
+          liftLevel: rp.liftLevel != null && String(rp.liftLevel).trim() !== '' ? String(rp.liftLevel).trim() : prev.liftLevel,
+          specialAreaCount: rp.specialAreaCount != null ? String(rp.specialAreaCount) : prev.specialAreaCount,
+        }
+      })
     })()
     return () => {
       cancelled = true
@@ -992,17 +2044,22 @@ export default function PropertyPage() {
 
   const securitySystemSummaryText = useMemo(() => {
     const sys = parseSecuritySystemFromDb(propertyForm.securitySystem)
-    return formatSecuritySystemSummary(sys, persistedSecurityCredentials)
-  }, [propertyForm.securitySystem, persistedSecurityCredentials])
+    const creds =
+      !editingPropertyId && insertSecurityCredentials
+        ? insertSecurityCredentials
+        : persistedSecurityCredentials
+    return formatSecuritySystemSummary(sys, creds)
+  }, [propertyForm.securitySystem, persistedSecurityCredentials, editingPropertyId, insertSecurityCredentials])
 
-  const openSecurityCredentialsModal = useCallback(() => {
-    if (!canEditCorePropertyFields) {
-      toast.error('This unit was registered by the client. Only the client can change key collection and security.')
+  const openSecurityCredentialsModal = useCallback((fromAdd: boolean) => {
+    if (operatorDoorSettingsLocked) {
+      toast.error('This unit was created in the client portal. Only the client can change security login and door access.')
       return
     }
+    setSecCredModalFromAdd(fromAdd)
     const sys = parseSecuritySystemFromDb(propertyForm.securitySystem)
     setSecCredModalSystem(sys)
-    const src = persistedSecurityCredentials
+    const src = fromAdd ? insertSecurityCredentials : persistedSecurityCredentials
     setSecCredPhone(
       src && typeof src === 'object' ? String((src as { phoneNumber?: string }).phoneNumber || '') : ''
     )
@@ -1030,19 +2087,13 @@ export default function PropertyPage() {
         : ''
     )
     setSecCredModalOpen(true)
-  }, [canEditCorePropertyFields, propertyForm.securitySystem, persistedSecurityCredentials])
+  }, [operatorDoorSettingsLocked, propertyForm.securitySystem, persistedSecurityCredentials, insertSecurityCredentials])
 
   const handleSecurityCredentialsModalSave = useCallback(async () => {
-    if (!editingPropertyId || !canEditCorePropertyFields) return
-    const colivingPd = String(operatorEditColivingPdId || '').trim()
-    if (!colivingPd) {
-      toast.error(
-        'Link this unit to a Coliving property first (Sync from Coliving). Security login details are stored on the Coliving property row.'
-      )
-      return
-    }
+    if (operatorDoorSettingsLocked) return
+
     const sys = secCredModalSystem
-    const prevObj = persistedSecurityCredentials
+    const prevObj = secCredModalFromAdd ? insertSecurityCredentials : persistedSecurityCredentials
     const prevPw =
       prevObj && typeof prevObj === 'object' && String((prevObj as { password?: string }).password || '').trim()
         ? String((prevObj as { password?: string }).password)
@@ -1064,6 +2115,24 @@ export default function PropertyPage() {
       )
       return
     }
+
+    if (secCredModalFromAdd) {
+      setPropertyForm((f) => ({ ...f, securitySystem: sys }))
+      setInsertSecurityCredentials(body)
+      setSecCredModalOpen(false)
+      setSecCredModalFromAdd(false)
+      toast.success('Security credentials saved — they will be stored when you create the property.')
+      return
+    }
+
+    if (!editingPropertyId) return
+    const colivingPd = String(operatorEditColivingPdId || '').trim()
+    if (!colivingPd) {
+      toast.error(
+        'Link this unit to a Coliving property first (Sync from Coliving). Security login details are stored on the Coliving property row.'
+      )
+      return
+    }
     setSecCredModalSaving(true)
     try {
       const next = toPropertyPayload(editingPropertyId, 'active')
@@ -1073,10 +2142,9 @@ export default function PropertyPage() {
         address: next.address,
         unitNumber: next.unitNumber,
         client: next.client,
-        team: '',
         premisesType: propertyForm.siteKind,
         securitySystem: sys,
-        securityUsername: propertyForm.securityUsername.trim() || null,
+        securityUsername: null,
         securitySystemCredentials: body,
         mailboxPassword: propertyForm.mailboxPasswordValue,
         smartdoorPassword: propertyForm.keyCollection.smartdoorPassword ? propertyForm.smartdoorPasswordValue : '',
@@ -1097,11 +2165,16 @@ export default function PropertyPage() {
       const baselineCd = bindingClientIdBaselineRef.current
       const nextCd = String(propertyForm.bindingClientId || '').trim()
       const bindChanged = nextCd !== baselineCd
-      if (propertyForm.bindingClientId && bindChanged && !bindingLocked) {
+      if (propertyForm.bindingClientId && bindChanged && !clientBindingLocked) {
         patch.clientdetailId = propertyForm.bindingClientId
         patch.deferClientBinding = true
-      } else if (!propertyForm.bindingClientId && !bindingLocked && bindChanged) {
+      } else if (!propertyForm.bindingClientId && !clientBindingLocked && bindChanged) {
         patch.clearClientdetail = true
+      }
+      const tidSec = String(propertyForm.bindingTeamId || '').trim()
+      const nextTeamNameSec = tidSec ? operatorTeamsList.find((x) => x.id === tidSec)?.name?.trim() ?? '' : ''
+      if (nextTeamNameSec !== teamNameBaselineRef.current) {
+        ;(patch as Record<string, unknown>).teamId = tidSec
       }
       const r = await updateOperatorProperty(editingPropertyId, patch)
       if (!r?.ok) {
@@ -1120,8 +2193,10 @@ export default function PropertyPage() {
     }
   }, [
     editingPropertyId,
-    canEditCorePropertyFields,
+    operatorDoorSettingsLocked,
     operatorEditColivingPdId,
+    secCredModalFromAdd,
+    insertSecurityCredentials,
     secCredModalSystem,
     secCredPhone,
     secCredDob,
@@ -1130,14 +2205,14 @@ export default function PropertyPage() {
     secCredLoginCode,
     secCredPassword,
     persistedSecurityCredentials,
-    propertyForm.securityUsername,
     propertyForm,
-    bindingLocked,
+    clientBindingLocked,
     reloadProperties,
+    operatorTeamsList,
   ])
 
   const commitNewApartmentName = () => {
-    const trimmed = apartmentNameDraft.trim()
+    const trimmed = apartmentBuildingDisplayName(apartmentNameDraft.trim())
     if (!trimmed) {
       toast.error('Enter a property name')
       return
@@ -1150,6 +2225,7 @@ export default function PropertyPage() {
       toast.message('Name already in list — selected.')
     }
     setPropertyForm((prev) => ({ ...prev, name: trimmed }))
+    if (bulkEditOpen) setBulkEditName(trimmed)
     setApartmentNameDraft('')
     setIsAddApartmentNameOpen(false)
   }
@@ -1260,7 +2336,14 @@ export default function PropertyPage() {
               <Icon className={`h-4 w-4 ${typeColors[row.type].split(' ')[1]}`} />
             </div>
             <div>
-              <p className="font-medium">{row.name}</p>
+              <p
+                className={cn(
+                  'font-medium',
+                  propertyNameWarnMissingAddress(row) && 'text-destructive',
+                )}
+              >
+                {propertyDisplayName(row)}
+              </p>
               <p className="text-xs text-muted-foreground">{row.unitNumber || '-'}</p>
             </div>
           </div>
@@ -1305,6 +2388,14 @@ export default function PropertyPage() {
         >
           {row.clientPortalOwned ? 'Client' : 'Operator'}
         </Badge>
+      ),
+    },
+    {
+      key: 'team',
+      label: 'Team',
+      sortable: true,
+      render: (_, row) => (
+        <span className="text-sm text-muted-foreground">{String(row.team || '').trim() || '—'}</span>
       ),
     },
     {
@@ -1378,7 +2469,7 @@ export default function PropertyPage() {
       setProperties((prev) => prev.filter((p) => p.id !== row.id))
       const namesR = await fetchOperatorDistinctPropertyNames(operatorId)
       if (namesR?.ok && Array.isArray(namesR.items)) {
-        setDbDistinctPropertyNames(namesR.items.map((x: unknown) => String(x).trim()).filter(Boolean))
+        setDbDistinctPropertyNames(filterDistinctPropertyNameList(namesR.items))
       }
       toast.success(`${row.name} deleted`)
       setDeletePropertyDialogOpen(false)
@@ -1473,10 +2564,24 @@ export default function PropertyPage() {
     {
       label: 'Edit',
       icon: <Edit className="h-4 w-4 mr-2" />,
+      visible: (row) => !row.clientPortalOwned,
       onClick: (row) => {
-        setEditingPropertyId(row.id)
-        seedFormFromProperty(row)
-        setIsAddDialogOpen(true)
+        void (async () => {
+          const tr = await fetchOperatorTeams(operatorId)
+          const teams =
+            tr?.ok && Array.isArray(tr.items)
+              ? tr.items
+                  .map((t: { id?: string; name?: string }) => ({
+                    id: String(t.id || '').trim(),
+                    name: String(t.name || '').trim(),
+                  }))
+                  .filter((t: { id: string }) => !!t.id)
+              : []
+          setOperatorTeamsList(teams)
+          setEditingPropertyId(row.id)
+          seedFormFromProperty(row, teams)
+          setIsAddDialogOpen(true)
+        })()
       },
     },
     {
@@ -1673,14 +2778,20 @@ export default function PropertyPage() {
 
   const toPropertyPayload = (id: string, status: Property['status']): Property => ({
     ...(() => {
-      const parsedLat = Number(propertyForm.latitude)
-      const parsedLng = Number(propertyForm.longitude)
-      const lat = Number.isFinite(parsedLat) ? parsedLat : DEFAULT_PROPERTY_MAP_LAT
-      const lng = Number.isFinite(parsedLng) ? parsedLng : DEFAULT_PROPERTY_MAP_LNG
+      const la = Number(String(propertyForm.latitude ?? '').trim())
+      const lo = Number(String(propertyForm.longitude ?? '').trim())
+      const ok =
+        Number.isFinite(la) &&
+        Number.isFinite(lo) &&
+        !(la === 0 && lo === 0) &&
+        Math.abs(la) <= 90 &&
+        Math.abs(lo) <= 180
+      const lat = ok ? la : NaN
+      const lng = ok ? lo : NaN
       return {
         lat,
         lng,
-        googleMapUrl: getGoogleMapUrl(String(lat), String(lng)),
+        googleMapUrl: ok ? getGoogleMapUrl(String(lat), String(lng)) : undefined,
       }
     })(),
     id,
@@ -1691,9 +2802,13 @@ export default function PropertyPage() {
     unitNumber: propertyForm.unitNumber,
     type: siteKindToPropertyType(propertyForm.siteKind),
     client: propertyForm.bindingClient,
+    team: (() => {
+      const tid = String(propertyForm.bindingTeamId || '').trim()
+      if (!tid) return ''
+      return operatorTeamsList.find((x) => x.id === tid)?.name?.trim() ?? ''
+    })(),
     status,
     securitySystem: propertyForm.securitySystem,
-    securityUsername: propertyForm.securityUsername.trim(),
     cleaningTypes: [],
     keyCollection: {
       mailboxPassword: propertyForm.keyCollection.mailboxPassword ? propertyForm.mailboxPasswordValue : '',
@@ -1702,12 +2817,182 @@ export default function PropertyPage() {
     },
     remark: propertyForm.remark,
     cleaningPriceSummary: cleaningPriceSummaryText,
-    estimatedTime: propertyForm.estimatedTime.trim() ? propertyForm.estimatedTime.trim() : undefined,
+    operatorCleaningPricingRows: buildOperatorCleaningPricingRowsApiPayload(propertyForm.operatorCleaningPricingRows),
+    operatorCleaningPricingLine: propertyForm.operatorCleaningPricingLine.trim(),
+    operatorCleaningPricingService: propertyForm.operatorCleaningPricingService.trim(),
+    operatorCleaningPriceMyr: (() => {
+      const t = String(propertyForm.operatorCleaningPriceMyr || '').trim()
+      if (t === '') return null
+      const n = Number(t)
+      return Number.isFinite(n) && n >= 0 ? n : null
+    })(),
+    operatorDoorAccessMode: propertyForm.operatorDoorAccessMode,
+    estimatedTime: (() => {
+      const v = coerceEstimatedTimeMinutesForApi(propertyForm.estimatedTime)
+      return v === '' ? undefined : v
+    })(),
     afterCleanPhotoSample: propertyForm.afterCleanPhotoSample,
     keyPhoto: propertyForm.keyPhoto,
     checklist: propertyForm.checklist,
     lastCleaned: undefined,
+    premisesType: propertyForm.siteKind,
+    bedCount: formDetailOptInt(propertyForm.bedCount) ?? null,
+    roomCount: formDetailOptInt(propertyForm.roomCount) ?? null,
+    bathroomCount: formDetailOptInt(propertyForm.bathroomCount) ?? null,
+    kitchen: formDetailOptInt(propertyForm.kitchen) ?? null,
+    livingRoom: formDetailOptInt(propertyForm.livingRoom) ?? null,
+    balcony: formDetailOptInt(propertyForm.balcony) ?? null,
+    staircase: formDetailOptInt(propertyForm.staircase) ?? null,
+    liftLevel: String(propertyForm.liftLevel || '').trim() || null,
+    specialAreaCount: formDetailOptInt(propertyForm.specialAreaCount) ?? null,
   })
+
+  /** Create property without latitude/longitude; caller opens map pin step when address is set. */
+  const performCreatePropertyOmitCoords = async (): Promise<{
+    ok: boolean
+    id?: string
+    deferClientBinding?: boolean
+  }> => {
+    const id = `${Date.now()}`
+    const next = toPropertyPayload(id, 'active')
+    const payload: Record<string, unknown> = {
+      name: next.name,
+      address: next.address,
+      unitNumber: next.unitNumber,
+      client: next.client,
+      operatorId,
+      premisesType: propertyForm.siteKind,
+      securitySystem: propertyForm.securitySystem,
+      securityUsername: null,
+      mailboxPassword: propertyForm.mailboxPasswordValue,
+      smartdoorPassword: propertyForm.keyCollection.smartdoorPassword ? propertyForm.smartdoorPasswordValue : '',
+      smartdoorTokenEnabled: propertyForm.keyCollection.smartdoorToken,
+      smartdoorToken: propertyForm.keyCollection.smartdoorToken ? SMARTDOOR_TOKEN_ENABLED_MARKER : '',
+      afterCleanPhotoUrl: propertyForm.afterCleanPhotoSample,
+      keyPhotoUrl: propertyForm.keyPhoto,
+      clientPortalOwned: 0,
+      wazeUrl: propertyForm.wazeUrl.trim(),
+      googleMapsUrl: propertyForm.googleMapsUrl.trim(),
+      operatorDoorAccessMode: propertyForm.operatorDoorAccessMode,
+      operatorCleaningPricingRows: buildOperatorCleaningPricingRowsApiPayload(propertyForm.operatorCleaningPricingRows),
+      operatorCleaningPricingLine: propertyForm.operatorCleaningPricingLine.trim(),
+      operatorCleaningPricingService: propertyForm.operatorCleaningPricingService.trim() || null,
+      operatorCleaningPriceMyr: (() => {
+        const t = String(propertyForm.operatorCleaningPriceMyr || '').trim()
+        if (t === '') return null
+        const n = Number(t)
+        return Number.isFinite(n) && n >= 0 ? n : null
+      })(),
+      bedCount: formDetailOptInt(propertyForm.bedCount),
+      roomCount: formDetailOptInt(propertyForm.roomCount),
+      bathroomCount: formDetailOptInt(propertyForm.bathroomCount),
+      kitchen: formDetailOptInt(propertyForm.kitchen),
+      livingRoom: formDetailOptInt(propertyForm.livingRoom),
+      balcony: formDetailOptInt(propertyForm.balcony),
+      staircase: formDetailOptInt(propertyForm.staircase),
+      specialAreaCount: formDetailOptInt(propertyForm.specialAreaCount),
+      liftLevel: (() => {
+        const ll = String(propertyForm.liftLevel || '').trim().toLowerCase()
+        return ll === '' ? undefined : ll
+      })(),
+      estimatedTime: coerceEstimatedTimeMinutesForApi(propertyForm.estimatedTime),
+    }
+    const teamTidCreate = String(propertyForm.bindingTeamId || '').trim()
+    if (teamTidCreate) payload.teamId = teamTidCreate
+    if (propertyForm.bindingClientId) {
+      payload.clientdetailId = propertyForm.bindingClientId
+      payload.deferClientBinding = true
+    }
+    const r = await createOperatorProperty(payload)
+    if (!r?.ok) {
+      toast.error('Failed to add property')
+      return { ok: false }
+    }
+    const namesR = await fetchOperatorDistinctPropertyNames(operatorId)
+    if (namesR?.ok && Array.isArray(namesR.items)) {
+      setDbDistinctPropertyNames(filterDistinctPropertyNameList(namesR.items))
+    }
+    return { ok: true, id: String(r.id || id), deferClientBinding: !!r.deferClientBinding }
+  }
+
+  /** Update property without latitude/longitude; caller opens map pin step when address is set. */
+  const performUpdatePropertyOmitCoords = async (): Promise<{
+    ok: boolean
+    deferClientBinding?: boolean
+  }> => {
+    if (!editingPropertyId) return { ok: false }
+    const prevRow = properties.find((p) => p.id === editingPropertyId)
+    const next = toPropertyPayload(editingPropertyId, prevRow?.status ?? 'active')
+    const doorLocked = !!prevRow?.clientPortalOwned
+    const patch: Record<string, unknown> = {
+      operatorId,
+      name: next.name,
+      address: next.address,
+      unitNumber: next.unitNumber,
+      client: next.client,
+      premisesType: propertyForm.siteKind,
+      afterCleanPhotoUrl: propertyForm.afterCleanPhotoSample,
+      keyPhotoUrl: propertyForm.keyPhoto,
+      wazeUrl: propertyForm.wazeUrl.trim(),
+      googleMapsUrl: propertyForm.googleMapsUrl.trim(),
+      operatorCleaningPricingRows: buildOperatorCleaningPricingRowsApiPayload(propertyForm.operatorCleaningPricingRows),
+      operatorCleaningPricingLine: propertyForm.operatorCleaningPricingLine.trim(),
+      operatorCleaningPricingService: propertyForm.operatorCleaningPricingService.trim() || null,
+      operatorCleaningPriceMyr: (() => {
+        const t = String(propertyForm.operatorCleaningPriceMyr || '').trim()
+        if (t === '') return null
+        const n = Number(t)
+        return Number.isFinite(n) && n >= 0 ? n : null
+      })(),
+      bedCount: formDetailOptInt(propertyForm.bedCount),
+      roomCount: formDetailOptInt(propertyForm.roomCount),
+      bathroomCount: formDetailOptInt(propertyForm.bathroomCount),
+      kitchen: formDetailOptInt(propertyForm.kitchen),
+      livingRoom: formDetailOptInt(propertyForm.livingRoom),
+      balcony: formDetailOptInt(propertyForm.balcony),
+      staircase: formDetailOptInt(propertyForm.staircase),
+      specialAreaCount: formDetailOptInt(propertyForm.specialAreaCount),
+      liftLevel: (() => {
+        const ll = String(propertyForm.liftLevel || '').trim().toLowerCase()
+        return ll === '' ? undefined : ll
+      })(),
+      estimatedTime: coerceEstimatedTimeMinutesForApi(propertyForm.estimatedTime),
+    }
+    if (!doorLocked) {
+      patch.securitySystem = propertyForm.securitySystem
+      patch.securityUsername = null
+      patch.mailboxPassword = propertyForm.mailboxPasswordValue
+      patch.smartdoorPassword = propertyForm.keyCollection.smartdoorPassword ? propertyForm.smartdoorPasswordValue : ''
+      patch.smartdoorTokenEnabled = propertyForm.keyCollection.smartdoorToken
+      if (propertyForm.operatorDoorAccessMode !== operatorDoorAccessModeBaselineRef.current) {
+        patch.operatorDoorAccessMode = propertyForm.operatorDoorAccessMode
+      }
+    }
+    const baselineCd = bindingClientIdBaselineRef.current
+    const nextCd = String(propertyForm.bindingClientId || '').trim()
+    const bindChanged = nextCd !== baselineCd
+    if (propertyForm.bindingClientId && bindChanged && !clientBindingLocked) {
+      patch.clientdetailId = propertyForm.bindingClientId
+      patch.deferClientBinding = true
+    } else if (!propertyForm.bindingClientId && !clientBindingLocked && bindChanged) {
+      patch.clearClientdetail = true
+    }
+    const tid = String(propertyForm.bindingTeamId || '').trim()
+    const nextTeamName = tid ? operatorTeamsList.find((x) => x.id === tid)?.name?.trim() ?? '' : ''
+    if (nextTeamName !== teamNameBaselineRef.current) {
+      patch.teamId = tid
+    }
+    const r = await updateOperatorProperty(editingPropertyId, patch)
+    if (!r?.ok) {
+      toast.error('Failed to update property')
+      return { ok: false }
+    }
+    const namesR = await fetchOperatorDistinctPropertyNames(operatorId)
+    if (namesR?.ok && Array.isArray(namesR.items)) {
+      setDbDistinctPropertyNames(filterDistinctPropertyNameList(namesR.items))
+    }
+    return { ok: true, deferClientBinding: !!patch.deferClientBinding }
+  }
 
   const handleAddProperty = async () => {
     const id = `${Date.now()}`
@@ -1717,11 +3002,10 @@ export default function PropertyPage() {
       address: next.address,
       unitNumber: next.unitNumber,
       client: next.client,
-      team: '',
       operatorId,
       premisesType: propertyForm.siteKind,
       securitySystem: propertyForm.securitySystem,
-      securityUsername: propertyForm.securityUsername.trim() || null,
+      securityUsername: null,
       mailboxPassword: propertyForm.mailboxPasswordValue,
       smartdoorPassword: propertyForm.keyCollection.smartdoorPassword ? propertyForm.smartdoorPasswordValue : '',
       smartdoorTokenEnabled: propertyForm.keyCollection.smartdoorToken,
@@ -1739,7 +3023,32 @@ export default function PropertyPage() {
         const n = Number(propertyForm.longitude)
         return Number.isFinite(n) ? n : undefined
       })(),
+      operatorDoorAccessMode: propertyForm.operatorDoorAccessMode,
+      operatorCleaningPricingRows: buildOperatorCleaningPricingRowsApiPayload(propertyForm.operatorCleaningPricingRows),
+      operatorCleaningPricingLine: propertyForm.operatorCleaningPricingLine.trim(),
+      operatorCleaningPricingService: propertyForm.operatorCleaningPricingService.trim() || null,
+      operatorCleaningPriceMyr: (() => {
+        const t = String(propertyForm.operatorCleaningPriceMyr || '').trim()
+        if (t === '') return null
+        const n = Number(t)
+        return Number.isFinite(n) && n >= 0 ? n : null
+      })(),
+      bedCount: formDetailOptInt(propertyForm.bedCount),
+      roomCount: formDetailOptInt(propertyForm.roomCount),
+      bathroomCount: formDetailOptInt(propertyForm.bathroomCount),
+      kitchen: formDetailOptInt(propertyForm.kitchen),
+      livingRoom: formDetailOptInt(propertyForm.livingRoom),
+      balcony: formDetailOptInt(propertyForm.balcony),
+      staircase: formDetailOptInt(propertyForm.staircase),
+      specialAreaCount: formDetailOptInt(propertyForm.specialAreaCount),
+      liftLevel: (() => {
+        const ll = String(propertyForm.liftLevel || '').trim().toLowerCase()
+        return ll === '' ? undefined : ll
+      })(),
+      estimatedTime: coerceEstimatedTimeMinutesForApi(propertyForm.estimatedTime),
     }
+    const teamTidAdd = String(propertyForm.bindingTeamId || '').trim()
+    if (teamTidAdd) payload.teamId = teamTidAdd
     if (propertyForm.bindingClientId) {
       payload.clientdetailId = propertyForm.bindingClientId
       payload.deferClientBinding = true
@@ -1752,7 +3061,7 @@ export default function PropertyPage() {
     setProperties((prev) => [{ ...next, id: r.id || id }, ...prev])
     const namesR = await fetchOperatorDistinctPropertyNames(operatorId)
     if (namesR?.ok && Array.isArray(namesR.items)) {
-      setDbDistinctPropertyNames(namesR.items.map((x: unknown) => String(x).trim()).filter(Boolean))
+      setDbDistinctPropertyNames(filterDistinctPropertyNameList(namesR.items))
     }
     if (r.deferClientBinding) {
       toast.success('Property saved. Client approval is pending for the binding.')
@@ -1765,27 +3074,16 @@ export default function PropertyPage() {
 
   const handleUpdateProperty = async () => {
     if (!editingPropertyId) return
-    if (bindingLocked) {
-      toast.error(
-        'This unit was registered by the client. They manage address and access; use Remove from my list if you no longer service it.'
-      )
-      return
-    }
     const prevRow = properties.find((p) => p.id === editingPropertyId)
     const next = toPropertyPayload(editingPropertyId, prevRow?.status ?? 'active')
+    const doorLocked = !!prevRow?.clientPortalOwned
     const patch: Record<string, unknown> = {
       operatorId,
       name: next.name,
       address: next.address,
       unitNumber: next.unitNumber,
       client: next.client,
-      team: '',
       premisesType: propertyForm.siteKind,
-      securitySystem: propertyForm.securitySystem,
-      securityUsername: propertyForm.securityUsername.trim() || null,
-      mailboxPassword: propertyForm.mailboxPasswordValue,
-      smartdoorPassword: propertyForm.keyCollection.smartdoorPassword ? propertyForm.smartdoorPasswordValue : '',
-      smartdoorTokenEnabled: propertyForm.keyCollection.smartdoorToken,
       afterCleanPhotoUrl: propertyForm.afterCleanPhotoSample,
       keyPhotoUrl: propertyForm.keyPhoto,
       wazeUrl: propertyForm.wazeUrl.trim(),
@@ -1798,15 +3096,52 @@ export default function PropertyPage() {
         const n = Number(propertyForm.longitude)
         return Number.isFinite(n) ? n : undefined
       })(),
+      operatorCleaningPricingRows: buildOperatorCleaningPricingRowsApiPayload(propertyForm.operatorCleaningPricingRows),
+      operatorCleaningPricingLine: propertyForm.operatorCleaningPricingLine.trim(),
+      operatorCleaningPricingService: propertyForm.operatorCleaningPricingService.trim() || null,
+      operatorCleaningPriceMyr: (() => {
+        const t = String(propertyForm.operatorCleaningPriceMyr || '').trim()
+        if (t === '') return null
+        const n = Number(t)
+        return Number.isFinite(n) && n >= 0 ? n : null
+      })(),
+      bedCount: formDetailOptInt(propertyForm.bedCount),
+      roomCount: formDetailOptInt(propertyForm.roomCount),
+      bathroomCount: formDetailOptInt(propertyForm.bathroomCount),
+      kitchen: formDetailOptInt(propertyForm.kitchen),
+      livingRoom: formDetailOptInt(propertyForm.livingRoom),
+      balcony: formDetailOptInt(propertyForm.balcony),
+      staircase: formDetailOptInt(propertyForm.staircase),
+      specialAreaCount: formDetailOptInt(propertyForm.specialAreaCount),
+      liftLevel: (() => {
+        const ll = String(propertyForm.liftLevel || '').trim().toLowerCase()
+        return ll === '' ? undefined : ll
+      })(),
+      estimatedTime: coerceEstimatedTimeMinutesForApi(propertyForm.estimatedTime),
+    }
+    if (!doorLocked) {
+      patch.securitySystem = propertyForm.securitySystem
+      patch.securityUsername = null
+      patch.mailboxPassword = propertyForm.mailboxPasswordValue
+      patch.smartdoorPassword = propertyForm.keyCollection.smartdoorPassword ? propertyForm.smartdoorPasswordValue : ''
+      patch.smartdoorTokenEnabled = propertyForm.keyCollection.smartdoorToken
+      if (propertyForm.operatorDoorAccessMode !== operatorDoorAccessModeBaselineRef.current) {
+        patch.operatorDoorAccessMode = propertyForm.operatorDoorAccessMode
+      }
     }
     const baselineCd = bindingClientIdBaselineRef.current
     const nextCd = String(propertyForm.bindingClientId || '').trim()
     const bindChanged = nextCd !== baselineCd
-    if (propertyForm.bindingClientId && bindChanged && !bindingLocked) {
+    if (propertyForm.bindingClientId && bindChanged && !clientBindingLocked) {
       patch.clientdetailId = propertyForm.bindingClientId
       patch.deferClientBinding = true
-    } else if (!propertyForm.bindingClientId && !bindingLocked && bindChanged) {
+    } else if (!propertyForm.bindingClientId && !clientBindingLocked && bindChanged) {
       patch.clearClientdetail = true
+    }
+    const tidUp = String(propertyForm.bindingTeamId || '').trim()
+    const nextTeamNameUp = tidUp ? operatorTeamsList.find((x) => x.id === tidUp)?.name?.trim() ?? '' : ''
+    if (nextTeamNameUp !== teamNameBaselineRef.current) {
+      patch.teamId = tidUp
     }
     const r = await updateOperatorProperty(editingPropertyId, patch)
     if (!r?.ok) {
@@ -1816,7 +3151,7 @@ export default function PropertyPage() {
     setProperties((prev) => prev.map((item) => (item.id === editingPropertyId ? toPropertyPayload(editingPropertyId, item.status) : item)))
     const namesR = await fetchOperatorDistinctPropertyNames(operatorId)
     if (namesR?.ok && Array.isArray(namesR.items)) {
-      setDbDistinctPropertyNames(namesR.items.map((x: unknown) => String(x).trim()).filter(Boolean))
+      setDbDistinctPropertyNames(filterDistinctPropertyNameList(namesR.items))
     }
     setIsAddDialogOpen(false)
     setEditingPropertyId(null)
@@ -1856,117 +3191,370 @@ export default function PropertyPage() {
     await reloadProperties()
   }
 
-  const openMapConfirmBeforeSubmit = (mode: 'add' | 'edit') => {
+  const validatePropertyBasicsForSave = (): boolean => {
     if (propertyForm.siteKind === 'apartment') {
       const n = propertyForm.name.trim()
       if (!n) {
         toast.error('Select or add a building name for apartment premises')
-        return
+        return false
       }
     } else if (!propertyForm.name.trim()) {
       toast.error('Enter a property name')
-      return
+      return false
     }
-    setPendingSubmitMode(mode)
-    setPropertyForm((prev) => {
-      const hasUsefulCoords =
-        prev.latitude.trim() &&
-        prev.longitude.trim() &&
-        !isLegacyKualaLumpurPlaceholder(prev.latitude, prev.longitude)
-      if (hasUsefulCoords) return prev
-      const parsed = parseLatLngFromNavigationUrls(prev.wazeUrl, prev.googleMapsUrl)
-      const lat = parsed?.lat ?? DEFAULT_PROPERTY_MAP_LAT
-      const lng = parsed?.lng ?? DEFAULT_PROPERTY_MAP_LNG
-      return { ...prev, latitude: String(lat), longitude: String(lng) }
-    })
-    setIsMapConfirmOpen(true)
+    return true
   }
 
-  const confirmMapAndSubmit = () => {
-    if (pendingSubmitMode === 'add') {
-      handleAddProperty()
-    } else if (pendingSubmitMode === 'edit') {
-      handleUpdateProperty()
+  const requestSavePropertyWithMapFlow = async () => {
+    if (!validatePropertyBasicsForSave()) return
+    const addr = propertyForm.propertyAddress.trim()
+    if (!addr) {
+      if (editingPropertyId) await handleUpdateProperty()
+      else await handleAddProperty()
+      return
     }
-    setPendingSubmitMode(null)
+    setIsPropertyDetailSaving(true)
+    try {
+      const seed = resolveMapConfirmInitialCoordsFromForm(propertyForm)
+      mapConfirmInitialRef.current = seed
+      setMapConfirmPinLabel(seed)
+      if (editingPropertyId) {
+        const pid = editingPropertyId
+        const r = await performUpdatePropertyOmitCoords()
+        if (!r.ok) return
+        await reloadProperties()
+        if (r.deferClientBinding) {
+          toast.success('Update saved. Client approval is pending for the new binding. Confirm the map pin.')
+        } else {
+          toast.success('Details saved. Confirm the map pin.')
+        }
+        pendingCoordsTargetRef.current = { variant: 'single', propertyId: pid }
+        setMapConfirmBulkDeferred(false)
+        setIsMapConfirmOpen(true)
+        setIsAddDialogOpen(false)
+        setEditingPropertyId(null)
+        resetForm()
+      } else {
+        const r = await performCreatePropertyOmitCoords()
+        if (!r.ok) return
+        await reloadProperties()
+        const newId = String(r.id || '').trim()
+        if (!newId) {
+          toast.error('Property was created but no id was returned')
+          return
+        }
+        if (r.deferClientBinding) {
+          toast.success('Property saved. Client approval is pending for the binding. Confirm the map pin.')
+        } else {
+          toast.success('Details saved. Confirm the map pin.')
+        }
+        pendingCoordsTargetRef.current = { variant: 'single', propertyId: newId }
+        setMapConfirmBulkDeferred(false)
+        setIsMapConfirmOpen(true)
+        setIsAddDialogOpen(false)
+        setEditingPropertyId(null)
+        resetForm()
+      }
+    } finally {
+      setIsPropertyDetailSaving(false)
+    }
+  }
+
+  const confirmMapPinAndPatchCoords = async () => {
+    const m = mapConfirmMarkerRef.current
+    const ll = m?.getLatLng?.()
+    const lat = Number(ll?.lat)
+    const lng = Number(ll?.lng)
+    if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+      toast.error('Invalid pin position')
+      return
+    }
+    const target = pendingCoordsTargetRef.current
+    if (!target) {
+      toast.error('Nothing to update')
+      return
+    }
+    setMapConfirmPatching(true)
+    try {
+      if (target.variant === 'single') {
+        const r = await updateOperatorProperty(target.propertyId, { operatorId, latitude: lat, longitude: lng })
+        if (!r?.ok) {
+          toast.error('Failed to save map pin')
+          return
+        }
+      } else {
+        const def = target.deferredFullPatch
+        let fail = 0
+        if (def && typeof def === 'object') {
+          for (const id of target.propertyIds) {
+            const r = await updateOperatorProperty(id, {
+              ...def,
+              operatorId,
+              latitude: lat,
+              longitude: lng,
+            })
+            if (!r?.ok) fail += 1
+          }
+        } else {
+          for (const id of target.propertyIds) {
+            const r = await updateOperatorProperty(id, { operatorId, latitude: lat, longitude: lng })
+            if (!r?.ok) fail += 1
+          }
+        }
+        if (fail) {
+          toast.error(`Saved on ${target.propertyIds.length - fail}, failed ${fail}`)
+          await reloadProperties()
+          pendingCoordsTargetRef.current = null
+          setMapConfirmBulkDeferred(false)
+          setIsMapConfirmOpen(false)
+          return
+        }
+      }
+      await reloadProperties()
+      const bulkDidDefer = target.variant === 'bulk' && !!target.deferredFullPatch
+      toast.success(bulkDidDefer ? 'Bulk changes and map pin saved' : 'Map pin saved')
+      pendingCoordsTargetRef.current = null
+      setMapConfirmBulkDeferred(false)
+      setIsMapConfirmOpen(false)
+    } finally {
+      setMapConfirmPatching(false)
+    }
+  }
+
+  const cancelMapConfirm = () => {
+    pendingCoordsTargetRef.current = null
+    setMapConfirmBulkDeferred(false)
     setIsMapConfirmOpen(false)
   }
 
-  const focusPropertyOnMap = (property: Property) => {
-    const map = leafletMapRef.current
-    if (!map) return
-    if (!Number.isFinite(property.lat) || !Number.isFinite(property.lng)) return
-    map.setView([property.lat, property.lng], 15, { animate: true })
-  }
-
   useEffect(() => {
+    if (!isMapConfirmOpen) {
+      if (mapConfirmLeafletMapRef.current) {
+        try {
+          mapConfirmLeafletMapRef.current.remove()
+        } catch {
+          /* ignore */
+        }
+        mapConfirmLeafletMapRef.current = null
+      }
+      mapConfirmMarkerRef.current = null
+      return
+    }
     let cancelled = false
-
-    const initMap = async () => {
-      if (viewMode !== 'map') return
-      if (!mapContainerRef.current) return
-      if (typeof window === 'undefined') return
-
-      const L = await import('leaflet')
-      if (cancelled) return
-      leafletLibRef.current = L
-
-      if (leafletMapRef.current) {
-        leafletMapRef.current.remove()
-        leafletMapRef.current = null
-      }
-
-      const validPoints = visibleListProperties.filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lng))
-      const initial = validPoints[0] || { lat: DEFAULT_PROPERTY_MAP_LAT, lng: DEFAULT_PROPERTY_MAP_LNG }
-      const map = L.map(mapContainerRef.current).setView([initial.lat, initial.lng], 11)
-
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '&copy; OpenStreetMap contributors',
-      }).addTo(map)
-
-      const bounds: Array<[number, number]> = []
-      validPoints.forEach((property) => {
-        bounds.push([property.lat, property.lng])
-        L.circleMarker([property.lat, property.lng], {
-          radius: 8,
-          color: '#1d4ed8',
-          fillColor: '#3b82f6',
-          fillOpacity: 0.85,
-          weight: 2,
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        const L = await import('leaflet')
+        if (cancelled) return
+        const el = mapConfirmContainerRef.current
+        if (!el) return
+        const seed = mapConfirmInitialRef.current
+        if (mapConfirmLeafletMapRef.current) {
+          try {
+            mapConfirmLeafletMapRef.current.remove()
+          } catch {
+            /* ignore */
+          }
+          mapConfirmLeafletMapRef.current = null
+        }
+        mapConfirmMarkerRef.current = null
+        const map = L.map(el).setView([seed.lat, seed.lng], 15)
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          attribution: '&copy; OpenStreetMap contributors',
+        }).addTo(map)
+        const pinIcon = L.divIcon({
+          className: 'cleanlemon-map-confirm-pin',
+          html: '<div style="width:14px;height:14px;background:#dc2626;border-radius:50%;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.35);"></div>',
+          iconSize: [14, 14],
+          iconAnchor: [7, 7],
         })
-          .addTo(map)
-          .bindPopup(
-            `<div style="min-width:180px">
-              <strong>${property.name}</strong><br/>
-              <span>${property.address}</span><br/>
-              ${
-                property.wazeUrl
-                  ? `<a href="${property.wazeUrl}" target="_blank" rel="noreferrer">Waze</a><br/>`
-                  : ''
-              }
-              <a href="${resolveGoogleMapsLink(property)}" target="_blank" rel="noreferrer">Google Maps</a>
-            </div>`
-          )
-      })
-
-      if (bounds.length > 1) {
-        map.fitBounds(bounds, { padding: [24, 24] })
+        const marker = L.marker([seed.lat, seed.lng], { draggable: true, icon: pinIcon }).addTo(map)
+        mapConfirmLeafletMapRef.current = map
+        mapConfirmMarkerRef.current = marker
+        const syncLabelFromMarker = () => {
+          const p = marker.getLatLng()
+          setMapConfirmPinLabel({ lat: p.lat, lng: p.lng })
+        }
+        map.on('click', (e: { latlng: { lat: number; lng: number } }) => {
+          marker.setLatLng(e.latlng)
+          syncLabelFromMarker()
+        })
+        marker.on('dragend', syncLabelFromMarker)
+        window.setTimeout(() => {
+          try {
+            map.invalidateSize()
+          } catch {
+            /* ignore */
+          }
+        }, 200)
+      })()
+    }, 80)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+      if (mapConfirmLeafletMapRef.current) {
+        try {
+          mapConfirmLeafletMapRef.current.remove()
+        } catch {
+          /* ignore */
+        }
+        mapConfirmLeafletMapRef.current = null
       }
+      mapConfirmMarkerRef.current = null
+    }
+  }, [isMapConfirmOpen])
 
-      leafletMapRef.current = map
+  const focusPropertyOnMap = useCallback((property: Property) => {
+    setSelectedMapListPropertyId(property.id)
+    const ll = overviewLatLngForProperty(property)
+    if (!ll) {
+      toast.error(
+        'No map pin for this property yet. Edit it, save, and confirm the pin — or use Waze/Google links that include coordinates (ll= or @lat,lng).'
+      )
+      return
+    }
+    const apply = (): boolean => {
+      const map = leafletMapRef.current
+      const marker = overviewMarkersByPropertyIdRef.current[property.id]
+      if (!map || !marker) return false
+      map.setView([ll.lat, ll.lng], Math.max(map.getZoom(), 15), { animate: true })
+      marker.openPopup()
       window.setTimeout(() => {
         try {
           map.invalidateSize()
         } catch {
           /* ignore */
         }
-      }, 120)
+      }, 150)
+      return true
     }
+    if (apply()) return
+    let attempts = 0
+    const tick = () => {
+      attempts += 1
+      if (apply()) return
+      if (attempts >= 28) {
+        toast.error('Map is still loading. Wait a few seconds and tap this property again.')
+        return
+      }
+      window.setTimeout(tick, 120)
+    }
+    window.setTimeout(tick, 120)
+  }, [])
 
-    void initMap()
+  useEffect(() => {
+    if (viewMode !== 'map') {
+      setSelectedMapListPropertyId(null)
+      setMapSidebarSearch('')
+    }
+  }, [viewMode])
+
+  useEffect(() => {
+    if (viewMode !== 'map') {
+      overviewMarkersByPropertyIdRef.current = {}
+      if (leafletMapRef.current) {
+        leafletMapRef.current.remove()
+        leafletMapRef.current = null
+      }
+      return
+    }
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        const L = await import('leaflet')
+        if (cancelled) return
+        const el = mapContainerRef.current
+        if (!el) return
+
+        const googleHref = (p: Property) => {
+          const stored = String(p.googleMapsUrl || '').trim()
+          if (stored) return stored
+          const fallback = p.googleMapUrl
+          if (fallback) return String(fallback)
+          const ll = overviewLatLngForProperty(p)
+          if (ll) return `https://www.google.com/maps?q=${encodeURIComponent(`${ll.lat},${ll.lng}`)}`
+          const q = encodeURIComponent(`${p.name || ''} ${p.address || ''}`.trim() || 'Johor Bahru')
+          return `https://www.google.com/maps?q=${q}`
+        }
+
+        const pts: Array<{ p: Property; lat: number; lng: number }> = []
+        for (const p of visibleListProperties) {
+          const ll = overviewLatLngForProperty(p)
+          if (!ll) continue
+          pts.push({ p, lat: ll.lat, lng: ll.lng })
+        }
+
+        if (leafletMapRef.current) {
+          leafletMapRef.current.remove()
+          leafletMapRef.current = null
+        }
+        overviewMarkersByPropertyIdRef.current = {}
+
+        const center: [number, number] =
+          pts.length > 0 ? [pts[0].lat, pts[0].lng] : [DEFAULT_PROPERTY_MAP_LAT, DEFAULT_PROPERTY_MAP_LNG]
+        const map = L.map(el).setView(center, pts.length === 1 ? 15 : pts.length === 0 ? 11 : 12)
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          attribution: '&copy; OpenStreetMap contributors',
+        }).addTo(map)
+
+        const latlngs: [number, number][] = []
+        const byCoord = new Map<string, Array<{ p: Property; lat: number; lng: number }>>()
+        for (const item of pts) {
+          const k = overviewCoordGroupKey(item.lat, item.lng)
+          const arr = byCoord.get(k)
+          if (arr) arr.push(item)
+          else byCoord.set(k, [item])
+        }
+
+        for (const group of byCoord.values()) {
+          group.sort((a, b) =>
+            String(a.p.name || a.p.id).localeCompare(String(b.p.name || b.p.id), undefined, {
+              sensitivity: 'base',
+            })
+          )
+          const { lat, lng } = group[0]
+          latlngs.push([lat, lng])
+          const propList = group.map((g) => g.p)
+          const pinColor = overviewMapPinColorForProperties(propList)
+          const count = group.length
+          const pinHtml =
+            count > 1
+              ? `<div style="position:relative;width:30px;height:30px;display:flex;align-items:center;justify-content:center"><div style="width:18px;height:18px;background:${pinColor};border-radius:50%;border:3px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.35)"></div><span style="position:absolute;bottom:-3px;right:-6px;min-width:18px;height:18px;padding:0 4px;background:#fff;border:1px solid #ccc;border-radius:9px;font-size:11px;font-weight:600;line-height:16px;text-align:center;color:#374151">${count}</span></div>`
+              : `<div style="width:18px;height:18px;background:${pinColor};border-radius:50%;border:3px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.35)"></div>`
+          const pinIcon = L.divIcon({
+            className: 'cleanlemon-overview-map-pin',
+            html: pinHtml,
+            iconSize: count > 1 ? [30, 30] : [18, 18],
+            iconAnchor: count > 1 ? [15, 15] : [9, 9],
+          })
+          const m = L.marker([lat, lng], { icon: pinIcon }).addTo(map)
+          m.bindPopup(buildCleanlemonOverviewMapPopupHtml(propList, googleHref))
+          for (const g of group) {
+            overviewMarkersByPropertyIdRef.current[g.p.id] = m
+          }
+        }
+
+        if (latlngs.length > 1) {
+          map.fitBounds(latlngs, { padding: [48, 48], maxZoom: 16 })
+        }
+
+        leafletMapRef.current = map
+        const bumpInvalidate = () => {
+          try {
+            map.invalidateSize()
+          } catch {
+            /* ignore */
+          }
+        }
+        window.setTimeout(bumpInvalidate, 200)
+        window.setTimeout(bumpInvalidate, 600)
+        requestAnimationFrame(bumpInvalidate)
+      })()
+    }, 120)
 
     return () => {
       cancelled = true
+      clearTimeout(timer)
+      overviewMarkersByPropertyIdRef.current = {}
       if (leafletMapRef.current) {
         leafletMapRef.current.remove()
         leafletMapRef.current = null
@@ -2015,7 +3603,7 @@ export default function PropertyPage() {
               onClick={() => setViewMode('map')}
               className="rounded-l-none"
             >
-              <Map className="h-4 w-4" />
+              <MapIcon className="h-4 w-4" />
             </Button>
           </div>
           <DropdownMenu>
@@ -2037,14 +3625,56 @@ export default function PropertyPage() {
                 <Plus className="h-4 w-4 shrink-0" />
                 Add property
               </DropdownMenuItem>
+              <DropdownMenuItem
+                disabled={viewMode !== 'list' || bulkWorking}
+                className="gap-2 cursor-pointer"
+                onClick={() => {
+                  if (viewMode !== 'list') {
+                    toast.error('Switch to list view to use bulk edit')
+                    return
+                  }
+                  if (selectedPropertyIds.size === 0) {
+                    toast.error('Tick one or more rows in the table, then open Bulk edit again')
+                    return
+                  }
+                  setBulkEditUsePropertySection(false)
+                  setBulkEditUsePricing(false)
+                  const first = properties.find((p) => selectedPropertyIds.has(p.id))
+                  if (first) {
+                    setBulkEditSiteKind(premisesTypeToSiteKind(first.premisesType || ''))
+                    setBulkEditName(
+                      sanitizedOperatorPropertyDisplayNameForBulk(String(first.name ?? ''), {
+                        rowId: first.id,
+                        selectedIds: selectedPropertyIds,
+                      })
+                    )
+                    setBulkEditPropertyAddress(first.address)
+                    setBulkEditLatitude(Number.isFinite(first.lat) ? String(first.lat) : '')
+                    setBulkEditLongitude(Number.isFinite(first.lng) ? String(first.lng) : '')
+                  } else {
+                    setBulkEditSiteKind('landed')
+                    setBulkEditName('')
+                    setBulkEditPropertyAddress('')
+                    setBulkEditLatitude('')
+                    setBulkEditLongitude('')
+                  }
+                  setBulkBuildingNameInput('')
+                  setBulkBuildingComboOpen(false)
+                  setBulkAddressSearchItems([])
+                  setBulkAddressSuggestOpen(false)
+                  setBulkEditService('general')
+                  setBulkEditPrice('')
+                  setBulkEditUseTeam(false)
+                  setBulkEditTeamId('')
+                  setBulkEditOpen(true)
+                }}
+              >
+                <Edit className="h-4 w-4 shrink-0" />
+                Bulk edit (property / pricing / team)… ({selectedPropertyIds.size})
+              </DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem
-                disabled={
-                  viewMode !== 'list' ||
-                  bulkWorking ||
-                  bookingClients.length === 0 ||
-                  selectedPropertyIds.size === 0
-                }
+                disabled={viewMode !== 'list' || bulkWorking}
                 className="gap-2 cursor-pointer"
                 onClick={() => {
                   if (viewMode !== 'list') {
@@ -2052,7 +3682,26 @@ export default function PropertyPage() {
                     return
                   }
                   if (selectedPropertyIds.size === 0) {
-                    toast.error('Select one or more properties first')
+                    toast.error('Tick one or more rows first')
+                    return
+                  }
+                  setAddToOperatorGroupPickId('')
+                  setAddToOperatorGroupOpen(true)
+                }}
+              >
+                <Users className="h-4 w-4 shrink-0" />
+                Add to operator group… ({selectedPropertyIds.size})
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                disabled={viewMode !== 'list' || bulkWorking || bookingClients.length === 0}
+                className="gap-2 cursor-pointer"
+                onClick={() => {
+                  if (viewMode !== 'list') {
+                    toast.error('Switch to list view to select properties')
+                    return
+                  }
+                  if (selectedPropertyIds.size === 0) {
+                    toast.error('Tick one or more rows first')
                     return
                   }
                   if (bookingClients.length === 0) {
@@ -2122,13 +3771,13 @@ export default function PropertyPage() {
                   {editingPropertyId ? 'Update the property details below.' : 'Enter the property details below.'}
                 </DialogDescription>
               </DialogHeader>
-              <div className="space-y-4 py-4">
+              <div className="space-y-6 py-4">
                 <div className="space-y-2">
                   <Label>Binding client</Label>
                   <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:flex-wrap">
                     <Select
                       value={propertyForm.bindingClientId || '__none__'}
-                      disabled={bindingLocked}
+                      disabled={clientBindingLocked}
                       onValueChange={(id) => {
                         if (id === '__none__') {
                           setPropertyForm({ ...propertyForm, bindingClientId: '', bindingClient: '' })
@@ -2154,7 +3803,7 @@ export default function PropertyPage() {
                         ))}
                       </SelectContent>
                     </Select>
-                    {!bindingLocked ? (
+                    {!clientBindingLocked ? (
                       <>
                         <Button
                           type="button"
@@ -2203,7 +3852,7 @@ export default function PropertyPage() {
                       </>
                     )}
                   </div>
-                  {bindingLocked ? (
+                  {clientBindingLocked ? (
                     <p className="text-xs text-muted-foreground">
                       Created by a client: you cannot change who is bound. Use &quot;Remove from my list&quot; to drop this
                       property from your operator view; the client keeps it.
@@ -2213,19 +3862,30 @@ export default function PropertyPage() {
                     <p className="text-xs text-muted-foreground">No clients linked to this operator yet.</p>
                   )}
                 </div>
-                {bindingLocked ? (
+                {clientBindingLocked ? (
                   <p className="text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
-                    Client-registered unit: name, address, navigation links, unit number, keys and security are managed by
-                    the client. You can still use pricing, checklist and remarks below, or remove this unit from your list.
+                    Client-registered unit: you cannot change which client is bound here. Use Remove from my list if you no
+                    longer service it.
                   </p>
                 ) : null}
+                <div className="rounded-lg border p-4 space-y-4">
+                  <p className="text-sm font-semibold text-foreground">Property &amp; access</p>
+                  <p className="text-xs text-muted-foreground">
+                    Same layout as client portal: premises, address, unit, links, mailbox and security login.
+                  </p>
                 <div className="space-y-2">
                   <Label htmlFor="site-kind">Premises type</Label>
                   <Select
                     value={propertyForm.siteKind}
                     disabled={!canEditCorePropertyFields}
                     onValueChange={(value: SiteKind) => {
-                      setPropertyForm((prev) => ({ ...prev, siteKind: value }))
+                      setPropertyForm((prev) => {
+                        const next = { ...prev, siteKind: value }
+                        if (value === 'apartment' && String(prev.name || '').trim()) {
+                          return { ...next, name: apartmentBuildingDisplayName(prev.name) }
+                        }
+                        return next
+                      })
                     }}
                   >
                     <SelectTrigger id="site-kind">
@@ -2320,7 +3980,7 @@ export default function PropertyPage() {
                         </Button>
                       </div>
                       <p className="text-xs text-muted-foreground">
-                        Selecting a building fills address, Waze, and Google Maps from the most common values saved for that name (all operators). You can edit after.
+                        Selecting a building fills the address from saved hints (all operators). Waze / Google links follow the address when you save.
                       </p>
                     </div>
                   ) : (
@@ -2392,8 +4052,8 @@ export default function PropertyPage() {
                         className="absolute z-50 mt-1 w-full rounded-md border bg-popover px-2 py-2 text-xs text-muted-foreground shadow-md"
                         role="status"
                       >
-                        No OpenStreetMap matches for this text in Malaysia. Try the exact building name
-                        (e.g. Citywoods), add city or area, or paste the address manually.
+                        No suggestions yet. Try the full building name, add city (e.g. Johor Bahru), fix spelling, fill
+                        Property name above, or paste the address manually.
                       </div>
                     ) : null}
                   </div>
@@ -2401,35 +4061,8 @@ export default function PropertyPage() {
                     OpenStreetMap search (server proxy, Malaysia by default). If your text finds nothing, we also try
                     your Property name above. Choose a result to set the text and map pin.
                   </p>
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="waze-url">Waze URL</Label>
-                  <Input
-                    id="waze-url"
-                    type="url"
-                    inputMode="url"
-                    autoComplete="off"
-                    disabled={!canEditCorePropertyFields}
-                    value={propertyForm.wazeUrl}
-                    onChange={(e) => setPropertyForm({ ...propertyForm, wazeUrl: e.target.value })}
-                    placeholder="https://waze.com/ul/…"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="google-maps-url">Google Maps URL</Label>
-                  <Input
-                    id="google-maps-url"
-                    type="url"
-                    inputMode="url"
-                    autoComplete="off"
-                    disabled={!canEditCorePropertyFields}
-                    value={propertyForm.googleMapsUrl}
-                    onChange={(e) => setPropertyForm({ ...propertyForm, googleMapsUrl: e.target.value })}
-                    placeholder="https://maps.app.goo.gl/…"
-                  />
                   <p className="text-xs text-muted-foreground">
-                    When you change the property address above, Waze and Google Maps are filled with search links for
-                    that text (same as save). Edit these fields if you need a specific share link.
+                    Waze and Google Maps links are generated from this address when you save (no separate URL fields).
                   </p>
                 </div>
                 <div className="space-y-2">
@@ -2442,19 +4075,13 @@ export default function PropertyPage() {
                     placeholder="e.g., A-12 / Level 8"
                   />
                 </div>
-                <div className="rounded-lg border p-4 space-y-4">
-                  <p className="text-sm font-semibold text-foreground">Key collection &amp; security</p>
-                  <p className="text-xs text-muted-foreground">
-                    Same pattern as client Properties: mailbox and smart door on the unit row; security system login is
-                    stored on the linked Coliving property when you use Edit login.
-                  </p>
                   <div className="space-y-2">
                     <Label htmlFor="op-mailbox-pw">Mailbox password</Label>
                     <Input
                       id="op-mailbox-pw"
                       type="text"
                       autoComplete="off"
-                      disabled={!canEditCorePropertyFields}
+                      disabled={operatorDoorSettingsLocked}
                       value={propertyForm.mailboxPasswordValue}
                       onChange={(e) =>
                         setPropertyForm((prev) => ({
@@ -2469,11 +4096,84 @@ export default function PropertyPage() {
                       placeholder="Mailbox password"
                     />
                   </div>
+                  <div>
+                    <Label className="text-xs">Security system</Label>
+                    <div className="flex flex-col sm:flex-row gap-2 mt-1 sm:items-start sm:justify-between">
+                      <div className="flex-1 min-w-0 space-y-1">
+                        <p className="text-sm font-medium text-foreground capitalize">
+                          {parseSecuritySystemFromDb(propertyForm.securitySystem)}
+                        </p>
+                        {securitySystemSummaryText ? (
+                          <p className="text-xs text-muted-foreground break-words">{securitySystemSummaryText}</p>
+                        ) : (
+                          <p className="text-xs text-muted-foreground">
+                            {editingPropertyId
+                              ? 'Not configured. Use Edit to choose the system and enter login details (saved in MySQL on the linked Coliving property row).'
+                              : 'Not configured. Use Edit to choose the system and enter login details (saved in MySQL when you create the property).'}
+                          </p>
+                        )}
+                      </div>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        className="shrink-0 w-full sm:w-auto"
+                        disabled={operatorDoorSettingsLocked}
+                        onClick={() => openSecurityCredentialsModal(!editingPropertyId)}
+                      >
+                        Edit
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+                <div className="rounded-lg border p-4 space-y-4">
+                  <p className="text-sm font-semibold text-foreground">Operator door access</p>
+                  <p className="text-xs text-muted-foreground">
+                    How your team may open this unit&apos;s smart door. Modes that use remote unlock need a gateway linked to the lock in Coliving.
+                  </p>
+                  {operatorDoorSettingsLocked ? (
+                    <p className="text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
+                      This unit was created in the client portal — only the client can change mailbox, smart door, and door
+                      access here. You can still edit address, pricing, and property details.
+                    </p>
+                  ) : null}
+                  {editingPropertyId &&
+                  ['full_access', 'temporary_password_only', 'working_date_only'].includes(
+                    propertyForm.operatorDoorAccessMode
+                  ) &&
+                  !editDialogGatewayReady ? (
+                    <p className="text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
+                      No gateway linked for remote unlock. Use &quot;Fixed password&quot; or link a gateway in Coliving → Smart door, or remote unlock will not work.
+                    </p>
+                  ) : null}
+                  <div className="space-y-2 max-w-md">
+                    <Label className="text-xs">Mode</Label>
+                    <Select
+                      value={propertyForm.operatorDoorAccessMode}
+                      disabled={operatorDoorSettingsLocked}
+                      onValueChange={(v) =>
+                        setPropertyForm((prev) => ({ ...prev, operatorDoorAccessMode: v }))
+                      }
+                    >
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="full_access">
+                          Full access — permanent PIN + remote when gateway is ready
+                        </SelectItem>
+                        <SelectItem value="temporary_password_only">
+                          Temporary password — PIN per job + remote on booking days
+                        </SelectItem>
+                        <SelectItem value="working_date_only">Booking day only — remote when gateway is ready</SelectItem>
+                        <SelectItem value="fixed_password">Fixed password — no remote unlock</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
                   <div className="rounded-md border p-3 space-y-2">
                     <label className="flex items-center gap-2 text-sm">
                       <Checkbox
                         checked={propertyForm.keyCollection.smartdoorPassword}
-                        disabled={!canEditCorePropertyFields}
+                        disabled={operatorDoorSettingsLocked}
                         onCheckedChange={(checked) =>
                           setPropertyForm({
                             ...propertyForm,
@@ -2486,8 +4186,10 @@ export default function PropertyPage() {
                     {propertyForm.keyCollection.smartdoorPassword ? (
                       <Input
                         value={propertyForm.smartdoorPasswordValue}
-                        disabled={!canEditCorePropertyFields}
-                        onChange={(e) => setPropertyForm({ ...propertyForm, smartdoorPasswordValue: e.target.value })}
+                        disabled={operatorDoorSettingsLocked}
+                        onChange={(e) =>
+                          setPropertyForm({ ...propertyForm, smartdoorPasswordValue: e.target.value })
+                        }
                         placeholder="Smart door password"
                       />
                     ) : null}
@@ -2496,7 +4198,7 @@ export default function PropertyPage() {
                     <label className="flex items-center gap-2 text-sm">
                       <Checkbox
                         checked={propertyForm.keyCollection.smartdoorToken}
-                        disabled={!canEditCorePropertyFields}
+                        disabled={operatorDoorSettingsLocked}
                         onCheckedChange={(checked) =>
                           setPropertyForm({
                             ...propertyForm,
@@ -2507,74 +4209,188 @@ export default function PropertyPage() {
                       Smart door (token)
                     </label>
                   </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="op-security-username" className="text-xs">
-                      Security username
-                    </Label>
-                    <Input
-                      id="op-security-username"
-                      className="mt-1"
-                      disabled={!canEditCorePropertyFields}
-                      value={propertyForm.securityUsername}
-                      onChange={(e) => setPropertyForm({ ...propertyForm, securityUsername: e.target.value })}
-                      placeholder="e.g. icare / gprop username"
-                    />
-                  </div>
-                  {editingPropertyId && operatorEditColivingPdId ? (
-                    <div>
-                      <Label className="text-xs">Security system</Label>
-                      <div className="flex flex-col sm:flex-row gap-2 mt-1 sm:items-start sm:justify-between">
-                        <div className="flex-1 min-w-0 space-y-1">
-                          <p className="text-sm font-medium text-foreground capitalize">
-                            {parseSecuritySystemFromDb(propertyForm.securitySystem)}
+                  {operatorEditColivingPdId ? (
+                    <div
+                      className={cn(
+                        'space-y-3 rounded-md border p-3',
+                        clientBindingLocked ? 'bg-muted/30' : 'bg-muted/20 border-primary/20'
+                      )}
+                    >
+                      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                        <div>
+                          <p className="text-sm font-semibold text-foreground">
+                            {clientBindingLocked ? 'Edit utility — smart door (read-only)' : 'Edit utility — smart door'}
                           </p>
-                          {securitySystemSummaryText ? (
-                            <p className="text-xs text-muted-foreground break-words">{securitySystemSummaryText}</p>
-                          ) : (
-                            <p className="text-xs text-muted-foreground">
-                              Not configured. Use Edit to choose the system and enter login details (saved on the linked
-                              Coliving property).
-                            </p>
-                          )}
+                          <p className="text-xs text-muted-foreground mt-1">
+                            {clientBindingLocked
+                              ? 'This unit was created in the client portal. Smart door binding is managed by the client in Coliving Edit utility — shown here for reference only.'
+                              : 'Binding and lock selection are done in Coliving (same linked property row). Open Coliving below, then Property → ⋮ → Edit utility.'}
+                          </p>
                         </div>
-                        <Button
-                          type="button"
-                          variant="outline"
-                          className="shrink-0 w-full sm:w-auto"
-                          disabled={!canEditCorePropertyFields}
-                          onClick={() => openSecurityCredentialsModal()}
-                        >
-                          Edit
-                        </Button>
+                        {!clientBindingLocked ? (
+                          <Button variant="default" size="sm" className="shrink-0 gap-2" asChild>
+                            <a
+                              href={`${COLIVING_PORTAL_ORIGIN}/operator/property`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                            >
+                              Open Coliving — Edit utility
+                              <ExternalLink className="h-4 w-4" />
+                            </a>
+                          </Button>
+                        ) : null}
                       </div>
+                      <div className="space-y-2 max-w-md">
+                        <Label className="text-xs">Smart door</Label>
+                        <Input
+                          readOnly
+                          className="bg-muted cursor-default"
+                          value={
+                            editDialogSmartdoorBindings?.property?.displayLabel?.trim()
+                              ? String(editDialogSmartdoorBindings.property.displayLabel)
+                              : '—'
+                          }
+                        />
+                      </div>
+                      {editDialogSmartdoorBindings?.rooms && editDialogSmartdoorBindings.rooms.length > 0 ? (
+                        <div className="space-y-2">
+                          <Label className="text-xs">Room-bound locks</Label>
+                          <ul className="text-sm space-y-2 rounded-md border p-3 bg-background">
+                            {editDialogSmartdoorBindings.rooms.map((r) => (
+                              <li
+                                key={r.roomId}
+                                className="flex flex-col gap-0.5 sm:flex-row sm:justify-between sm:items-baseline sm:gap-4"
+                              >
+                                <span className="text-muted-foreground">{r.roomDisplayLabel}</span>
+                                <span className="font-medium">{r.lockDisplayLabel}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      ) : null}
+                      {!editDialogSmartdoorBindings?.property &&
+                      (!editDialogSmartdoorBindings?.rooms ||
+                        editDialogSmartdoorBindings.rooms.length === 0) ? (
+                        <p className="text-xs text-muted-foreground">
+                          No smart door bound at property or room level in Coliving.
+                        </p>
+                      ) : null}
                     </div>
-                  ) : (
-                    <div className="space-y-2">
-                      <Label>Security system (unit row)</Label>
-                      <Select
-                        value={propertyForm.securitySystem}
+                  ) : editingPropertyId ? (
+                    <CleanlemonPropertyNativeLocksPanel
+                      scope="operator"
+                      email={String(user?.email || '')}
+                      operatorId={operatorId}
+                      propertyId={editingPropertyId}
+                      canBindAndUnbind={!operatorDoorSettingsLocked}
+                      readOnlyHint={
+                        operatorDoorSettingsLocked
+                          ? 'This unit was created in the client portal — only the client can link or unlink TTLock here.'
+                          : undefined
+                      }
+                    />
+                  ) : null}
+                </div>
+                <div className="rounded-lg border p-4 space-y-4">
+                  <p className="text-sm font-semibold text-foreground">Property details</p>
+                  <p className="text-xs text-muted-foreground">
+                    Room counts and lift level are stored on this unit (same fields as the client portal property
+                    details).
+                  </p>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                    {(
+                      [
+                        ['bedCount', 'Bed count'],
+                        ['roomCount', 'Room count'],
+                        ['bathroomCount', 'Bathroom count'],
+                        ['kitchen', 'Kitchen'],
+                        ['livingRoom', 'Living room'],
+                        ['balcony', 'Balcony'],
+                        ['staircase', 'Staircase'],
+                        ['specialAreaCount', 'Special area count'],
+                      ] as const
+                    ).map(([key, label]) => (
+                      <div key={key} className="space-y-1">
+                        <Label className="text-xs">{label}</Label>
+                        <Input
+                          inputMode="numeric"
+                          value={propertyForm[key]}
+                          onChange={(e) =>
+                            setPropertyForm((prev) => ({ ...prev, [key]: e.target.value }))
+                          }
+                        />
+                      </div>
+                    ))}
+                  </div>
+                  <div className="space-y-2 max-w-xs">
+                    <Label>Lift level</Label>
+                    <Select
+                      value={propertyForm.liftLevel || '__none__'}
+                      onValueChange={(v) =>
+                        setPropertyForm((prev) => ({ ...prev, liftLevel: v === '__none__' ? '' : v }))
+                      }
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="—" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__none__">—</SelectItem>
+                        <SelectItem value="slow">slow</SelectItem>
+                        <SelectItem value="medium">medium</SelectItem>
+                        <SelectItem value="fast">fast</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+                <div className="rounded-lg border p-4 space-y-4">
+                  <p className="text-sm font-semibold text-foreground">Cleaning price</p>
+                  <p className="text-xs text-muted-foreground">
+                    Choose the service provider and your MYR price for this unit (property size is set above in
+                    property details).
+                  </p>
+                  <div className="space-y-2">
+                    <Label>Cleaning price summary</Label>
+                    <div className="flex gap-2">
+                      <Input value={cleaningPriceSummaryText} readOnly />
+                      <Button
+                        variant="outline"
+                        type="button"
                         disabled={!canEditCorePropertyFields}
-                        onValueChange={(value: SecuritySystemIdOption) =>
-                          setPropertyForm({ ...propertyForm, securitySystem: value })
-                        }
+                        onClick={() => setIsPriceSummaryOpen(true)}
                       >
-                        <SelectTrigger>
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {SECURITY_SYSTEM_IDS.map((id) => (
-                            <SelectItem key={id} value={id}>
-                              {id}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                      <p className="text-xs text-muted-foreground">
-                        Full login details (password, etc.) are saved after you link a Coliving property — then use Edit
-                        above.
-                      </p>
+                        Edit
+                      </Button>
                     </div>
-                  )}
+                  </div>
+                </div>
+                <div className="rounded-lg border p-4 space-y-4">
+                  <p className="text-sm font-semibold text-foreground">Photos &amp; notes</p>
+                  <p className="text-xs text-muted-foreground">
+                    After-clean sample, key photo, estimated duration (minutes), checklist and remarks.
+                  </p>
+                <div className="space-y-2 max-w-md">
+                  <Label>Default team</Label>
+                  <Select
+                    value={propertyForm.bindingTeamId ? propertyForm.bindingTeamId : '__none__'}
+                    onValueChange={(v) =>
+                      setPropertyForm((prev) => ({ ...prev, bindingTeamId: v === '__none__' ? '' : v }))
+                    }
+                  >
+                    <SelectTrigger>
+                      <SelectValue placeholder="Unassigned" />
+                    </SelectTrigger>
+                    <SelectContent className="max-h-72">
+                      <SelectItem value="__none__">— Unassigned —</SelectItem>
+                      {operatorTeamsList.map((t) => (
+                        <SelectItem key={t.id} value={t.id}>
+                          {t.name || t.id}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs text-muted-foreground">
+                    Default cleaning team for this unit. If the list is empty, add teams under Operator → Team first.
+                  </p>
                 </div>
                 <div className="space-y-2">
                   <Label>After Clean Photo Sample (Preview Required)</Label>
@@ -2585,25 +4401,39 @@ export default function PropertyPage() {
                     onChange={(e) => handleImageUpload(e, 'afterCleanPhotoSample')}
                   />
                   {propertyForm.afterCleanPhotoSample && (
-                    <img src={propertyForm.afterCleanPhotoSample} alt="After clean sample preview" className="h-28 rounded-md border object-cover" />
+                    <img
+                      src={
+                        normalizeDamageAttachmentUrl(propertyForm.afterCleanPhotoSample) ||
+                        propertyForm.afterCleanPhotoSample
+                      }
+                      alt="After clean sample preview"
+                      className="h-28 rounded-md border object-cover"
+                    />
                   )}
                 </div>
                 <div className="space-y-2">
-                  <Label>Cleaning Price Summary</Label>
-                  <div className="flex gap-2">
-                    <Input value={cleaningPriceSummaryText} readOnly />
-                    <Button variant="outline" type="button" onClick={() => setIsPriceSummaryOpen(true)}>
-                      Edit
-                    </Button>
-                  </div>
-                </div>
-                <div className="space-y-2">
-                  <Label>Estimate time (optional)</Label>
+                  <Label htmlFor="property-estimated-minutes">Estimated time (minutes, optional)</Label>
                   <Input
+                    id="property-estimated-minutes"
+                    type="number"
+                    inputMode="numeric"
+                    min={0}
+                    step={1}
                     value={propertyForm.estimatedTime}
-                    onChange={(e) => setPropertyForm({ ...propertyForm, estimatedTime: e.target.value })}
-                    placeholder="e.g., 2h 30m"
+                    onChange={(e) => {
+                      const v = e.target.value
+                      if (v === '') {
+                        setPropertyForm({ ...propertyForm, estimatedTime: '' })
+                        return
+                      }
+                      const n = parseInt(v, 10)
+                      if (!Number.isFinite(n) || n < 0) return
+                      setPropertyForm({ ...propertyForm, estimatedTime: String(n) })
+                    }}
+                    placeholder="e.g. 90"
+                    disabled={!canEditCorePropertyFields}
                   />
+                  <p className="text-xs text-muted-foreground">Enter minutes only (e.g. 1 hour 30 minutes = 90).</p>
                 </div>
                 <div className="space-y-2">
                   <Label>Key Photo</Label>
@@ -2614,14 +4444,23 @@ export default function PropertyPage() {
                     onChange={(e) => handleImageUpload(e, 'keyPhoto')}
                   />
                   {propertyForm.keyPhoto && (
-                    <img src={propertyForm.keyPhoto} alt="Key photo preview" className="h-28 rounded-md border object-cover" />
+                    <img
+                      src={normalizeDamageAttachmentUrl(propertyForm.keyPhoto) || propertyForm.keyPhoto}
+                      alt="Key photo preview"
+                      className="h-28 rounded-md border object-cover"
+                    />
                   )}
                 </div>
                 <div className="space-y-2">
                   <Label>Checklist</Label>
                   <div className="flex items-center gap-2">
                     <span className="text-sm text-muted-foreground">{propertyForm.checklist.length} item(s)</span>
-                    <Button variant="outline" type="button" onClick={() => setIsChecklistOpen(true)}>
+                    <Button
+                      variant="outline"
+                      type="button"
+                      disabled={!canEditCorePropertyFields}
+                      onClick={() => setIsChecklistOpen(true)}
+                    >
                       Detail
                     </Button>
                   </div>
@@ -2634,7 +4473,9 @@ export default function PropertyPage() {
                     onChange={(e) => setPropertyForm({ ...propertyForm, remark: e.target.value })}
                     placeholder="Any special instructions or notes"
                     rows={3}
+                    disabled={!canEditCorePropertyFields}
                   />
+                </div>
                 </div>
               </div>
               <DialogFooter>
@@ -2642,10 +4483,10 @@ export default function PropertyPage() {
                   Cancel
                 </Button>
                 <Button
-                  disabled={!!(editingPropertyId && bindingLocked)}
-                  onClick={() => openMapConfirmBeforeSubmit(editingPropertyId ? 'edit' : 'add')}
+                  disabled={isPropertyDetailSaving}
+                  onClick={() => void requestSavePropertyWithMapFlow()}
                 >
-                  {editingPropertyId ? 'Save Changes' : 'Add Property'}
+                  {isPropertyDetailSaving ? 'Saving…' : editingPropertyId ? 'Save Changes' : 'Add Property'}
                 </Button>
               </DialogFooter>
             </DialogContent>
@@ -2658,8 +4499,9 @@ export default function PropertyPage() {
           <DialogHeader>
             <DialogTitle>Security system login</DialogTitle>
             <DialogDescription>
-              Choose the system here and enter login details. Data is saved to MySQL and shown in plain text when you
-              reopen the property. Leave password empty only when saving without changing an existing password.
+              Choose the system here and enter login details. Data is saved to MySQL and shown in plain text on this
+              screen when you reopen the property. Leave password empty only when saving without changing an existing
+              password.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3 py-2">
@@ -2753,7 +4595,12 @@ export default function PropertyPage() {
             <Button type="button" variant="outline" onClick={() => setSecCredModalOpen(false)}>
               Cancel
             </Button>
-            <Button type="button" disabled={secCredModalSaving} onClick={() => void handleSecurityCredentialsModalSave()}>
+            <Button
+              type="button"
+              style={{ background: 'var(--brand)' }}
+              disabled={secCredModalSaving}
+              onClick={() => void handleSecurityCredentialsModalSave()}
+            >
               {secCredModalSaving ? (
                 <>
                   <Loader2 className="h-4 w-4 animate-spin mr-2 inline" />
@@ -2791,10 +4638,33 @@ export default function PropertyPage() {
 
       {/* Content */}
       {viewMode === 'list' ? (
+        <Tabs
+          value={operatorPortalMainTab}
+          onValueChange={(v) => {
+            const next = v as 'properties' | 'groups'
+            setOperatorPortalMainTab(next)
+            if (next === 'properties') {
+              setSelectedOperatorGroupIds(new Set())
+            }
+          }}
+          className="flex min-h-0 flex-1 flex-col gap-3"
+        >
+          <TabsList className="h-auto w-full flex-wrap justify-start gap-1 sm:w-auto">
+            <TabsTrigger value="groups" className="gap-1.5">
+              <Users className="h-4 w-4" />
+              Group view
+              <span className="text-muted-foreground">({operatorPropertyGroups.length})</span>
+            </TabsTrigger>
+            <TabsTrigger value="properties" className="gap-1.5">
+              Property view
+              <span className="text-muted-foreground">({visibleListProperties.length})</span>
+            </TabsTrigger>
+          </TabsList>
+          <TabsContent value="properties" className="mt-0 flex min-h-0 flex-1 flex-col data-[state=inactive]:hidden">
         <Card className="flex min-h-0 flex-1 flex-col gap-0 border py-4 shadow-sm">
           <CardHeader className="flex flex-col gap-3 px-4 pb-0 pt-0 sm:px-6">
             <div className="min-w-0 space-y-1">
-              <CardTitle>All Properties</CardTitle>
+              <CardTitle>Property view</CardTitle>
               <CardDescription>{visibleListProperties.length} properties registered</CardDescription>
             </div>
           </CardHeader>
@@ -2951,7 +4821,14 @@ export default function PropertyPage() {
                           onClick={() => setSelectedProperty(row)}
                         >
                           <div className="flex flex-wrap items-center gap-2">
-                            <h2 className="text-lg font-bold leading-snug text-foreground">{row.name}</h2>
+                            <h2
+                              className={cn(
+                                'text-lg font-bold leading-snug',
+                                propertyNameWarnMissingAddress(row) ? 'text-destructive' : 'text-foreground',
+                              )}
+                            >
+                              {propertyDisplayName(row)}
+                            </h2>
                           </div>
                           <p className="text-sm text-muted-foreground">
                             Unit {row.unitNumber || '—'}
@@ -2988,20 +4865,6 @@ export default function PropertyPage() {
                           ) : null}
                         </button>
                         <div className="flex shrink-0 items-center gap-0.5 self-center">
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="icon"
-                            className="h-9 w-9"
-                            title="Edit"
-                            onClick={() => {
-                              setEditingPropertyId(row.id)
-                              seedFormFromProperty(row)
-                              setIsAddDialogOpen(true)
-                            }}
-                          >
-                            <Edit className="h-4 w-4" />
-                          </Button>
                           {visibleActions.length > 0 ? (
                             <DropdownMenu>
                               <DropdownMenuTrigger asChild>
@@ -3115,12 +4978,7 @@ export default function PropertyPage() {
                 data={visibleListProperties}
                 columns={columns}
                 actions={actions}
-                onEditClick={(row) => {
-                  setEditingPropertyId(row.id)
-                  seedFormFromProperty(row)
-                  setIsAddDialogOpen(true)
-                }}
-                searchKeys={['name', 'address', 'client']}
+                searchKeys={['name', 'address', 'client', 'unitNumber']}
                 pageSize={propertyListPageSize}
                 fillContainer
                 noHorizontalScroll
@@ -3148,6 +5006,195 @@ export default function PropertyPage() {
             </div>
           </CardContent>
         </Card>
+          </TabsContent>
+          <TabsContent
+            value="groups"
+            className="mt-0 min-h-0 flex-1 overflow-hidden data-[state=inactive]:hidden"
+          >
+            <Card className="flex min-h-0 flex-1 flex-col border py-4 shadow-sm">
+              <CardHeader className="space-y-1 px-6 pb-2 pt-0">
+                <CardTitle className="flex items-center gap-2 text-lg">
+                  <Users className="h-5 w-5" />
+                  Group view
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3 px-6 pb-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button type="button" variant="outline" size="sm" onClick={() => setOperatorGroupCreateOpen(true)}>
+                    <Plus className="h-4 w-4 mr-1" />
+                    New group
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    disabled={operatorPropertyGroups.length === 0}
+                    onClick={() => {
+                      if (selectedOperatorGroupIds.size === operatorPropertyGroups.length) {
+                        setSelectedOperatorGroupIds(new Set())
+                      } else {
+                        setSelectedOperatorGroupIds(new Set(operatorPropertyGroups.map((x) => x.id)))
+                      }
+                    }}
+                  >
+                    {selectedOperatorGroupIds.size === operatorPropertyGroups.length && operatorPropertyGroups.length > 0
+                      ? 'Clear selection'
+                      : 'Select all groups'}
+                  </Button>
+                  {selectedOperatorGroupIds.size > 0 ? (
+                    <span className="text-xs text-muted-foreground">{selectedOperatorGroupIds.size} selected</span>
+                  ) : null}
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Operator-only groups for routing and scheduling — separate from client portal property groups.
+                </p>
+                {operatorPropertyGroups.length === 0 ? (
+                  <p className="text-sm text-muted-foreground">
+                    No groups yet. Create one and add properties from Property view → Actions.
+                  </p>
+                ) : (
+                  <ul className="space-y-2 text-sm">
+                    {operatorPropertyGroups.map((g) => {
+                      const isOpen = opGroupExpandedId === g.id
+                      const cache = opGroupDetailById[g.id]
+                      const detail = cache?.detail
+                      const loading = !!cache?.loading && !detail
+                      return (
+                        <li key={g.id} className="overflow-hidden rounded-md border bg-muted/30">
+                          <div className="flex flex-wrap items-center gap-2 px-2 py-2 sm:px-3">
+                            <div
+                              className="flex h-8 w-8 shrink-0 items-center justify-center"
+                              onClick={(e) => e.stopPropagation()}
+                              onPointerDown={(e) => e.stopPropagation()}
+                            >
+                              <Checkbox
+                                checked={selectedOperatorGroupIds.has(g.id)}
+                                onCheckedChange={(v) => {
+                                  setSelectedOperatorGroupIds((prev) => {
+                                    const next = new Set(prev)
+                                    if (v === true) next.add(g.id)
+                                    else next.delete(g.id)
+                                    return next
+                                  })
+                                }}
+                                aria-label={`Select group ${g.name || g.id}`}
+                              />
+                            </div>
+                            <button
+                              type="button"
+                              aria-expanded={isOpen}
+                              className="flex min-w-0 flex-1 items-center gap-2 rounded-md text-left outline-none ring-offset-background hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring"
+                              onClick={() => toggleOpGroupRow(g.id)}
+                            >
+                              <span className="flex h-8 w-8 shrink-0 items-center justify-center text-muted-foreground">
+                                {isOpen ? (
+                                  <ChevronDown className="h-4 w-4 transition-transform" />
+                                ) : (
+                                  <ChevronRight className="h-4 w-4 transition-transform" />
+                                )}
+                              </span>
+                              <span className="min-w-0">
+                                <span className="font-medium">{g.name || 'Group'}</span>
+                                <span className="text-muted-foreground font-normal">
+                                  {' '}
+                                  · {g.propertyCount} properties
+                                </span>
+                              </span>
+                            </button>
+                            <div className="flex shrink-0 items-center gap-2 pl-1">
+                              <Button
+                                type="button"
+                                variant="secondary"
+                                size="sm"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  openManageOperatorGroup(g.id)
+                                }}
+                              >
+                                Manage
+                              </Button>
+                            </div>
+                          </div>
+                          {isOpen ? (
+                            <div className="space-y-3 border-t border-border/60 bg-background/60 px-3 py-3 sm:px-4">
+                              {loading ? (
+                                <div className="flex items-center justify-center gap-2 py-4 text-muted-foreground">
+                                  <Loader2 className="h-5 w-5 animate-spin" />
+                                  <span>Loading details…</span>
+                                </div>
+                              ) : detail?.properties?.length ? (
+                                <>
+                                  <div>
+                                    <p className="mb-1.5 text-xs font-medium text-muted-foreground">Properties</p>
+                                    <ul className="space-y-2">
+                                      {detail.properties.map((p) => (
+                                        <li
+                                          key={p.id}
+                                          className="flex flex-col gap-1 rounded border border-border/60 bg-background p-2 sm:flex-row sm:items-center sm:justify-between"
+                                        >
+                                          <div className="min-w-0">
+                                            <p
+                                              className={cn(
+                                                'text-sm font-medium',
+                                                propertyGroupMemberNameWarn(p) && 'text-destructive',
+                                              )}
+                                            >
+                                              {propertyGroupMemberLabel(p)}
+                                            </p>
+                                            <p className="text-xs text-muted-foreground line-clamp-2">{p.address || '—'}</p>
+                                          </div>
+                                          <Button
+                                            type="button"
+                                            variant="ghost"
+                                            size="sm"
+                                            className="shrink-0"
+                                            onClick={() => void removePropFromOpGroup(g.id, p.id)}
+                                          >
+                                            Remove
+                                          </Button>
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                  <div className="flex justify-end border-t border-border/60 pt-3">
+                                    <Button
+                                      type="button"
+                                      variant="outline"
+                                      size="sm"
+                                      className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                                      onClick={() => void deleteOpGroup(g.id)}
+                                    >
+                                      Delete group
+                                    </Button>
+                                  </div>
+                                </>
+                              ) : (
+                                <>
+                                  <p className="text-xs text-muted-foreground">No properties in this group.</p>
+                                  <div className="flex justify-end border-t border-border/60 pt-3">
+                                    <Button
+                                      type="button"
+                                      variant="outline"
+                                      size="sm"
+                                      className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                                      onClick={() => void deleteOpGroup(g.id)}
+                                    >
+                                      Delete group
+                                    </Button>
+                                  </div>
+                                </>
+                              )}
+                            </div>
+                          ) : null}
+                        </li>
+                      )
+                    })}
+                  </ul>
+                )}
+              </CardContent>
+            </Card>
+          </TabsContent>
+        </Tabs>
       ) : (
         <Card
           className={cn(
@@ -3169,45 +5216,89 @@ export default function PropertyPage() {
             <p className="text-xs text-muted-foreground lg:hidden">Tap List to exit full screen</p>
           </CardHeader>
           <CardContent className="flex flex-col flex-1 min-h-0 p-4 sm:p-6 pt-0 max-lg:flex-1 max-lg:min-h-0 max-lg:p-3 max-lg:pt-0">
+            {propertiesWithMapCoordinatesCount === 0 && visibleListProperties.length > 0 ? (
+              <p className="text-sm text-muted-foreground mb-3">
+                No map pins yet: each property needs saved GPS (edit → save → confirm pin on the map), or Waze/Google
+                links that contain coordinates (<span className="whitespace-nowrap">ll=</span> or{' '}
+                <span className="whitespace-nowrap">@lat,lng</span>). Search-only links do not place a pin.
+              </p>
+            ) : null}
             <div
               className={cn(
-                'relative bg-muted rounded-lg overflow-hidden flex-1 min-h-[min(500px,70vh)] w-full',
-                'max-lg:min-h-0 max-lg:flex-1 max-lg:rounded-md',
-                'lg:h-[500px]',
+                'flex flex-col md:flex-row rounded-lg border border-border overflow-hidden bg-background flex-1 min-h-[min(70vh,640px)]',
+                'max-lg:min-h-0 max-lg:flex-1',
               )}
             >
-              <div ref={mapContainerRef} className="absolute inset-0 z-0" />
-              
-              {/* Property List Overlay */}
-              <div className="absolute z-[1000] top-4 left-4 w-72 max-h-[calc(100%-2rem)] bg-card rounded-lg shadow-lg border overflow-hidden">
-                <div className="p-3 border-b">
-                  <div className="relative">
-                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                    <Input placeholder="Search properties..." className="pl-9 h-9" />
-                  </div>
+              <aside className="flex w-full md:w-[min(100%,320px)] md:max-w-[38vw] shrink-0 flex-col border-b md:border-b-0 md:border-r border-border bg-muted/30 max-h-[min(40vh,360px)] md:max-h-none md:h-auto">
+                <div className="px-3 py-2.5 border-b border-border text-sm font-semibold text-foreground">
+                  Properties ({visibleListProperties.length})
                 </div>
-                <div className="max-h-80 overflow-y-auto">
-                  {visibleListProperties.map((property) => {
+                <div className="relative px-2 pt-2 pb-1.5 border-b border-border shrink-0">
+                  <Search className="pointer-events-none absolute left-5 top-1/2 z-10 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    placeholder="Search name, address, client…"
+                    value={mapSidebarSearch}
+                    onChange={(e) => setMapSidebarSearch(e.target.value)}
+                    className="h-9 pl-9 text-sm"
+                    aria-label="Search properties on map"
+                  />
+                </div>
+                <div className="overflow-y-auto flex-1 p-2 space-y-1 min-h-0">
+                  {mapSidebarFilteredProperties.map((property) => {
                     const Icon = typeIcons[property.type]
+                    const hasGps = overviewLatLngForProperty(property) !== null
                     return (
-                      <div
+                      <button
                         key={property.id}
-                        className="p-3 border-b last:border-b-0 hover:bg-muted/50 cursor-pointer transition-colors"
-                        onClick={() => {
-                          focusPropertyOnMap(property)
-                        }}
+                        type="button"
+                        onClick={() => focusPropertyOnMap(property)}
+                        className={cn(
+                          'w-full rounded-md border border-transparent px-2.5 py-2 text-left text-sm transition-colors hover:bg-accent/80',
+                          selectedMapListPropertyId === property.id && 'border border-primary/40 bg-accent',
+                        )}
                       >
                         <div className="flex items-start gap-2">
-                          <Icon className={`h-4 w-4 mt-0.5 ${typeColors[property.type].split(' ')[1]}`} />
-                          <div className="flex-1 min-w-0">
-                            <p className="font-medium text-sm truncate">{property.name}</p>
-                            <p className="text-xs text-muted-foreground truncate">{property.address}</p>
+                          <Icon className={`h-4 w-4 mt-0.5 shrink-0 ${typeColors[property.type].split(' ')[1]}`} />
+                          <div className="min-w-0 flex-1">
+                            <div
+                              className={cn(
+                                'font-medium line-clamp-2',
+                                propertyNameWarnMissingAddress(property) ? 'text-destructive' : 'text-foreground',
+                              )}
+                            >
+                              {propertyDisplayName(property)}
+                            </div>
+                            <div className="text-xs text-muted-foreground line-clamp-2 mt-0.5">{property.address}</div>
+                            {!hasGps ? (
+                              <span className="text-[10px] text-muted-foreground mt-1 block">No GPS saved</span>
+                            ) : null}
+                            <div className="flex flex-wrap gap-1 mt-1">
+                              {property.status === 'inactive' ? (
+                                <Badge variant="secondary" className="text-[10px] px-1 py-0">
+                                  Inactive
+                                </Badge>
+                              ) : null}
+                            </div>
                           </div>
                         </div>
-                      </div>
+                      </button>
                     )
                   })}
                 </div>
+              </aside>
+              <div className="relative z-0 min-h-[280px] h-[min(52vh,520px)] w-full min-w-0 flex-1 bg-muted md:h-[min(62vh,680px)] md:min-h-[min(62vh,680px)]">
+                <div
+                  ref={mapContainerRef}
+                  className="leaflet-map-host absolute inset-0 min-h-[280px] md:min-h-0"
+                />
+                {propertiesWithMapCoordinatesCount === 0 && visibleListProperties.length > 0 ? (
+                  <div className="pointer-events-none absolute inset-0 z-[400] flex items-center justify-center p-4">
+                    <div className="max-w-sm rounded-lg border border-border bg-background/95 px-4 py-3 text-center text-sm text-muted-foreground shadow-sm">
+                      No pins to show. Save GPS per property (edit → save → confirm map pin), or use navigation links
+                      that embed coordinates — not plain address search links.
+                    </div>
+                  </div>
+                ) : null}
               </div>
             </div>
           </CardContent>
@@ -3220,12 +5311,17 @@ export default function PropertyPage() {
           {selectedProperty && (
             <>
               <DialogHeader>
-                <DialogTitle className="flex items-center gap-2">
+                <DialogTitle
+                  className={cn(
+                    'flex items-center gap-2',
+                    propertyNameWarnMissingAddress(selectedProperty) && 'text-destructive',
+                  )}
+                >
                   {(() => {
                     const Icon = typeIcons[selectedProperty.type]
                     return <Icon className="h-5 w-5" />
                   })()}
-                  {selectedProperty.name}
+                  {propertyDisplayName(selectedProperty)}
                 </DialogTitle>
                 <DialogDescription>{selectedProperty.client}</DialogDescription>
               </DialogHeader>
@@ -3269,8 +5365,8 @@ export default function PropertyPage() {
                 </div>
                 {selectedProperty.estimatedTime && (
                   <div>
-                    <p className="text-sm text-muted-foreground">Estimate time</p>
-                    <p className="text-sm">{selectedProperty.estimatedTime}</p>
+                    <p className="text-sm text-muted-foreground">Estimated time</p>
+                    <p className="text-sm">{selectedProperty.estimatedTime} min</p>
                   </div>
                 )}
                 {selectedProperty.lastCleaned && (
@@ -3325,59 +5421,557 @@ export default function PropertyPage() {
       <Dialog open={isPriceSummaryOpen} onOpenChange={setIsPriceSummaryOpen}>
         <DialogContent className="max-w-[95vw] sm:max-w-[90vw] md:max-w-[85vw]">
           <DialogHeader>
-            <DialogTitle>Cleaning Price Summary</DialogTitle>
-            <DialogDescription>Default calculated price and adjust amount for this property.</DialogDescription>
+            <DialogTitle>Cleaning price</DialogTitle>
+            <DialogDescription>
+              Choose the same service as on your Pricing page, then enter your MYR price for this unit.
+            </DialogDescription>
           </DialogHeader>
-          <div className="space-y-3 py-2">
-            {(() => {
-              const type = PRICE_SUMMARY_LABEL
-              const row = propertyForm.cleaningPriceByType[type] || { defaultPrice: '0', adjustAmount: '0' }
-              return (
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-3 border rounded-md p-3">
-                  <div className="space-y-2">
-                    <Label>Line</Label>
-                    <Input value={type} readOnly />
+          <div className="space-y-4 py-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-xs text-muted-foreground max-w-xl">
+                Add a row for each services provider you use for this unit. Property size (beds, rooms, etc.) is set in
+                the main form — here you only pick provider and price.
+              </p>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={!canEditCorePropertyFields}
+                onClick={() =>
+                  setPropertyForm((prev) =>
+                    withSyncedLegacyFromCleaningRows(prev, [
+                      ...prev.operatorCleaningPricingRows,
+                      defaultCleaningPricingRow(),
+                    ])
+                  )
+                }
+              >
+                <Plus className="h-4 w-4 mr-1" />
+                Add row
+              </Button>
+            </div>
+            <div className="max-h-[min(60vh,480px)] overflow-y-auto space-y-4 pr-1">
+              {propertyForm.operatorCleaningPricingRows.map((row, idx) => {
+                return (
+                  <div
+                    key={`cleaning-row-${idx}`}
+                    className="grid grid-cols-1 sm:grid-cols-[1fr_auto] gap-4 border-b border-border pb-4 last:border-0 last:pb-0"
+                  >
+                    <div className="space-y-3 min-w-0">
+                      <div className="space-y-2">
+                        <Label>Services provider</Label>
+                        <Select
+                          value={row.service || 'general'}
+                          disabled={!canEditCorePropertyFields}
+                          onValueChange={(v) => {
+                            setPropertyForm((prev) => {
+                              const nextRows = prev.operatorCleaningPricingRows.map((r, j) =>
+                                j === idx ? { ...r, service: v } : r
+                              )
+                              return withSyncedLegacyFromCleaningRows(prev, nextRows)
+                            })
+                          }}
+                        >
+                          <SelectTrigger>
+                            <SelectValue placeholder="Select service" />
+                          </SelectTrigger>
+                          <SelectContent className="max-h-72">
+                            {(pricingServiceSelectOptions.length ? pricingServiceSelectOptions : PRICING_SERVICES).map(
+                              (s) => (
+                                <SelectItem key={s.key} value={s.key}>
+                                  {s.label}
+                                </SelectItem>
+                              )
+                            )}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    </div>
+                    <div className="space-y-2 sm:w-[148px] sm:shrink-0">
+                      <div className="flex items-start justify-between gap-2">
+                        <Label>Price (MYR)</Label>
+                        {propertyForm.operatorCleaningPricingRows.length > 1 ? (
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon"
+                            className="h-8 w-8 shrink-0 -mr-1"
+                            disabled={!canEditCorePropertyFields}
+                            onClick={() => {
+                              setPropertyForm((prev) => {
+                                if (prev.operatorCleaningPricingRows.length <= 1) return prev
+                                const nextRows = prev.operatorCleaningPricingRows.filter((_, j) => j !== idx)
+                                return withSyncedLegacyFromCleaningRows(prev, nextRows)
+                              })
+                            }}
+                            aria-label="Remove row"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        ) : null}
+                      </div>
+                      <Input
+                        inputMode="decimal"
+                        value={row.myr}
+                        disabled={!canEditCorePropertyFields}
+                        onChange={(e) => {
+                          const val = e.target.value
+                          setPropertyForm((prev) => {
+                            const nextRows = prev.operatorCleaningPricingRows.map((r, j) =>
+                              j === idx ? { ...r, myr: val } : r
+                            )
+                            return withSyncedLegacyFromCleaningRows(prev, nextRows)
+                          })
+                        }}
+                        placeholder="e.g. 180"
+                      />
+                    </div>
                   </div>
-                  <div className="space-y-2">
-                    <Label>Default Calculate Price</Label>
-                    <Input
-                      value={row.defaultPrice}
-                      onChange={(e) =>
-                        setPropertyForm((prev) => ({
-                          ...prev,
-                          cleaningPriceByType: {
-                            ...prev.cleaningPriceByType,
-                            [type]: { ...row, defaultPrice: e.target.value },
-                          },
-                        }))
-                      }
-                      placeholder="e.g., 220"
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label>Adjust Amount</Label>
-                    <Input
-                      type="number"
-                      value={row.adjustAmount}
-                      onChange={(e) =>
-                        setPropertyForm((prev) => ({
-                          ...prev,
-                          cleaningPriceByType: {
-                            ...prev.cleaningPriceByType,
-                            [type]: { ...row, adjustAmount: e.target.value },
-                          },
-                        }))
-                      }
-                      placeholder="0"
-                    />
-                  </div>
-                </div>
-              )
-            })()}
+                )
+              })}
+            </div>
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setIsPriceSummaryOpen(false)}>Close</Button>
-            <Button onClick={() => setIsPriceSummaryOpen(false)}>Save</Button>
+            <Button variant="outline" onClick={() => setIsPriceSummaryOpen(false)}>
+              Close
+            </Button>
+            <Button type="button" onClick={() => setIsPriceSummaryOpen(false)}>
+              Done
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={bulkEditOpen} onOpenChange={setBulkEditOpen}>
+        <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Bulk edit</DialogTitle>
+            <DialogDescription>
+              Apply the same property details, cleaning pricing, and/or default team to {selectedPropertyIds.size}{' '}
+              selected propert
+              {selectedPropertyIds.size === 1 ? 'y' : 'ies'}. Navigation links follow the address (no separate Waze /
+              Google fields).
+            </DialogDescription>
+          </DialogHeader>
+          <div
+            className="rounded-md border border-amber-200/80 bg-amber-50/90 px-3 py-2.5 text-xs text-foreground space-y-1.5"
+            role="note"
+          >
+            <p className="font-semibold">What gets saved (per property)</p>
+            <ul className="list-disc pl-4 space-y-0.5 text-muted-foreground">
+              <li>
+                <span className="text-foreground font-medium">Unit number is never sent</span> in bulk edit — the
+                server keeps each row&apos;s existing unit.
+              </li>
+              {bulkEditUsePropertySection ? (
+                <>
+                  <li>
+                    <span className="text-foreground">Premises type</span> → always written:{' '}
+                    <span className="font-mono text-foreground">{bulkEditSiteKind}</span>
+                  </li>
+                  {bulkEditName.trim() ? (
+                    <li>
+                      <span className="text-foreground">Property name</span> → written (same text for all).
+                    </li>
+                  ) : (
+                    <li>
+                      <span className="text-foreground">Property name</span> → not sent; each row keeps its current
+                      name.
+                    </li>
+                  )}
+                  {bulkEditPropertyAddress.trim() ? (
+                    <li>
+                      <span className="text-foreground">Address + Waze/Google links</span> → written from your bulk
+                      address. If you confirm the map pin afterwards, <span className="text-foreground">latitude &amp; longitude</span> are written in the same step.
+                    </li>
+                  ) : (
+                    <li>
+                      <span className="text-foreground">Address / links / GPS</span> → not sent in this bulk (unchanged
+                      until you edit elsewhere).
+                    </li>
+                  )}
+                </>
+              ) : null}
+              {bulkEditUsePricing ? (
+                <li>
+                  <span className="text-foreground">Cleaning price</span> → one row (service + MYR) written for each
+                  selected property.
+                </li>
+              ) : null}
+              {bulkEditUseTeam ? (
+                <li>
+                  <span className="text-foreground">Default team</span> →{' '}
+                  {bulkEditTeamId
+                    ? operatorTeamsList.find((t) => t.id === bulkEditTeamId)?.name || bulkEditTeamId
+                    : 'cleared (unassigned)'}{' '}
+                  for each selected property.
+                </li>
+              ) : null}
+              {!bulkEditUsePropertySection && !bulkEditUsePricing && !bulkEditUseTeam ? (
+                <li>Turn on at least one section above, or nothing will be applied.</li>
+              ) : null}
+            </ul>
+          </div>
+          <div className="space-y-6 py-2">
+            <div className="rounded-lg border p-4 space-y-4">
+              <p className="text-sm font-semibold text-foreground">Property &amp; access</p>
+              <div className="flex items-center gap-2">
+                <Checkbox
+                  id="bulk-edit-property-section"
+                  checked={bulkEditUsePropertySection}
+                  onCheckedChange={(c) => setBulkEditUsePropertySection(c === true)}
+                />
+                <Label htmlFor="bulk-edit-property-section" className="cursor-pointer font-normal">
+                  Apply premises, property name, and address to all selected
+                </Label>
+              </div>
+              <div className={`space-y-4 ${bulkEditUsePropertySection ? '' : 'opacity-50 pointer-events-none'}`}>
+                <div className="space-y-2">
+                  <Label htmlFor="bulk-site-kind">Premises type</Label>
+                  <Select
+                    value={bulkEditSiteKind}
+                    onValueChange={(value: SiteKind) => {
+                      setBulkEditSiteKind(value)
+                      if (value === 'apartment' && String(bulkEditName || '').trim()) {
+                        const cleaned = sanitizedOperatorPropertyDisplayNameForBulk(bulkEditName, {
+                          selectedIds: selectedPropertyIds,
+                        })
+                        setBulkEditName(cleaned ? apartmentBuildingDisplayName(cleaned) : '')
+                      }
+                    }}
+                  >
+                    <SelectTrigger id="bulk-site-kind">
+                      <SelectValue placeholder="Select premises type" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {SITE_KIND_OPTIONS.map((opt) => (
+                        <SelectItem key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor={bulkEditSiteKind === 'apartment' ? 'bulk-property-name-select' : 'bulk-property-name'}>
+                    Property name
+                  </Label>
+                  {bulkEditSiteKind === 'apartment' ? (
+                    <div className="space-y-2">
+                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                        <div className="min-w-0 flex-1">
+                          <Popover open={bulkBuildingComboOpen} onOpenChange={setBulkBuildingComboOpen}>
+                            <PopoverTrigger asChild>
+                              <Button
+                                id="bulk-property-name-select"
+                                type="button"
+                                variant="outline"
+                                role="combobox"
+                                aria-expanded={bulkBuildingComboOpen}
+                                className="h-10 w-full justify-between px-3 font-normal"
+                              >
+                                <span className={cn('truncate', !bulkEditName.trim() && 'text-muted-foreground')}>
+                                  {bulkEditName.trim() || 'Search or select building / condo'}
+                                </span>
+                                <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                              </Button>
+                            </PopoverTrigger>
+                            <PopoverContent
+                              className="z-[100] w-[min(100vw-2rem,var(--radix-popover-trigger-width))] min-w-[min(100%,20rem)] max-h-[min(70vh,22rem)] flex flex-col overflow-hidden p-0"
+                              align="start"
+                              onWheel={(e) => e.stopPropagation()}
+                            >
+                              <Command
+                                shouldFilter={false}
+                                className="max-h-[min(70vh,22rem)] min-h-0 flex flex-col overflow-hidden"
+                              >
+                                <CommandInput
+                                  placeholder="Search buildings (saved by any operator)…"
+                                  value={bulkBuildingNameInput}
+                                  onValueChange={setBulkBuildingNameInput}
+                                />
+                                <CommandList className="max-h-[min(50vh,18rem)] flex-1">
+                                  <CommandEmpty>No building found.</CommandEmpty>
+                                  <CommandGroup>
+                                    <CommandItem
+                                      value="__clear__"
+                                      onSelect={() => {
+                                        setBulkEditName('')
+                                        setBulkBuildingComboOpen(false)
+                                      }}
+                                    >
+                                      Clear selection
+                                    </CommandItem>
+                                    {filteredBulkBuildingNames.map((n) => (
+                                      <CommandItem
+                                        key={n}
+                                        value={n}
+                                        onSelect={() => {
+                                          void applyBulkBuildingDefaults(n)
+                                          setBulkBuildingComboOpen(false)
+                                        }}
+                                      >
+                                        {n}
+                                      </CommandItem>
+                                    ))}
+                                  </CommandGroup>
+                                </CommandList>
+                              </Command>
+                            </PopoverContent>
+                          </Popover>
+                        </div>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          className="h-10 shrink-0 whitespace-nowrap sm:w-auto w-full"
+                          onClick={() => setIsAddApartmentNameOpen(true)}
+                        >
+                          Add property name
+                        </Button>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        Selecting a building fills the address from saved hints when available.
+                      </p>
+                    </div>
+                  ) : (
+                    <Input
+                      id="bulk-property-name"
+                      value={bulkEditName}
+                      onChange={(e) => setBulkEditName(e.target.value)}
+                      placeholder="e.g., Sunrise Villa A-12"
+                    />
+                  )}
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="bulk-address">Property address</Label>
+                  <div ref={bulkAddressFieldWrapRef} className="relative">
+                    <div className="relative">
+                      <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                      <Input
+                        id="bulk-address"
+                        className="pl-9 pr-9"
+                        value={bulkEditPropertyAddress}
+                        onChange={(e) => {
+                          const v = e.target.value
+                          setBulkEditPropertyAddress(v)
+                          setBulkEditLatitude('')
+                          setBulkEditLongitude('')
+                          if (v.trim().length >= 3) setBulkAddressSuggestOpen(true)
+                          scheduleBulkAddressSearch(v, bulkEditName)
+                        }}
+                        onFocus={() => {
+                          setBulkAddressSuggestOpen(true)
+                          if (bulkEditPropertyAddress.trim().length >= 3) {
+                            scheduleBulkAddressSearch(bulkEditPropertyAddress, bulkEditName)
+                          }
+                        }}
+                        placeholder="Type to search (Malaysia) or enter address manually"
+                        autoComplete="off"
+                      />
+                      {bulkAddressSearchLoading ? (
+                        <Loader2 className="pointer-events-none absolute right-2.5 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin text-muted-foreground" />
+                      ) : null}
+                    </div>
+                    {bulkAddressSuggestOpen && bulkAddressSearchItems.length > 0 ? (
+                      <ul
+                        className="absolute z-50 mt-1 max-h-60 w-full overflow-auto rounded-md border bg-popover p-1 text-popover-foreground shadow-md"
+                        role="listbox"
+                      >
+                        {bulkAddressSearchItems.map((item, idx) => (
+                          <li key={`bulk-${item.placeId || 'p'}-${idx}`}>
+                            <button
+                              type="button"
+                              className="w-full rounded-sm px-2 py-1.5 text-left text-sm hover:bg-accent"
+                              onMouseDown={(e) => e.preventDefault()}
+                              onClick={() => pickBulkAddressSuggestion(item)}
+                            >
+                              {item.displayName}
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                    {bulkAddressSuggestOpen &&
+                    !bulkAddressSearchLoading &&
+                    bulkAddressSearchItems.length === 0 &&
+                    bulkEditPropertyAddress.trim().length >= 3 ? (
+                      <div
+                        className="absolute z-50 mt-1 w-full rounded-md border bg-popover px-2 py-2 text-xs text-muted-foreground shadow-md"
+                        role="status"
+                      >
+                        No suggestions yet. Try full building name, add city (e.g. Johor Bahru), fix spelling, or paste
+                        the address manually.
+                      </div>
+                    ) : null}
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Waze and Google Maps URLs are generated from this address when you apply (same as single-property
+                    save).
+                  </p>
+                </div>
+              </div>
+            </div>
+            <div className="rounded-lg border p-4 space-y-4">
+              <div className="flex items-center gap-2">
+                <Checkbox
+                  id="bulk-edit-team"
+                  checked={bulkEditUseTeam}
+                  onCheckedChange={(c) => setBulkEditUseTeam(c === true)}
+                />
+                <Label htmlFor="bulk-edit-team" className="cursor-pointer font-normal">
+                  Set default cleaning team
+                </Label>
+              </div>
+              <div className={`space-y-2 max-w-md ${bulkEditUseTeam ? '' : 'opacity-50 pointer-events-none'}`}>
+                <Label>Team</Label>
+                <Select
+                  value={bulkEditTeamId ? bulkEditTeamId : '__none__'}
+                  onValueChange={(v) => setBulkEditTeamId(v === '__none__' ? '' : v)}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="Unassigned" />
+                  </SelectTrigger>
+                  <SelectContent className="max-h-72">
+                    <SelectItem value="__none__">— Unassigned (clear team) —</SelectItem>
+                    {operatorTeamsList.map((t) => (
+                      <SelectItem key={t.id} value={t.id}>
+                        {t.name || t.id}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+            <div className="rounded-lg border p-4 space-y-4">
+              <div className="flex items-center gap-2">
+                <Checkbox
+                  id="bulk-edit-price"
+                  checked={bulkEditUsePricing}
+                  onCheckedChange={(c) => setBulkEditUsePricing(c === true)}
+                />
+                <Label htmlFor="bulk-edit-price" className="cursor-pointer font-normal">
+                  Update cleaning pricing (service + MYR)
+                </Label>
+              </div>
+              <div className={`space-y-3 ${bulkEditUsePricing ? '' : 'opacity-50 pointer-events-none'}`}>
+                <div className="space-y-2">
+                  <Label>Services provider</Label>
+                  <Select value={bulkEditService} onValueChange={setBulkEditService}>
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent className="max-h-72">
+                      {(pricingServiceSelectOptions.length ? pricingServiceSelectOptions : PRICING_SERVICES).map((s) => (
+                        <SelectItem key={s.key} value={s.key}>
+                          {s.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-2">
+                  <Label>Price (MYR)</Label>
+                  <Input
+                    inputMode="decimal"
+                    value={bulkEditPrice}
+                    onChange={(e) => setBulkEditPrice(e.target.value)}
+                    placeholder="e.g. 180"
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+          <DialogFooter className="gap-2">
+            <Button type="button" variant="outline" onClick={() => setBulkEditOpen(false)}>
+              Cancel
+            </Button>
+            <Button type="button" disabled={bulkEditWorking} onClick={() => void runBulkEditApply()}>
+              {bulkEditWorking ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              Apply
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={addToOperatorGroupOpen}
+        onOpenChange={(o) => {
+          setAddToOperatorGroupOpen(o)
+          if (!o) setAddToOperatorGroupPickId('')
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Add to operator group</DialogTitle>
+            <DialogDescription>
+              Add {selectedPropertyIds.size} selected propert{selectedPropertyIds.size === 1 ? 'y' : 'ies'} to a group.
+              This is separate from client portal groups.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 py-2">
+            <Label htmlFor="op-add-group">Group</Label>
+            {operatorPropertyGroups.length > 0 ? (
+              <Select value={addToOperatorGroupPickId || undefined} onValueChange={setAddToOperatorGroupPickId}>
+                <SelectTrigger id="op-add-group">
+                  <SelectValue placeholder="Select a group…" />
+                </SelectTrigger>
+                <SelectContent className="max-h-72">
+                  {operatorPropertyGroups.map((g) => (
+                    <SelectItem key={g.id} value={g.id}>
+                      {g.name || 'Group'}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            ) : (
+              <p className="text-sm text-muted-foreground">Create a group first (Group view → New group).</p>
+            )}
+          </div>
+          <DialogFooter className="gap-2">
+            <Button type="button" variant="outline" onClick={() => setAddToOperatorGroupOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              disabled={!addToOperatorGroupPickId || addToOperatorGroupBusy || selectedPropertyIds.size === 0}
+              onClick={() => void runAddSelectedToOperatorGroup()}
+            >
+              {addToOperatorGroupBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              Add
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={operatorGroupCreateOpen}
+        onOpenChange={(o) => {
+          setOperatorGroupCreateOpen(o)
+          if (!o) setOperatorNewGroupName('')
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>New operator group</DialogTitle>
+            <DialogDescription>Name this group for your own use (not visible to clients as a client group).</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2 py-2">
+            <Label htmlFor="op-new-grp">Name</Label>
+            <Input
+              id="op-new-grp"
+              value={operatorNewGroupName}
+              onChange={(e) => setOperatorNewGroupName(e.target.value)}
+              placeholder="e.g. West JB route"
+            />
+          </div>
+          <DialogFooter className="gap-2">
+            <Button type="button" variant="outline" onClick={() => setOperatorGroupCreateOpen(false)}>
+              Cancel
+            </Button>
+            <Button type="button" disabled={operatorGroupCreating} onClick={() => void runCreateOperatorGroup()}>
+              {operatorGroupCreating ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              Create
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -3452,68 +6046,51 @@ export default function PropertyPage() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={isMapConfirmOpen} onOpenChange={setIsMapConfirmOpen}>
+      <Dialog
+        open={isMapConfirmOpen}
+        onOpenChange={(open) => {
+          if (!open) cancelMapConfirm()
+        }}
+      >
         <DialogContent className="max-w-[95vw] sm:max-w-[90vw] md:max-w-[85vw]">
           <DialogHeader>
-            <DialogTitle>Confirm Property Location</DialogTitle>
+            <DialogTitle>Confirm map pin</DialogTitle>
             <DialogDescription>
-              Confirm GPS before submit. Coordinates are taken from your Waze/Google links when present, otherwise
-              Johor Bahru as a starting point (not Kuala Lumpur). Adjust the pin if needed.
+              {mapConfirmBulkDeferred ? (
+                <>
+                  Bulk changes are <strong>not</strong> saved until you confirm below. Drag the pin, then confirm — all
+                  selected properties get the same address/details, pricing (if enabled), and GPS. Starting point uses
+                  Waze/Google links when present, otherwise Johor Bahru (not Kuala Lumpur).
+                </>
+              ) : (
+                <>
+                  Property details are already saved. Drag the pin to the exact location, then confirm. The starting
+                  point uses your Waze/Google links when present, otherwise Johor Bahru (not Kuala Lumpur).
+                </>
+              )}
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-2">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              <div className="space-y-2">
-                <Label>Latitude</Label>
-                <Input
-                  value={propertyForm.latitude}
-                  onChange={(e) => setPropertyForm((prev) => ({ ...prev, latitude: e.target.value }))}
-                  placeholder={`e.g. ${DEFAULT_PROPERTY_MAP_LAT.toFixed(4)}`}
-                />
-              </div>
-              <div className="space-y-2">
-                <Label>Longitude</Label>
-                <Input
-                  value={propertyForm.longitude}
-                  onChange={(e) => setPropertyForm((prev) => ({ ...prev, longitude: e.target.value }))}
-                  placeholder={`e.g. ${DEFAULT_PROPERTY_MAP_LNG.toFixed(4)}`}
-                />
-              </div>
-            </div>
-            <div className="rounded-md border overflow-hidden">
-              <iframe
-                title="Property location preview"
-                src={getGoogleMapEmbedUrl(
-                  propertyForm.latitude || String(DEFAULT_PROPERTY_MAP_LAT),
-                  propertyForm.longitude || String(DEFAULT_PROPERTY_MAP_LNG)
-                )}
-                className="w-full h-[320px]"
-                loading="lazy"
-              />
-            </div>
+            <p className="text-sm text-muted-foreground">
+              Latitude {mapConfirmPinLabel.lat.toFixed(6)}, longitude {mapConfirmPinLabel.lng.toFixed(6)}
+            </p>
+            <div ref={mapConfirmContainerRef} className="rounded-md border overflow-hidden h-[320px] w-full z-0" />
             <a
-              href={getGoogleMapUrl(
-                propertyForm.latitude || String(DEFAULT_PROPERTY_MAP_LAT),
-                propertyForm.longitude || String(DEFAULT_PROPERTY_MAP_LNG)
-              )}
+              href={getGoogleMapUrl(String(mapConfirmPinLabel.lat), String(mapConfirmPinLabel.lng))}
               target="_blank"
               rel="noreferrer"
               className="text-sm text-primary hover:underline"
             >
-              Open current GPS on Google Maps
+              Open this position on Google Maps
             </a>
           </div>
           <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => {
-                setIsMapConfirmOpen(false)
-                setPendingSubmitMode(null)
-              }}
-            >
-              Cancel
+            <Button variant="outline" disabled={mapConfirmPatching} onClick={cancelMapConfirm}>
+              {mapConfirmBulkDeferred ? 'Cancel' : 'Skip for now'}
             </Button>
-            <Button onClick={confirmMapAndSubmit}>Confirm & Submit</Button>
+            <Button disabled={mapConfirmPatching} onClick={() => void confirmMapPinAndPatchCoords()}>
+              {mapConfirmPatching ? 'Saving…' : 'Confirm pin'}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -3804,6 +6381,7 @@ export default function PropertyPage() {
           if (!v) setDoorOpenPayload(null)
         }}
         title={doorOpenPayload?.title}
+        smartdoorId={doorOpenPayload?.smartdoorId}
         operatorDoorAccessMode={doorOpenPayload?.operatorDoorAccessMode}
         smartdoorGatewayReady={doorOpenPayload?.smartdoorGatewayReady}
         hasBookingToday={doorOpenPayload?.hasBookingToday}

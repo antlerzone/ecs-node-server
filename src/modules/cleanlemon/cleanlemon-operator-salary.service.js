@@ -2,8 +2,11 @@
  * Operator salary → accounting accrual + payout (MY):
  * - Bukku: journal + banking expense (see Bukku payroll guide).
  * - Xero: Accounting API only — Manual Journal (accrual) + Bank SPEND (payout). Maps same GL titles
- *   "Salary & Wages" / "Salary Control" / Bank|Cash in cln_account_client with system=xero (not Payroll AU/NZ/UK).
+ *   "Salaries & Wages" / "Salary Control" / Bank|Cash in cln_account_client with system=xero (not Payroll AU/NZ/UK).
  */
+
+/** Must match `cln_account.title` for id e0c10001-0000-4000-8000-000000000013 (salary accrual expense line). */
+const CLN_SALARY_WAGES_ACCOUNT_TITLE = 'Salaries & Wages';
 
 const crypto = require('crypto');
 const pool = require('../../config/db');
@@ -95,6 +98,72 @@ function formatXeroErr(err) {
   }
 }
 
+function isIgnorableXeroBankTxnDeleteError(err) {
+  const msg = formatXeroErr(err).toLowerCase();
+  return msg.includes('not found') || msg.includes('does not exist') || msg.includes('already deleted');
+}
+
+/**
+ * When operator has addon accounting: void Bukku banking expense (money out) / Xero SPEND linked on this row.
+ * Same pattern as commission-release voidCommissionAccounting.
+ */
+async function voidSalaryPayoutMoneyOutAccounting(operatorId, row, voidReasonLabel = 'Void salary payout') {
+  const oid = String(operatorId || '').trim();
+  const provider = await getClnAddonAccountProvider(oid);
+  if (!provider || !['bukku', 'xero'].includes(provider)) {
+    return { ok: true, skippedVoid: true };
+  }
+  const bukkuId = row.bukku_expense_id != null ? String(row.bukku_expense_id).trim() : '';
+  const xeroId = row.xero_bank_transaction_id != null ? String(row.xero_bank_transaction_id).trim() : '';
+
+  try {
+    if (provider === 'bukku' && bukkuId) {
+      const creds = await clnInt.getBukkuCredentials(oid);
+      if (!creds?.token) {
+        return { ok: false, code: 'BUKKU_NOT_CONNECTED', detail: 'Bukku not connected' };
+      }
+      const req = bukkuReq(oid, creds);
+      const moneyOutVoidRes = await bukkuBankingExpense.updateStatus(req, bukkuId, {
+        status: 'void',
+        void_reason: String(voidReasonLabel || 'Void salary payout').slice(0, 255)
+      });
+      if (moneyOutVoidRes?.ok !== true) {
+        const detail =
+          typeof moneyOutVoidRes?.error === 'string'
+            ? moneyOutVoidRes.error
+            : JSON.stringify(moneyOutVoidRes?.error || {});
+        return { ok: false, code: 'BUKKU_VOID_FAILED', detail };
+      }
+    }
+    if (provider === 'xero' && xeroId) {
+      const req = xeroReq(oid);
+      const delRes = await xeroBankTransaction.deleteBankTransaction(req, xeroId);
+      if (!delRes?.ok) {
+        const updDeleted = await xeroBankTransaction.updateBankTransactionStatus(req, xeroId, 'DELETED');
+        if (!updDeleted?.ok) {
+          const updVoided = await xeroBankTransaction.updateBankTransactionStatus(req, xeroId, 'VOIDED');
+          if (!updVoided?.ok && !isIgnorableXeroBankTxnDeleteError(delRes?.error)) {
+            return {
+              ok: false,
+              code: 'VOID_XERO_SPEND_FAILED',
+              detail: formatXeroErr(delRes?.error) || String(delRes?.error || '')
+            };
+          }
+        }
+      }
+    }
+  } catch (e) {
+    if (provider === 'xero' && !isIgnorableXeroBankTxnDeleteError(e)) {
+      return { ok: false, code: 'VOID_XERO_EXCEPTION', detail: e?.message || String(e) };
+    }
+    if (provider === 'bukku') {
+      return { ok: false, code: 'VOID_BUKKU_EXCEPTION', detail: e?.message || String(e) };
+    }
+  }
+
+  return { ok: true };
+}
+
 function ymdLastOfMonth(period) {
   const [ys, ms] = String(period || '').split('-');
   const y = parseInt(ys, 10);
@@ -126,6 +195,20 @@ function roundMoney(n) {
   return Math.round(x * 100) / 100;
 }
 
+/** Per salary record id → MYR amount for this mark-paid run (optional; default = remaining net). */
+function parseReleaseAmountsInput(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out = {};
+  for (const [k, v] of Object.entries(raw)) {
+    const id = String(k || '').trim();
+    if (!id) continue;
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0) continue;
+    out[id] = roundMoney(n);
+  }
+  return out;
+}
+
 /** Only approved lines (or legacy rows with no status) count toward flexible payroll. */
 function lineIncludedInPayroll(meta) {
   const m = meta && typeof meta === 'object' ? meta : {};
@@ -141,9 +224,25 @@ function mapRecordRow(r) {
   const mtdTick =
     Number(r.mtd_applies) === 1 || (mtdAmt != null && !Number.isNaN(mtdAmt) && mtdAmt > 0);
   const payrollInputs = parseJsonObject(r.payroll_inputs_json);
+  const contactLegalName =
+    r.contact_legal_name != null && String(r.contact_legal_name).trim() !== ''
+      ? String(r.contact_legal_name).trim()
+      : '';
+  const contactFullName =
+    r.contact_full_name != null && String(r.contact_full_name).trim() !== ''
+      ? String(r.contact_full_name).trim()
+      : '';
+  const contactEmail =
+    r.contact_email != null && String(r.contact_email).trim() !== ''
+      ? String(r.contact_email).trim()
+      : '';
   return {
     id: r.id,
     employeeLabel: r.employee_label != null ? String(r.employee_label) : '',
+    /** From linked employee (payroll_inputs.sourceContactId → cln_employee_operator); for UI labels. */
+    contactLegalName: contactLegalName || undefined,
+    contactFullName: contactFullName || undefined,
+    contactEmail: contactEmail || undefined,
     team: r.team != null ? String(r.team) : '',
     baseSalary: Number(r.base_salary || 0),
     netSalary: Number(r.net_salary || 0),
@@ -174,20 +273,27 @@ async function listOperatorSalaries(operatorId, periodOpt) {
   const oid = String(operatorId || '').trim();
   if (!oid) return [];
   const period = periodOpt != null && String(periodOpt).trim() !== '' ? String(periodOpt).trim() : null;
-  let sql = `SELECT id, operator_id, period, team, employee_label, base_salary, net_salary,
-            status, bukku_journal_id, bukku_expense_id, xero_manual_journal_id, xero_bank_transaction_id,
-            payment_method, paid_date,
-            mtd_applies, epf_applies, socso_applies, eis_applies,
-            mtd_amount, epf_amount, socso_amount, eis_amount,
-            payroll_inputs_json
-     FROM cln_salary_record
-     WHERE operator_id = ?`;
+  let sql = `SELECT r.id, r.operator_id, r.period, r.team, r.employee_label, r.base_salary, r.net_salary,
+            r.status, r.bukku_journal_id, r.bukku_expense_id, r.xero_manual_journal_id, r.xero_bank_transaction_id,
+            r.payment_method, r.paid_date,
+            r.mtd_applies, r.epf_applies, r.socso_applies, r.eis_applies,
+            r.mtd_amount, r.epf_amount, r.socso_amount, r.eis_amount,
+            r.payroll_inputs_json,
+            ed.legal_name AS contact_legal_name,
+            ed.full_name AS contact_full_name,
+            ed.email AS contact_email
+     FROM cln_salary_record r
+     LEFT JOIN cln_employee_operator eo
+       ON eo.operator_id = r.operator_id
+      AND eo.id = JSON_UNQUOTE(JSON_EXTRACT(r.payroll_inputs_json, '$.sourceContactId'))
+     LEFT JOIN cln_employeedetail ed ON ed.id = eo.employee_id
+     WHERE r.operator_id = ?`;
   const params = [oid];
   if (period) {
-    sql += ` AND period = ?`;
+    sql += ` AND r.period = ?`;
     params.push(period);
   }
-  sql += ` ORDER BY period DESC, team ASC, employee_label ASC`;
+  sql += ` ORDER BY r.period DESC, r.team ASC, r.employee_label ASC`;
   const [rows] = await pool.query(sql, params);
   return rows.map(mapRecordRow);
 }
@@ -686,8 +792,119 @@ async function patchSalaryRecordStatus(operatorId, recordId, status) {
   return r ? mapRecordRow(r) : null;
 }
 
+/** Remove payout tracking in portal; row becomes payable again. Accrual journal ids (Bukku/Xero) are kept. */
+async function voidSalaryRecordPayment(operatorId, recordId) {
+  const oid = String(operatorId || '').trim();
+  const rid = String(recordId || '').trim();
+  if (!oid || !rid) throw Object.assign(new Error('MISSING_PARAMS'), { code: 'MISSING_PARAMS' });
+  const ok = await salaryTablesExist();
+  if (!ok) throw Object.assign(new Error('SALARY_TABLES_MISSING'), { code: 'SALARY_TABLES_MISSING' });
+  const [[row]] = await pool.query(
+    `SELECT * FROM cln_salary_record WHERE id = ? AND operator_id = ? LIMIT 1`,
+    [rid, oid]
+  );
+  if (!row) throw Object.assign(new Error('RECORD_NOT_FOUND'), { code: 'RECORD_NOT_FOUND' });
+  const st = String(row.status || '');
+  if (st !== 'complete' && st !== 'partial_paid') {
+    throw Object.assign(new Error('INVALID_STATUS'), { code: 'INVALID_STATUS' });
+  }
+  const acctVoid = await voidSalaryPayoutMoneyOutAccounting(oid, row, 'Void salary payout (portal)');
+  if (!acctVoid.ok) {
+    throw Object.assign(new Error(acctVoid.code || 'ACCOUNTING_VOID_FAILED'), {
+      code: acctVoid.code || 'ACCOUNTING_VOID_FAILED',
+      detail: acctVoid.detail
+    });
+  }
+  const pi = parseJsonObject(row.payroll_inputs_json) || {};
+  const piNext = { ...pi };
+  delete piNext.payoutReleasedTotal;
+  const piJson = JSON.stringify(piNext);
+  await pool.query(
+    `UPDATE cln_salary_record SET
+      status = 'pending_sync',
+      paid_date = NULL,
+      payment_method = NULL,
+      bukku_expense_id = NULL,
+      xero_bank_transaction_id = NULL,
+      payroll_inputs_json = CAST(? AS JSON),
+      updated_at = CURRENT_TIMESTAMP(3)
+     WHERE id = ? AND operator_id = ? LIMIT 1`,
+    [piJson, rid, oid]
+  );
+  const [[r2]] = await pool.query(`SELECT * FROM cln_salary_record WHERE id = ? LIMIT 1`, [rid]);
+  return r2 ? mapRecordRow(r2) : null;
+}
+
+async function restoreSalaryRecordFromVoid(operatorId, recordId) {
+  const oid = String(operatorId || '').trim();
+  const rid = String(recordId || '').trim();
+  if (!oid || !rid) throw Object.assign(new Error('MISSING_PARAMS'), { code: 'MISSING_PARAMS' });
+  const ok = await salaryTablesExist();
+  if (!ok) throw Object.assign(new Error('SALARY_TABLES_MISSING'), { code: 'SALARY_TABLES_MISSING' });
+  const [[row]] = await pool.query(
+    `SELECT * FROM cln_salary_record WHERE id = ? AND operator_id = ? LIMIT 1`,
+    [rid, oid]
+  );
+  if (!row) throw Object.assign(new Error('RECORD_NOT_FOUND'), { code: 'RECORD_NOT_FOUND' });
+  if (String(row.status) !== 'void') {
+    throw Object.assign(new Error('INVALID_STATUS'), { code: 'INVALID_STATUS' });
+  }
+  const pi = parseJsonObject(row.payroll_inputs_json) || {};
+  const piNext = { ...pi };
+  delete piNext.payoutReleasedTotal;
+  const piJson = JSON.stringify(piNext);
+  await pool.query(
+    `UPDATE cln_salary_record SET
+      status = 'pending_sync',
+      paid_date = NULL,
+      payment_method = NULL,
+      bukku_expense_id = NULL,
+      xero_bank_transaction_id = NULL,
+      payroll_inputs_json = CAST(? AS JSON),
+      updated_at = CURRENT_TIMESTAMP(3)
+     WHERE id = ? AND operator_id = ? AND status = 'void' LIMIT 1`,
+    [piJson, rid, oid]
+  );
+  const [[r2]] = await pool.query(`SELECT * FROM cln_salary_record WHERE id = ? LIMIT 1`, [rid]);
+  return r2 ? mapRecordRow(r2) : null;
+}
+
+async function restoreSalaryRecordFromArchive(operatorId, recordId) {
+  const oid = String(operatorId || '').trim();
+  const rid = String(recordId || '').trim();
+  if (!oid || !rid) throw Object.assign(new Error('MISSING_PARAMS'), { code: 'MISSING_PARAMS' });
+  const ok = await salaryTablesExist();
+  if (!ok) throw Object.assign(new Error('SALARY_TABLES_MISSING'), { code: 'SALARY_TABLES_MISSING' });
+  const [[row]] = await pool.query(
+    `SELECT * FROM cln_salary_record WHERE id = ? AND operator_id = ? LIMIT 1`,
+    [rid, oid]
+  );
+  if (!row) throw Object.assign(new Error('RECORD_NOT_FOUND'), { code: 'RECORD_NOT_FOUND' });
+  if (String(row.status) !== 'archived') {
+    throw Object.assign(new Error('INVALID_STATUS'), { code: 'INVALID_STATUS' });
+  }
+  const pi = parseJsonObject(row.payroll_inputs_json) || {};
+  const piNext = { ...pi };
+  delete piNext.payoutReleasedTotal;
+  const piJson = JSON.stringify(piNext);
+  await pool.query(
+    `UPDATE cln_salary_record SET
+      status = 'pending_sync',
+      paid_date = NULL,
+      payment_method = NULL,
+      bukku_expense_id = NULL,
+      xero_bank_transaction_id = NULL,
+      payroll_inputs_json = CAST(? AS JSON),
+      updated_at = CURRENT_TIMESTAMP(3)
+     WHERE id = ? AND operator_id = ? AND status = 'archived' LIMIT 1`,
+    [piJson, rid, oid]
+  );
+  const [[r2]] = await pool.query(`SELECT * FROM cln_salary_record WHERE id = ? LIMIT 1`, [rid]);
+  return r2 ? mapRecordRow(r2) : null;
+}
+
 /**
- * Dr Salary & Wages, Cr Salary Control — net pay accrual (MYR).
+ * Dr Salaries & Wages, Cr Salary Control — net pay accrual (MYR).
  * @param {string} [journalDate] YYYY-MM-DD journal entry date (from UI); else last day of salary period.
  */
 async function syncSalaryRecordsToBukku(operatorId, recordIds, journalDate) {
@@ -703,10 +920,10 @@ async function syncSalaryRecordsToBukku(operatorId, recordIds, journalDate) {
   const req = bukkuReq(oid, creds);
   const system = 'bukku';
 
-  const expenseId = await resolveMappedAccountId(oid, 'Salary & Wages', system);
+  const expenseId = await resolveMappedAccountId(oid, CLN_SALARY_WAGES_ACCOUNT_TITLE, system);
   const controlId = await resolveMappedAccountId(oid, 'Salary Control', system);
   if (!expenseId || !controlId) {
-    return { ok: false, reason: 'BUKKU_ACCOUNT_MAPPING_MISSING', detail: 'Map Salary & Wages and Salary Control in Accounting' };
+    return { ok: false, reason: 'BUKKU_ACCOUNT_MAPPING_MISSING', detail: 'Map Salaries & Wages and Salary Control in Accounting' };
   }
 
   const results = [];
@@ -801,7 +1018,7 @@ async function syncSalaryRecordsToBukku(operatorId, recordIds, journalDate) {
 }
 
 /**
- * Dr Salary & Wages, Cr Salary Control — net pay accrual in Xero (LineAmount: negative = debit).
+ * Dr Salaries & Wages, Cr Salary Control — net pay accrual in Xero (LineAmount: negative = debit).
  */
 async function syncSalaryRecordsToXero(operatorId, recordIds, journalDate) {
   const oid = String(operatorId || '').trim();
@@ -813,13 +1030,13 @@ async function syncSalaryRecordsToXero(operatorId, recordIds, journalDate) {
 
   const req = xeroReq(oid);
   const system = 'xero';
-  const expenseRaw = await resolveMappedAccountExternal(oid, 'Salary & Wages', system);
+  const expenseRaw = await resolveMappedAccountExternal(oid, CLN_SALARY_WAGES_ACCOUNT_TITLE, system);
   const controlRaw = await resolveMappedAccountExternal(oid, 'Salary Control', system);
   if (!expenseRaw || !controlRaw) {
     return {
       ok: false,
       reason: 'XERO_ACCOUNT_MAPPING_MISSING',
-      detail: 'Map Salary & Wages and Salary Control in Accounting (Xero)'
+      detail: 'Map Salaries & Wages and Salary Control in Accounting (Xero)'
     };
   }
   const expenseCode = await resolveXeroAccountCode(req, expenseRaw);
@@ -828,7 +1045,7 @@ async function syncSalaryRecordsToXero(operatorId, recordIds, journalDate) {
     return {
       ok: false,
       reason: 'XERO_ACCOUNT_CODE_REQUIRED',
-      detail: 'Could not resolve Xero account codes for Salary & Wages / Salary Control'
+      detail: 'Could not resolve Xero account codes for Salaries & Wages / Salary Control'
     };
   }
 
@@ -906,7 +1123,7 @@ async function syncSalaryRecordsToAccounting(operatorId, recordIds, journalDate)
   return { ok: false, reason: 'NO_ACCOUNTING_PROVIDER', provider: provider || null };
 }
 
-async function markSalaryRecordsPaid(operatorId, recordIds, paymentDate, paymentMethod) {
+async function markSalaryRecordsPaid(operatorId, recordIds, paymentDate, paymentMethod, releaseAmountsInput) {
   const oid = String(operatorId || '').trim();
   if (!oid) return { ok: false, reason: 'MISSING_OPERATOR_ID' };
   const ok = await salaryTablesExist();
@@ -916,6 +1133,7 @@ async function markSalaryRecordsPaid(operatorId, recordIds, paymentDate, payment
   const pd = String(paymentDate || '').slice(0, 10);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(pd)) return { ok: false, reason: 'INVALID_DATE' };
   const pm = String(paymentMethod || 'bank_transfer').trim().slice(0, 32);
+  const releaseAmountsMap = parseReleaseAmountsInput(releaseAmountsInput);
   const provider = await getClnAddonAccountProvider(oid);
   const bukkuCreds = provider === 'bukku' ? await clnInt.getBukkuCredentials(oid) : null;
   const bukkuReqHttp = bukkuCreds?.token && bukkuCreds?.subdomain ? bukkuReq(oid, bukkuCreds) : null;
@@ -928,7 +1146,12 @@ async function markSalaryRecordsPaid(operatorId, recordIds, paymentDate, payment
       results.push({ id, ok: false, reason: 'NOT_FOUND' });
       continue;
     }
-    if (['void', 'archived', 'complete'].includes(row.status)) {
+    const st = String(row.status || '');
+    if (['void', 'archived', 'complete'].includes(st)) {
+      results.push({ id, ok: false, reason: 'INVALID_STATUS' });
+      continue;
+    }
+    if (st !== 'pending_sync' && st !== 'partial_paid') {
       results.push({ id, ok: false, reason: 'INVALID_STATUS' });
       continue;
     }
@@ -938,37 +1161,44 @@ async function markSalaryRecordsPaid(operatorId, recordIds, paymentDate, payment
         results.push({ id, ok: false, reason: 'NOT_SYNCED' });
         continue;
       }
-      if (row.bukku_expense_id) {
-        await pool.query(
-          `UPDATE cln_salary_record SET status = 'complete', payment_method = ?, paid_date = ?, updated_at = CURRENT_TIMESTAMP(3)
-           WHERE id = ? AND operator_id = ? LIMIT 1`,
-          [pm, pd, id, oid]
-        );
-        results.push({ id, ok: true, skipped: true, expenseId: String(row.bukku_expense_id) });
-        continue;
-      }
     } else if (provider === 'xero') {
       if (!row.xero_manual_journal_id) {
         results.push({ id, ok: false, reason: 'NOT_SYNCED' });
         continue;
       }
-      if (row.xero_bank_transaction_id) {
-        await pool.query(
-          `UPDATE cln_salary_record SET status = 'complete', payment_method = ?, paid_date = ?, updated_at = CURRENT_TIMESTAMP(3)
-           WHERE id = ? AND operator_id = ? LIMIT 1`,
-          [pm, pd, id, oid]
-        );
-        results.push({ id, ok: true, skipped: true, bankTransactionId: String(row.xero_bank_transaction_id) });
-        continue;
-      }
-    } else {
-      results.push({ id, ok: false, reason: 'NO_ACCOUNTING_PROVIDER' });
+    }
+    /* provider null: no Bukku/Xero — record payments in portal only (no accrual journal required). */
+
+    const pi = parseJsonObject(row.payroll_inputs_json) || {};
+    const released = roundMoney(Number(pi.payoutReleasedTotal || 0));
+    const net = roundMoney(Math.max(0, Number(row.net_salary || 0)));
+    if (net <= 0) {
+      results.push({ id, ok: false, reason: 'INVALID_AMOUNT' });
+      continue;
+    }
+    const remaining = roundMoney(Math.max(0, net - released));
+    if (remaining <= 0) {
+      await pool.query(
+        `UPDATE cln_salary_record SET status = 'complete', updated_at = CURRENT_TIMESTAMP(3)
+         WHERE id = ? AND operator_id = ? AND status <> 'complete' LIMIT 1`,
+        [id, oid]
+      );
+      results.push({ id, ok: true, skipped: true, reason: 'ALREADY_RELEASED' });
       continue;
     }
 
-    const net = Math.max(0, Number(row.net_salary || 0));
-    if (net <= 0) {
-      results.push({ id, ok: false, reason: 'INVALID_AMOUNT' });
+    let amt = releaseAmountsMap[id];
+    if (amt == null || !Number.isFinite(amt) || amt <= 0) {
+      amt = remaining;
+    } else {
+      amt = roundMoney(amt);
+    }
+    if (amt <= 0) {
+      results.push({ id, ok: false, reason: 'INVALID_RELEASE_AMOUNT' });
+      continue;
+    }
+    if (amt > remaining + 0.009) {
+      results.push({ id, ok: false, reason: 'RELEASE_EXCEEDS_REMAINING', detail: { remaining } });
       continue;
     }
 
@@ -1007,11 +1237,11 @@ async function markSalaryRecordsPaid(operatorId, recordIds, paymentDate, payment
             line: 1,
             account_id: salaryControlId,
             description: desc,
-            amount: net,
+            amount: amt,
             tax_code_id: null
           }
         ],
-        deposit_items: [{ account_id: bankAccountId, amount: net }],
+        deposit_items: [{ account_id: bankAccountId, amount: amt }],
         status: 'ready'
       };
       try {
@@ -1032,7 +1262,11 @@ async function markSalaryRecordsPaid(operatorId, recordIds, paymentDate, payment
         results.push({ id, ok: false, reason: e?.message || 'BUKKU_MONEY_OUT_FAILED' });
         continue;
       }
-    } else if (provider === 'xero' && xeroHttpReq) {
+    } else if (provider === 'xero') {
+      if (!xeroHttpReq) {
+        results.push({ id, ok: false, reason: 'XERO_NOT_CONNECTED' });
+        continue;
+      }
       const salaryControlRaw = await resolveMappedAccountExternal(oid, 'Salary Control', 'xero');
       if (!salaryControlRaw) {
         results.push({
@@ -1067,7 +1301,7 @@ async function markSalaryRecordsPaid(operatorId, recordIds, paymentDate, payment
       const lineItem = {
         Description: desc.slice(0, 500),
         Quantity: 1,
-        UnitAmount: net,
+        UnitAmount: amt,
         ...ctrlLine
       };
       const payloadX = {
@@ -1102,22 +1336,42 @@ async function markSalaryRecordsPaid(operatorId, recordIds, paymentDate, payment
       }
     }
 
+    const newReleased = roundMoney(released + amt);
+    const piNext = { ...pi, payoutReleasedTotal: newReleased };
+    const completeNow = newReleased >= net - 0.005;
+    const statusNext = completeNow ? 'complete' : 'partial_paid';
+    const piJson = JSON.stringify(piNext);
+
     if (provider === 'bukku') {
       await pool.query(
-        `UPDATE cln_salary_record SET status = 'complete', payment_method = ?, paid_date = ?,
-                bukku_expense_id = COALESCE(?, bukku_expense_id), updated_at = CURRENT_TIMESTAMP(3)
+        `UPDATE cln_salary_record SET status = ?, payment_method = ?, paid_date = ?,
+                payroll_inputs_json = CAST(? AS JSON), bukku_expense_id = ?, updated_at = CURRENT_TIMESTAMP(3)
          WHERE id = ? AND operator_id = ? LIMIT 1`,
-        [pm, pd, expenseIdOut, id, oid]
+        [statusNext, pm, pd, piJson, expenseIdOut, id, oid]
       );
-      results.push({ id, ok: true, expenseId: expenseIdOut || undefined });
+      results.push({ id, ok: true, expenseId: expenseIdOut || undefined, releasedTotal: newReleased, complete: completeNow });
+    } else if (provider === 'xero') {
+      await pool.query(
+        `UPDATE cln_salary_record SET status = ?, payment_method = ?, paid_date = ?,
+                payroll_inputs_json = CAST(? AS JSON), xero_bank_transaction_id = ?, updated_at = CURRENT_TIMESTAMP(3)
+         WHERE id = ? AND operator_id = ? LIMIT 1`,
+        [statusNext, pm, pd, piJson, bankTxnIdOut, id, oid]
+      );
+      results.push({ id, ok: true, bankTransactionId: bankTxnIdOut || undefined, releasedTotal: newReleased, complete: completeNow });
     } else {
       await pool.query(
-        `UPDATE cln_salary_record SET status = 'complete', payment_method = ?, paid_date = ?,
-                xero_bank_transaction_id = COALESCE(?, xero_bank_transaction_id), updated_at = CURRENT_TIMESTAMP(3)
+        `UPDATE cln_salary_record SET status = ?, payment_method = ?, paid_date = ?,
+                payroll_inputs_json = CAST(? AS JSON), updated_at = CURRENT_TIMESTAMP(3)
          WHERE id = ? AND operator_id = ? LIMIT 1`,
-        [pm, pd, bankTxnIdOut, id, oid]
+        [statusNext, pm, pd, piJson, id, oid]
       );
-      results.push({ id, ok: true, bankTransactionId: bankTxnIdOut || undefined });
+      results.push({
+        id,
+        ok: true,
+        releasedTotal: newReleased,
+        complete: completeNow,
+        manualOnly: true
+      });
     }
   }
   return { ok: results.every((r) => r.ok), results, provider: provider || undefined };
@@ -1219,6 +1473,9 @@ module.exports = {
   updateSalaryLine,
   deleteSalaryLine,
   patchSalaryRecordStatus,
+  voidSalaryRecordPayment,
+  restoreSalaryRecordFromVoid,
+  restoreSalaryRecordFromArchive,
   syncSalaryRecordsToBukku,
   syncSalaryRecordsToXero,
   syncSalaryRecordsToAccounting,

@@ -23,7 +23,18 @@ function SignUpInner() {
   function startOAuth(provider: "google" | "facebook") {
     if (isDemoSite()) {
       const demoEmail = "demo@demo.com"
-      setMember({ email: demoEmail, roles: [{ type: "staff", staffId: "demo-staff", clientId: "demo-client", clientTitle: "Demo Client" }] })
+      setMember({
+        email: demoEmail,
+        roles: [
+          {
+            type: "staff",
+            staffSource: "coliving_client_user",
+            staffId: "demo-staff",
+            clientId: "demo-client",
+            clientTitle: "Demo Client",
+          },
+        ],
+      })
       if (typeof window !== "undefined") {
         localStorage.setItem("user", JSON.stringify({
           email: demoEmail,

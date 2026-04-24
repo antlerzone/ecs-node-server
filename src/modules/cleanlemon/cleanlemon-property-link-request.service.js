@@ -408,7 +408,15 @@ async function approvePropertyLinkRequest({ requestId, decidedByEmail, getClnAcc
       e.code = 'CLIENTDETAIL_COLUMN_MISSING';
       throw e;
     }
-    await pool.query('UPDATE cln_property SET clientdetail_id = ?, updated_at = NOW(3) WHERE id = ?', [cid, pid]);
+    const hasLegacyClientId = await databaseHasColumn('cln_property', 'client_id');
+    if (hasLegacyClientId) {
+      await pool.query(
+        'UPDATE cln_property SET clientdetail_id = ?, client_id = ?, updated_at = NOW(3) WHERE id = ?',
+        [cid, cid, pid]
+      );
+    } else {
+      await pool.query('UPDATE cln_property SET clientdetail_id = ?, updated_at = NOW(3) WHERE id = ?', [cid, pid]);
+    }
     await ensureClnClientOperatorJunction(cid, oid);
     await pushAccountingAfterLinkApproval(getClnAccountProviderForOperator, cid, oid);
   }

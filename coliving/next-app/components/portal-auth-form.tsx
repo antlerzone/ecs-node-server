@@ -137,7 +137,15 @@ export function PortalAuthForm({
     if (isDemoSite()) {
       setMember({
         email: email.trim(),
-        roles: [{ type: "staff", staffId: "demo-staff", clientId: "demo-client", clientTitle: "Demo Client" }],
+        roles: [
+          {
+            type: "staff",
+            staffSource: "coliving_client_user",
+            staffId: "demo-staff",
+            clientId: "demo-client",
+            clientTitle: "Demo Client",
+          },
+        ],
       })
       setCurrentRole({
         type: "staff",
@@ -212,7 +220,15 @@ export function PortalAuthForm({
       const demoEmail = email?.trim() || "demo@demo.com"
       setMember({
         email: demoEmail,
-        roles: [{ type: "staff", staffId: "demo-staff", clientId: "demo-client", clientTitle: "Demo Client" }],
+        roles: [
+          {
+            type: "staff",
+            staffSource: "coliving_client_user",
+            staffId: "demo-staff",
+            clientId: "demo-client",
+            clientTitle: "Demo Client",
+          },
+        ],
       })
       setCurrentRole({
         type: "staff",
@@ -385,6 +401,10 @@ export function PortalAuthForm({
             </svg>
             Sign in with Facebook
           </Button>
+
+          <p className="text-xs text-red-600 text-center leading-snug">
+            Don&apos;t use a company email — you may need to verify your identity.
+          </p>
         </div>
 
         <div className="mt-6 pt-6 border-t border-border text-center space-y-2">

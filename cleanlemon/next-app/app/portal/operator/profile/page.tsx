@@ -1,7 +1,6 @@
-"use client"
+import { redirect } from 'next/navigation'
 
-import UnifiedProfilePage from '@/components/shared/unified-profile-page'
-
-export default function OperatorProfilePage() {
-  return <UnifiedProfilePage roleLabel="Operator" backendProfile />
+/** Operator portal no longer uses a personal Profile page — company/settings live under Company & Pricing. */
+export default function OperatorProfileRedirectPage() {
+  redirect('/operator')
 }

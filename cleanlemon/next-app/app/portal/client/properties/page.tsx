@@ -46,6 +46,13 @@ function isCompleteSecurityCredentials(
   }
 }
 
+function cleanlemonPortalOrigin(): string {
+  const o = (process.env.NEXT_PUBLIC_CLEANLEMON_PORTAL_ORIGIN || '').trim().replace(/\/$/, '')
+  if (o) return o
+  if (typeof window !== 'undefined') return window.location.origin
+  return ''
+}
+
 function formatSecuritySystemSummary(
   system: SecuritySystemIdOption,
   cred: Record<string, unknown> | null
@@ -125,6 +132,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { toast } from 'sonner'
+import { CleanlemonPropertyNativeLocksPanel } from '@/components/cleanlemons/cleanlemon-property-native-locks-panel'
 import {
   Building2,
   MapPin,
@@ -171,6 +179,8 @@ function formatPermTripletBits(t: { create: boolean; edit: boolean; delete: bool
 const OPERATOR_FILTER_UNASSIGNED = '__unassigned__'
 /** Row has pending `client_requests_operator` and no `operator_id` yet. */
 const OPERATOR_FILTER_PENDING = '__pending_approval__'
+
+const CLIENT_PROPERTIES_PAGE_SIZE_OPTIONS = [10, 20, 50, 100, 200] as const
 
 type ClientPropertyRow = {
   id: string
@@ -240,7 +250,6 @@ type DetailFormState = {
   propertyName: string
   address: string
   unitNumber: string
-  securityUsername: string
   mailboxPassword: string
   /** full_access | working_date_only | fixed_password */
   operatorDoorAccessMode: string
@@ -277,7 +286,6 @@ function detailToForm(p: ClientPortalPropertyDetail): DetailFormState {
     propertyName: String(p.name || '').trim(),
     address: String(p.address || '').trim(),
     unitNumber: String(p.unitNumber || '').trim(),
-    securityUsername: String(p.securityUsername || '').trim(),
     mailboxPassword: p.mailboxPassword || '',
     operatorDoorAccessMode,
     smartdoorPassword: sdp,
@@ -309,7 +317,6 @@ const ClientPropertiesPage = () => {
     propertyName: '',
     address: '',
     unitNumber: '',
-    securityUsername: '',
     mailboxPassword: '',
     operatorDoorAccessMode: 'temporary_password_only',
     smartdoorPassword: '',
@@ -349,7 +356,15 @@ const ClientPropertiesPage = () => {
   const [apartmentNameDraft, setApartmentNameDraft] = useState('')
   const [connectOpen1, setConnectOpen1] = useState(false)
   const [connectOpen2, setConnectOpen2] = useState(false)
-  const [connectOperators, setConnectOperators] = useState<Array<{ id: string; name?: string; email?: string }>>([])
+  const [connectOperators, setConnectOperators] = useState<
+    Array<{
+      id: string
+      name?: string
+      email?: string
+      clientToOperatorReviewCount?: number
+      clientToOperatorAverageStars?: number | null
+    }>
+  >([])
   const [connectPickId, setConnectPickId] = useState('')
   const [connectAckTtlock, setConnectAckTtlock] = useState(false)
   const [connectBusy, setConnectBusy] = useState(false)
@@ -367,7 +382,6 @@ const ClientPropertiesPage = () => {
     name: '',
     address: '',
     unitNumber: '',
-    securityUsername: '',
     keyCollection: 'no',
     securitySystem: '',
     afterCleanPhoto: '',
@@ -389,6 +403,7 @@ const ClientPropertiesPage = () => {
     specialAreaCount: '',
   })
   const [properties, setProperties] = useState<ClientPropertyRow[]>([])
+  const [propertiesTablePageSize, setPropertiesTablePageSize] = useState(10)
   const [selectedPropertyIds, setSelectedPropertyIds] = useState<Set<string>>(() => new Set())
   const [bulkConnectOpen1, setBulkConnectOpen1] = useState(false)
   const [bulkConnectOpen2, setBulkConnectOpen2] = useState(false)
@@ -916,7 +931,7 @@ const ClientPropertiesPage = () => {
         clientPortalOwned: true,
         keyCollection: form.mailboxPassword || form.smartdoorPasswordEnabled || form.smartdoorTokenEnabled ? 'yes' : 'no',
         securitySystem: String(form.securitySystem || '').trim(),
-        securityUsername: String(form.securityUsername || '').trim(),
+        securityUsername: null,
         afterCleanPhoto: form.afterCleanPhoto,
         keyPhoto: form.keyPhoto,
         importSource: '',
@@ -953,7 +968,6 @@ const ClientPropertiesPage = () => {
         name: '',
         address: '',
         unitNumber: '',
-        securityUsername: '',
         keyCollection: 'no',
         securitySystem: '',
         afterCleanPhoto: '',
@@ -1018,9 +1032,16 @@ const ClientPropertiesPage = () => {
     return !!(ga.perm?.property?.edit ?? false)
   }, [propertyDetail])
 
-  /** Coliving-synced row (`client_portal_owned=0`): only photos + bed/room/bathroom counts. */
-  const isColivingImportedProperty = propertyDetail != null && propertyDetail.clientPortalOwned === false
-  const canEditAllCorePropertyFields = canEditPropertyFields && !isColivingImportedProperty
+  /** Full edit: client-created, or operator-linked unit with bound B2B client (`clientPortalAllowsFullEdit` from API). */
+  const clientPortalAllowsFullEdit = useMemo(() => {
+    if (!propertyDetail) return true
+    if (typeof propertyDetail.clientPortalAllowsFullEdit === 'boolean') {
+      return propertyDetail.clientPortalAllowsFullEdit
+    }
+    if (propertyDetail.clientPortalOwned !== false) return true
+    return !!String(propertyDetail.operatorId || '').trim()
+  }, [propertyDetail])
+  const canEditAllCorePropertyFields = canEditPropertyFields && clientPortalAllowsFullEdit
   /** Green channel: smart door / operator door mode editable even for Coliving-synced units. */
   const canEditOperatorDoorBlock = canEditPropertyFields
 
@@ -1030,7 +1051,7 @@ const ClientPropertiesPage = () => {
   }, [detailForm.securitySystem, persistedSecurityCredentials])
 
   const openSecurityCredentialsModal = useCallback(() => {
-    if (propertyDetail?.clientPortalOwned === false) {
+    if (propertyDetail && !clientPortalAllowsFullEdit) {
       toast.error('This property is synced from Coliving. Change security in the operator property page.')
       return
     }
@@ -1064,7 +1085,7 @@ const ClientPropertiesPage = () => {
         : ''
     )
     setSecCredModalOpen(true)
-  }, [detailForm.securitySystem, persistedSecurityCredentials, propertyDetail?.clientPortalOwned])
+  }, [detailForm.securitySystem, persistedSecurityCredentials, propertyDetail, clientPortalAllowsFullEdit])
 
   const handleSecurityCredentialsModalSave = useCallback(async () => {
     if (!selectedProperty?.id || !user?.email) return
@@ -1072,7 +1093,7 @@ const ClientPropertiesPage = () => {
       toast.error('You do not have permission to edit this property.')
       return
     }
-    if (propertyDetail?.clientPortalOwned === false) {
+    if (propertyDetail && !clientPortalAllowsFullEdit) {
       toast.error('Synced properties: edit security in the Coliving operator property page.')
       return
     }
@@ -1139,7 +1160,7 @@ const ClientPropertiesPage = () => {
     user?.email,
     user?.operatorId,
     canEditPropertyFields,
-    propertyDetail?.clientPortalOwned,
+    clientPortalAllowsFullEdit,
     propertyDetail?.colivingPropertydetailId,
     secCredModalSystem,
     secCredPhone,
@@ -1203,7 +1224,7 @@ const ClientPropertiesPage = () => {
     }
     setDetailSaving(true)
     try {
-      const importedRestricted = propertyDetail?.clientPortalOwned === false
+      const importedRestricted = propertyDetail != null && !clientPortalAllowsFullEdit
       const body = importedRestricted
         ? {
             afterCleanPhotoUrl: detailForm.afterCleanPhotoUrl,
@@ -1211,6 +1232,10 @@ const ClientPropertiesPage = () => {
             bedCount: detailForm.bedCount,
             roomCount: detailForm.roomCount,
             bathroomCount: detailForm.bathroomCount,
+            mailboxPassword: detailForm.mailboxPassword,
+            operatorDoorAccessMode: detailForm.operatorDoorAccessMode,
+            smartdoorPassword: detailForm.smartdoorPasswordEnabled ? detailForm.smartdoorPassword : '',
+            smartdoorTokenEnabled: detailForm.smartdoorTokenEnabled,
           }
         : {
             premisesType: detailForm.premisesType,
@@ -1218,7 +1243,7 @@ const ClientPropertiesPage = () => {
             address: detailForm.address,
             unitNumber: detailForm.unitNumber,
             securitySystem: detailForm.securitySystem,
-            securityUsername: detailForm.securityUsername,
+            securityUsername: null,
             mailboxPassword: detailForm.mailboxPassword,
             operatorDoorAccessMode: detailForm.operatorDoorAccessMode,
             smartdoorPassword: detailForm.smartdoorPasswordEnabled ? detailForm.smartdoorPassword : '',
@@ -2115,7 +2140,17 @@ const ClientPropertiesPage = () => {
                     columns={columns}
                     actions={actions}
                     searchKeys={['name', 'unitNumber', 'groupLabel', 'operator']}
-                    pageSize={10}
+                    pageSize={propertiesTablePageSize}
+                    pageSizeSelect={{
+                      value: propertiesTablePageSize,
+                      onChange: (n) => {
+                        if (CLIENT_PROPERTIES_PAGE_SIZE_OPTIONS.some((x) => x === n)) {
+                          setPropertiesTablePageSize(n)
+                        }
+                      },
+                      options: [...CLIENT_PROPERTIES_PAGE_SIZE_OPTIONS],
+                      id: 'client-properties-page-size',
+                    }}
                     fillContainer
                     noHorizontalScroll
                     emptyMessage={
@@ -2166,7 +2201,7 @@ const ClientPropertiesPage = () => {
                     </div>
                   </div>
 
-                  {isColivingImportedProperty ? (
+                  {!clientPortalAllowsFullEdit ? (
                     <p className="text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
                       Synced from Coliving: name, address, unit, premises type, security, mailbox and smart door are read-only
                       here — change them in the Coliving operator property page. You can still update after-clean / key photos
@@ -2224,19 +2259,6 @@ const ClientPropertiesPage = () => {
                         id="dlg-unit"
                         value={detailForm.unitNumber}
                         onChange={(e) => setDetailForm((f) => ({ ...f, unitNumber: e.target.value }))}
-                        disabled={!canEditAllCorePropertyFields}
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <Label htmlFor="dlg-security-username" className="text-xs">
-                        Security username
-                      </Label>
-                      <Input
-                        id="dlg-security-username"
-                        className="mt-1"
-                        value={detailForm.securityUsername}
-                        onChange={(e) => setDetailForm((f) => ({ ...f, securityUsername: e.target.value }))}
-                        placeholder="e.g. icare / gprop username"
                         disabled={!canEditAllCorePropertyFields}
                       />
                     </div>
@@ -2438,7 +2460,7 @@ const ClientPropertiesPage = () => {
                     <p className="text-xs text-muted-foreground">
                       Counts and mailbox (above) are saved to Cleanlemons and mirrored to Coliving{' '}
                       <code className="text-xs">propertydetail</code> when this unit is linked (same DB as api.colivingjb.com).
-                      {isColivingImportedProperty
+                      {!clientPortalAllowsFullEdit
                         ? ' For synced units, only bed / room / bathroom counts are editable here; other area counts and lift level follow Coliving.'
                         : ''}
                     </p>
@@ -2463,7 +2485,7 @@ const ClientPropertiesPage = () => {
                             onChange={(e) => setDetailForm((f) => ({ ...f, [key]: e.target.value }))}
                             disabled={
                               !canEditPropertyFields ||
-                              (isColivingImportedProperty &&
+                              (!clientPortalAllowsFullEdit &&
                                 key !== 'bedCount' &&
                                 key !== 'roomCount' &&
                                 key !== 'bathroomCount')
@@ -2535,6 +2557,23 @@ const ClientPropertiesPage = () => {
                         </p>
                       ) : null}
                     </div>
+                  ) : null}
+
+                  {propertyDetail &&
+                  !String(propertyDetail.colivingPropertydetailId || '').trim() &&
+                  propertyDetail.smartdoorBindManualAllowed !== false ? (
+                    <CleanlemonPropertyNativeLocksPanel
+                      scope="client"
+                      email={String(user?.email || '')}
+                      operatorId={String(propertyDetail.operatorId || '').trim()}
+                      propertyId={propertyDetail.id}
+                      canBindAndUnbind={canEditPropertyFields}
+                      readOnlyHint={
+                        !canEditPropertyFields
+                          ? 'You cannot change TTLock binding for this property with your current access.'
+                          : undefined
+                      }
+                    />
                   ) : null}
 
                   {/* Cleaning prices — view only, MYR; cleang_fees / cleaning_fees shown as Homestay cleaning */}
@@ -2770,10 +2809,21 @@ const ClientPropertiesPage = () => {
         <DialogContent className="max-w-md">
           <DialogHeader>
             <DialogTitle>Authorise operator (bulk)</DialogTitle>
-            <DialogDescription>
-              Choose one cleaning operator for {bulkConnectMeta.selectedCount} propert
-              {bulkConnectMeta.selectedCount === 1 ? 'y' : 'ies'}. Each will get a pending approval request (same as
-              single Connect).
+            <DialogDescription asChild>
+              <span className="text-sm text-muted-foreground">
+                Choose one cleaning operator for {bulkConnectMeta.selectedCount} propert
+                {bulkConnectMeta.selectedCount === 1 ? 'y' : 'ies'}. Each will get a pending approval request (same as
+                single Connect). Browse all{' '}
+                <a
+                  href={`${cleanlemonPortalOrigin()}/cleaning-company`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-primary underline"
+                >
+                  operator companies
+                </a>
+                .
+              </span>
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3 py-2">
@@ -2783,13 +2833,32 @@ const ClientPropertiesPage = () => {
                 <SelectValue placeholder="Select operator…" />
               </SelectTrigger>
               <SelectContent className="max-h-72">
-                {connectOperators.map((op) => (
-                  <SelectItem key={op.id} value={op.id}>
-                    {op.name || op.email || op.id}
-                  </SelectItem>
-                ))}
+                {connectOperators.map((op) => {
+                  const avg = op.clientToOperatorAverageStars
+                  const label =
+                    avg != null
+                      ? `${op.name || op.email || op.id} (${avg} review)`
+                      : `${op.name || op.email || op.id}`
+                  return (
+                    <SelectItem key={op.id} value={op.id}>
+                      {label}
+                    </SelectItem>
+                  )
+                })}
               </SelectContent>
             </Select>
+            {bulkConnectPickId ? (
+              <p className="text-sm">
+                <a
+                  className="text-primary underline"
+                  href={`/profile/${encodeURIComponent(bulkConnectPickId)}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  View profile
+                </a>
+              </p>
+            ) : null}
           </div>
           <DialogFooter className="gap-2">
             <Button type="button" variant="outline" onClick={() => setBulkConnectOpen1(false)}>
@@ -2944,7 +3013,20 @@ const ClientPropertiesPage = () => {
         <DialogContent className="max-w-md">
           <DialogHeader>
             <DialogTitle>Connect cleaning operator</DialogTitle>
-            <DialogDescription>Choose which Cleanlemons operator company manages this property.</DialogDescription>
+            <DialogDescription asChild>
+              <span className="text-sm text-muted-foreground">
+                Choose which Cleanlemons{' '}
+                <a
+                  href={`${cleanlemonPortalOrigin()}/cleaning-company`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-primary underline"
+                >
+                  operator company
+                </a>{' '}
+                manages this property.
+              </span>
+            </DialogDescription>
           </DialogHeader>
           <div className="space-y-3 py-2">
             <Label>Operator</Label>
@@ -2953,13 +3035,32 @@ const ClientPropertiesPage = () => {
                 <SelectValue placeholder="Select operator…" />
               </SelectTrigger>
               <SelectContent className="max-h-72">
-                {connectOperators.map((op) => (
-                  <SelectItem key={op.id} value={op.id}>
-                    {op.name || op.email || op.id}
-                  </SelectItem>
-                ))}
+                {connectOperators.map((op) => {
+                  const avg = op.clientToOperatorAverageStars
+                  const label =
+                    avg != null
+                      ? `${op.name || op.email || op.id} (${avg} review)`
+                      : `${op.name || op.email || op.id}`
+                  return (
+                    <SelectItem key={op.id} value={op.id}>
+                      {label}
+                    </SelectItem>
+                  )
+                })}
               </SelectContent>
             </Select>
+            {connectPickId ? (
+              <p className="text-sm">
+                <a
+                  className="text-primary underline"
+                  href={`/profile/${encodeURIComponent(connectPickId)}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  View profile
+                </a>
+              </p>
+            ) : null}
           </div>
           <DialogFooter className="gap-2">
             <Button type="button" variant="outline" onClick={() => setConnectOpen1(false)}>
@@ -3209,15 +3310,6 @@ const ClientPropertiesPage = () => {
                     <option value="icare">icare</option>
                     <option value="ecommunity">ecommunity</option>
                   </select>
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="securityUsername">Security Username</Label>
-                  <Input
-                    id="securityUsername"
-                    value={form.securityUsername}
-                    onChange={(e) => setForm((prev) => ({ ...prev, securityUsername: e.target.value }))}
-                    placeholder="e.g. icare / gprop username"
-                  />
                 </div>
                 <div className="space-y-2 md:col-span-2 border rounded-md p-3">
                   <label className="flex items-center gap-2 text-sm">

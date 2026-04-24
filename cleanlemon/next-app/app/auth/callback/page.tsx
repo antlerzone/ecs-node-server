@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { getCleanlemonApiBase } from "@/lib/portal-auth-mock";
+import { getCleanlemonApiBaseWithDevFallback } from "@/lib/portal-auth-mock";
 import { pickFirstClientIdFromMemberRoles, type CleanlemonsJwtContext } from "@/lib/auth-context";
 import {
   CLEANLEMONS_ACTIVE_OPERATOR_ID_KEY,
@@ -52,7 +52,7 @@ export default function CleanlemonsAuthCallbackPage() {
       setError("Missing auth token.");
       return;
     }
-    const apiBase = getCleanlemonApiBase();
+    const apiBase = getCleanlemonApiBaseWithDevFallback();
     if (!apiBase) {
       setError("OAuth verification failed (API base URL not set). Check NEXT_PUBLIC_CLEANLEMON_API_URL and restart dev.");
       return;

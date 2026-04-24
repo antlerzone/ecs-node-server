@@ -35,7 +35,7 @@ type Props = {
   roleLabel: string
   backendProfile?: boolean
   localStorageKey?: string
-  /** Client/employee: confirm profile (portal self-verify gate). */
+  /** Employee (and optional others): Aliyun eKYC / self-verify UI. Client portal does not use this. */
   selfVerifyMode?: boolean
 }
 
@@ -79,6 +79,8 @@ export default function UnifiedProfilePage({
   const [profileSelfVerifiedAt, setProfileSelfVerifiedAt] = useState('')
   const [profileIdentityVerified, setProfileIdentityVerified] = useState(false)
   const [passportExpiryDate, setPassportExpiryDate] = useState('')
+  /** Coliving public `/profile/{portal_account.id}` (hosted on portal.colivingjb.com). */
+  const [portalAccountId, setPortalAccountId] = useState<string | null>(null)
   const [aliyunEkycVerified, setAliyunEkycVerified] = useState(false)
   const [aliyunEkycStarting, setAliyunEkycStarting] = useState(false)
   const [govDialogOpen, setGovDialogOpen] = useState(false)
@@ -121,17 +123,28 @@ export default function UnifiedProfilePage({
     [nickname, legalName, fullName]
   )
 
+  const colivingPublicProfileHref = useMemo(() => {
+    const id = String(portalAccountId || '').trim()
+    if (!id) return ''
+    const origin = (process.env.NEXT_PUBLIC_COLIVING_PORTAL_ORIGIN || 'https://portal.colivingjb.com').replace(
+      /\/$/,
+      ''
+    )
+    return `${origin}/profile/${encodeURIComponent(id)}`
+  }, [portalAccountId])
+
   const idTypeU = useMemo(() => String(idType || '').toUpperCase(), [idType])
 
   const roleNorm = String(roleLabel || '')
     .trim()
     .toLowerCase()
 
-  /** Employee/Client + API profile: always show Verify (covers stale builds where selfVerifyMode was omitted). */
+  /** Employee eKYC hard gate (layout + modal) — off until product turns it back on. */
+  const requiresMandatoryEkyc = false
+
+  /** Employee + API profile: Verify / eKYC. Client uses profile completeness only (no eKYC). */
   const selfVerifyActive = useMemo(
-    () =>
-      !!backendProfile &&
-      (selfVerifyMode || roleNorm === 'employee' || roleNorm === 'client'),
+    () => !!backendProfile && (selfVerifyMode || roleNorm === 'employee'),
     [backendProfile, selfVerifyMode, roleNorm]
   )
 
@@ -289,10 +302,12 @@ export default function UnifiedProfilePage({
     }
     let cancelled = false
     ;(async () => {
-      const result = await fetchEmployeeProfileByEmail(email)
+      const result = await fetchEmployeeProfileByEmail(email, clientId)
       if (cancelled) return
       if (result?.ok && result.profile) {
         const p = result.profile
+        const pid = String((p as { portalAccountId?: string }).portalAccountId || '').trim()
+        setPortalAccountId(pid || null)
         setFullName(String(p.fullName || fullName))
         setLegalName(String(p.legalName || legalName))
         setNickname(String(p.nickname || nickname))
@@ -686,7 +701,9 @@ export default function UnifiedProfilePage({
 
   const selfVerifyVerifiedForUi =
     selfVerifyActive &&
-    (profileSelfVerifiedAt.trim() !== '' || aliyunEkycVerified || profileIdentityVerified)
+    (requiresMandatoryEkyc
+      ? aliyunEkycVerified
+      : profileSelfVerifiedAt.trim() !== '' || aliyunEkycVerified || profileIdentityVerified)
 
   const selfVerifyAliyunDone = selfVerifyActive && aliyunEkycVerified
   const disableVerificationDialogMyKad = !backendProfile || aliyunEkycStarting || selfVerifyAliyunDone
@@ -736,13 +753,14 @@ export default function UnifiedProfilePage({
     }
   }
 
-  const selfVerifyDialogMandatory = selfVerifyActive && !selfVerifyVerifiedForUi
+  const selfVerifyDialogMandatory = selfVerifyActive && !selfVerifyVerifiedForUi && requiresMandatoryEkyc
 
   useEffect(() => {
     if (isInitializing) return
     if (!selfVerifyActive) return
+    if (!requiresMandatoryEkyc) return
     if (!selfVerifyVerifiedForUi) setGovDialogOpen(true)
-  }, [isInitializing, selfVerifyActive, selfVerifyVerifiedForUi])
+  }, [isInitializing, selfVerifyActive, selfVerifyVerifiedForUi, requiresMandatoryEkyc])
 
   useEffect(() => {
     if (!selfVerifyActive) {
@@ -769,6 +787,8 @@ export default function UnifiedProfilePage({
           return
         }
         const p = result.profile as Record<string, unknown>
+        const pid = String(p.portalAccountId || '').trim()
+        if (pid) setPortalAccountId(pid)
         const psva = String(p.profileSelfVerifiedAt || '').trim()
         const ekycLock = !!(p as { aliyunEkycLocked?: boolean }).aliyunEkycLocked
         const piv = !!(p as { profileIdentityVerified?: boolean }).profileIdentityVerified
@@ -776,19 +796,46 @@ export default function UnifiedProfilePage({
         setAliyunEkycVerified(ekycLock)
         setProfileIdentityVerified(piv)
         setPassportExpiryDate(String((p as { passportExpiryDate?: string }).passportExpiryDate || '').trim())
-        if (psva === '' && !ekycLock && !piv) setGovDialogOpen(true)
+        if (requiresMandatoryEkyc && !ekycLock) setGovDialogOpen(true)
       })()
     }
     window.addEventListener('pageshow', onPageShow)
     return () => window.removeEventListener('pageshow', onPageShow)
-  }, [selfVerifyActive, email, clientId])
+  }, [selfVerifyActive, email, clientId, requiresMandatoryEkyc])
 
   return (
     <div className="p-4 sm:p-8 max-w-4xl mx-auto">
-      <div className="mb-8">
-        <h1 className="text-3xl font-black text-foreground">Profile Settings</h1>
-        <p className="text-muted-foreground mt-1">Manage your personal information and preferences.</p>
-        <p className="text-xs text-muted-foreground mt-2">{saveHint}</p>
+      <div className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0">
+          <h1 className="text-3xl font-black text-foreground">Profile Settings</h1>
+          <p className="text-muted-foreground mt-1">Manage your personal information and preferences.</p>
+          <p className="text-xs text-muted-foreground mt-2">{saveHint}</p>
+        </div>
+        {backendProfile ? (
+          <div className="flex flex-wrap items-center justify-end gap-2 shrink-0">
+            <Button
+              type="button"
+              variant="outline"
+              className="shrink-0 gap-2 rounded-xl border-border font-semibold"
+              disabled={!colivingPublicProfileHref}
+              title={
+                !colivingPublicProfileHref
+                  ? 'Public profile link will be available after your account is linked'
+                  : undefined
+              }
+              onClick={() => {
+                if (!colivingPublicProfileHref) {
+                  toast.error('Public profile link is not available yet')
+                  return
+                }
+                window.open(colivingPublicProfileHref, '_blank', 'noopener,noreferrer')
+              }}
+            >
+              <Eye className="h-4 w-4" />
+              View my profile
+            </Button>
+          </div>
+        ) : null}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -888,7 +935,7 @@ export default function UnifiedProfilePage({
             {selfVerifyActive && !selfVerifyVerifiedForUi ? (
               <div className="mb-5 flex flex-col gap-3 rounded-xl border border-primary/35 bg-primary/5 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
                 <p className="text-sm font-medium text-foreground">
-                  Complete identity verification (MyKad or passport). Required for Employee and Client portal access.
+                  Complete MyKad or passport eKYC — required before using the rest of the portal.
                 </p>
                 <Button
                   type="button"
@@ -994,7 +1041,11 @@ export default function UnifiedProfilePage({
               <Label className="text-[10px] font-semibold tracking-[0.2em] uppercase text-muted-foreground mb-2 block">
                 {idLabels.section}
               </Label>
-              <p className="text-xs text-muted-foreground mb-3">Upload images for verification. Preview updates after upload.</p>
+              <p className="text-xs text-muted-foreground mb-3">
+                {selfVerifyActive
+                  ? 'Upload images for verification. Preview updates after upload.'
+                  : 'Optional: upload ID images. Preview updates after upload.'}
+              </p>
               <div className={`grid grid-cols-1 ${requiresBackImage ? 'sm:grid-cols-2' : ''} gap-4`}>
                 <div>
                   <p className="text-xs font-medium text-foreground mb-2">{idLabels.front} *</p>
@@ -1157,7 +1208,7 @@ export default function UnifiedProfilePage({
           </DialogHeader>
           <div className="flex flex-col gap-3 py-2">
             <p className="text-sm text-muted-foreground">
-              Choose Malaysian MyKad (NRIC) or passport. After verification you can finish your profile here.
+              Choose Malaysian MyKad (NRIC) or passport. Required for employee portal access.
             </p>
             <Button
               type="button"

@@ -6,7 +6,7 @@ import { useTenantOptional } from "@/contexts/tenant-context"
 export default function TenantProfilePage() {
   const tenantState = useTenantOptional()
   const t = tenantState?.tenant
-  const publicProfileTenantId = (t?.id ?? t?._id ?? '').trim() || null
+  const publicProfileTenantId = (t?.id ?? t?._id ?? "").trim() || null
 
   return (
     <UnifiedProfilePage

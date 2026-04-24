@@ -26,9 +26,12 @@ import {
   fetchCleanlemonPricingConfig,
   saveCleanlemonPricingConfig,
   fetchOperatorPortalSetupStatus,
+  normalizeServiceAreaZones,
   type CleanlemonPricingConfig,
   type OperatorPortalSetupStatus,
+  type ServiceAreaZone,
 } from "@/lib/cleanlemon-api"
+import { OperatorServiceLocationDialog } from "@/components/portal/operator/operator-service-location-dialog"
 import { PRICING_SERVICES, type ServiceKey } from "@/lib/cleanlemon-pricing-services"
 import { cn } from "@/lib/utils"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -271,6 +274,8 @@ export default function OperatorPricingPage() {
   const [portalSetupGate, setPortalSetupGate] = useState<OperatorPortalSetupStatus | null>(null)
 
   const [serviceDialogOpen, setServiceDialogOpen] = useState(false)
+  const [serviceLocationDialogOpen, setServiceLocationDialogOpen] = useState(false)
+  const [serviceAreaZones, setServiceAreaZones] = useState<ServiceAreaZone[]>([])
   const [detailDialogOpen, setDetailDialogOpen] = useState(false)
   const [detailType, setDetailType] = useState<DetailType>("by_hour")
   /** By Hour / By Property detail dialog: must reach Summary before Save commits. */
@@ -333,6 +338,7 @@ export default function OperatorPricingPage() {
           }
           setLeadTimeByService(next)
         }
+        setServiceAreaZones(normalizeServiceAreaZones(config.serviceAreaZones))
       }
       setIsLoadingRemote(false)
     })()
@@ -468,26 +474,29 @@ export default function OperatorPricingPage() {
     }))
   }
 
-  const persistPricingConfig = useCallback(async () => {
-    if (isLoadingRemote) return
-    setIsSavingRemote(true)
-    try {
-      const prevR = await fetchCleanlemonPricingConfig(operatorId)
-      const prev = (prevR.ok && prevR.config ? prevR.config : {}) as Partial<CleanlemonPricingConfig>
-      const payload: CleanlemonPricingConfig = {
-        ...prev,
-        selectedServices,
-        activeServiceTab,
-        serviceConfigs,
-        bookingMode,
-        bookingModeByService: Object.fromEntries(
-          Object.entries(bookingModeByService).filter(([, v]) => v === "instant" || v === "request_approve")
-        ) as CleanlemonPricingConfig["bookingModeByService"],
-        leadTime,
-        leadTimeByService: Object.fromEntries(
-          Object.entries(leadTimeByService).filter(([, v]) => typeof v === "string" && isLeadTime(v))
-        ) as CleanlemonPricingConfig["leadTimeByService"],
-      }
+  const persistPricingConfig = useCallback(
+    async (overrideServiceAreaZones?: ServiceAreaZone[]) => {
+      if (isLoadingRemote) return
+      setIsSavingRemote(true)
+      try {
+        const prevR = await fetchCleanlemonPricingConfig(operatorId)
+        const prev = (prevR.ok && prevR.config ? prevR.config : {}) as Partial<CleanlemonPricingConfig>
+        const zonesToSave = overrideServiceAreaZones ?? serviceAreaZones
+        const payload: CleanlemonPricingConfig = {
+          ...prev,
+          selectedServices,
+          activeServiceTab,
+          serviceConfigs,
+          bookingMode,
+          bookingModeByService: Object.fromEntries(
+            Object.entries(bookingModeByService).filter(([, v]) => v === "instant" || v === "request_approve")
+          ) as CleanlemonPricingConfig["bookingModeByService"],
+          leadTime,
+          leadTimeByService: Object.fromEntries(
+            Object.entries(leadTimeByService).filter(([, v]) => typeof v === "string" && isLeadTime(v))
+          ) as CleanlemonPricingConfig["leadTimeByService"],
+          serviceAreaZones: zonesToSave,
+        }
       const r = await saveCleanlemonPricingConfig(operatorId, payload)
       if (!r.ok) {
         toast.error(`Save failed (${r.reason || "UNKNOWN"})`)
@@ -502,21 +511,32 @@ export default function OperatorPricingPage() {
           /* ignore */
         }
       }
-    } finally {
-      setIsSavingRemote(false)
-    }
-  }, [
-    operatorId,
-    isLoadingRemote,
-    selectedServices,
-    activeServiceTab,
-    serviceConfigs,
-    bookingMode,
-    bookingModeByService,
-    leadTime,
-    leadTimeByService,
-    user?.email,
-  ])
+      } finally {
+        setIsSavingRemote(false)
+      }
+    },
+    [
+      operatorId,
+      isLoadingRemote,
+      selectedServices,
+      activeServiceTab,
+      serviceConfigs,
+      bookingMode,
+      bookingModeByService,
+      leadTime,
+      leadTimeByService,
+      serviceAreaZones,
+      user?.email,
+    ]
+  )
+
+  const handleServiceLocationCommit = useCallback(
+    async (next: ServiceAreaZone[]) => {
+      setServiceAreaZones(next)
+      await persistPricingConfig(next)
+    },
+    [persistPricingConfig]
+  )
 
   const handleServiceDialogOpenChange = (open: boolean) => {
     if (!open) void persistPricingConfig()
@@ -592,6 +612,9 @@ export default function OperatorPricingPage() {
         <CardContent className="flex flex-wrap items-center gap-2">
           <Button variant="outline" onClick={() => setServiceDialogOpen(true)}>
             Services Provider
+          </Button>
+          <Button variant="outline" onClick={() => setServiceLocationDialogOpen(true)}>
+            Services location
           </Button>
           <Badge variant="secondary">{selectedServices.length} service(s) selected</Badge>
         </CardContent>
@@ -786,6 +809,13 @@ export default function OperatorPricingPage() {
           </Card>
         </CardContent>
       </Card>
+
+      <OperatorServiceLocationDialog
+        open={serviceLocationDialogOpen}
+        onOpenChange={setServiceLocationDialogOpen}
+        zones={serviceAreaZones}
+        onCommit={handleServiceLocationCommit}
+      />
 
       <Dialog open={serviceDialogOpen} onOpenChange={handleServiceDialogOpenChange}>
         <DialogContent className="max-h-[88vh] max-w-[95vw] overflow-y-auto sm:max-w-lg md:max-w-2xl">

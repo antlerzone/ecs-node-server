@@ -20,6 +20,8 @@ export interface PayrollInputsJson {
   unpaidLeaveDays?: number
   sourceContactId?: string
   sourceContactEmail?: string
+  /** Cumulative MYR released via Mark as paid (Bukku Money Out / Xero bank spend) for this period row. */
+  payoutReleasedTotal?: number
 }
 
 export type SalaryLineApprovalStatus = "pending" | "approved" | "rejected"

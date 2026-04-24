@@ -117,7 +117,16 @@ const cleanlemonApiGateEnabled =
   String(process.env.CLEANLEMON_API_GATE_ENABLED || '').toLowerCase() === 'true';
 
 app.use(cors({
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-request-id', 'X-Request-Id', 'x-sync-secret', 'X-Sync-Secret']
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'x-request-id',
+    'X-Request-Id',
+    'x-sync-secret',
+    'X-Sync-Secret',
+    'X-Cleanlemons-Portal',
+    'x-cleanlemons-portal',
+  ],
 }));
 // Finverse Link (link.prod.finverse.net) XHR to our callback must pass preflight; ensure OPTIONS and GET get CORS.
 app.use('/api/finverse', (req, res, next) => {

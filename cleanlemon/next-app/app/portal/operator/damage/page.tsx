@@ -1,11 +1,10 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useState } from "react"
-import { Eye, Loader2, AlertTriangle, Search, Download, ListFilter } from "lucide-react"
+import { Eye, Loader2, AlertTriangle, Search, Download, ListFilter, ChevronLeft, ChevronRight } from "lucide-react"
 import { jsPDF } from "jspdf"
 import autoTable from "jspdf-autotable"
 import { Button } from "@/components/ui/button"
-import { Badge } from "@/components/ui/badge"
 import {
   Dialog,
   DialogContent,
@@ -34,41 +33,16 @@ import {
 import { useAuth } from "@/lib/auth-context"
 import { useEffectiveOperatorId } from "@/lib/cleanlemon-effective-operator-id"
 import { fetchOperatorDamageReports, type DamageReportItem } from "@/lib/cleanlemon-api"
+import { damageReportDateYmd, damageReportDateLabel } from "@/lib/damage-report-dates"
 import { DamageMediaAttachments } from "@/components/shared/damage-media-attachments"
 import { toast } from "sonner"
-
-function formatWhen(r: DamageReportItem): string {
-  const parts: string[] = []
-  if (r.jobDate) parts.push(r.jobDate)
-  if (r.jobStartTime) parts.push(`Start ${r.jobStartTime}`)
-  if (r.reportedAt) {
-    const d = new Date(r.reportedAt)
-    if (!Number.isNaN(d.getTime())) {
-      parts.push(`Reported ${d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}`)
-    }
-  }
-  return parts.length ? parts.join(" · ") : "—"
-}
-
-function reportSortYmd(r: DamageReportItem): string {
-  const jd = (r.jobDate || "").trim()
-  if (/^\d{4}-\d{2}-\d{2}/.test(jd)) return jd.slice(0, 10)
-  if (r.reportedAt) {
-    const d = new Date(r.reportedAt)
-    if (!Number.isNaN(d.getTime())) return d.toISOString().slice(0, 10)
-  }
-  return ""
-}
 
 function propertyLabel(r: DamageReportItem): string {
   const u = r.unitNumber ? ` · ${r.unitNumber}` : ""
   return `${r.propertyName || "—"}${u}`
 }
 
-function damageStatusLabel(r: DamageReportItem): "Pending" | "Acknowledged" {
-  if (!r.acknowledgedAt) return "Pending"
-  return "Acknowledged"
-}
+const PAGE_SIZE_OPTIONS = [10, 20, 50, 100, 200] as const
 
 export default function OperatorDamagePage() {
   const { user } = useAuth()
@@ -83,11 +57,13 @@ export default function OperatorDamagePage() {
   const [dateFrom, setDateFrom] = useState("")
   const [dateTo, setDateTo] = useState("")
   const [filterExpanded, setFilterExpanded] = useState(false)
+  const [pageSize, setPageSize] = useState(20)
+  const [currentPage, setCurrentPage] = useState(1)
 
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const r = await fetchOperatorDamageReports({ operatorId: operatorId || undefined, limit: 500 })
+      const r = await fetchOperatorDamageReports({ operatorId: operatorId || undefined, limit: 1000 })
       if (r?.ok && Array.isArray(r.items)) setItems(r.items)
       else setItems([])
     } finally {
@@ -119,7 +95,7 @@ export default function OperatorDamagePage() {
         const key = String(r.propertyId || "").trim() || propertyLabel(r)
         if (key !== propertyFilter) return false
       }
-      const ymd = reportSortYmd(r)
+      const ymd = damageReportDateYmd(r)
       if (dateFrom && ymd && ymd < dateFrom) return false
       if (dateTo && ymd && ymd > dateTo) return false
       if ((dateFrom || dateTo) && !ymd) return false
@@ -130,13 +106,32 @@ export default function OperatorDamagePage() {
         r.clientName,
         r.staffEmail,
         r.remark,
-        formatWhen(r),
+        damageReportDateLabel(r),
       ]
         .join(" ")
         .toLowerCase()
       return hay.includes(q)
     })
   }, [items, search, propertyFilter, ackFilter, dateFrom, dateTo])
+
+  useEffect(() => {
+    setCurrentPage(1)
+  }, [search, propertyFilter, ackFilter, dateFrom, dateTo])
+
+  const totalPages = useMemo(
+    () => (filteredItems.length === 0 ? 1 : Math.max(1, Math.ceil(filteredItems.length / pageSize))),
+    [filteredItems.length, pageSize]
+  )
+
+  useEffect(() => {
+    if (totalPages < 1) return
+    setCurrentPage((p) => (p > totalPages ? totalPages : p))
+  }, [totalPages])
+
+  const paginatedItems = useMemo(
+    () => filteredItems.slice((currentPage - 1) * pageSize, currentPage * pageSize),
+    [filteredItems, currentPage, pageSize]
+  )
 
   const hasActiveFilters = useMemo(() => {
     return propertyFilter !== "all" || ackFilter !== "all" || Boolean(dateFrom) || Boolean(dateTo)
@@ -151,14 +146,12 @@ export default function OperatorDamagePage() {
   }, [])
 
   const rowToExportCells = useCallback((r: DamageReportItem) => {
-    const statusLabel = damageStatusLabel(r)
     return {
       property: r.propertyName || "—",
       unit: r.unitNumber || "",
-      status: statusLabel,
       client: r.clientName || "—",
       staff: r.staffEmail || "—",
-      when: formatWhen(r),
+      when: damageReportDateLabel(r),
       remark: (r.remark || "").replace(/\r?\n/g, " "),
     }
   }, [])
@@ -174,7 +167,7 @@ export default function OperatorDamagePage() {
       toast.error("No rows to export.")
       return
     }
-    const header = ["Property", "Unit", "Status", "Client", "Staff email", "When", "Remark"]
+    const header = ["Property", "Unit", "Client", "Staff email", "When", "Remark"]
     const lines = [header.join(",")]
     for (const r of filteredItems) {
       const c = rowToExportCells(r)
@@ -182,7 +175,6 @@ export default function OperatorDamagePage() {
         [
           escapeCsvCell(c.property),
           escapeCsvCell(c.unit),
-          escapeCsvCell(c.status),
           escapeCsvCell(c.client),
           escapeCsvCell(c.staff),
           escapeCsvCell(c.when),
@@ -210,22 +202,21 @@ export default function OperatorDamagePage() {
     doc.text("Damage reports (filtered)", 8, 10)
     const body = filteredItems.map((r) => {
       const c = rowToExportCells(r)
-      return [c.property, c.unit || "—", c.status, c.client, c.staff, c.when, c.remark]
+      return [c.property, c.unit || "—", c.client, c.staff, c.when, c.remark]
     })
     autoTable(doc, {
       startY: 14,
-      head: [["Property", "Unit", "Status", "Client", "Staff", "When", "Remark"]],
+      head: [["Property", "Unit", "Client", "Staff", "When", "Remark"]],
       body,
       styles: { fontSize: 7, cellPadding: 1.5 },
       headStyles: { fillColor: [30, 64, 175] },
       columnStyles: {
-        0: { cellWidth: 38 },
-        1: { cellWidth: 18 },
-        2: { cellWidth: 24 },
-        3: { cellWidth: 32 },
-        4: { cellWidth: 38 },
-        5: { cellWidth: 42 },
-        6: { cellWidth: "auto" },
+        0: { cellWidth: 42 },
+        1: { cellWidth: 20 },
+        2: { cellWidth: 36 },
+        3: { cellWidth: 40 },
+        4: { cellWidth: 44 },
+        5: { cellWidth: "auto" },
       },
       margin: { left: 8, right: 8 },
     })
@@ -242,7 +233,8 @@ export default function OperatorDamagePage() {
             Damage reports
           </h1>
           <p className="text-muted-foreground text-sm mt-1">
-            Staff-submitted damage from jobs (property + schedule). Open a row to preview photos and remarks.
+            Staff reports from jobs (schedule + property) plus older imported rows for properties under your
+            company. Open a row to preview photos and remarks.
           </p>
         </div>
         <div className="hidden shrink-0 md:block">
@@ -313,11 +305,11 @@ export default function OperatorDamagePage() {
                 disabled={loading}
               >
                 <SelectTrigger className="w-full border-input lg:w-[180px]">
-                  <SelectValue placeholder="Status" />
+                  <SelectValue placeholder="Client acknowledge" />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="all">All</SelectItem>
-                  <SelectItem value="pending">Pending</SelectItem>
+                  <SelectItem value="pending">Not acknowledged</SelectItem>
                   <SelectItem value="acknowledged">Acknowledged</SelectItem>
                   <SelectItem value="complete">Complete</SelectItem>
                 </SelectContent>
@@ -383,7 +375,6 @@ export default function OperatorDamagePage() {
                 <TableHeader>
                   <TableRow>
                     <TableHead>Property</TableHead>
-                    <TableHead className="w-[120px]">Status</TableHead>
                     <TableHead>Client</TableHead>
                     <TableHead>Submit by</TableHead>
                     <TableHead>When</TableHead>
@@ -392,8 +383,7 @@ export default function OperatorDamagePage() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {filteredItems.map((r) => {
-                    const statusLabel = damageStatusLabel(r)
+                  {paginatedItems.map((r) => {
                     return (
                       <TableRow key={r.id}>
                         <TableCell className="font-medium">
@@ -402,22 +392,10 @@ export default function OperatorDamagePage() {
                             <span className="text-muted-foreground font-normal"> · {r.unitNumber}</span>
                           ) : null}
                         </TableCell>
-                        <TableCell>
-                          <Badge
-                            variant="outline"
-                            className={
-                              statusLabel === "Pending"
-                                ? "border-amber-300 bg-amber-50 text-amber-900"
-                                : "border-emerald-300 bg-emerald-50 text-emerald-900"
-                            }
-                          >
-                            {statusLabel}
-                          </Badge>
-                        </TableCell>
                         <TableCell>{r.clientName || "—"}</TableCell>
                         <TableCell className="text-sm">{r.staffEmail || "—"}</TableCell>
                         <TableCell className="text-sm text-muted-foreground whitespace-nowrap max-w-[220px]">
-                          {formatWhen(r)}
+                          {damageReportDateLabel(r)}
                         </TableCell>
                         <TableCell className="text-sm max-w-[200px] truncate" title={r.remark}>
                           {r.remark || "—"}
@@ -434,6 +412,70 @@ export default function OperatorDamagePage() {
               </Table>
             </div>
           )}
+          {!loading && filteredItems.length > 0 ? (
+            <div className="flex shrink-0 flex-col gap-3 border-t border-border pt-4 mt-4">
+              <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                <p className="text-sm text-muted-foreground order-2 lg:order-1">
+                  Showing {(currentPage - 1) * pageSize + 1} to{" "}
+                  {Math.min(currentPage * pageSize, filteredItems.length)} of {filteredItems.length} results
+                </p>
+                <div className="order-1 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end lg:order-2">
+                  <div className="flex items-center justify-center gap-2 sm:justify-end">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                      disabled={currentPage === 1 || totalPages <= 1}
+                      aria-label="Previous page"
+                    >
+                      <ChevronLeft className="h-4 w-4" />
+                    </Button>
+                    <span className="min-w-[7rem] text-center text-sm tabular-nums">
+                      Page {currentPage} of {totalPages}
+                    </span>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                      disabled={currentPage === totalPages || totalPages <= 1}
+                      aria-label="Next page"
+                    >
+                      <ChevronRight className="h-4 w-4" />
+                    </Button>
+                  </div>
+                  <div className="flex flex-wrap items-center justify-center gap-2 sm:justify-end">
+                    <Label htmlFor="operator-damage-page-size" className="text-sm text-muted-foreground whitespace-nowrap">
+                      Show
+                    </Label>
+                    <Select
+                      value={String(pageSize)}
+                      onValueChange={(v) => {
+                        const n = Number(v)
+                        if (PAGE_SIZE_OPTIONS.includes(n as (typeof PAGE_SIZE_OPTIONS)[number])) {
+                          setPageSize(n)
+                          setCurrentPage(1)
+                        }
+                      }}
+                    >
+                      <SelectTrigger id="operator-damage-page-size" className="h-9 w-[100px] border-input">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {PAGE_SIZE_OPTIONS.map((n) => (
+                          <SelectItem key={n} value={String(n)}>
+                            {n}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <span className="text-sm text-muted-foreground whitespace-nowrap">per page</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </CardContent>
       </Card>
 
@@ -456,12 +498,16 @@ export default function OperatorDamagePage() {
                 <span className="text-muted-foreground">Submit by: </span>
                 {preview.staffEmail || "—"}
               </p>
-              <p className="text-sm text-muted-foreground">{formatWhen(preview)}</p>
+              <p className="text-sm text-muted-foreground">{damageReportDateLabel(preview)}</p>
               <div>
                 <p className="text-sm font-medium mb-1">Remark</p>
                 <p className="text-sm whitespace-pre-wrap rounded-md bg-muted/50 p-3">{preview.remark || "—"}</p>
               </div>
-              <DamageMediaAttachments urls={preview.photoUrls} emptyLabel="No photos or videos." />
+              <DamageMediaAttachments
+                urls={preview.photoUrls}
+                attachments={preview.photoAttachments}
+                emptyLabel="No photos or videos."
+              />
             </div>
           ) : null}
         </DialogContent>

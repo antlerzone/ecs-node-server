@@ -1,7 +1,8 @@
 "use client"
 
 import { useState, useEffect, useCallback } from "react"
-import { Lock, Edit, Search, Filter, RefreshCw, Wifi, WifiOff, Radio, DoorOpen, LayoutGrid, Trash2, Info, AlertTriangle, KeyRound, ScrollText } from "lucide-react"
+import { Lock, Edit, Search, Filter, RefreshCw, Wifi, WifiOff, Radio, DoorOpen, LayoutGrid, Trash2, Info, AlertTriangle, KeyRound, ScrollText, ChevronDown } from "lucide-react"
+import { cn } from "@/lib/utils"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -205,6 +206,10 @@ export function CleanlemonSmartDoorPage({ scope }: { scope: CleanlemonSmartDoorS
   const [search, setSearch] = useState("")
   const [filterType, setFilterType] = useState("ALL")
   const [filterProperty, setFilterProperty] = useState("ALL")
+  /** Operator portal: all | own (operator TTLock only) | cln_clientdetail id */
+  const [ownershipFilter, setOwnershipFilter] = useState<"all" | "own" | string>("all")
+  const [linkedClients, setLinkedClients] = useState<Array<{ value: string; label: string }>>([])
+  const [filtersExpanded, setFiltersExpanded] = useState(false)
   const [detailOpen, setDetailOpen] = useState(false)
   const [currentItem, setCurrentItem] = useState<SmartDoorItem | null>(null)
   const [detailLockAlias, setDetailLockAlias] = useState("")
@@ -260,7 +265,16 @@ export function CleanlemonSmartDoorPage({ scope }: { scope: CleanlemonSmartDoorS
     setLoading(true)
     // Smart Door = lockdetail only (LOCK), Gateway = gatewaydetail only (GATEWAY), All = use dropdown filter (ALL/ACTIVE/INACTIVE)
     const filter = deviceTypeTab === "smartdoor" ? "LOCK" : deviceTypeTab === "gateway" ? "GATEWAY" : (filterType !== "ALL" ? filterType : "ALL")
-    const listOpts = { search, propertyId: filterProperty !== "ALL" ? filterProperty : undefined, filter, page: listPage, pageSize: listPageSize }
+    const listOpts: Record<string, unknown> = {
+      search,
+      propertyId: filterProperty !== "ALL" ? filterProperty : undefined,
+      filter,
+      page: listPage,
+      pageSize: listPageSize,
+    }
+    if (scope === "operator" && ownershipFilter !== "all") {
+      listOpts.clnClientOwnership = ownershipFilter === "own" ? "own" : ownershipFilter
+    }
     console.log("[smart-door] loadData request opts=", JSON.stringify(listOpts))
     try {
       const [listRes, filtersRes] = await Promise.all([
@@ -305,14 +319,16 @@ export function CleanlemonSmartDoorPage({ scope }: { scope: CleanlemonSmartDoorS
       }
       const props = ((filtersRes as { properties?: Array<{ value: string; label: string }> })?.properties || [])
       setProperties([{ value: "ALL", label: "All Properties" }, ...props])
+      const lc = (filtersRes as { linkedClients?: Array<{ value: string; label: string }> })?.linkedClients
+      setLinkedClients(Array.isArray(lc) ? lc : [])
     } catch (e) {
       console.error("[smart-door] loadData error", e)
     } finally {
       setLoading(false)
     }
-  }, [search, filterProperty, filterType, listPage, listPageSize, deviceTypeTab, scope, email, operatorId])
+  }, [search, filterProperty, filterType, listPage, listPageSize, deviceTypeTab, scope, email, operatorId, ownershipFilter])
 
-  useEffect(() => { setListPage(1) }, [search, filterProperty, filterType, deviceTypeTab])
+  useEffect(() => { setListPage(1) }, [search, filterProperty, filterType, deviceTypeTab, ownershipFilter])
 
   useEffect(() => {
     if (!email) return
@@ -937,32 +953,79 @@ export function CleanlemonSmartDoorPage({ scope }: { scope: CleanlemonSmartDoorS
         {/* Filters */}
         <Card>
             <CardContent className="p-3 sm:p-4">
-              <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-                <div className="relative flex-1">
-                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" size={16} />
-                  <Input placeholder="Search device name..." value={search} onChange={(e) => setSearch(e.target.value)} className="pl-9 text-sm" />
+              <div className="flex flex-col gap-3">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                  <div className="relative flex-1 min-w-0">
+                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" size={16} />
+                    <Input placeholder="Search device name..." value={search} onChange={(e) => setSearch(e.target.value)} className="pl-9 text-sm" />
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="default"
+                    className={cn(
+                      "shrink-0 gap-2 justify-between sm:justify-center sm:min-w-[8.5rem]",
+                      filtersExpanded && "border-primary/60 bg-muted/50"
+                    )}
+                    onClick={() => setFiltersExpanded((v) => !v)}
+                    aria-expanded={filtersExpanded}
+                  >
+                    <span className="inline-flex items-center gap-2">
+                      <Filter size={16} className="text-muted-foreground" />
+                      Filters
+                    </span>
+                    <ChevronDown className={cn("h-4 w-4 text-muted-foreground transition-transform shrink-0", filtersExpanded && "rotate-180")} />
+                  </Button>
                 </div>
-                <Select value={filterProperty} onValueChange={setFilterProperty}>
-                  <SelectTrigger className="w-full sm:w-36">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {properties.map((p) => (
-                      <SelectItem key={p.value} value={p.value}>{p.label}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <Select value={filterType} onValueChange={setFilterType}>
-                  <SelectTrigger className="w-full sm:w-32">
-                    <Filter size={14} className="mr-2 text-muted-foreground" />
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {filterOptions.map((f) => (
-                      <SelectItem key={f.value} value={f.value}>{f.label}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                {filtersExpanded ? (
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 rounded-lg border bg-muted/30 p-3">
+                    <div className="space-y-1.5 min-w-0">
+                      <Label className="text-xs text-muted-foreground">Property</Label>
+                      <Select value={filterProperty} onValueChange={setFilterProperty}>
+                        <SelectTrigger className="w-full">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {properties.map((p) => (
+                            <SelectItem key={p.value} value={p.value}>{p.label}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-1.5 min-w-0">
+                      <Label className="text-xs text-muted-foreground">Status / type</Label>
+                      <Select value={filterType} onValueChange={setFilterType}>
+                        <SelectTrigger className="w-full">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {filterOptions.map((f) => (
+                            <SelectItem key={f.value} value={f.value}>{f.label}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    {scope === "operator" ? (
+                      <div className="space-y-1.5 min-w-0 sm:col-span-2 lg:col-span-1">
+                        <Label className="text-xs text-muted-foreground">Owner</Label>
+                        <Select value={ownershipFilter} onValueChange={(v) => setOwnershipFilter(v as "all" | "own" | string)}>
+                          <SelectTrigger className="w-full">
+                            <SelectValue placeholder="All" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="all">All devices</SelectItem>
+                            <SelectItem value="own">Operator (own)</SelectItem>
+                            {linkedClients.map((c) => (
+                              <SelectItem key={c.value} value={c.value}>
+                                Client: {c.label}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
               </div>
             </CardContent>
         </Card>

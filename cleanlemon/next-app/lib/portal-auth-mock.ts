@@ -9,7 +9,14 @@
 
 export const CLEANLEMON_LIVE_PORTAL_HOST = "portal.cleanlemons.com";
 export const CLEANLEMON_DEMO_HOST = "demo.cleanlemons.com";
-export const CLEANLEMON_LOCAL_API_BASE = "http://localhost:5000";
+export const CLEANLEMON_LOCAL_API_BASE = "http://127.0.0.1:5000";
+
+/** True when env points at a loopback Node API (typical local dev); browser should use same-origin + Next rewrite to avoid Failed to fetch / CORS / ::1 quirks. */
+function isLoopbackCleanlemonApiEnv(base: string): boolean {
+  const s = String(base || "").trim();
+  if (!s) return false;
+  return /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\]):(5000|5001)\/?$/i.test(s.replace(/\/$/, ""));
+}
 
 /** Strip trailing dot, IPv6 brackets (e.g. [::1] → ::1). */
 function normalizeBrowserHostname(hostname: string): string {
@@ -35,9 +42,18 @@ export const DEFAULT_CLEANLEMON_PROD_API = "https://portal.cleanlemons.com";
  */
 export function getCleanlemonApiBase(): string {
   const fromEnv = (process.env.NEXT_PUBLIC_CLEANLEMON_API_URL || "").trim().replace(/\/$/, "");
-  if (fromEnv) return fromEnv;
+  if (fromEnv) {
+    if (
+      typeof window !== "undefined" &&
+      isLocalLoopbackHostname(window.location.hostname) &&
+      isLoopbackCleanlemonApiEnv(fromEnv)
+    ) {
+      return "";
+    }
+    return fromEnv;
+  }
   if (typeof window !== "undefined" && isLocalLoopbackHostname(window.location.hostname)) {
-    return CLEANLEMON_LOCAL_API_BASE;
+    return "";
   }
   if (isLivePortalCleanlemonsBuild()) return DEFAULT_CLEANLEMON_PROD_API;
   if (typeof window !== "undefined" && isLivePortalCleanlemonsHost()) return DEFAULT_CLEANLEMON_PROD_API;
@@ -128,12 +144,29 @@ export function isLivePortalCleanlemonsBuild(): boolean {
   return v === "true" || v === "1";
 }
 
+/**
+ * Client: same effective API origin as OAuth redirects (`LoginForm` previously duplicated this).
+ * `getCleanlemonApiBase()` is intentionally "" on localhost (same-origin API calls); in development
+ * we still have a loopback Node URL for `/api/portal-auth/google` and verify — without this,
+ * `shouldUseMockOAuthClient` stayed true and Google always used the client mock on :3100.
+ */
+export function getCleanlemonApiBaseWithDevFallback(): string {
+  const base = getCleanlemonApiBase().trim().replace(/\/$/, "");
+  if (base) return base;
+  if (process.env.NODE_ENV === "development") return CLEANLEMON_LOCAL_API_BASE;
+  /** `next start` (production) on localhost: `getCleanlemonApiBase()` is "" for same-origin /api rewrites; OAuth still needs an absolute Node URL. */
+  if (typeof window !== "undefined" && isLocalLoopbackHostname(window.location.hostname)) {
+    return CLEANLEMON_LOCAL_API_BASE;
+  }
+  return "";
+}
+
 /** Browser: use client mock for Google (no redirect to ECS). Never on portal.cleanlemons.com. */
 export function shouldUseMockOAuthClient(): boolean {
   if (isLivePortalCleanlemonsBuild()) return false;
   if (isLivePortalCleanlemonsHost()) return false;
   if (isPortalAuthMockExplicit()) return true;
-  const base = getCleanlemonApiBase();
+  const base = getCleanlemonApiBaseWithDevFallback();
   return !base;
 }
 
@@ -148,5 +181,5 @@ export function isPortalOfflineDemo(): boolean {
   if (isPortalAuthMockExplicit()) return true;
   const force = process.env.NEXT_PUBLIC_PORTAL_SHOW_ALL_CARDS;
   if (force === "true" || force === "1") return true;
-  return !getCleanlemonApiBase();
+  return !getCleanlemonApiBaseWithDevFallback();
 }

@@ -66,6 +66,10 @@ import {
   getCleanlemonsLinkStatus,
   confirmCleanlemonsLink,
   disconnectCleanlemonsLink,
+  requestOperatorCompanyEmailChange,
+  confirmOperatorCompanyEmailChange,
+  getOperatorCompanyEmailChangeStatus,
+  cancelOperatorCompanyEmailChange,
 } from "@/lib/operator-api"
 import { useOperatorContext } from "@/contexts/operator-context"
 import { hasPermission } from "@/lib/operator-permissions"
@@ -274,6 +278,8 @@ export default function CompanySettingPage() {
     title?: string; ssm?: string; address?: string; contact?: string;
     currency?: string; subdomain?: string; tin?: string; accountholder?: string; accountnumber?: string; bankId?: string | null;
     profilephoto?: string; companyChop?: string; paynowQr?: string; uen?: string;
+    companyEmail?: string;
+    canChangeCompanyEmail?: boolean;
   } | null>(null)
   const [profileDraft, setProfileDraft] = useState({
     title: "", ssm: "", address: "", contact: "",
@@ -284,6 +290,21 @@ export default function CompanySettingPage() {
   const [uploadingLogo, setUploadingLogo] = useState(false)
   const [uploadingChop, setUploadingChop] = useState(false)
   const [savingProfile, setSavingProfile] = useState(false)
+  /** Company master email change (TAC + 7-day schedule) — from status API */
+  const [companyEmailChangePending, setCompanyEmailChangePending] = useState<{
+    newEmail: string
+    status: string
+    tacExpiresAt: string | null
+    effectiveAt: string | null
+  } | null>(null)
+  const [companyEmailDialogOpen, setCompanyEmailDialogOpen] = useState(false)
+  const [companyEmailNew, setCompanyEmailNew] = useState("")
+  const [companyEmailCode, setCompanyEmailCode] = useState("")
+  const [companyEmailStep, setCompanyEmailStep] = useState<"enter" | "code" | "done">("enter")
+  const [companyEmailBusy, setCompanyEmailBusy] = useState(false)
+  const [companyEmailDoneEffectiveAt, setCompanyEmailDoneEffectiveAt] = useState<string | null>(null)
+  const [companyEmailCancelOpen, setCompanyEmailCancelOpen] = useState(false)
+  const [companyEmailCancelBusy, setCompanyEmailCancelBusy] = useState(false)
   const [savingFees, setSavingFees] = useState(false)
   const [savingStaff, setSavingStaff] = useState(false)
   const [deletingStaffId, setDeletingStaffId] = useState<string | null>(null)
@@ -380,6 +401,7 @@ export default function CompanySettingPage() {
       getPaymentGatewayDirectStatus(clientOpts),
       getCompanyBanks(clientOpts),
       getCleanlemonsLinkStatus(operatorClientId ? { clientId: operatorClientId } : {}),
+      getOperatorCompanyEmailChangeStatus(operatorClientId ? { clientId: operatorClientId } : {}),
     ])
     const profileRes = results[0].status === "fulfilled" ? results[0].value : null
     const adminRes = results[1].status === "fulfilled" ? results[1].value : null
@@ -388,6 +410,7 @@ export default function CompanySettingPage() {
     const paymentGatewayStatusRes = results[4].status === "fulfilled" ? results[4].value : null
     const banksRes = results[5].status === "fulfilled" ? results[5].value : null
     const cleanlemonsRes = results[6].status === "fulfilled" ? results[6].value : null
+    const emailChangeStatusRes = results[7].status === "fulfilled" ? results[7].value : null
     const rejectedReasons = results.map((r) => (r.status === "rejected" ? (r.reason instanceof Error ? r.reason.message : String(r.reason)) : null))
     const firstRejection = rejectedReasons.find(Boolean)
     // Only show page error when profile failed; other endpoints can fail and we still render with partial data
@@ -453,7 +476,14 @@ export default function CompanySettingPage() {
       })))
     }
     if (profileRes?.ok !== false && profileRes?.client) {
-        const c = profileRes.client as { title?: string; currency?: string; profilephoto?: string; subdomain?: string }
+        const c = profileRes.client as {
+          title?: string
+          currency?: string
+          profilephoto?: string
+          subdomain?: string
+          companyEmail?: string
+          canChangeCompanyEmail?: boolean
+        }
         const p = (profileRes as { profile?: Record<string, string | null> }).profile || {}
         const prof = {
           title: c.title,
@@ -470,6 +500,8 @@ export default function CompanySettingPage() {
           companyChop: p.companyChop ?? "",
           paynowQr: (p as { paynowQr?: string }).paynowQr ?? "",
           uen: (p as { uen?: string }).uen ?? "",
+          companyEmail: typeof c.companyEmail === "string" ? c.companyEmail : "",
+          canChangeCompanyEmail: !!c.canChangeCompanyEmail,
         }
         setProfile(prof)
         setProfileDraft({
@@ -487,6 +519,10 @@ export default function CompanySettingPage() {
           paynowQr: prof.paynowQr || null,
           uen: prof.uen || "",
         })
+      }
+      if (emailChangeStatusRes && typeof emailChangeStatusRes === "object" && (emailChangeStatusRes as { ok?: boolean }).ok !== false) {
+        const pend = (emailChangeStatusRes as { pending?: typeof companyEmailChangePending }).pending
+        setCompanyEmailChangePending(pend ?? null)
       }
       if (banksRes?.ok !== false && (banksRes as { items?: Array<{ label: string; value: string }> }).items) {
         setBanks((banksRes as { items: Array<{ label: string; value: string }> }).items)
@@ -566,6 +602,101 @@ export default function CompanySettingPage() {
       setLoading(false)
     }
   }, [operatorClientId])
+
+  const openCompanyEmailDialog = useCallback(() => {
+    setCompanyEmailNew("")
+    setCompanyEmailCode("")
+    setCompanyEmailStep("enter")
+    setCompanyEmailDoneEffectiveAt(null)
+    setCompanyEmailDialogOpen(true)
+  }, [])
+
+  const sendCompanyEmailTac = useCallback(async () => {
+    const trimmed = companyEmailNew.trim()
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) {
+      toast.error("Enter a valid email address.")
+      return
+    }
+    setCompanyEmailBusy(true)
+    try {
+      const r = await requestOperatorCompanyEmailChange(trimmed, operatorClientId ? { clientId: operatorClientId } : {})
+      if (!r?.ok) {
+        const reason = r?.reason
+        toast.error(
+          reason === "EMAIL_TAKEN"
+            ? "That email is already in use."
+            : reason === "SAME_EMAIL"
+              ? "New email must differ from the current company email."
+              : reason === "NOT_MASTER"
+                ? "Only the company master account can change this."
+                : reason === "ALREADY_SCHEDULED"
+                  ? "A change is already scheduled. Wait for it to apply or contact support."
+                  : reason === "MIGRATION_REQUIRED"
+                    ? "Database migration required — contact support."
+                    : reason || "Request failed"
+        )
+        return
+      }
+      toast.success("Verification code sent to the new email.")
+      setCompanyEmailStep("code")
+    } finally {
+      setCompanyEmailBusy(false)
+    }
+  }, [companyEmailNew, operatorClientId])
+
+  const submitCancelCompanyEmailChange = useCallback(async () => {
+    setCompanyEmailCancelBusy(true)
+    try {
+      const r = await cancelOperatorCompanyEmailChange(operatorClientId ? { clientId: operatorClientId } : {})
+      if (!r?.ok) {
+        toast.error(
+          r?.reason === "NOTHING_TO_CANCEL"
+            ? "No pending change to cancel."
+            : r?.reason === "NOT_MASTER"
+              ? "Only the company master can cancel."
+              : r?.reason || "Cancel failed"
+        )
+        return
+      }
+      toast.success("Scheduled email change cancelled.")
+      setCompanyEmailCancelOpen(false)
+      void loadData()
+    } finally {
+      setCompanyEmailCancelBusy(false)
+    }
+  }, [operatorClientId, loadData])
+
+  const confirmCompanyEmailTac = useCallback(async () => {
+    const code = companyEmailCode.trim()
+    if (!/^\d{4,8}$/.test(code)) {
+      toast.error("Enter the verification code from the email.")
+      return
+    }
+    setCompanyEmailBusy(true)
+    try {
+      const r = await confirmOperatorCompanyEmailChange(
+        companyEmailNew.trim(),
+        code,
+        operatorClientId ? { clientId: operatorClientId } : {}
+      )
+      if (!r?.ok) {
+        toast.error(
+          r?.reason === "INVALID_OR_EXPIRED_CODE"
+            ? "Invalid or expired code."
+            : r?.reason === "EMAIL_TAKEN"
+              ? "That email is already in use."
+              : r?.reason || "Confirm failed"
+        )
+        return
+      }
+      setCompanyEmailStep("done")
+      setCompanyEmailDoneEffectiveAt(r.effectiveAt ?? null)
+      toast.success("Company email change scheduled.")
+      void loadData()
+    } finally {
+      setCompanyEmailBusy(false)
+    }
+  }, [companyEmailNew, companyEmailCode, operatorClientId, loadData])
 
   const confirmCleanlemonsLinkFlow = useCallback(
     async (replaceTtlockFromColiving: boolean) => {
@@ -822,6 +953,8 @@ export default function CompanySettingPage() {
           companyChop: profileDraft.companyChop || undefined,
           paynowQr: profileDraft.paynowQr || undefined,
           uen: profileDraft.uen || undefined,
+          companyEmail: profile?.companyEmail,
+          canChangeCompanyEmail: profile?.canChangeCompanyEmail,
         })
         await refresh()
       } else {
@@ -1342,6 +1475,45 @@ export default function CompanySettingPage() {
                 <Label className="text-xs uppercase text-muted-foreground">Company Name</Label>
                 <Input value={profileDraft.title} onChange={(e) => setProfileDraft(p => ({ ...p, title: e.target.value }))} className="mt-1" readOnly={!canEditProfile} />
               </div>
+              <div className="sm:col-span-2">
+                <Label className="text-xs uppercase text-muted-foreground">Company email</Label>
+                <p className="text-xs text-muted-foreground mt-0.5">
+                  Master company account (operatordetail). Login uses this until a scheduled change completes (7 days after you verify the code).
+                </p>
+                <Input value={profile?.companyEmail ?? ""} className="mt-1 bg-muted" disabled readOnly />
+                {profile?.canChangeCompanyEmail && (
+                  <button
+                    type="button"
+                    className="text-sm text-primary underline underline-offset-2 mt-1.5 block hover:opacity-90"
+                    onClick={openCompanyEmailDialog}
+                  >
+                    Change email address
+                  </button>
+                )}
+                {companyEmailChangePending?.status === "scheduled" && companyEmailChangePending.effectiveAt && (
+                  <div className="mt-2 space-y-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1.5">
+                    <p className="text-xs text-amber-800 dark:text-amber-400">
+                      Change to <strong>{companyEmailChangePending.newEmail}</strong> is scheduled for{" "}
+                      {new Date(companyEmailChangePending.effectiveAt).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}.
+                      Until then, sign in with your current email.
+                    </p>
+                    {profile?.canChangeCompanyEmail && (
+                      <button
+                        type="button"
+                        className="text-xs font-medium text-destructive underline underline-offset-2 hover:opacity-90"
+                        onClick={() => setCompanyEmailCancelOpen(true)}
+                      >
+                        Cancel change
+                      </button>
+                    )}
+                  </div>
+                )}
+                {companyEmailChangePending?.status === "pending_tac" && (
+                  <p className="text-xs text-muted-foreground mt-2">
+                    A verification code was sent to the new address. Enter it in &quot;Change email address&quot; to finish scheduling, or request a new code.
+                  </p>
+                )}
+              </div>
               <div>
                 <Label className="text-xs uppercase text-muted-foreground">{(profile?.currency || profileDraft.currency || "").toUpperCase() === "SGD" ? "UEN Number" : "SSM Number"}</Label>
                 <p className="text-xs text-muted-foreground mt-0.5">{(profile?.currency || profileDraft.currency || "").toUpperCase() === "SGD" ? "For PayNow: tenants copy UEN, pay in app, then upload receipt." : "Company registration number (Malaysia)."}</p>
@@ -1433,6 +1605,126 @@ export default function CompanySettingPage() {
             <Button style={{ background: "var(--brand)" }} className="w-full sm:w-auto" onClick={handleSaveProfile} disabled={savingProfile || !canEditProfile}>
               {savingProfile ? "Saving..." : "Save Company Info"}
             </Button>
+
+            <Dialog
+              open={companyEmailDialogOpen}
+              onOpenChange={(o) => {
+                setCompanyEmailDialogOpen(o)
+                if (!o) {
+                  setCompanyEmailStep("enter")
+                  setCompanyEmailCode("")
+                  setCompanyEmailDoneEffectiveAt(null)
+                }
+              }}
+            >
+              <DialogContent className="sm:max-w-md">
+                <DialogHeader>
+                  <DialogTitle>Change company email</DialogTitle>
+                  <DialogDescription>
+                    We send a code to the new inbox. After you verify, the switch is scheduled for 7 days later. Your master login and portal account email will match the new address when it applies.
+                  </DialogDescription>
+                </DialogHeader>
+                {companyEmailStep === "enter" && (
+                  <div className="space-y-3 py-1">
+                    <div>
+                      <Label htmlFor="company-email-new">New email</Label>
+                      <Input
+                        id="company-email-new"
+                        type="email"
+                        autoComplete="email"
+                        value={companyEmailNew}
+                        onChange={(e) => setCompanyEmailNew(e.target.value)}
+                        className="mt-1"
+                        placeholder="new@company.com"
+                      />
+                    </div>
+                    <DialogFooter className="gap-2 sm:gap-0">
+                      <Button type="button" variant="outline" onClick={() => setCompanyEmailDialogOpen(false)}>
+                        Cancel
+                      </Button>
+                      <Button type="button" style={{ background: "var(--brand)" }} onClick={() => void sendCompanyEmailTac()} disabled={companyEmailBusy}>
+                        {companyEmailBusy ? "Sending..." : "Send verification code"}
+                      </Button>
+                    </DialogFooter>
+                  </div>
+                )}
+                {companyEmailStep === "code" && (
+                  <div className="space-y-3 py-1">
+                    <p className="text-sm text-muted-foreground">
+                      Enter the code sent to <strong>{companyEmailNew.trim()}</strong>.
+                    </p>
+                    <div>
+                      <Label htmlFor="company-email-code">Verification code</Label>
+                      <Input
+                        id="company-email-code"
+                        inputMode="numeric"
+                        autoComplete="one-time-code"
+                        value={companyEmailCode}
+                        onChange={(e) => setCompanyEmailCode(e.target.value.replace(/\D/g, "").slice(0, 8))}
+                        className="mt-1 font-mono tracking-widest"
+                        placeholder="6-digit code"
+                      />
+                    </div>
+                    <DialogFooter className="gap-2 sm:gap-0">
+                      <Button type="button" variant="outline" onClick={() => setCompanyEmailStep("enter")}>
+                        Back
+                      </Button>
+                      <Button type="button" style={{ background: "var(--brand)" }} onClick={() => void confirmCompanyEmailTac()} disabled={companyEmailBusy}>
+                        {companyEmailBusy ? "Verifying..." : "Verify and schedule"}
+                      </Button>
+                    </DialogFooter>
+                  </div>
+                )}
+                {companyEmailStep === "done" && (
+                  <div className="space-y-3 py-1">
+                    <p className="text-sm text-foreground">
+                      Your company email change is scheduled.
+                      {companyEmailDoneEffectiveAt && (
+                        <>
+                          {" "}
+                          It will apply on{" "}
+                          <strong>
+                            {new Date(companyEmailDoneEffectiveAt).toLocaleString(undefined, {
+                              dateStyle: "medium",
+                              timeStyle: "short",
+                            })}
+                          </strong>
+                          . Until then, keep signing in with your current email.
+                        </>
+                      )}
+                    </p>
+                    <DialogFooter>
+                      <Button type="button" style={{ background: "var(--brand)" }} onClick={() => setCompanyEmailDialogOpen(false)}>
+                        Done
+                      </Button>
+                    </DialogFooter>
+                  </div>
+                )}
+              </DialogContent>
+            </Dialog>
+
+            <AlertDialog open={companyEmailCancelOpen} onOpenChange={setCompanyEmailCancelOpen}>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>Cancel scheduled email change?</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    This removes the scheduled switch to{" "}
+                    <strong>{companyEmailChangePending?.newEmail ?? "the new address"}</strong>. You will keep using your current company email to sign in. This cannot be undone from here except by starting a new change request.
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel disabled={companyEmailCancelBusy}>Keep scheduled change</AlertDialogCancel>
+                  <Button
+                    type="button"
+                    variant="destructive"
+                    disabled={companyEmailCancelBusy}
+                    onClick={() => void submitCancelCompanyEmailChange()}
+                  >
+                    {companyEmailCancelBusy ? "Cancelling..." : "Yes, cancel change"}
+                  </Button>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
           </CardContent>
         </Card>
 

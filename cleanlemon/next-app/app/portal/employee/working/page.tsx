@@ -330,9 +330,11 @@ export default function WorkingPage() {
   }
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between gap-3">
-        <p className="text-sm text-muted-foreground">Clock in, selfie & GPS for attendance</p>
+    <div className="min-w-0 max-w-full space-y-6">
+      <div className="flex items-start justify-between gap-2 sm:items-center sm:gap-3">
+        <p className="min-w-0 flex-1 text-sm leading-snug text-muted-foreground">
+          Clock in, selfie & GPS for attendance
+        </p>
         <Badge
           variant={isWorking ? 'default' : 'secondary'}
           className={`shrink-0 h-7 px-2.5 text-[11px] font-medium ${isWorking ? 'bg-green-600 hover:bg-green-600' : ''}`}
@@ -342,10 +344,10 @@ export default function WorkingPage() {
         </Badge>
       </div>
 
-      <Card className={isWorking ? 'border-green-500' : ''}>
+      <Card className={`max-w-full overflow-hidden ${isWorking ? 'border-green-500' : ''}`}>
         <CardContent className="p-4 sm:p-5">
-          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-            <div className="flex items-start gap-3">
+          <div className="flex min-w-0 flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex min-w-0 items-start gap-3">
               <div
                 className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-full ${
                   isWorking ? 'bg-green-100' : 'bg-muted'
@@ -411,8 +413,8 @@ export default function WorkingPage() {
         </Card>
       )}
 
-      <Card>
-        <CardHeader>
+      <Card className="max-w-full overflow-hidden">
+        <CardHeader className="min-w-0">
           <CardTitle className="text-lg">My attendance records</CardTitle>
           <CardDescription>Times in UTC+8</CardDescription>
         </CardHeader>

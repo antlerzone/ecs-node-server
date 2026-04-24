@@ -1,6 +1,7 @@
 "use client"
 
 import { useState } from 'react'
+import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -10,8 +11,7 @@ import { Separator } from '@/components/ui/separator'
 import { useAuth } from '@/lib/auth-context'
 import {
   shouldUseMockOAuthClient,
-  getCleanlemonApiBase,
-  CLEANLEMON_LOCAL_API_BASE,
+  getCleanlemonApiBaseWithDevFallback,
 } from '@/lib/portal-auth-mock'
 import { Spinner } from '@/components/ui/spinner'
 import {
@@ -39,17 +39,6 @@ function openOAuthPopupWindow(url: string): Window | null {
     'cleanlemons_oauth',
     `width=${w},height=${h},left=${left},top=${top},scrollbars=yes,resizable=yes`
   )
-}
-
-/**
- * Same API base as `cleanlemon-api` / `getCleanlemonApiBase` (loopback, live portal host, env).
- * Dev fallback avoids empty client bundle when NEXT_PUBLIC was missing at build time.
- */
-function resolvePortalApiBaseForOAuth(): string {
-  const base = getCleanlemonApiBase().trim().replace(/\/$/, '')
-  if (base) return base
-  if (process.env.NODE_ENV === 'development') return CLEANLEMON_LOCAL_API_BASE
-  return ''
 }
 
 export function LoginForm({ initialMode = 'login', redirectTo, oauthUsePopup }: LoginFormProps = {}) {
@@ -97,7 +86,7 @@ export function LoginForm({ initialMode = 'login', redirectTo, oauthUsePopup }: 
     setError('')
     setIsSubmitting(true)
     try {
-      const apiBase = resolvePortalApiBaseForOAuth()
+      const apiBase = getCleanlemonApiBaseWithDevFallback()
       if (!apiBase) {
         setError('Google sign-in is not available. Please contact support.')
         setIsSubmitting(false)
@@ -152,7 +141,7 @@ export function LoginForm({ initialMode = 'login', redirectTo, oauthUsePopup }: 
     setError('')
     setIsSubmitting(true)
     try {
-      const apiBase = resolvePortalApiBaseForOAuth()
+      const apiBase = getCleanlemonApiBaseWithDevFallback()
       if (!apiBase) {
         setError('Facebook sign-in is not available. Please contact support.')
         setIsSubmitting(false)
@@ -284,7 +273,20 @@ export function LoginForm({ initialMode = 'login', redirectTo, oauthUsePopup }: 
           </div>
           
           <div className="space-y-2">
-            <Label htmlFor="password" className="text-foreground">Password</Label>
+            <div className="flex items-center justify-between gap-2">
+              <Label htmlFor="password" className="text-foreground">
+                Password
+              </Label>
+              {isLogin ? (
+                <Link
+                  href="/forgot-password"
+                  className="text-xs font-medium text-primary hover:underline shrink-0"
+                  tabIndex={-1}
+                >
+                  Forgot password?
+                </Link>
+              ) : null}
+            </div>
             <Input
               id="password"
               type="password"
@@ -311,6 +313,12 @@ export function LoginForm({ initialMode = 'login', redirectTo, oauthUsePopup }: 
             ) : null}
             {isLogin ? 'Sign In' : 'Create Account'}
           </Button>
+
+          {isLogin ? (
+            <p className="text-xs text-red-600 text-center leading-snug">
+              Don&apos;t use a company email — you may need to verify your identity.
+            </p>
+          ) : null}
         </form>
 
         <div className="text-center text-sm">

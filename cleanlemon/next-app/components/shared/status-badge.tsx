@@ -5,7 +5,7 @@ import type { TaskStatus } from '@/lib/types'
 
 const statusConfig: Record<TaskStatus, { label: string; className: string }> = {
   'pending-checkout': {
-    label: 'Pending Checkout',
+    label: 'Pending check out',
     className: 'bg-amber-100 text-amber-800 border-amber-200',
   },
   'ready-to-clean': {

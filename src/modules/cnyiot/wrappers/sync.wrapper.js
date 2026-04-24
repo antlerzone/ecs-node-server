@@ -6,12 +6,13 @@
 const pool = require('../../../config/db');
 const { callCnyIot } = require('./cnyiotRequest');
 const meterWrapper = require('./meter.wrapper');
+const { hasUnpaidRentalPastDue } = require('../../tenancysetting/tenancy-active.service');
 
 async function syncMeterByCmsMeterId(clientId, meterId) {
   if (!clientId) throw new Error('CLIENT_ID_REQUIRED');
   if (!meterId) throw new Error('METER_ID_REQUIRED');
 
-  console.log('[sync] sync.wrapper version=portal-balance-guard+prepaid-zero-relay-off');
+  console.log('[sync] sync.wrapper version=portal-balance-guard+prepaid-zero-relay-off+sync-auto-connect');
 
   const [rows] = await pool.query(
     'SELECT * FROM meterdetail WHERE meterid = ? AND client_id = ? LIMIT 1',
@@ -138,6 +139,49 @@ async function syncMeterByCmsMeterId(clientId, meterId) {
           lastsyncat: new Date()
         };
 
+  /** After sync: 通电 when kWh balance > 0 OR linked room tenancy has no unpaid rent past due (same grace as daily check). */
+  let rentNoOverdue = false;
+  const roomIdForRent = String(after.room_id || meter.room_id || '').trim();
+  if (roomIdForRent) {
+    try {
+      const [tenRows] = await pool.query(
+        'SELECT id FROM tenancy WHERE client_id = ? AND room_id = ? ORDER BY active DESC, `end` DESC LIMIT 1',
+        [clientId, roomIdForRent]
+      );
+      const tid = tenRows && tenRows[0] && tenRows[0].id ? String(tenRows[0].id) : '';
+      if (tid) {
+        rentNoOverdue = !(await hasUnpaidRentalPastDue(tid));
+      }
+    } catch (e) {
+      console.warn('[sync] rent overdue check failed', roomIdForRent, e?.message || e);
+      rentNoOverdue = false;
+    }
+  }
+
+  const balFinal = Number(after.balance);
+  const hasPositiveBalance = !Number.isNaN(balFinal) && balFinal > 0;
+  const shouldAutoConnect = hasPositiveBalance || rentNoOverdue;
+  let syncAutoConnected = false;
+  if (shouldAutoConnect && metidToUse) {
+    try {
+      await pool.query('UPDATE meterdetail SET status = 1, updated_at = NOW() WHERE id = ? AND client_id = ?', [
+        meter.id,
+        clientId
+      ]);
+      await meterWrapper.setRelay(clientId, metidToUse, 2);
+      after.status = 1;
+      syncAutoConnected = true;
+      console.log(
+        '[sync] auto-connect setRelay Val=2 metid=%s hasPositiveBalance=%s rentNoOverdue=%s',
+        metidToUse,
+        hasPositiveBalance,
+        rentNoOverdue
+      );
+    } catch (e) {
+      console.warn('[sync] auto-connect failed', metidToUse, e?.message || e);
+    }
+  }
+
   return {
     ok: true,
     meterId,
@@ -145,7 +189,13 @@ async function syncMeterByCmsMeterId(clientId, meterId) {
     before: meter,
     after,
     raw: d,
-    prepaidZeroBalanceRelayOff: zeroBalanceForcedRelayOff
+    prepaidZeroBalanceRelayOff: zeroBalanceForcedRelayOff,
+    syncAutoConnected,
+    syncAutoConnectReason: syncAutoConnected
+      ? hasPositiveBalance
+        ? 'BALANCE_POSITIVE'
+        : 'NO_RENT_OVERDUE'
+      : undefined
   };
 }
 

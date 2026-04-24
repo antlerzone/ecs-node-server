@@ -3,8 +3,19 @@
  * Main body comes from Google Docs export; this page is generated with pdf-lib merge.
  */
 
+const crypto = require('crypto');
 const PDFDocument = require('pdfkit');
 const { PDFDocument: PdfLibDocument } = require('pdf-lib');
+
+function clnPartyAuditHash(agreementId, partyKey, signedAt, signatureDataUrl) {
+  const sig = String(signatureDataUrl || '').trim();
+  const sigRef =
+    sig.length > 240 ? crypto.createHash('sha256').update(sig, 'utf8').digest('hex') : sig;
+  return crypto
+    .createHash('sha256')
+    .update([String(agreementId || ''), partyKey, String(signedAt || ''), sigRef].join('|'), 'utf8')
+    .digest('hex');
+}
 
 function formatDt(v) {
   if (v == null) return '—';
@@ -133,4 +144,91 @@ async function mergePdfBuffers(mainPdfBuffer, appendixPdfBuffer) {
   return Buffer.from(out);
 }
 
-module.exports = { buildSigningAuditPdfBuffer, mergePdfBuffers };
+/**
+ * Cleanlemons cln_operator_agreement — one-page audit (operator_staff / operator_client).
+ * @param {object} meta
+ * @param {string} meta.agreementId
+ * @param {'operator_staff'|'operator_client'} meta.mode
+ * @param {string} [meta.hashDraft]
+ * @param {string} [meta.mainBodySha256]
+ * @param {Date} [meta.generatedAt]
+ * @param {object} [meta.parties] — from signed_meta_json.parties
+ */
+function buildCleanlemonsSigningAuditPdfBuffer(meta) {
+  const mode = String(meta.mode || '').trim().toLowerCase();
+  const parties = meta.parties && typeof meta.parties === 'object' ? meta.parties : {};
+  const op = parties.operator && typeof parties.operator === 'object' ? parties.operator : {};
+  const st = parties.staff && typeof parties.staff === 'object' ? parties.staff : {};
+  const cl = parties.client && typeof parties.client === 'object' ? parties.client : {};
+  const agreementId = meta.agreementId || '—';
+
+  const opHash = op.signedAt
+    ? clnPartyAuditHash(agreementId, 'operator', op.signedAt, op.signatureDataUrl)
+    : '';
+  const staffHash = st.signedAt
+    ? clnPartyAuditHash(agreementId, 'staff', st.signedAt, st.signatureDataUrl)
+    : '';
+  const clientHash = cl.signedAt
+    ? clnPartyAuditHash(agreementId, 'client', cl.signedAt, cl.signatureDataUrl)
+    : '';
+
+  const modeLabel =
+    mode === 'operator_client' ? 'operator & client (cleaning)' : 'operator & staff (offer letter)';
+
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: 'A4', margin: 48, info: { Title: 'Execution & audit schedule' } });
+    const chunks = [];
+    doc.on('data', (c) => chunks.push(c));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+
+    doc.fontSize(16).text('Execution & audit schedule (Cleanlemons)', { underline: true });
+    doc.moveDown(0.6);
+    doc.fontSize(9).fillColor('#444').text(
+      'This page records signing metadata and integrity hashes for the contract on the preceding pages.',
+      { align: 'left' }
+    );
+    doc.moveDown(0.8);
+    doc.fillColor('#000');
+
+    const rows = [
+      ['Agreement ID', agreementId],
+      ['Mode', modeLabel],
+      ['Draft PDF hash (hash_draft)', meta.hashDraft || '—'],
+      ['Main contract PDF SHA-256 (before this page)', meta.mainBodySha256 || '—'],
+      ['Schedule generated at', formatDt(meta.generatedAt)]
+    ];
+
+    if (mode === 'operator_client') {
+      rows.splice(
+        4,
+        0,
+        ['Operator signed at', formatDt(op.signedAt)],
+        ['Operator sign audit hash', opHash || '—'],
+        ['Client signed at', formatDt(cl.signedAt)],
+        ['Client sign audit hash', clientHash || '—']
+      );
+    } else {
+      rows.splice(
+        4,
+        0,
+        ['Operator signed at', formatDt(op.signedAt)],
+        ['Operator sign audit hash', opHash || '—'],
+        ['Staff signed at', formatDt(st.signedAt)],
+        ['Staff sign audit hash', staffHash || '—']
+      );
+    }
+
+    doc.fontSize(10);
+    for (const [label, value] of rows) {
+      const valStr = String(value).length > 200 ? `${String(value).slice(0, 197)}…` : String(value);
+      doc.font('Helvetica-Bold').text(`${label}: `, { continued: true });
+      doc.font('Helvetica').text(valStr);
+      doc.moveDown(0.45);
+    }
+
+    doc.end();
+  });
+}
+
+module.exports = { buildSigningAuditPdfBuffer, mergePdfBuffers, buildCleanlemonsSigningAuditPdfBuffer };

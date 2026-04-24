@@ -88,6 +88,27 @@ function scopeRowOwnerWhere(scopeOrColivingClientId) {
   return { sql: 'cln_operatorid = ?', params: [s.clnOperatorId] };
 }
 
+function getClnServiceLazy() {
+  return require('../cleanlemon/cleanlemon.service');
+}
+
+/**
+ * TTLock API credentials belong to the B2B client that owns the lockdetail row, not the logged-in grantee.
+ */
+function ttLockScopeForClnClientDevice(sessionScopeOrRow, deviceRow) {
+  const session = normalizeSmartDoorScope(sessionScopeOrRow);
+  const ownerId =
+    deviceRow?.clnClientdetailId != null && String(deviceRow.clnClientdetailId).trim() !== ''
+      ? String(deviceRow.clnClientdetailId).trim()
+      : '';
+  const slotRaw = deviceRow?.clnTtlockSlot != null ? Number(deviceRow.clnTtlockSlot) : 0;
+  const ttlockSlot = Number.isFinite(slotRaw) && slotRaw >= 0 ? slotRaw : 0;
+  if (session.kind === 'cln_client' && ownerId) {
+    return { kind: 'cln_client', clnClientId: ownerId, ttlockSlot };
+  }
+  return scopeWithTtlockSlotFromRow(sessionScopeOrRow, deviceRow?.clnTtlockSlot);
+}
+
 /** INSERT column values for scope (only one of the three FK columns is set). */
 function scopeInsertTriple(scopeOrColivingClientId) {
   const s = normalizeSmartDoorScope(scopeOrColivingClientId);
@@ -182,9 +203,58 @@ async function getColivingPropertySmartDoorIds(propertydetailId) {
 }
 
 /**
+ * Lockdetail ids linked to a Cleanlemons `cln_property` (Coliving mirror + cln_property_lock + optional smartdoor_id).
+ * Does not filter by portal owner — use with client portal property ACL.
+ */
+async function getMergedLockDetailIdsForCleanlemonsProperty(propertyId) {
+  const pid = String(propertyId || '').trim();
+  if (!pid) return [];
+  let colivingPid = null;
+  try {
+    const [clnRows] = await pool.query(
+      'SELECT coliving_propertydetail_id AS pid FROM cln_property WHERE id = ? LIMIT 1',
+      [pid]
+    );
+    colivingPid = clnRows?.[0]?.pid ? String(clnRows[0].pid).trim() : null;
+  } catch (e) {
+    const msg = String(e?.sqlMessage || e?.message || '');
+    if (!/Unknown column/i.test(msg)) throw e;
+  }
+  const nativeIds = [];
+  try {
+    const [plRows] = await pool.query(
+      'SELECT lockdetail_id AS lid FROM cln_property_lock WHERE property_id = ?',
+      [pid]
+    );
+    for (const r of plRows || []) {
+      const lid = r.lid != null ? String(r.lid).trim() : '';
+      if (lid) nativeIds.push(lid);
+    }
+  } catch (e) {
+    const msg = String(e?.sqlMessage || e?.message || '');
+    if (!/doesn't exist|ER_NO_SUCH_TABLE|Table .* doesn't exist/i.test(msg)) throw e;
+  }
+  try {
+    const [[row]] = await pool.query(
+      'SELECT NULLIF(TRIM(smartdoor_id), \'\') AS sd FROM cln_property WHERE id = ? LIMIT 1',
+      [pid]
+    );
+    if (row?.sd) nativeIds.push(String(row.sd).trim());
+  } catch (e) {
+    const msg = String(e?.sqlMessage || e?.message || '');
+    if (!/Unknown column/i.test(msg)) throw e;
+  }
+  let candidates = [];
+  if (colivingPid) {
+    candidates = await getColivingPropertySmartDoorIds(colivingPid);
+  }
+  return [...new Set([...candidates, ...nativeIds])].filter(Boolean);
+}
+
+/**
  * Property shortname / cln_property name for filter fallback (when smartdoor_id not set on property/rooms).
  */
-async function getPropertyDisplayNameForSmartDoorFilter(scopeOrColivingClientId, propertyId) {
+async function getPropertyDisplayNameForSmartDoorFilter(scopeOrColivingClientId, propertyId, opts = {}) {
   const integId = scopeToIntegrationId(scopeOrColivingClientId);
   const kind = await detectTtlockOwnerKind(integId);
   if (kind === 'cln_operator') {
@@ -195,9 +265,22 @@ async function getPropertyDisplayNameForSmartDoorFilter(scopeOrColivingClientId,
     return rows?.[0]?.nm ? String(rows[0].nm).trim() : null;
   }
   if (kind === 'cln_client') {
+    const loginEmail = opts.loginEmail != null ? String(opts.loginEmail).trim().toLowerCase() : '';
+    try {
+      const cln = getClnServiceLazy();
+      const acc = await cln.getClientPortalAccessiblePropertyIds({
+        clientdetailId: integId,
+        loginEmail,
+        limit: 1000,
+      });
+      const want = String(propertyId || '').trim();
+      if (!acc.some((x) => String(x).trim() === want)) return null;
+    } catch (_) {
+      return null;
+    }
     const [rows] = await pool.query(
-      `SELECT COALESCE(NULLIF(TRIM(property_name), ''), id) AS nm FROM cln_property WHERE id = ? AND clientdetail_id = ? LIMIT 1`,
-      [propertyId, integId]
+      `SELECT COALESCE(NULLIF(TRIM(property_name), ''), id) AS nm FROM cln_property WHERE id = ? LIMIT 1`,
+      [propertyId]
     );
     return rows?.[0]?.nm ? String(rows[0].nm).trim() : null;
   }
@@ -235,14 +318,137 @@ function filterSmartDoorItemsByPropertyNameTokens(items, propertyDisplayName) {
   });
 }
 
+async function clnClientPortalCanViewLockDetail(clnClientId, loginEmail, lockDetailId) {
+  const cid = String(clnClientId || '').trim();
+  const lid = String(lockDetailId || '').trim();
+  const em = String(loginEmail || '').trim().toLowerCase();
+  if (!cid || !lid || !em) return false;
+  try {
+    const cln = getClnServiceLazy();
+    const acc = await cln.getClientPortalAccessiblePropertyIds({
+      clientdetailId: cid,
+      loginEmail: em,
+      limit: 1000,
+    });
+    if (!acc.length) return false;
+    for (const pid of acc) {
+      const merged = await getMergedLockDetailIdsForCleanlemonsProperty(pid);
+      if (merged.some((x) => String(x) === lid)) return true;
+    }
+  } catch (_) {
+    return false;
+  }
+  return false;
+}
+
+async function collectGatewayIdsFromClnClientAccessiblePropertyLocks(scope, loginEmail) {
+  const s = normalizeSmartDoorScope(scope);
+  if (s.kind !== 'cln_client') return new Set();
+  const em = String(loginEmail || '').trim().toLowerCase();
+  if (!em) return new Set();
+  const gw = new Set();
+  try {
+    const cln = getClnServiceLazy();
+    const acc = await cln.getClientPortalAccessiblePropertyIds({
+      clientdetailId: s.clnClientId,
+      loginEmail: em,
+      limit: 1000,
+    });
+    for (const pid of acc) {
+      const merged = await getMergedLockDetailIdsForCleanlemonsProperty(pid);
+      if (!merged.length) continue;
+      const ph = merged.map(() => '?').join(',');
+      const [rows] = await pool.query(
+        `SELECT DISTINCT gateway_id FROM lockdetail WHERE id IN (${ph})
+         AND gateway_id IS NOT NULL AND TRIM(COALESCE(gateway_id, '')) != ''`,
+        merged
+      );
+      for (const r of rows || []) {
+        if (r.gateway_id) gw.add(String(r.gateway_id).trim());
+      }
+    }
+  } catch (_) {
+    /* ignore */
+  }
+  return gw;
+}
+
+async function clnClientPortalCanViewGatewayDetail(clnClientId, loginEmail, gatewayDetailId) {
+  const gid = String(gatewayDetailId || '').trim();
+  if (!gid) return false;
+  const [locks] = await pool.query(
+    `SELECT id FROM lockdetail
+     WHERE gateway_id IS NOT NULL AND TRIM(COALESCE(gateway_id, '')) != '' AND gateway_id = ?
+     LIMIT 200`,
+    [gid]
+  );
+  for (const r of locks || []) {
+    const ok = await clnClientPortalCanViewLockDetail(clnClientId, loginEmail, r.id);
+    if (ok) return true;
+  }
+  return false;
+}
+
+function mapLockDetailQueryRowToItem(r, scope) {
+  const clnCid = r.cln_clientid != null && String(r.cln_clientid).trim() !== '' ? String(r.cln_clientid).trim() : '';
+  const gwFk = r.gateway_id != null && String(r.gateway_id).trim() !== '' ? String(r.gateway_id).trim() : '';
+  const name = r.cln_client_fullname != null ? String(r.cln_client_fullname).trim() : '';
+  const em = r.cln_client_email != null ? String(r.cln_client_email).trim() : '';
+  return {
+    _id: r.id,
+    __type: 'lock',
+    lockId: r.lockid,
+    lockAlias: r.lockalias || '',
+    lockName: r.lockname || '',
+    gateway: r.gateway_id || null,
+    hasGateway: !!r.hasgateway,
+    electricQuantity: r.electricquantity != null ? Number(r.electricquantity) : 0,
+    type: r.type || '',
+    brand: r.brand || '',
+    isOnline: !!r.isonline,
+    active: !!r.active,
+    childmeter: parseChildmeter(r.childmeter),
+    client: r.client_id,
+    clnClientdetailId: clnCid || undefined,
+    ownedByClientName: name,
+    ownedByClientEmail: em,
+    needsGatewayDbLink: !!r.hasgateway && !gwFk,
+    operatorCanDelete: scope.kind !== 'cln_operator' || !clnCid,
+    clnTtlockSlot: r.cln_ttlock_slot != null ? Number(r.cln_ttlock_slot) : 0,
+  };
+}
+
+function mapGatewayQueryRowToItem(r, scope) {
+  const clnCid = r.cln_clientid != null && String(r.cln_clientid).trim() !== '' ? String(r.cln_clientid).trim() : '';
+  const name = r.cln_client_fullname != null ? String(r.cln_client_fullname).trim() : '';
+  const em = r.cln_client_email != null ? String(r.cln_client_email).trim() : '';
+  return {
+    _id: r.id,
+    __type: 'gateway',
+    gatewayId: r.gatewayid,
+    gatewayName: r.gatewayname || '',
+    networkName: r.networkname || '',
+    lockNum: r.locknum != null ? Number(r.locknum) : 0,
+    isOnline: !!r.isonline,
+    type: r.type || '',
+    client: r.client_id,
+    clnClientdetailId: clnCid || undefined,
+    ownedByClientName: name,
+    ownedByClientEmail: em,
+    operatorCanDelete: scope.kind !== 'cln_operator' || !clnCid,
+    clnTtlockSlot: r.cln_ttlock_slot != null ? Number(r.cln_ttlock_slot) : 0,
+  };
+}
+
 /**
  * Remote unlock a lock by lockdetail id. Resolves lockid from DB and calls TTLock API.
  * @param {object} [logContext] - { actorEmail, portalSource?, jobId? } — on success writes lockdetail_log when actorEmail set.
  */
 async function remoteUnlockLock(scopeOrColivingClientId, lockDetailId, logContext = null) {
-  const lock = await getLock(scopeOrColivingClientId, lockDetailId);
+  const loginEmail = logContext?.loginEmail != null ? String(logContext.loginEmail).trim().toLowerCase() : '';
+  const lock = await getLock(scopeOrColivingClientId, lockDetailId, { loginEmail });
   if (!lock || !lock.lockId) throw new Error('LOCK_NOT_FOUND');
-  const scopeForTt = scopeWithTtlockSlotFromRow(scopeOrColivingClientId, lock.clnTtlockSlot);
+  const scopeForTt = ttLockScopeForClnClientDevice(scopeOrColivingClientId, lock);
   const ttKey = ttLockIntegrationKey(scopeForTt);
   const ttOpt = ttLockApiOptions(scopeForTt);
   await lockWrapper.remoteUnlock(ttKey, lock.lockId, ttOpt);
@@ -474,9 +680,9 @@ async function getOperatorDoorPasswordReveal(scopeOrColivingClientId, lockDetail
 /**
  * Portal: unlock logs for a lock (scope must own lockdetail row). `date` or `from`+`to` = Malaysia YYYY-MM-DD.
  */
-async function listLockUnlockLogsForPortalScope(scopeOrColivingClientId, lockDetailId, { date, from, to, page, pageSize } = {}) {
+async function listLockUnlockLogsForPortalScope(scopeOrColivingClientId, lockDetailId, { date, from, to, page, pageSize, loginEmail } = {}) {
   const lid = String(lockDetailId || '').trim();
-  const lock = await getLock(scopeOrColivingClientId, lid);
+  const lock = await getLock(scopeOrColivingClientId, lid, { loginEmail });
   if (!lock) {
     const e = new Error('LOCK_NOT_FOUND');
     e.code = 'LOCK_NOT_FOUND';
@@ -586,10 +792,43 @@ async function getSmartDoorList(scopeOrColivingClientId, opts = {}) {
         operatorCanDelete: scope.kind !== 'cln_operator' || !clnCid,
       };
     });
-    const idToLock = new Map(lockItems.map(l => [l._id, l]));
-    lockItems.forEach(l => {
-      l.childmeterAliases = (l.childmeter || []).map(id => idToLock.get(id)?.lockAlias || id);
-      const parent = lockItems.find(o => o._id !== l._id && (o.childmeter || []).includes(l._id));
+    if (scope.kind === 'cln_client' && opts.loginEmail) {
+      try {
+        const cln = getClnServiceLazy();
+        const acc = await cln.getClientPortalAccessiblePropertyIds({
+          clientdetailId: scope.clnClientId,
+          loginEmail: String(opts.loginEmail || '').trim().toLowerCase(),
+          limit: 1000,
+        });
+        const ownedIds = new Set(lockItems.map((l) => String(l._id)));
+        const extraIds = new Set();
+        for (const pid of acc) {
+          const merged = await getMergedLockDetailIdsForCleanlemonsProperty(pid);
+          for (const lid of merged) {
+            const s = String(lid);
+            if (!ownedIds.has(s)) extraIds.add(s);
+          }
+        }
+        if (extraIds.size) {
+          const ph = [...extraIds].map(() => '?').join(',');
+          const [extraRows] = await pool.query(
+            `SELECT l.id, l.lockid, l.lockalias, l.lockname, l.gateway_id, l.hasgateway, l.electricquantity, l.type, l.brand, l.isonline, l.active, l.childmeter, l.client_id, l.cln_clientid, l.cln_operatorid, l.cln_ttlock_slot,
+             cd.fullname AS cln_client_fullname, cd.email AS cln_client_email
+             FROM lockdetail l
+             LEFT JOIN cln_clientdetail cd ON cd.id = l.cln_clientid
+             WHERE l.id IN (${ph})`,
+            [...extraIds]
+          );
+          lockItems = lockItems.concat((extraRows || []).map((r) => mapLockDetailQueryRowToItem(r, scope)));
+        }
+      } catch (e) {
+        console.warn('[smartdoorsetting] cln_client shared smartdoor locks:', e?.message || e);
+      }
+    }
+    const idToLock = new Map(lockItems.map((l) => [l._id, l]));
+    lockItems.forEach((l) => {
+      l.childmeterAliases = (l.childmeter || []).map((id) => idToLock.get(id)?.lockAlias || id);
+      const parent = lockItems.find((o) => o._id !== l._id && (o.childmeter || []).includes(l._id));
       l.parentLockAlias = parent ? parent.lockAlias : null;
     });
     if (scope.kind === 'cln_operator' && lockItems.length) {
@@ -630,9 +869,44 @@ async function getSmartDoorList(scopeOrColivingClientId, opts = {}) {
         operatorCanDelete: scope.kind !== 'cln_operator' || !clnCid,
       };
     });
+    if (scope.kind === 'cln_client' && opts.loginEmail && (lockItems.length || filter === 'GATEWAY')) {
+      const have = new Set(gatewayItems.map((g) => String(g._id)));
+      const need = new Set();
+      for (const l of lockItems) {
+        if (l.gateway != null && String(l.gateway).trim() !== '') need.add(String(l.gateway).trim());
+      }
+      if (filter === 'GATEWAY') {
+        const fromAcc = await collectGatewayIdsFromClnClientAccessiblePropertyLocks(scope, opts.loginEmail);
+        for (const id of fromAcc) need.add(id);
+      }
+      const toFetch = [...need].filter((id) => !have.has(id));
+      if (toFetch.length) {
+        const ph = toFetch.map(() => '?').join(',');
+        const [gr] = await pool.query(
+          `SELECT g.id, g.gatewayid, g.gatewayname, g.networkname, g.locknum, g.isonline, g.type, g.client_id, g.cln_clientid, g.cln_operatorid, g.cln_ttlock_slot,
+           cd.fullname AS cln_client_fullname, cd.email AS cln_client_email
+           FROM gatewaydetail g
+           LEFT JOIN cln_clientdetail cd ON cd.id = g.cln_clientid
+           WHERE g.id IN (${ph})`,
+          toFetch
+        );
+        gatewayItems = gatewayItems.concat((gr || []).map((r) => mapGatewayQueryRowToItem(r, scope)));
+      }
+    }
   }
 
   let items = [...lockItems, ...gatewayItems];
+
+  /** Cleanlemons operator portal: filter by operator-owned rows vs a linked B2B client (`cln_clientid`). */
+  const ownOpt = opts.clnClientOwnership != null ? String(opts.clnClientOwnership).trim().toLowerCase() : 'all';
+  if (scope.kind === 'cln_operator' && ownOpt && ownOpt !== 'all') {
+    if (ownOpt === 'own' || ownOpt === 'operator') {
+      items = items.filter((i) => !i.clnClientdetailId);
+    } else {
+      const want = String(opts.clnClientOwnership || '').trim();
+      items = items.filter((i) => String(i.clnClientdetailId || '').trim() === want);
+    }
+  }
 
   if (keyword) {
     items = items.filter(i => {
@@ -648,17 +922,18 @@ async function getSmartDoorList(scopeOrColivingClientId, opts = {}) {
   }
 
   if (propertyId) {
-    const doorIds = await getSmartDoorIdsByProperty(scope, propertyId);
+    const doorIds = await getSmartDoorIdsByProperty(scopeOrColivingClientId, propertyId, {
+      loginEmail: opts.loginEmail,
+    });
     // 1) Strict: locks on property/room smartdoor_id + gateways linked via lockdetail.gateway_id
     // 2) Fallback: no DB linkage — match device alias/name to property label tokens (e.g. "Paragon Suite" → "ps" for "PS A 29-05")
     if (doorIds && doorIds.length > 0) {
       const lockSet = new Set(doorIds);
       const inPh = doorIds.map(() => '?').join(',');
-      const { sql: ownerSql, params: ownerParams } = scopeRowOwnerWhere(scope);
       const [gwFromLocks] = await pool.query(
-        `SELECT DISTINCT gateway_id FROM lockdetail WHERE ${ownerSql} AND id IN (${inPh})
+        `SELECT DISTINCT gateway_id FROM lockdetail WHERE id IN (${inPh})
          AND gateway_id IS NOT NULL AND TRIM(COALESCE(gateway_id, '')) != ''`,
-        [...ownerParams, ...doorIds]
+        doorIds
       );
       const gwSet = new Set((gwFromLocks || []).map((r) => String(r.gateway_id).trim()));
       items = items.filter(
@@ -667,7 +942,9 @@ async function getSmartDoorList(scopeOrColivingClientId, opts = {}) {
           (i.__type === 'gateway' && gwSet.has(String(i._id)))
       );
     } else {
-      const label = await getPropertyDisplayNameForSmartDoorFilter(scopeOrColivingClientId, propertyId);
+      const label = await getPropertyDisplayNameForSmartDoorFilter(scopeOrColivingClientId, propertyId, {
+        loginEmail: opts.loginEmail,
+      });
       items = filterSmartDoorItemsByPropertyNameTokens(items, label);
     }
   }
@@ -697,7 +974,7 @@ function parseChildmeter(val) {
 /**
  * Get filter options: properties for dropdown.
  */
-async function getSmartDoorFilters(scopeOrColivingClientId) {
+async function getSmartDoorFilters(scopeOrColivingClientId, opts = {}) {
   const integId = scopeToIntegrationId(scopeOrColivingClientId);
   const kind = await detectTtlockOwnerKind(integId);
   if (kind === 'cln_operator') {
@@ -708,7 +985,38 @@ async function getSmartDoorFilters(scopeOrColivingClientId) {
         [integId]
       );
       const properties = (rows || []).map((r) => ({ label: r.shortname || r.id, value: r.id }));
-      return { properties };
+      let linkedClients = [];
+      try {
+        const [lr] = await pool.query(
+          `SELECT DISTINCT l.cln_clientid AS id, cd.fullname, cd.email
+           FROM lockdetail l
+           INNER JOIN cln_clientdetail cd ON cd.id = l.cln_clientid
+           WHERE l.cln_operatorid = ? AND l.cln_clientid IS NOT NULL AND TRIM(COALESCE(l.cln_clientid, '')) != ''`,
+          [integId]
+        );
+        const [gr] = await pool.query(
+          `SELECT DISTINCT g.cln_clientid AS id, cd.fullname, cd.email
+           FROM gatewaydetail g
+           INNER JOIN cln_clientdetail cd ON cd.id = g.cln_clientid
+           WHERE g.cln_operatorid = ? AND g.cln_clientid IS NOT NULL AND TRIM(COALESCE(g.cln_clientid, '')) != ''`,
+          [integId]
+        );
+        const m = new Map();
+        for (const r of [...(lr || []), ...(gr || [])]) {
+          const id = r.id != null ? String(r.id).trim() : '';
+          if (!id || m.has(id)) continue;
+          const fn = r.fullname != null ? String(r.fullname).trim() : '';
+          const em = r.email != null ? String(r.email).trim() : '';
+          const label = fn || em || id;
+          m.set(id, label);
+        }
+        linkedClients = [...m.entries()]
+          .sort((a, b) => String(a[1]).localeCompare(String(b[1]), undefined, { sensitivity: 'base' }))
+          .map(([value, label]) => ({ value, label }));
+      } catch (_) {
+        linkedClients = [];
+      }
+      return { properties, linkedClients };
     } catch (e) {
       const msg = String(e?.sqlMessage || e?.message || '');
       if (!/Unknown column/i.test(msg)) throw e;
@@ -716,6 +1024,20 @@ async function getSmartDoorFilters(scopeOrColivingClientId) {
   }
   if (kind === 'cln_client') {
     try {
+      const loginEmail = opts.loginEmail != null ? String(opts.loginEmail).trim().toLowerCase() : '';
+      if (loginEmail) {
+        const cln = getClnServiceLazy();
+        const rows = await cln.listClientPortalProperties({
+          clientdetailId: integId,
+          limit: 1000,
+          loginEmail,
+        });
+        const properties = (rows || []).map((r) => ({
+          label: (r.name && String(r.name).trim()) || r.id,
+          value: r.id,
+        }));
+        return { properties };
+      }
       const [rows] = await pool.query(
         `SELECT id, COALESCE(NULLIF(TRIM(property_name), ''), id) AS shortname
          FROM cln_property WHERE clientdetail_id = ? ORDER BY property_name ASC LIMIT 1000`,
@@ -739,82 +1061,47 @@ async function getSmartDoorFilters(scopeOrColivingClientId) {
 /**
  * Get single lock by id (client must own it).
  */
-async function getLock(scopeOrColivingClientId, id) {
+async function getLock(scopeOrColivingClientId, id, viewOpts = {}) {
   const scope = normalizeSmartDoorScope(scopeOrColivingClientId);
   const { sql, params } = scopeRowOwnerWhere(scopeOrColivingClientId);
-  const [rows] = await pool.query(
-    `SELECT l.id, l.lockid, l.lockalias, l.lockname, l.gateway_id, l.hasgateway, l.electricquantity, l.type, l.brand, l.isonline, l.active, l.childmeter, l.client_id, l.cln_clientid, l.cln_operatorid, l.cln_ttlock_slot,
+  const sel = `SELECT l.id, l.lockid, l.lockalias, l.lockname, l.gateway_id, l.hasgateway, l.electricquantity, l.type, l.brand, l.isonline, l.active, l.childmeter, l.client_id, l.cln_clientid, l.cln_operatorid, l.cln_ttlock_slot,
      cd.fullname AS cln_client_fullname, cd.email AS cln_client_email
      FROM lockdetail l
-     LEFT JOIN cln_clientdetail cd ON cd.id = l.cln_clientid
-     WHERE l.id = ? AND l.${sql} LIMIT 1`,
-    [id, ...params]
-  );
-  const r = rows && rows[0];
+     LEFT JOIN cln_clientdetail cd ON cd.id = l.cln_clientid`;
+  const [rows] = await pool.query(`${sel} WHERE l.id = ? AND l.${sql} LIMIT 1`, [id, ...params]);
+  let r = rows && rows[0];
+  if (!r && scope.kind === 'cln_client' && viewOpts.loginEmail) {
+    const em = String(viewOpts.loginEmail || '').trim().toLowerCase();
+    if (em && (await clnClientPortalCanViewLockDetail(scope.clnClientId, em, id))) {
+      const [rows2] = await pool.query(`${sel} WHERE l.id = ? LIMIT 1`, [id]);
+      r = rows2 && rows2[0];
+    }
+  }
   if (!r) return null;
-  const clnCid = r.cln_clientid != null && String(r.cln_clientid).trim() !== '' ? String(r.cln_clientid).trim() : '';
-  const gwFk = r.gateway_id != null && String(r.gateway_id).trim() !== '' ? String(r.gateway_id).trim() : '';
-  const name = r.cln_client_fullname != null ? String(r.cln_client_fullname).trim() : '';
-  const em = r.cln_client_email != null ? String(r.cln_client_email).trim() : '';
-  return {
-    _id: r.id,
-    __type: 'lock',
-    lockId: r.lockid,
-    lockAlias: r.lockalias || '',
-    lockName: r.lockname || '',
-    gateway: r.gateway_id || null,
-    hasGateway: !!r.hasgateway,
-    electricQuantity: r.electricquantity != null ? Number(r.electricquantity) : 0,
-    type: r.type || '',
-    brand: r.brand || '',
-    isOnline: !!r.isonline,
-    active: !!r.active,
-    childmeter: parseChildmeter(r.childmeter),
-    client: r.client_id,
-    clnClientdetailId: clnCid || undefined,
-    ownedByClientName: name,
-    ownedByClientEmail: em,
-    needsGatewayDbLink: !!r.hasgateway && !gwFk,
-    operatorCanDelete: scope.kind !== 'cln_operator' || !clnCid,
-    clnTtlockSlot: r.cln_ttlock_slot != null ? Number(r.cln_ttlock_slot) : 0,
-  };
+  return mapLockDetailQueryRowToItem(r, scope);
 }
 
 /**
  * Get single gateway by id.
  */
-async function getGateway(scopeOrColivingClientId, id) {
+async function getGateway(scopeOrColivingClientId, id, viewOpts = {}) {
   const scope = normalizeSmartDoorScope(scopeOrColivingClientId);
   const { sql, params } = scopeRowOwnerWhere(scopeOrColivingClientId);
-  const [rows] = await pool.query(
-    `SELECT g.id, g.gatewayid, g.gatewayname, g.networkname, g.locknum, g.isonline, g.type, g.client_id, g.cln_clientid, g.cln_operatorid, g.cln_ttlock_slot,
+  const sel = `SELECT g.id, g.gatewayid, g.gatewayname, g.networkname, g.locknum, g.isonline, g.type, g.client_id, g.cln_clientid, g.cln_operatorid, g.cln_ttlock_slot,
      cd.fullname AS cln_client_fullname, cd.email AS cln_client_email
      FROM gatewaydetail g
-     LEFT JOIN cln_clientdetail cd ON cd.id = g.cln_clientid
-     WHERE g.id = ? AND g.${sql} LIMIT 1`,
-    [id, ...params]
-  );
-  const r = rows && rows[0];
+     LEFT JOIN cln_clientdetail cd ON cd.id = g.cln_clientid`;
+  const [rows] = await pool.query(`${sel} WHERE g.id = ? AND g.${sql} LIMIT 1`, [id, ...params]);
+  let r = rows && rows[0];
+  if (!r && scope.kind === 'cln_client' && viewOpts.loginEmail) {
+    const em = String(viewOpts.loginEmail || '').trim().toLowerCase();
+    if (em && (await clnClientPortalCanViewGatewayDetail(scope.clnClientId, em, id))) {
+      const [rows2] = await pool.query(`${sel} WHERE g.id = ? LIMIT 1`, [id]);
+      r = rows2 && rows2[0];
+    }
+  }
   if (!r) return null;
-  const clnCid = r.cln_clientid != null && String(r.cln_clientid).trim() !== '' ? String(r.cln_clientid).trim() : '';
-  const name = r.cln_client_fullname != null ? String(r.cln_client_fullname).trim() : '';
-  const em = r.cln_client_email != null ? String(r.cln_client_email).trim() : '';
-  return {
-    _id: r.id,
-    __type: 'gateway',
-    gatewayId: r.gatewayid,
-    gatewayName: r.gatewayname || '',
-    networkName: r.networkname || '',
-    lockNum: r.locknum != null ? Number(r.locknum) : 0,
-    isOnline: !!r.isonline,
-    type: r.type || '',
-    client: r.client_id,
-    clnClientdetailId: clnCid || undefined,
-    ownedByClientName: name,
-    ownedByClientEmail: em,
-    operatorCanDelete: scope.kind !== 'cln_operator' || !clnCid,
-    clnTtlockSlot: r.cln_ttlock_slot != null ? Number(r.cln_ttlock_slot) : 0,
-  };
+  return mapGatewayQueryRowToItem(r, scope);
 }
 
 /**
@@ -1008,15 +1295,15 @@ async function fetchTtlockLockListAndMergeToDb(scopeOrColivingClientId) {
 /**
  * Refresh one lockdetail row from TTLock (battery, alias, gateway link). Does not sync gateways table.
  */
-async function syncSingleLockStatusFromTtlock(scopeOrColivingClientId, lockDetailId) {
+async function syncSingleLockStatusFromTtlock(scopeOrColivingClientId, lockDetailId, opts = {}) {
   const id = String(lockDetailId || '').trim();
   if (!id) return { ok: false, reason: 'NO_ID' };
-  const dbLock = await getLock(scopeOrColivingClientId, id);
+  const dbLock = await getLock(scopeOrColivingClientId, id, { loginEmail: opts.loginEmail });
   if (!dbLock || dbLock.lockId == null) return { ok: false, reason: 'LOCK_NOT_FOUND' };
   const lockIdNum = Number(dbLock.lockId);
   if (!Number.isFinite(lockIdNum)) return { ok: false, reason: 'INVALID_LOCK_ID' };
 
-  const scopeForTt = scopeWithTtlockSlotFromRow(scopeOrColivingClientId, dbLock.clnTtlockSlot);
+  const scopeForTt = ttLockScopeForClnClientDevice(scopeOrColivingClientId, dbLock);
   const ttKey = ttLockIntegrationKey(scopeForTt);
   const ttOpt = ttLockApiOptions(scopeForTt);
   const lockRes = await lockWrapper.listAllLocks(ttKey, ttOpt);
@@ -1035,7 +1322,7 @@ async function syncSingleLockStatusFromTtlock(scopeOrColivingClientId, lockDetai
   let singleGatewayFallbackPromise;
   const getSingleGatewayDbIdFallback = () => {
     if (!singleGatewayFallbackPromise) {
-      const { sql, params } = scopeRowOwnerWhere(scopeOrColivingClientId);
+      const { sql, params } = scopeRowOwnerWhere(scopeForTt);
       singleGatewayFallbackPromise = pool
         .query(`SELECT id FROM gatewaydetail WHERE ${sql} LIMIT 2`, params)
         .then(([rows]) => (rows && rows.length === 1 ? rows[0].id : null));
@@ -1044,7 +1331,7 @@ async function syncSingleLockStatusFromTtlock(scopeOrColivingClientId, lockDetai
   };
 
   await mergeOneLockFromTtlockListItem(scopeForTt, l, getSingleGatewayDbIdFallback);
-  const updated = await getLock(scopeOrColivingClientId, id);
+  const updated = await getLock(scopeOrColivingClientId, id, { loginEmail: opts.loginEmail });
   return { ok: true, lock: updated };
 }
 
@@ -1095,15 +1382,15 @@ async function fetchTtlockGatewayListAndMergeToDb(scopeOrColivingClientId) {
 /**
  * Refresh one gatewaydetail row from TTLock (name, online, lock count, network).
  */
-async function syncSingleGatewayStatusFromTtlock(scopeOrColivingClientId, gatewayDetailId) {
+async function syncSingleGatewayStatusFromTtlock(scopeOrColivingClientId, gatewayDetailId, opts = {}) {
   const id = String(gatewayDetailId || '').trim();
   if (!id) return { ok: false, reason: 'NO_ID' };
-  const dbGw = await getGateway(scopeOrColivingClientId, id);
+  const dbGw = await getGateway(scopeOrColivingClientId, id, { loginEmail: opts.loginEmail });
   if (!dbGw || dbGw.gatewayId == null) return { ok: false, reason: 'GATEWAY_NOT_FOUND' };
   const extId = Number(dbGw.gatewayId);
   if (!Number.isFinite(extId)) return { ok: false, reason: 'INVALID_GATEWAY_ID' };
 
-  const scopeForTt = scopeWithTtlockSlotFromRow(scopeOrColivingClientId, dbGw.clnTtlockSlot);
+  const scopeForTt = ttLockScopeForClnClientDevice(scopeOrColivingClientId, dbGw);
   const ttKey = ttLockIntegrationKey(scopeForTt);
   const ttOpt = ttLockApiOptions(scopeForTt);
   const gatewayRes = await gatewayWrapper.listAllGateways(ttKey, ttOpt);
@@ -1111,8 +1398,8 @@ async function syncSingleGatewayStatusFromTtlock(scopeOrColivingClientId, gatewa
   if (!g) {
     return { ok: false, reason: 'TTLOCK_GATEWAY_NOT_FOUND' };
   }
-  await mergeOneGatewayFromTtlockListItem(scopeOrColivingClientId, g);
-  const updated = await getGateway(scopeOrColivingClientId, id);
+  await mergeOneGatewayFromTtlockListItem(scopeForTt, g);
+  const updated = await getGateway(scopeOrColivingClientId, id, { loginEmail: opts.loginEmail });
   return { ok: true, gateway: updated };
 }
 
@@ -1211,10 +1498,46 @@ async function previewSmartDoorSelection(scopeOrColivingClientId) {
 /**
  * Sync name to TTLock (rename lock or gateway).
  */
-async function syncTTLockName(scopeOrColivingClientId, { type, externalId, name }) {
+async function syncTTLockName(scopeOrColivingClientId, { type, externalId, name }, opts = {}) {
   if (!name || !externalId) throw new Error('NAME_AND_EXTERNAL_ID_REQUIRED');
-  const ttKey = ttLockIntegrationKey(scopeOrColivingClientId);
-  const ttOpt = ttLockApiOptions(scopeOrColivingClientId);
+  const sess = normalizeSmartDoorScope(scopeOrColivingClientId);
+  let ttScope = scopeOrColivingClientId;
+  const em = opts.loginEmail != null ? String(opts.loginEmail).trim().toLowerCase() : '';
+  if (sess.kind === 'cln_client' && em) {
+    if (type === 'lock') {
+      const ext = Number(externalId);
+      if (Number.isFinite(ext)) {
+        const [lr] = await pool.query('SELECT id FROM lockdetail WHERE lockid = ? LIMIT 1', [ext]);
+        const lid = lr?.[0]?.id;
+        if (lid) {
+          const lock = await getLock(scopeOrColivingClientId, lid, { loginEmail: em });
+          if (!lock) {
+            const e = new Error('LOCK_NOT_FOUND');
+            e.code = 'LOCK_NOT_FOUND';
+            throw e;
+          }
+          ttScope = ttLockScopeForClnClientDevice(scopeOrColivingClientId, lock);
+        }
+      }
+    } else if (type === 'gateway') {
+      const ext = Number(externalId);
+      if (Number.isFinite(ext)) {
+        const [gr] = await pool.query('SELECT id FROM gatewaydetail WHERE gatewayid = ? LIMIT 1', [ext]);
+        const gid = gr?.[0]?.id;
+        if (gid) {
+          const gw = await getGateway(scopeOrColivingClientId, gid, { loginEmail: em });
+          if (!gw) {
+            const e = new Error('GATEWAY_NOT_FOUND');
+            e.code = 'GATEWAY_NOT_FOUND';
+            throw e;
+          }
+          ttScope = ttLockScopeForClnClientDevice(scopeOrColivingClientId, gw);
+        }
+      }
+    }
+  }
+  const ttKey = ttLockIntegrationKey(ttScope);
+  const ttOpt = ttLockApiOptions(ttScope);
   if (type === 'lock') {
     await lockWrapper.changeLockName(ttKey, Number(externalId), name, ttOpt);
     return { ok: true };
@@ -1230,11 +1553,32 @@ async function syncTTLockName(scopeOrColivingClientId, { type, externalId, name 
  * Get lockdetail ids that belong to this property (property.smartdoor_id + rooms' smartdoor_id).
  * Cleanlemons: propertyId is cln_property.id; resolves via coliving_propertydetail_id when set.
  */
-async function getSmartDoorIdsByProperty(scopeOrColivingClientId, propertyId) {
+async function getSmartDoorIdsByProperty(scopeOrColivingClientId, propertyId, opts = {}) {
   const integId = scopeToIntegrationId(scopeOrColivingClientId);
   const kind = await detectTtlockOwnerKind(integId);
-  if (kind === 'cln_operator' || kind === 'cln_client') {
-    const col = kind === 'cln_operator' ? 'operator_id' : 'clientdetail_id';
+  if (kind === 'cln_client') {
+    const loginEmail = opts.loginEmail != null ? String(opts.loginEmail).trim().toLowerCase() : '';
+    const want = String(propertyId || '').trim();
+    if (!want) return [];
+    if (loginEmail) {
+      try {
+        const cln = getClnServiceLazy();
+        const acc = await cln.getClientPortalAccessiblePropertyIds({
+          clientdetailId: integId,
+          loginEmail,
+          limit: 1000,
+        });
+        if (!acc.some((x) => String(x).trim() === want)) return [];
+      } catch (_) {
+        return [];
+      }
+      const merged = await getMergedLockDetailIdsForCleanlemonsProperty(want);
+      if (!merged.length) return [];
+      const inPh = merged.map(() => '?').join(',');
+      const [rows] = await pool.query(`SELECT id FROM lockdetail WHERE id IN (${inPh})`, merged);
+      return (rows || []).map((r) => r.id);
+    }
+    const col = 'clientdetail_id';
     let colivingPid = null;
     try {
       const [clnRows] = await pool.query(
@@ -1246,14 +1590,66 @@ async function getSmartDoorIdsByProperty(scopeOrColivingClientId, propertyId) {
       const msg = String(e?.sqlMessage || e?.message || '');
       if (!/Unknown column/i.test(msg)) throw e;
     }
-    if (!colivingPid) return [];
-    const candidates = await getColivingPropertySmartDoorIds(colivingPid);
-    if (!candidates.length) return [];
+    let nativeIds = [];
+    try {
+      const [plRows] = await pool.query(
+        'SELECT lockdetail_id AS lid FROM cln_property_lock WHERE property_id = ?',
+        [propertyId]
+      );
+      nativeIds = (plRows || []).map((r) => String(r.lid || '').trim()).filter(Boolean);
+    } catch (e) {
+      const msg = String(e?.sqlMessage || e?.message || '');
+      if (!/doesn't exist|ER_NO_SUCH_TABLE|Table .* doesn't exist/i.test(msg)) throw e;
+    }
+    let candidates = [];
+    if (colivingPid) {
+      candidates = await getColivingPropertySmartDoorIds(colivingPid);
+    }
+    const merged = [...new Set([...candidates, ...nativeIds])];
+    if (!merged.length) return [];
     const { sql, params } = scopeRowOwnerWhere(scopeOrColivingClientId);
-    const inPh = candidates.map(() => '?').join(',');
+    const inPh = merged.map(() => '?').join(',');
     const [owned] = await pool.query(
       `SELECT id FROM lockdetail WHERE ${sql} AND id IN (${inPh})`,
-      [...params, ...candidates]
+      [...params, ...merged]
+    );
+    return (owned || []).map((r) => r.id);
+  }
+  if (kind === 'cln_operator') {
+    const col = 'operator_id';
+    let colivingPid = null;
+    try {
+      const [clnRows] = await pool.query(
+        `SELECT coliving_propertydetail_id AS pid FROM cln_property WHERE id = ? AND ${col} = ? LIMIT 1`,
+        [propertyId, integId]
+      );
+      colivingPid = clnRows?.[0]?.pid ? String(clnRows[0].pid).trim() : null;
+    } catch (e) {
+      const msg = String(e?.sqlMessage || e?.message || '');
+      if (!/Unknown column/i.test(msg)) throw e;
+    }
+    let nativeIds = [];
+    try {
+      const [plRows] = await pool.query(
+        'SELECT lockdetail_id AS lid FROM cln_property_lock WHERE property_id = ?',
+        [propertyId]
+      );
+      nativeIds = (plRows || []).map((r) => String(r.lid || '').trim()).filter(Boolean);
+    } catch (e) {
+      const msg = String(e?.sqlMessage || e?.message || '');
+      if (!/doesn't exist|doesn't exist|ER_NO_SUCH_TABLE|Table .* doesn't exist/i.test(msg)) throw e;
+    }
+    let candidates = [];
+    if (colivingPid) {
+      candidates = await getColivingPropertySmartDoorIds(colivingPid);
+    }
+    const merged = [...new Set([...candidates, ...nativeIds])];
+    if (!merged.length) return [];
+    const { sql, params } = scopeRowOwnerWhere(scopeOrColivingClientId);
+    const inPh = merged.map(() => '?').join(',');
+    const [owned] = await pool.query(
+      `SELECT id FROM lockdetail WHERE ${sql} AND id IN (${inPh})`,
+      [...params, ...merged]
     );
     return (owned || []).map((r) => r.id);
   }

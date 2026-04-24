@@ -77,12 +77,8 @@ function isProfileComplete(profile: Record<string, unknown> | null | undefined):
   return required.every((key) => String(profile[key] || '').trim() !== '')
 }
 
-function isProfileSelfVerified(profile: Record<string, unknown> | null | undefined): boolean {
-  if (!profile) return false
-  if (profile.profileIdentityVerified === true) return true
-  const v = profile.profileSelfVerifiedAt
-  return v != null && String(v).trim() !== ''
-}
+/** When false: do not redirect to `/employee/profile?gate=required` or block other routes on incomplete profile. */
+const EMPLOYEE_PROFILE_GATE_ENABLED = false
 
 /** Mobile quick bar: staff = Dashboard + Transport + Working + Linens + Other; driver/dobi field = role home + Working + Other (both roles = Driver + Dobi + Working + Other). */
 type EmployeeMobileBarVariant = 'staffFull' | 'fieldDriverOnly' | 'fieldDobiOnly' | 'fieldDriverAndDobi'
@@ -236,7 +232,7 @@ function EmployeeQuickBar({
   )
 
   return (
-    <div className="flex items-center justify-between gap-0.5">
+    <div className="flex max-w-full items-center justify-between gap-0.5 overflow-hidden">
       {variant === 'staffFull' ? (
         <>
           {dashboardLink}
@@ -282,7 +278,7 @@ export default function EmployeeLayout({ children }: { children: React.ReactNode
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [selectedOperatorId, setSelectedOperatorId] = useState('')
   const [sessionReady, setSessionReady] = useState(false)
-  const [checkingProfileGate, setCheckingProfileGate] = useState(true)
+  const [checkingProfileGate, setCheckingProfileGate] = useState(EMPLOYEE_PROFILE_GATE_ENABLED)
   const [currentTeam, setCurrentTeam] = useState<string>('-')
   const [teamMembers, setTeamMembers] = useState<{ name: string; email: string }[]>([])
   const [showEmployeeKpiNav, setShowEmployeeKpiNav] = useState(false)
@@ -384,6 +380,10 @@ export default function EmployeeLayout({ children }: { children: React.ReactNode
   useEffect(() => {
     let cancelled = false
     if (!sessionReady) return
+    if (!EMPLOYEE_PROFILE_GATE_ENABLED) {
+      setCheckingProfileGate(false)
+      return
+    }
     if (!hasAnyEmployeeBinding) {
       setCheckingProfileGate(false)
       return
@@ -399,8 +399,7 @@ export default function EmployeeLayout({ children }: { children: React.ReactNode
         if (cancelled) return
         const profile = (res?.profile || {}) as Record<string, unknown>
         const complete = !!(res?.ok && isProfileComplete(profile))
-        const selfVerified = !!(res?.ok && isProfileSelfVerified(profile))
-        if ((!complete || !selfVerified) && !isEmployeeProfileRoute) {
+        if (!complete && !isEmployeeProfileRoute) {
           router.replace('/employee/profile?gate=required')
         }
       } finally {
@@ -643,15 +642,15 @@ export default function EmployeeLayout({ children }: { children: React.ReactNode
   }
 
   return (
-    <div className="min-h-screen bg-background flex">
+    <div className="flex min-h-screen max-w-[100vw] overflow-x-hidden bg-background">
       <aside className="hidden lg:flex w-64 bg-sidebar border-r border-sidebar-border flex-col fixed h-full">
         <NavContent />
       </aside>
 
-      <div className="flex-1 lg:ml-64">
+      <div className="min-w-0 flex-1 lg:ml-64">
         <header className="sticky top-0 z-20 bg-card border-b border-border px-4 py-3">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
+          <div className="flex min-w-0 items-center justify-between gap-2">
+            <div className="flex min-w-0 items-center gap-3">
               <Sheet open={sidebarOpen} onOpenChange={setSidebarOpen}>
                 <SheetTrigger asChild>
                   <Button variant="ghost" size="icon" className="lg:hidden">
@@ -664,7 +663,7 @@ export default function EmployeeLayout({ children }: { children: React.ReactNode
                 </SheetContent>
               </Sheet>
 
-              <h1 className="text-lg font-semibold text-foreground">
+              <h1 className="truncate text-lg font-semibold text-foreground">
                 {normalizedPathname === '/employee'
                   ? 'Dashboard'
                   : navItems.find((item) => item.href === normalizedPathname)?.label || 'Employee Portal'}
@@ -722,12 +721,12 @@ export default function EmployeeLayout({ children }: { children: React.ReactNode
           </div>
         </header>
 
-        <main className="p-4 lg:p-6 pb-24 lg:pb-6">
+        <main className="min-w-0 max-w-full overflow-x-hidden p-4 pb-[calc(6.75rem+env(safe-area-inset-bottom,0px))] lg:p-6 lg:pb-6">
           {children}
         </main>
       </div>
 
-      <nav className="lg:hidden fixed bottom-0 left-0 right-0 bg-card border-t border-border px-1 py-2 z-20 safe-area-pb">
+      <nav className="lg:hidden fixed bottom-0 left-0 right-0 z-20 border-t border-border bg-card px-1 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom,0px))]">
         {hasStaffBinding || hasDriverBinding || hasDobiBinding ? (
           <Suspense
             fallback={

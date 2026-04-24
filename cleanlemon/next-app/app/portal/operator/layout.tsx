@@ -19,7 +19,10 @@ import {
   fetchOperatorSubscription,
   fetchOperatorPortalSetupStatus,
   fetchOperatorSettings,
+  fetchOperatorScheduleAiSettings,
 } from '@/lib/cleanlemon-api'
+import { OperatorAiBotDock, type OperatorAiBotDockHandle } from '@/components/portal/operator/operator-ai-bot-dock'
+import { OPERATOR_SCHEDULE_AI_DISPLAY_NAME } from '@/lib/cleanlemon-operator-ai-brand'
 import { CLEANLEMONS_ACTIVE_OPERATOR_ID_KEY } from '@/lib/cleanlemon-portal-constants'
 import { useEffectiveOperatorId } from '@/lib/cleanlemon-effective-operator-id'
 import { isPortalOfflineDemo } from '@/lib/portal-auth-mock'
@@ -41,7 +44,6 @@ import {
   Briefcase,
   Target,
   UserCog,
-  UserCircle,
   Receipt,
   Tags,
   Link2,
@@ -55,6 +57,7 @@ import {
   Truck,
   Megaphone,
   MoreHorizontal,
+  Bot,
   Sparkles,
   UnfoldVertical,
   FoldVertical,
@@ -76,7 +79,6 @@ const navSections: { title: string; items: NavItem[] }[] = [
     title: 'Overview',
     items: [
       { href: '/operator', label: 'Dashboard', icon: LayoutDashboard },
-      { href: '/operator/profile', label: 'Profile', icon: UserCircle },
       { href: '/operator/company', label: 'Company', icon: Briefcase },
     ],
   },
@@ -149,12 +151,11 @@ const OPERATOR_MOBILE_QUICK_NAV: NavItem[] = [
 const OPERATOR_SETUP_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
-const OPERATOR_SETUP_STEPS = ['company', 'profile', 'pricing'] as const
+const OPERATOR_SETUP_STEPS = ['company', 'pricing'] as const
 type OperatorSetupStep = (typeof OPERATOR_SETUP_STEPS)[number]
 
 const OPERATOR_SETUP_PATH: Record<OperatorSetupStep, string> = {
   company: '/operator/company',
-  profile: '/operator/profile',
   pricing: '/operator/pricing',
 }
 
@@ -174,6 +175,8 @@ function OperatorLayoutInner({ children }: { children: React.ReactNode }) {
   const [notifications, setNotifications] = useState<Notification[]>([])
   const [accountingNavAllowed, setAccountingNavAllowed] = useState(false)
   const [publicMarketingSubdomain, setPublicMarketingSubdomain] = useState('')
+  const [operatorAiDockEnabled, setOperatorAiDockEnabled] = useState(false)
+  const operatorAiDockRef = useRef<OperatorAiBotDockHandle | null>(null)
 
   const isOperatorPricingPage = useMemo(() => {
     const p = (normalizedPathname || '').split('?')[0].replace(/\/$/, '') || '/'
@@ -338,6 +341,42 @@ function OperatorLayoutInner({ children }: { children: React.ReactNode }) {
   )
 
   useEffect(() => {
+    let cancelled = false
+    const oid = String(operatorId || '').trim()
+    if (!oid || offlineDemo) {
+      setOperatorAiDockEnabled(false)
+      return () => {
+        cancelled = true
+      }
+    }
+    void (async () => {
+      const r = await fetchOperatorSettings(oid)
+      if (cancelled || !r?.ok) return
+      const s = (r as { settings?: { ai?: boolean; aiKeyConfigured?: boolean } }).settings || {}
+      const base = !!s.ai && !!s.aiKeyConfigured
+      if (!base) {
+        setOperatorAiDockEnabled(false)
+        return
+      }
+      const st = await fetchOperatorScheduleAiSettings(oid, userEmailNorm ? { email: userEmailNorm } : undefined)
+      if (cancelled || !st?.ok) {
+        setOperatorAiDockEnabled(base)
+        return
+      }
+      const pol = st.data?.platformOperatorAi as
+        | { accessEnabled?: boolean; allowedDataScopes?: string[] }
+        | undefined
+      const platformOk =
+        pol?.accessEnabled !== false &&
+        (Array.isArray(pol?.allowedDataScopes) ? pol!.allowedDataScopes : ['cln_schedule']).includes('cln_schedule')
+      setOperatorAiDockEnabled(base && platformOk)
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [operatorId, offlineDemo, userEmailNorm])
+
+  useEffect(() => {
     setupGateLoadedRef.current = false
   }, [operatorId, userEmailNorm])
 
@@ -368,7 +407,7 @@ function OperatorLayoutInner({ children }: { children: React.ReactNode }) {
         return
       }
       const first = r.firstIncomplete
-      if (first === 'company' || first === 'profile' || first === 'pricing') {
+      if (first === 'company' || first === 'pricing') {
         setSetupFirstIncomplete(first)
       } else {
         setSetupFirstIncomplete(null)
@@ -401,7 +440,8 @@ function OperatorLayoutInner({ children }: { children: React.ReactNode }) {
   }
 
   const handleMarkAsRead = (id: string) => {
-    void readOperatorNotification(id)
+    const oid = String(operatorId || '').trim()
+    if (oid) void readOperatorNotification(id, oid)
     setNotifications(prev => prev.map(n => n.id === id ? { ...n, read: true } : n))
   }
 
@@ -411,7 +451,8 @@ function OperatorLayoutInner({ children }: { children: React.ReactNode }) {
   }
 
   const handleDismiss = (id: string) => {
-    void dismissOperatorNotification(id)
+    const oid = String(operatorId || '').trim()
+    if (oid) void dismissOperatorNotification(id, oid)
     setNotifications(prev => prev.filter(n => n.id !== id))
   }
 
@@ -693,6 +734,18 @@ function OperatorLayoutInner({ children }: { children: React.ReactNode }) {
                   Marketing
                 </Button>
               ) : null}
+              {operatorAiDockEnabled && operatorId && !offlineDemo ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="relative lg:hidden"
+                  aria-label={`Open ${OPERATOR_SCHEDULE_AI_DISPLAY_NAME}`}
+                  onClick={() => operatorAiDockRef.current?.open()}
+                >
+                  <Bot className="h-5 w-5" />
+                </Button>
+              ) : null}
               {/* Notifications */}
               <Popover>
                 <PopoverTrigger asChild>
@@ -833,6 +886,15 @@ function OperatorLayoutInner({ children }: { children: React.ReactNode }) {
           </button>
         </div>
       </nav>
+
+      {operatorAiDockEnabled && operatorId && !offlineDemo ? (
+        <OperatorAiBotDock
+          ref={operatorAiDockRef}
+          operatorId={operatorId}
+          staffEmail={String(user?.email || '').trim()}
+          enabled
+        />
+      ) : null}
 
       <Toaster />
     </div>

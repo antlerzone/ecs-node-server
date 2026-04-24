@@ -395,12 +395,18 @@ async function resolveRentalIds(referenceNumber, invoiceIdsJoined, clientId, ten
 }
 
 async function applyBillplzPaymentSuccess({ bill, clientId, context = {} }) {
-  const type = normalizeText(context.type);
+  let type = normalizeText(context.type);
   const referenceNumber = normalizeText(context.reference_number);
   const tenancyId = normalizeText(context.tenancy_id);
   const tenantId = normalizeText(context.tenant_id);
   const tenantName = normalizeText(context.tenant_name || bill?.name);
-  const meterTransactionId = normalizeText(context.meter_transaction_id);
+  let meterTransactionId = normalizeText(context.meter_transaction_id);
+  if (!meterTransactionId && /^MT-/i.test(referenceNumber)) {
+    meterTransactionId = referenceNumber.replace(/^MT-/i, '').trim();
+  }
+  if (!type && meterTransactionId && /^MT-/i.test(referenceNumber)) {
+    type = 'TenantMeter';
+  }
   const invoiceIdsJoined = normalizeText(context.invoice_ids);
   const amountCents = Math.round(Number(bill?.paid_amount ?? bill?.amount ?? 0));
   const now = toMysqlNow();

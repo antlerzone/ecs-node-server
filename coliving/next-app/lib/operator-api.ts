@@ -490,6 +490,49 @@ export async function getProfile(opts?: { clientId?: string | null }) {
   return post<{ ok?: boolean; client?: unknown; reason?: string }>("companysetting/profile", opts?.clientId ? { clientId: opts.clientId } : {});
 }
 
+/** Master-only: request TAC to new company email; change applies after confirm + 7 days (cron). */
+export async function requestOperatorCompanyEmailChange(newEmail: string, opts?: { clientId?: string | null }) {
+  return post<{
+    ok: boolean;
+    reason?: string;
+    effectiveAt?: string | null;
+  }>("companysetting/company-email-change/request", { newEmail, ...(opts?.clientId ? { clientId: opts.clientId } : {}) });
+}
+
+export async function confirmOperatorCompanyEmailChange(newEmail: string, code: string, opts?: { clientId?: string | null }) {
+  return post<{
+    ok: boolean;
+    reason?: string;
+    newEmail?: string;
+    effectiveAt?: string | null;
+  }>("companysetting/company-email-change/confirm", {
+    newEmail,
+    code,
+    ...(opts?.clientId ? { clientId: opts.clientId } : {}),
+  });
+}
+
+export async function getOperatorCompanyEmailChangeStatus(opts?: { clientId?: string | null }) {
+  return post<{
+    ok?: boolean;
+    master?: boolean;
+    pending?: {
+      newEmail: string;
+      status: string;
+      tacExpiresAt: string | null;
+      effectiveAt: string | null;
+    } | null;
+  }>("companysetting/company-email-change/status", opts?.clientId ? { clientId: opts.clientId } : {});
+}
+
+/** Master only: cancel pending company email change (after TAC verify / before cron applies). */
+export async function cancelOperatorCompanyEmailChange(opts?: { clientId?: string | null }) {
+  return post<{ ok: boolean; reason?: string }>(
+    "companysetting/company-email-change/cancel",
+    opts?.clientId ? { clientId: opts.clientId } : {}
+  );
+}
+
 /** POST portal-auth/change-password – change logged-in user password (Operator / Staff). */
 export async function changePassword(currentPassword: string, newPassword: string) {
   const email = getEmail();

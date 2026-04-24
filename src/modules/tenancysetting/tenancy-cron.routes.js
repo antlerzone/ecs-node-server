@@ -25,6 +25,8 @@ const { runTenantXenditAutoDebitForDueRentals } = require('../billing/tenant-xen
 const { runTenantStripeAutoDebitForDueRentals } = require('../billing/tenant-stripe-auto-debit.service');
 const { runDemoAccountRefresh } = require('./demo-refresh-cron.service');
 const { runOwnerReportMonthlyAutomation } = require('../generatereport/generatereport.service');
+const { runDueOperatorCompanyEmailChanges } = require('../companysetting/companysetting.service');
+const { runDueClnOperatorCompanyEmailChanges } = require('../cleanlemon/cln-operator-company-email.service');
 
 function checkCronSecret(req) {
   const secret = process.env.CRON_SECRET;
@@ -130,6 +132,20 @@ router.post('/daily', async (req, res) => {
       tenantStripeAutoDebit = { enabled: false, error: stripeAutoErr?.message || 'JOB_FAILED' };
     }
     const batteryResult = await runDailyBatteryCheckAndInsertFeedback();
+    let operatorCompanyEmailChange = null;
+    try {
+      operatorCompanyEmailChange = await runDueOperatorCompanyEmailChanges();
+    } catch (opEmailErr) {
+      console.error('[cron] operator company email change', opEmailErr?.message);
+      operatorCompanyEmailChange = { applied: 0, errors: [{ reason: opEmailErr?.message || 'JOB_FAILED' }] };
+    }
+    let clnOperatorCompanyEmailChange = null;
+    try {
+      clnOperatorCompanyEmailChange = await runDueClnOperatorCompanyEmailChanges();
+    } catch (clnEmailErr) {
+      console.error('[cron] Cleanlemons operator company email change', clnEmailErr?.message);
+      clnOperatorCompanyEmailChange = { applied: 0, errors: [{ reason: clnEmailErr?.message || 'JOB_FAILED' }] };
+    }
     const body = {
       ok: true,
       tenancy: tenancyResult,
@@ -145,7 +161,9 @@ router.post('/daily', async (req, res) => {
       demoRefresh: { updated: demoRefresh.updated, clientIds: demoRefresh.clientIds, errors: demoRefresh.errors },
       ownerReportAutomation,
       tenantXenditAutoDebit,
-      tenantStripeAutoDebit
+      tenantStripeAutoDebit,
+      operatorCompanyEmailChange,
+      clnOperatorCompanyEmailChange
     };
     if (activeRoomMonthly) body.activeRoomMonthly = activeRoomMonthly;
     return res.json(body);

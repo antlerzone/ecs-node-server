@@ -548,7 +548,7 @@ router.put('/profile', requirePortalToken, async (req, res) => {
  */
 router.post('/email-change/request', requirePortalToken, async (req, res) => {
   try {
-    const result = await contactVerify.requestEmailChangeOtp(req.portalEmail, req.body?.newEmail);
+    const result = await contactVerify.requestEmailChangeOtp(req.portalEmail, req.body?.newEmail, req);
     res.status(200).json(result);
   } catch (err) {
     console.error('[portal-auth] email-change/request', err?.message || err);
@@ -573,7 +573,7 @@ router.post('/email-change/confirm', requirePortalToken, async (req, res) => {
 /** Body: { phone } — OTP emailed to current login address. */
 router.post('/phone-verify/request', requirePortalToken, async (req, res) => {
   try {
-    const result = await contactVerify.requestPhoneVerifyOtp(req.portalEmail, req.body?.phone);
+    const result = await contactVerify.requestPhoneVerifyOtp(req.portalEmail, req.body?.phone, req);
     res.status(200).json(result);
   } catch (err) {
     console.error('[portal-auth] phone-verify/request', err?.message || err);
@@ -598,7 +598,7 @@ router.post('/phone-verify/confirm', requirePortalToken, async (req, res) => {
 /** Body: { newPhone } */
 router.post('/phone-change/request', requirePortalToken, async (req, res) => {
   try {
-    const result = await contactVerify.requestPhoneChangeOtp(req.portalEmail, req.body?.newPhone);
+    const result = await contactVerify.requestPhoneChangeOtp(req.portalEmail, req.body?.newPhone, req);
     res.status(200).json(result);
   } catch (err) {
     console.error('[portal-auth] phone-change/request', err?.message || err);
@@ -628,7 +628,7 @@ router.post('/phone-change/confirm', requirePortalToken, async (req, res) => {
 router.post('/forgot-password', async (req, res) => {
   try {
     const email = (req.body && req.body.email) ? String(req.body.email).trim() : '';
-    const result = await requestPasswordReset(email);
+    const result = await requestPasswordReset(email, req);
     if (!result.ok && result.reason === 'NO_ACCOUNT') {
       return res.status(200).json({ ok: true });
     }

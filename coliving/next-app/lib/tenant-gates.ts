@@ -12,7 +12,7 @@
 export type TenantGateLayer = 1 | 2 | 3 | 4 | 5 | "open"
 
 const LAYER_REDIRECT: Record<Exclude<TenantGateLayer, "open">, string> = {
-  1: "/tenant/profile?reason=profile",
+  1: "/tenant/profile?gate=required",
   2: "/tenant/approval",
   3: "/tenant/agreement",
   4: "/tenant/payment?reason=overdue",
@@ -65,6 +65,8 @@ export interface TenantProfileLite {
   profileSelfVerifiedAt?: string | null
   /** Server: true when self-attested or Aliyun eKYC locked */
   profileIdentityVerified?: boolean
+  /** portal_account.aliyun_ekyc_locked — required for tenant portal layer 1 (with field-complete) */
+  aliyunEkycLocked?: boolean
   profile?: {
     entity_type?: string
     reg_no_type?: string
@@ -262,9 +264,7 @@ export function getTenantGateLayerFromInitPayload(payload: {
   const tenant = payload.tenant ?? null
   const tenancies = payload.tenancies ?? []
   const profileFieldsComplete = computeTenantProfileComplete(tenant)
-  const profileSelfVerified =
-    tenant?.profileIdentityVerified === true ||
-    (tenant?.profileSelfVerifiedAt != null && String(tenant.profileSelfVerifiedAt).trim() !== "")
+  const profileSelfVerified = tenant?.aliyunEkycLocked === true
   const profileComplete = profileFieldsComplete && profileSelfVerified
   const hasPendingOperatorInvite = computeHasPendingOperatorInvite(tenant)
   const hasPendingAgreement = tenantHasPendingAgreementToSign(tenancies)

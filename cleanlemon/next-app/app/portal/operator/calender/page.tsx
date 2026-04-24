@@ -97,7 +97,7 @@ const promotionBadgeColors = [
 
 export default function OperatorCalenderPage() {
   const { user } = useAuth()
-  const operatorId = user?.operatorId || "op_demo_001"
+  const operatorId = String(user?.operatorId || "").trim()
   const now = new Date()
   const [viewYear, setViewYear] = useState(now.getFullYear())
   const [viewMonth, setViewMonth] = useState(now.getMonth())
@@ -127,6 +127,12 @@ export default function OperatorCalenderPage() {
 
   useEffect(() => {
     let cancelled = false
+    if (!operatorId) {
+      setAdjustments([])
+      return () => {
+        cancelled = true
+      }
+    }
     ;(async () => {
       const [adjR, propertyR, contactR] = await Promise.all([
         fetchOperatorCalendarAdjustments(operatorId),
@@ -260,6 +266,7 @@ export default function OperatorCalenderPage() {
   }
 
   const save = async () => {
+    if (!operatorId) return toast.error("Operator not loaded")
     if (!activeStart || !activeEnd) return toast.error("Start and end date required")
     if (!name.trim()) return toast.error("Name is required")
     if (value <= 0) return toast.error("Value must be greater than 0")
@@ -301,7 +308,8 @@ export default function OperatorCalenderPage() {
 
   const removeAdjustment = async () => {
     if (!editingId) return
-    const r = await deleteOperatorCalendarAdjustment(editingId)
+    if (!operatorId) return toast.error("Operator not loaded")
+    const r = await deleteOperatorCalendarAdjustment(editingId, operatorId)
     if (!r?.ok) {
       toast.error(r?.reason || "Failed to delete adjustment")
       return

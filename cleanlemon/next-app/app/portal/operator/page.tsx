@@ -16,10 +16,10 @@ import {
   TrendingUp,
   Calendar,
   ArrowRight,
-  Sparkles,
 } from 'lucide-react'
 import Link from 'next/link'
 import { fetchOperatorDashboard, fetchOperatorDamageReports, type DamageReportItem } from '@/lib/cleanlemon-api'
+import { damageReportDateLabel } from '@/lib/damage-report-dates'
 import { useAuth } from '@/lib/auth-context'
 import { useEffectiveOperatorId } from '@/lib/cleanlemon-effective-operator-id'
 
@@ -39,15 +39,22 @@ export default function OperatorDashboard() {
 
   useEffect(() => {
     let cancelled = false
+    const oid = String(operatorId || '').trim()
+    if (!oid) {
+      setDashboard(null)
+      return () => {
+        cancelled = true
+      }
+    }
     ;(async () => {
-      const r = await fetchOperatorDashboard()
+      const r = await fetchOperatorDashboard(oid)
       if (cancelled) return
       if (r?.ok) setDashboard(r)
     })()
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [operatorId])
 
   useEffect(() => {
     let cancelled = false
@@ -77,6 +84,16 @@ export default function OperatorDashboard() {
   }))
 
   const topPerformers: Array<{ name: string; tasks: number; rating: number; avatar: string }> = []
+
+  const mp = dashboard?.monthlyProgress as
+    | {
+        monthLabel?: string
+        tasksCompleted?: number
+        tasksTotal?: number
+        tasksPercent?: number
+        onTimePercent?: number
+      }
+    | undefined
 
   return (
     <div className="space-y-6 pb-20 lg:pb-0">
@@ -153,12 +170,7 @@ export default function OperatorDashboard() {
                     </p>
                   </div>
                   <span className="text-xs text-muted-foreground whitespace-nowrap shrink-0">
-                    {d.reportedAt
-                      ? new Date(d.reportedAt).toLocaleString(undefined, {
-                          dateStyle: 'medium',
-                          timeStyle: 'short',
-                        })
-                      : '—'}
+                    {damageReportDateLabel(d)}
                   </span>
                 </div>
               ))}
@@ -252,28 +264,6 @@ export default function OperatorDashboard() {
         </Card>
       </div>
 
-      {/* AI Assistant Banner */}
-      <Card className="bg-gradient-to-r from-primary to-primary/80 text-primary-foreground">
-        <CardContent className="p-6">
-          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-            <div className="flex items-start gap-4">
-              <div className="p-3 bg-accent rounded-xl">
-                <Sparkles className="h-6 w-6 text-accent-foreground" />
-              </div>
-              <div>
-                <h3 className="font-semibold text-lg">AI Task Scheduler</h3>
-                <p className="text-primary-foreground/80 text-sm mt-1">
-                  Let AI optimize your cleaning schedules. Set rules and let the system automatically assign teams based on location, priority, and workload.
-                </p>
-              </div>
-            </div>
-            <Button variant="secondary" className="whitespace-nowrap">
-              Configure AI Rules
-            </Button>
-          </div>
-        </CardContent>
-      </Card>
-
       {/* Quick Actions */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
         <Button variant="outline" className="h-auto py-4 flex flex-col gap-2" asChild>
@@ -302,34 +292,45 @@ export default function OperatorDashboard() {
         </Button>
       </div>
 
-      {/* Monthly Progress */}
+      {/* Monthly Progress — data from /api/cleanlemon/operator/dashboard (Malaysia calendar month) */}
       <Card>
         <CardHeader>
           <CardTitle className="text-lg">Monthly Progress</CardTitle>
-          <CardDescription>Task completion rate for March 2024</CardDescription>
+          <CardDescription>
+            {mp?.monthLabel ? `${mp.monthLabel}` : 'Current month'} (Malaysia calendar) — from your schedule records
+          </CardDescription>
         </CardHeader>
         <CardContent>
           <div className="space-y-4">
             <div>
               <div className="flex justify-between text-sm mb-2">
-                <span className="text-muted-foreground">Tasks Completed</span>
-                <span className="font-medium">423 / 450</span>
+                <span className="text-muted-foreground">Tasks completed</span>
+                <span className="font-medium">
+                  {mp != null
+                    ? `${mp.tasksCompleted ?? 0} / ${mp.tasksTotal ?? 0}`
+                    : '—'}
+                </span>
               </div>
-              <Progress value={94} className="h-2" />
+              <Progress value={mp?.tasksPercent ?? 0} className="h-2" />
             </div>
             <div>
               <div className="flex justify-between text-sm mb-2">
-                <span className="text-muted-foreground">On-Time Rate</span>
-                <span className="font-medium">89%</span>
+                <span
+                  className="text-muted-foreground"
+                  title="Among completed jobs this month: share with no lateness points on the job"
+                >
+                  On-time rate
+                </span>
+                <span className="font-medium">
+                  {mp != null && (mp.tasksCompleted ?? 0) > 0 ? `${mp.onTimePercent ?? 0}%` : '—'}
+                </span>
               </div>
-              <Progress value={89} className="h-2" />
-            </div>
-            <div>
-              <div className="flex justify-between text-sm mb-2">
-                <span className="text-muted-foreground">Customer Satisfaction</span>
-                <span className="font-medium">96%</span>
-              </div>
-              <Progress value={96} className="h-2" />
+              <Progress
+                value={
+                  mp != null && (mp.tasksCompleted ?? 0) > 0 ? Math.min(100, mp.onTimePercent ?? 0) : 0
+                }
+                className="h-2"
+              />
             </div>
           </div>
         </CardContent>

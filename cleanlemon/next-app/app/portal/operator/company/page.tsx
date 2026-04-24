@@ -1,7 +1,7 @@
 "use client"
 
 import type { ReactNode } from 'react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -12,6 +12,15 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import {
+  AlertDialog,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import {
   Building2,
   BookOpen,
@@ -35,6 +44,7 @@ import {
   ChevronDown,
 } from 'lucide-react'
 import { toast } from 'sonner'
+import { OPERATOR_SCHEDULE_AI_DISPLAY_NAME } from '@/lib/cleanlemon-operator-ai-brand'
 import {
   PRICING_PLANS,
   CLN_ADDON_CATALOG_FALLBACK,
@@ -63,6 +73,8 @@ import {
   postCleanlemonGoogleDriveDisconnect,
   postCleanlemonStripeConnectOAuthUrl,
   postCleanlemonStripeConnectDisconnect,
+  postClnOperatorClientInvoiceXenditCredentials,
+  postClnOperatorClientInvoiceXenditDisconnect,
   postCleanlemonAiAgentConnect,
   postCleanlemonAiAgentDisconnect,
   fetchEmployeeBanks,
@@ -75,7 +87,13 @@ import {
   fetchOperatorPortalSetupStatus,
   type ClmAddonCatalogItem,
   type OperatorPortalSetupStatus,
+  getClnOperatorCompanyEmailChangeStatus,
+  requestClnOperatorCompanyEmailChange,
+  confirmClnOperatorCompanyEmailChange,
+  cancelClnOperatorCompanyEmailChange,
+  getPublicCleanlemonOperatorProfile,
 } from '@/lib/cleanlemon-api'
+import { useRouter } from 'next/navigation'
 import { canonicalOperatorPlanCode, planAllowsAccounting } from '@/lib/cleanlemon-subscription-plan'
 import { cn } from '@/lib/utils'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
@@ -301,6 +319,15 @@ function computeSurchargeApplySegments(
 
 /** Mirrors `clnCompanyProfileCompleteForAutomation` + public subdomain rules in `cleanlemon.service.js` (setup gate). */
 const COMPANY_GATE_FIELD_KEYS = ['companyName', 'ssmNumber', 'address', 'contact', 'subdomain'] as const
+/** Radix Select must stay controlled; empty bank uses sentinel (not `undefined`). */
+const BANK_SELECT_NONE = '__no_bank__'
+
+/** Placeholder shown in inputs when a value exists on server (full secrets are never returned). */
+function clnXenditSavedValueDisplay(last4: string): string {
+  const s = String(last4 || '').trim()
+  return `${'•'.repeat(16)}${s}`
+}
+
 type CompanyGateFieldKey = (typeof COMPANY_GATE_FIELD_KEYS)[number]
 
 function companySetupMissingFieldKeys(ci: {
@@ -370,8 +397,15 @@ function QuarterHourTimeSelect({
 }
 
 export default function CompanyPage() {
+  const router = useRouter()
   const { user } = useAuth()
   const operatorId = String(user?.operatorId || '').trim()
+  /** Public API base (same as portal → Node). Xendit Dashboard must reach this host. */
+  const clnXenditWebhookUrl = useMemo(() => {
+    const base = (process.env.NEXT_PUBLIC_CLEANLEMON_API_URL || '').trim().replace(/\/$/, '')
+    if (!base || !operatorId) return ''
+    return `${base}/api/cleanlemon/client/invoices/xendit-webhook?operator_id=${encodeURIComponent(operatorId)}`
+  }, [operatorId])
   const [activeTab, setActiveTab] = useState('profile')
   const [billingPeriod, setBillingPeriod] = useState<'monthly' | 'quarterly' | 'yearly'>('yearly')
   const [companyInfo, setCompanyInfo] = useState({
@@ -403,6 +437,22 @@ export default function CompanyPage() {
   const [bankOptions, setBankOptions] = useState<Array<{ id: string; name: string }>>([])
   const [uploadingLogo, setUploadingLogo] = useState(false)
   const [uploadingChop, setUploadingChop] = useState(false)
+  const [clnCompanyEmailDisplay, setClnCompanyEmailDisplay] = useState('')
+  const [clnCanChangeCompanyEmail, setClnCanChangeCompanyEmail] = useState(false)
+  const [clnCompanyEmailPending, setClnCompanyEmailPending] = useState<{
+    newEmail: string
+    status: string
+    tacExpiresAt: string | null
+    effectiveAt: string | null
+  } | null>(null)
+  const [clnCompanyEmailDialogOpen, setClnCompanyEmailDialogOpen] = useState(false)
+  const [clnCompanyEmailNew, setClnCompanyEmailNew] = useState('')
+  const [clnCompanyEmailCode, setClnCompanyEmailCode] = useState('')
+  const [clnCompanyEmailStep, setClnCompanyEmailStep] = useState<'enter' | 'code' | 'done'>('enter')
+  const [clnCompanyEmailBusy, setClnCompanyEmailBusy] = useState(false)
+  const [clnCompanyEmailDoneEffectiveAt, setClnCompanyEmailDoneEffectiveAt] = useState<string | null>(null)
+  const [clnCompanyEmailCancelOpen, setClnCompanyEmailCancelOpen] = useState(false)
+  const [clnCompanyEmailCancelBusy, setClnCompanyEmailCancelBusy] = useState(false)
   const [integrationState, setIntegrationState] = useState({
     stripe: false,
     xendit: false,
@@ -431,6 +481,61 @@ export default function CompanyPage() {
   const [manageSlot, setManageSlot] = useState<number | null>(null)
   const [ttlockAccountName, setTtlockAccountName] = useState('')
   const [selectedPaymentProvider, setSelectedPaymentProvider] = useState<'stripe' | 'xendit'>('stripe')
+  /** Coliving-style: choose → Xendit form; Stripe manage = disconnect inside dialog only. */
+  const [paymentGatewayStep, setPaymentGatewayStep] = useState<'choose' | 'xendit-form' | 'stripe-manage'>('choose')
+  const [xenditGatewayState, setXenditGatewayState] = useState({
+    connectionStatus: 'no_connect',
+    hasSecretKey: false,
+    hasWebhookToken: false,
+    secretKeyLast4: '',
+    webhookTokenLast4: '',
+    lastWebhookAt: null as string | null,
+    lastWebhookType: null as string | null,
+  })
+  const [xenditSecretInput, setXenditSecretInput] = useState('')
+  const [xenditCallbackTokenInput, setXenditCallbackTokenInput] = useState('')
+  const [xenditCredentialBusy, setXenditCredentialBusy] = useState(false)
+  const primeXenditCredentialInputs = useCallback(() => {
+    setXenditSecretInput(
+      xenditGatewayState.hasSecretKey ? clnXenditSavedValueDisplay(xenditGatewayState.secretKeyLast4) : ''
+    )
+    setXenditCallbackTokenInput(
+      xenditGatewayState.hasWebhookToken ? clnXenditSavedValueDisplay(xenditGatewayState.webhookTokenLast4) : ''
+    )
+  }, [
+    xenditGatewayState.hasSecretKey,
+    xenditGatewayState.hasWebhookToken,
+    xenditGatewayState.secretKeyLast4,
+    xenditGatewayState.webhookTokenLast4,
+  ])
+  const xenditCredentialsSaveEnabled = useMemo(() => {
+    if (!clnXenditWebhookUrl) return false
+    const maskSk = clnXenditSavedValueDisplay(xenditGatewayState.secretKeyLast4)
+    const maskTok = clnXenditSavedValueDisplay(xenditGatewayState.webhookTokenLast4)
+    const skTrim = xenditSecretInput.trim()
+    const tokTrim = xenditCallbackTokenInput.trim()
+    const keepSk = xenditGatewayState.hasSecretKey && (!skTrim || skTrim === maskSk)
+    const keepTok = xenditGatewayState.hasWebhookToken && (!tokTrim || tokTrim === maskTok)
+    const skOk =
+      xenditGatewayState.hasSecretKey
+        ? keepSk || (!!skTrim && skTrim !== maskSk)
+        : !!skTrim
+    const tokOk =
+      xenditGatewayState.hasWebhookToken
+        ? keepTok || (!!tokTrim && tokTrim !== maskTok)
+        : !!tokTrim
+    return skOk && tokOk
+  }, [
+    clnXenditWebhookUrl,
+    xenditSecretInput,
+    xenditCallbackTokenInput,
+    xenditGatewayState.hasSecretKey,
+    xenditGatewayState.hasWebhookToken,
+    xenditGatewayState.secretKeyLast4,
+    xenditGatewayState.webhookTokenLast4,
+  ])
+  /** When true, Xendit "Back" closes dialog (opened from Manage); when false, returns to provider chooser. */
+  const [paymentGatewayFromManage, setPaymentGatewayFromManage] = useState(false)
   const [selectedAccountingProvider, setSelectedAccountingProvider] = useState<'bukku' | 'xero'>('bukku')
   const [selectedAiProvider, setSelectedAiProvider] = useState<'openai' | 'deepseek' | 'gemini'>('openai')
   const [aiProviderConnected, setAiProviderConnected] = useState<'openai' | 'deepseek' | 'gemini' | null>(null)
@@ -441,6 +546,7 @@ export default function CompanyPage() {
   const [subscriptionItem, setSubscriptionItem] = useState<any>(null)
   const [subscriptionLoading, setSubscriptionLoading] = useState(false)
   const [portalSetupGate, setPortalSetupGate] = useState<OperatorPortalSetupStatus | null>(null)
+  const [publicReviewSummary, setPublicReviewSummary] = useState<{ avg: number | null; count: number } | null>(null)
   const [checkoutBusyKey, setCheckoutBusyKey] = useState<string | null>(null)
   const [clnPlanAmounts, setClnPlanAmounts] = useState<Record<
     string,
@@ -565,6 +671,166 @@ export default function CompanyPage() {
   }, [operatorId, user?.email])
 
   useEffect(() => {
+    if (!operatorId) {
+      setPublicReviewSummary(null)
+      return
+    }
+    let cancelled = false
+    ;(async () => {
+      const r = await getPublicCleanlemonOperatorProfile(operatorId)
+      if (cancelled) return
+      if (r?.ok && r.summary) {
+        setPublicReviewSummary({
+          avg: r.summary.averageStars ?? null,
+          count: Number(r.summary.reviewCount) || 0,
+        })
+      } else {
+        setPublicReviewSummary({ avg: null, count: 0 })
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [operatorId])
+
+  const reloadClnCompanyEmailStatus = useCallback(async () => {
+    const oid = String(operatorId || '').trim()
+    const em = String(user?.email || '').trim().toLowerCase()
+    if (!oid || !em) {
+      setClnCompanyEmailDisplay('')
+      setClnCanChangeCompanyEmail(false)
+      setClnCompanyEmailPending(null)
+      return
+    }
+    try {
+      const st = await getClnOperatorCompanyEmailChangeStatus({ operatorId: oid, email: em })
+      if (st?.ok) {
+        setClnCompanyEmailDisplay(String(st.companyEmail ?? '').trim())
+        setClnCanChangeCompanyEmail(!!st.canChangeCompanyEmail)
+        setClnCompanyEmailPending(st.pending ?? null)
+      }
+    } catch {
+      /* ignore */
+    }
+  }, [operatorId, user?.email])
+
+  useEffect(() => {
+    void reloadClnCompanyEmailStatus()
+  }, [reloadClnCompanyEmailStatus])
+
+  const openClnCompanyEmailDialog = useCallback(() => {
+    setClnCompanyEmailNew('')
+    setClnCompanyEmailCode('')
+    setClnCompanyEmailStep('enter')
+    setClnCompanyEmailDoneEffectiveAt(null)
+    setClnCompanyEmailDialogOpen(true)
+  }, [])
+
+  const sendClnCompanyEmailTac = useCallback(async () => {
+    const trimmed = clnCompanyEmailNew.trim()
+    const oid = String(operatorId || '').trim()
+    const em = String(user?.email || '').trim().toLowerCase()
+    if (!oid || !em) {
+      toast.error('Missing account context')
+      return
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) {
+      toast.error('Enter a valid email address.')
+      return
+    }
+    setClnCompanyEmailBusy(true)
+    try {
+      const r = await requestClnOperatorCompanyEmailChange(trimmed, { operatorId: oid, email: em })
+      if (!r?.ok) {
+        const reason = r?.reason
+        toast.error(
+          reason === 'EMAIL_TAKEN'
+            ? 'That email is already in use.'
+            : reason === 'SAME_EMAIL'
+              ? 'New email must differ from the current company email.'
+              : reason === 'NOT_MASTER'
+                ? 'Only the company master account can change this.'
+                : reason === 'ALREADY_SCHEDULED'
+                  ? 'A change is already scheduled. Wait for it to apply or cancel it first.'
+                  : reason === 'MIGRATION_REQUIRED'
+                    ? 'Database migration required — contact support.'
+                    : reason || 'Request failed'
+        )
+        return
+      }
+      toast.success('Verification code sent to the new email.')
+      setClnCompanyEmailStep('code')
+    } finally {
+      setClnCompanyEmailBusy(false)
+    }
+  }, [clnCompanyEmailNew, operatorId, user?.email])
+
+  const confirmClnCompanyEmailTac = useCallback(async () => {
+    const code = clnCompanyEmailCode.trim()
+    const oid = String(operatorId || '').trim()
+    const em = String(user?.email || '').trim().toLowerCase()
+    if (!oid || !em) {
+      toast.error('Missing account context')
+      return
+    }
+    if (!/^\d{4,8}$/.test(code)) {
+      toast.error('Enter the verification code from the email.')
+      return
+    }
+    setClnCompanyEmailBusy(true)
+    try {
+      const r = await confirmClnOperatorCompanyEmailChange(clnCompanyEmailNew.trim(), code, {
+        operatorId: oid,
+        email: em,
+      })
+      if (!r?.ok) {
+        toast.error(
+          r?.reason === 'INVALID_OR_EXPIRED_CODE'
+            ? 'Invalid or expired code.'
+            : r?.reason === 'EMAIL_TAKEN'
+              ? 'That email is already in use.'
+              : r?.reason || 'Confirm failed'
+        )
+        return
+      }
+      setClnCompanyEmailStep('done')
+      setClnCompanyEmailDoneEffectiveAt(r.effectiveAt ?? null)
+      toast.success('Company email change scheduled.')
+      void reloadClnCompanyEmailStatus()
+    } finally {
+      setClnCompanyEmailBusy(false)
+    }
+  }, [clnCompanyEmailNew, clnCompanyEmailCode, operatorId, user?.email, reloadClnCompanyEmailStatus])
+
+  const submitCancelClnCompanyEmailChange = useCallback(async () => {
+    const oid = String(operatorId || '').trim()
+    const em = String(user?.email || '').trim().toLowerCase()
+    if (!oid || !em) {
+      toast.error('Missing account context')
+      return
+    }
+    setClnCompanyEmailCancelBusy(true)
+    try {
+      const r = await cancelClnOperatorCompanyEmailChange({ operatorId: oid, email: em })
+      if (!r?.ok) {
+        toast.error(
+          r?.reason === 'NOTHING_TO_CANCEL'
+            ? 'No pending change to cancel.'
+            : r?.reason === 'NOT_MASTER'
+              ? 'Only the company master can cancel.'
+              : r?.reason || 'Cancel failed'
+        )
+        return
+      }
+      toast.success('Scheduled email change cancelled.')
+      setClnCompanyEmailCancelOpen(false)
+      void reloadClnCompanyEmailStatus()
+    } finally {
+      setClnCompanyEmailCancelBusy(false)
+    }
+  }, [operatorId, user?.email, reloadClnCompanyEmailStatus])
+
+  useEffect(() => {
     skipInitialIntegrationSave.current = true
     oauthReturnHandledRef.current = false
   }, [operatorId])
@@ -633,6 +899,18 @@ export default function CompanyPage() {
       window.history.replaceState({}, '', getOperatorCompanyPathname())
       void fetchOperatorSettings(operatorId).then((r) => {
         if (r?.ok && r.settings) {
+          const gw = r.settings.xenditGateway
+          if (gw && typeof gw === 'object') {
+            setXenditGatewayState({
+              connectionStatus: String((gw as { connectionStatus?: string }).connectionStatus || 'no_connect'),
+              hasSecretKey: !!(gw as { hasSecretKey?: boolean }).hasSecretKey,
+              hasWebhookToken: !!(gw as { hasWebhookToken?: boolean }).hasWebhookToken,
+              secretKeyLast4: String((gw as { secretKeyLast4?: string }).secretKeyLast4 || ''),
+              webhookTokenLast4: String((gw as { webhookTokenLast4?: string }).webhookTokenLast4 || ''),
+              lastWebhookAt: (gw as { lastWebhookAt?: string | null }).lastWebhookAt ?? null,
+              lastWebhookType: (gw as { lastWebhookType?: string | null }).lastWebhookType ?? null,
+            })
+          }
           setIntegrationState((prev) => ({
             ...prev,
             stripe: !!r.settings.stripe,
@@ -661,6 +939,28 @@ export default function CompanyPage() {
         setTtlockAccounts(ttSt.accounts)
       }
       const parsed = r.settings || {}
+      const gw = parsed.xenditGateway
+      if (gw && typeof gw === 'object') {
+        setXenditGatewayState({
+          connectionStatus: String((gw as { connectionStatus?: string }).connectionStatus || 'no_connect'),
+          hasSecretKey: !!(gw as { hasSecretKey?: boolean }).hasSecretKey,
+          hasWebhookToken: !!(gw as { hasWebhookToken?: boolean }).hasWebhookToken,
+          secretKeyLast4: String((gw as { secretKeyLast4?: string }).secretKeyLast4 || ''),
+          webhookTokenLast4: String((gw as { webhookTokenLast4?: string }).webhookTokenLast4 || ''),
+          lastWebhookAt: (gw as { lastWebhookAt?: string | null }).lastWebhookAt ?? null,
+          lastWebhookType: (gw as { lastWebhookType?: string | null }).lastWebhookType ?? null,
+        })
+      } else {
+        setXenditGatewayState({
+          connectionStatus: 'no_connect',
+          hasSecretKey: false,
+          hasWebhookToken: false,
+          secretKeyLast4: '',
+          webhookTokenLast4: '',
+          lastWebhookAt: null,
+          lastWebhookType: null,
+        })
+      }
       setIntegrationState((prev) => ({
         ...prev,
         stripe: !!parsed.stripe,
@@ -1135,13 +1435,43 @@ export default function CompanyPage() {
 
   const connectedPaymentProvider = integrationState.stripe ? 'stripe' : integrationState.xendit ? 'xendit' : null
   const connectedAccountingProvider = integrationState.bukku ? 'bukku' : integrationState.xero ? 'xero' : null
+  const xenditPendingVerification =
+    !!integrationState.xendit && xenditGatewayState.connectionStatus === 'pending_verification'
+  const xenditGatewayStatusLabel =
+    xenditGatewayState.connectionStatus === 'connected'
+      ? 'Connected'
+      : xenditGatewayState.connectionStatus === 'pending_verification'
+        ? 'Pending verification'
+        : 'Not connected'
 
+  /** First-time connect only (no gateway on file). */
   const openPaymentConnectDialog = () => {
     if (connectedPaymentProvider) {
-      toast.error(`Please disconnect ${connectedPaymentProvider} first`)
+      toast.error('Use Manage on the payment card')
       return
     }
     setSelectedPaymentProvider('stripe')
+    setPaymentGatewayStep('choose')
+    setPaymentGatewayFromManage(false)
+    setXenditSecretInput('')
+    setXenditCallbackTokenInput('')
+    setShowPaymentDialog(true)
+  }
+
+  /** Coliving-style: disconnect only from dialog, not from the integration list row. */
+  const openPaymentGatewayManageDialog = () => {
+    if (!connectedPaymentProvider) return
+    setPaymentGatewayFromManage(true)
+    if (connectedPaymentProvider === 'stripe') {
+      setXenditSecretInput('')
+      setXenditCallbackTokenInput('')
+      setSelectedPaymentProvider('stripe')
+      setPaymentGatewayStep('stripe-manage')
+    } else {
+      setSelectedPaymentProvider('xendit')
+      setPaymentGatewayStep('xendit-form')
+      primeXenditCredentialInputs()
+    }
     setShowPaymentDialog(true)
   }
 
@@ -1154,23 +1484,76 @@ export default function CompanyPage() {
     setShowAccountingDialog(true)
   }
 
-  const connectSelectedPaymentProvider = async () => {
-    if (selectedPaymentProvider === 'stripe') {
-      setShowPaymentDialog(false)
-      try {
-        const r = await postCleanlemonStripeConnectOAuthUrl(operatorId)
-        if (!r?.ok || !r.url) {
-          toast.error(r?.reason || 'Stripe Connect not configured')
-          return
-        }
-        window.location.href = r.url
-      } catch {
-        toast.error('Could not start Stripe Connect')
+  const startStripeConnectOAuth = async () => {
+    setShowPaymentDialog(false)
+    try {
+      const r = await postCleanlemonStripeConnectOAuthUrl(operatorId)
+      if (!r?.ok || !r.url) {
+        toast.error(r?.reason || 'Stripe Connect not configured')
+        return
       }
+      window.location.href = r.url
+    } catch {
+      toast.error('Could not start Stripe Connect')
+    }
+  }
+
+  const saveClnXenditCredentialsFromDialog = async () => {
+    if (!xenditCredentialsSaveEnabled) {
+      toast.error('Add both Xendit secret key and X-CALLBACK-TOKEN (or keep the saved placeholders).')
       return
     }
-    toggleIntegration('xendit')
-    setShowPaymentDialog(false)
+    const maskSk = clnXenditSavedValueDisplay(xenditGatewayState.secretKeyLast4)
+    const maskTok = clnXenditSavedValueDisplay(xenditGatewayState.webhookTokenLast4)
+    const skTrim = xenditSecretInput.trim()
+    const tokTrim = xenditCallbackTokenInput.trim()
+    const keepSk = xenditGatewayState.hasSecretKey && (!skTrim || skTrim === maskSk)
+    const keepTok = xenditGatewayState.hasWebhookToken && (!tokTrim || tokTrim === maskTok)
+    const payload: { operatorId: string; secretKey?: string; callbackToken?: string } = { operatorId }
+    if (!keepSk) payload.secretKey = skTrim
+    if (!keepTok) payload.callbackToken = tokTrim
+
+    setXenditCredentialBusy(true)
+    try {
+      const r = await postClnOperatorClientInvoiceXenditCredentials(payload)
+      if (!r?.ok) {
+        toast.error(r?.reason || 'Save failed')
+        return
+      }
+      toast.success('Saved. Placeholders refresh below; status stays Pending until Xendit hits your webhook URL.')
+      const s = await fetchOperatorSettings(operatorId)
+      if (s?.ok && s.settings) {
+        const gw = s.settings.xenditGateway
+        if (gw && typeof gw === 'object') {
+          const nextGw = {
+            connectionStatus: String((gw as { connectionStatus?: string }).connectionStatus || 'no_connect'),
+            hasSecretKey: !!(gw as { hasSecretKey?: boolean }).hasSecretKey,
+            hasWebhookToken: !!(gw as { hasWebhookToken?: boolean }).hasWebhookToken,
+            secretKeyLast4: String((gw as { secretKeyLast4?: string }).secretKeyLast4 || ''),
+            webhookTokenLast4: String((gw as { webhookTokenLast4?: string }).webhookTokenLast4 || ''),
+            lastWebhookAt: (gw as { lastWebhookAt?: string | null }).lastWebhookAt ?? null,
+            lastWebhookType: (gw as { lastWebhookType?: string | null }).lastWebhookType ?? null,
+          }
+          setXenditGatewayState(nextGw)
+          setXenditSecretInput(nextGw.hasSecretKey ? clnXenditSavedValueDisplay(nextGw.secretKeyLast4) : '')
+          setXenditCallbackTokenInput(nextGw.hasWebhookToken ? clnXenditSavedValueDisplay(nextGw.webhookTokenLast4) : '')
+        }
+        setIntegrationState((prev) => ({
+          ...prev,
+          stripe: !!s.settings.stripe,
+          xendit: !!s.settings.xendit,
+          bukku: !!s.settings.bukku,
+          xero: !!s.settings.xero,
+          googleDrive: !!s.settings.googleDrive,
+          ai: !!s.settings.ai,
+          ttlock: !!s.settings.ttlock,
+        }))
+      }
+    } catch {
+      toast.error('Save failed')
+    } finally {
+      setXenditCredentialBusy(false)
+    }
   }
 
   const disconnectPayment = async () => {
@@ -1181,11 +1564,37 @@ export default function CompanyPage() {
         await postCleanlemonStripeConnectDisconnect(operatorId)
         toast.success('Stripe disconnected')
       } else {
-        setIntegrationState((prev) => ({ ...prev, xendit: false }))
+        const r = await postClnOperatorClientInvoiceXenditDisconnect(operatorId)
+        if (!r?.ok) {
+          toast.error(r?.reason || 'Disconnect failed')
+          return
+        }
         toast.success('Xendit disconnected')
       }
       const s = await fetchOperatorSettings(operatorId)
       if (s?.ok && s.settings) {
+        const gw = s.settings.xenditGateway
+        if (gw && typeof gw === 'object') {
+          setXenditGatewayState({
+            connectionStatus: String((gw as { connectionStatus?: string }).connectionStatus || 'no_connect'),
+            hasSecretKey: !!(gw as { hasSecretKey?: boolean }).hasSecretKey,
+            hasWebhookToken: !!(gw as { hasWebhookToken?: boolean }).hasWebhookToken,
+            secretKeyLast4: String((gw as { secretKeyLast4?: string }).secretKeyLast4 || ''),
+            webhookTokenLast4: String((gw as { webhookTokenLast4?: string }).webhookTokenLast4 || ''),
+            lastWebhookAt: (gw as { lastWebhookAt?: string | null }).lastWebhookAt ?? null,
+            lastWebhookType: (gw as { lastWebhookType?: string | null }).lastWebhookType ?? null,
+          })
+        } else {
+          setXenditGatewayState({
+            connectionStatus: 'no_connect',
+            hasSecretKey: false,
+            hasWebhookToken: false,
+            secretKeyLast4: '',
+            webhookTokenLast4: '',
+            lastWebhookAt: null,
+            lastWebhookType: null,
+          })
+        }
         setIntegrationState((prev) => ({
           ...prev,
           stripe: !!s.settings.stripe,
@@ -1327,7 +1736,7 @@ export default function CompanyPage() {
         apiKey: aiApiKeyInput.trim(),
       })
       if (!r?.ok) {
-        toast.error(r?.reason || 'AI connect failed')
+        toast.error(r?.reason || `${OPERATOR_SCHEDULE_AI_DISPLAY_NAME} connect failed`)
         return
       }
       const s = await fetchOperatorSettings(operatorId)
@@ -1346,9 +1755,9 @@ export default function CompanyPage() {
       }
       setAiApiKeyInput('')
       setShowAiApiKeyDialog(false)
-      toast.success(`Connected AI Agent (${selectedAiProvider})`)
+      toast.success(`Connected ${OPERATOR_SCHEDULE_AI_DISPLAY_NAME} (${selectedAiProvider})`)
     } catch {
-      toast.error('AI connect failed')
+      toast.error(`${OPERATOR_SCHEDULE_AI_DISPLAY_NAME} connect failed`)
     }
   }
 
@@ -1372,7 +1781,7 @@ export default function CompanyPage() {
         setAiApiKeySet(false)
       }
       setAiApiKeyInput('')
-      toast.success('Disconnected AI Agent')
+      toast.success(`Disconnected ${OPERATOR_SCHEDULE_AI_DISPLAY_NAME}`)
     } catch {
       toast.error('Disconnect failed')
     }
@@ -1489,6 +1898,31 @@ export default function CompanyPage() {
           <h2 className="text-2xl font-bold text-foreground">Company Settings</h2>
           <p className="text-muted-foreground">Manage your company profile and subscription</p>
         </div>
+        {operatorId ? (
+          <div className="flex flex-col items-stretch gap-1 sm:items-end shrink-0">
+            <Button
+              type="button"
+              variant="outline"
+              className="h-9 gap-2 justify-center sm:justify-end"
+              onClick={() => router.push(`/profile/${encodeURIComponent(operatorId)}`)}
+            >
+              Review
+              <span className="font-medium tabular-nums">
+                (
+                {publicReviewSummary === null
+                  ? '…'
+                  : publicReviewSummary.avg != null
+                    ? `${publicReviewSummary.avg}`
+                    : '—'}
+                )
+              </span>
+            </Button>
+            <span className="text-center text-xs text-muted-foreground sm:text-right">
+              Total reviews:{' '}
+              {publicReviewSummary === null ? '…' : publicReviewSummary.count}
+            </span>
+          </div>
+        ) : null}
       </div>
 
       <Tabs value={activeTab} onValueChange={setActiveTab} className="min-w-0">
@@ -1549,6 +1983,55 @@ export default function CompanyPage() {
                     onChange={(e) => setCompanyInfo({ ...companyInfo, companyName: e.target.value })}
                   />
                 </div>
+              </div>
+              <div className="space-y-2">
+                <Label className="text-xs uppercase text-muted-foreground">Company email</Label>
+                <p className="text-xs text-muted-foreground">
+                  Master company account (cln_operatordetail). Login uses this until a scheduled change completes (7 days
+                  after you verify the code).
+                </p>
+                <Input
+                  value={clnCompanyEmailDisplay || String(user?.email || '').trim()}
+                  className="bg-muted"
+                  disabled
+                  readOnly
+                />
+                {clnCanChangeCompanyEmail ? (
+                  <button
+                    type="button"
+                    className="text-sm text-primary underline underline-offset-2 mt-1.5 block hover:opacity-90"
+                    onClick={openClnCompanyEmailDialog}
+                  >
+                    Change email address
+                  </button>
+                ) : null}
+                {clnCompanyEmailPending?.status === 'scheduled' && clnCompanyEmailPending.effectiveAt ? (
+                  <div className="mt-2 space-y-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1.5">
+                    <p className="text-xs text-amber-800 dark:text-amber-400">
+                      Change to <strong>{clnCompanyEmailPending.newEmail}</strong> is scheduled for{' '}
+                      {new Date(clnCompanyEmailPending.effectiveAt).toLocaleString(undefined, {
+                        dateStyle: 'medium',
+                        timeStyle: 'short',
+                      })}
+                      . Until then, sign in with your current email.
+                    </p>
+                    {clnCanChangeCompanyEmail ? (
+                      <button
+                        type="button"
+                        className="text-xs font-medium text-destructive underline underline-offset-2 hover:opacity-90"
+                        onClick={() => setClnCompanyEmailCancelOpen(true)}
+                      >
+                        Cancel change
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
+                {clnCompanyEmailPending?.status === 'pending_tac' ? (
+                  <p className="text-xs text-muted-foreground mt-2">
+                    A verification code was sent to the new address. Open &quot;Change email address&quot; to enter it,
+                    or request a new code.
+                  </p>
+                ) : null}
               </div>
               <div className="grid sm:grid-cols-2 gap-4">
                 <div
@@ -1855,13 +2338,16 @@ export default function CompanyPage() {
                   <Label htmlFor="bank">Bank name</Label>
                   <p className="text-xs text-muted-foreground">Options loaded from MySQL bankdetail.</p>
                   <Select
-                    value={companyInfo.bankdetailId || undefined}
-                    onValueChange={(v) => setCompanyInfo({ ...companyInfo, bankdetailId: v })}
+                    value={companyInfo.bankdetailId?.trim() ? companyInfo.bankdetailId : BANK_SELECT_NONE}
+                    onValueChange={(v) =>
+                      setCompanyInfo({ ...companyInfo, bankdetailId: v === BANK_SELECT_NONE ? '' : v })
+                    }
                   >
                     <SelectTrigger id="bank">
                       <SelectValue placeholder="Select bank" />
                     </SelectTrigger>
                     <SelectContent>
+                      <SelectItem value={BANK_SELECT_NONE}>Select bank</SelectItem>
                       {bankOptions.map((b) => (
                         <SelectItem key={b.id} value={b.id}>
                           {b.name}
@@ -1890,6 +2376,128 @@ export default function CompanyPage() {
               <div className="flex justify-end">
                 <Button onClick={handleSave}>Save Changes</Button>
               </div>
+
+              <Dialog
+                open={clnCompanyEmailDialogOpen}
+                onOpenChange={(o) => {
+                  setClnCompanyEmailDialogOpen(o)
+                  if (!o) {
+                    setClnCompanyEmailStep('enter')
+                    setClnCompanyEmailCode('')
+                    setClnCompanyEmailDoneEffectiveAt(null)
+                  }
+                }}
+              >
+                <DialogContent className="sm:max-w-md">
+                  <DialogHeader>
+                    <DialogTitle>Change company email</DialogTitle>
+                    <DialogDescription>
+                      We send a code to the new inbox. After you verify, the switch is scheduled for 7 days later. Your
+                      master login and portal account email will match the new address when it applies.
+                    </DialogDescription>
+                  </DialogHeader>
+                  {clnCompanyEmailStep === 'enter' && (
+                    <div className="space-y-3 py-1">
+                      <div>
+                        <Label htmlFor="cln-company-email-new">New email</Label>
+                        <Input
+                          id="cln-company-email-new"
+                          type="email"
+                          autoComplete="email"
+                          value={clnCompanyEmailNew}
+                          onChange={(e) => setClnCompanyEmailNew(e.target.value)}
+                          className="mt-1"
+                          placeholder="new@company.com"
+                        />
+                      </div>
+                      <DialogFooter className="gap-2 sm:gap-0">
+                        <Button type="button" variant="outline" onClick={() => setClnCompanyEmailDialogOpen(false)}>
+                          Cancel
+                        </Button>
+                        <Button type="button" onClick={() => void sendClnCompanyEmailTac()} disabled={clnCompanyEmailBusy}>
+                          {clnCompanyEmailBusy ? 'Sending…' : 'Send verification code'}
+                        </Button>
+                      </DialogFooter>
+                    </div>
+                  )}
+                  {clnCompanyEmailStep === 'code' && (
+                    <div className="space-y-3 py-1">
+                      <p className="text-sm text-muted-foreground">
+                        Enter the code sent to <strong>{clnCompanyEmailNew.trim()}</strong>.
+                      </p>
+                      <div>
+                        <Label htmlFor="cln-company-email-code">Verification code</Label>
+                        <Input
+                          id="cln-company-email-code"
+                          inputMode="numeric"
+                          autoComplete="one-time-code"
+                          value={clnCompanyEmailCode}
+                          onChange={(e) => setClnCompanyEmailCode(e.target.value.replace(/\D/g, '').slice(0, 8))}
+                          className="mt-1 font-mono tracking-widest"
+                          placeholder="6-digit code"
+                        />
+                      </div>
+                      <DialogFooter className="gap-2 sm:gap-0">
+                        <Button type="button" variant="outline" onClick={() => setClnCompanyEmailStep('enter')}>
+                          Back
+                        </Button>
+                        <Button type="button" onClick={() => void confirmClnCompanyEmailTac()} disabled={clnCompanyEmailBusy}>
+                          {clnCompanyEmailBusy ? 'Verifying…' : 'Verify and schedule'}
+                        </Button>
+                      </DialogFooter>
+                    </div>
+                  )}
+                  {clnCompanyEmailStep === 'done' && (
+                    <div className="space-y-3 py-1">
+                      <p className="text-sm text-foreground">
+                        Your company email change is scheduled.
+                        {clnCompanyEmailDoneEffectiveAt ? (
+                          <>
+                            {' '}
+                            It will apply on{' '}
+                            <strong>
+                              {new Date(clnCompanyEmailDoneEffectiveAt).toLocaleString(undefined, {
+                                dateStyle: 'medium',
+                                timeStyle: 'short',
+                              })}
+                            </strong>
+                            . Until then, keep signing in with your current email.
+                          </>
+                        ) : null}
+                      </p>
+                      <DialogFooter>
+                        <Button type="button" onClick={() => setClnCompanyEmailDialogOpen(false)}>
+                          Done
+                        </Button>
+                      </DialogFooter>
+                    </div>
+                  )}
+                </DialogContent>
+              </Dialog>
+
+              <AlertDialog open={clnCompanyEmailCancelOpen} onOpenChange={setClnCompanyEmailCancelOpen}>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>Cancel scheduled email change?</AlertDialogTitle>
+                    <AlertDialogDescription>
+                      This removes the scheduled switch to{' '}
+                      <strong>{clnCompanyEmailPending?.newEmail ?? 'the new address'}</strong>. You will keep using your
+                      current company email to sign in.
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel disabled={clnCompanyEmailCancelBusy}>Keep scheduled change</AlertDialogCancel>
+                    <Button
+                      type="button"
+                      variant="destructive"
+                      disabled={clnCompanyEmailCancelBusy}
+                      onClick={() => void submitCancelClnCompanyEmailChange()}
+                    >
+                      {clnCompanyEmailCancelBusy ? 'Cancelling…' : 'Yes, cancel change'}
+                    </Button>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
             </CardContent>
           </Card>
         </TabsContent>
@@ -1910,7 +2518,7 @@ export default function CompanyPage() {
                   { key: 'xendit', label: 'Xendit' },
                   { key: 'bukku', label: 'Bukku' },
                   { key: 'xero', label: 'Xero' },
-                  { key: 'ai', label: 'AI Agent' },
+                  { key: 'ai', label: OPERATOR_SCHEDULE_AI_DISPLAY_NAME },
                   { key: 'googleDrive', label: 'Google Drive' },
                   { key: 'ttlock', label: 'TTLock' },
                 ].map((item) => {
@@ -1937,12 +2545,26 @@ export default function CompanyPage() {
                     </div>
                     <div className="min-w-0">
                       <p className="font-semibold text-foreground text-sm">Payment gateway</p>
-                      <p className="text-xs text-muted-foreground leading-relaxed">Connect Stripe or Xendit (MYR / SGD). One payment gateway per company.</p>
+                      <p className="text-xs text-muted-foreground leading-relaxed">
+                        Stripe: connect your own account (OAuth). Xendit: your own keys + webhook URL (same idea as Coliving
+                        company settings).
+                      </p>
                       <div className="flex items-center gap-1 mt-1.5">
                         {connectedPaymentProvider ? (
                           <>
-                            <CheckCircle size={12} className="text-green-600" />
-                            <span className="text-xs text-green-600 font-medium">Connected ({connectedPaymentProvider === 'stripe' ? 'Stripe' : 'Xendit'})</span>
+                            <CheckCircle
+                              size={12}
+                              className={xenditPendingVerification ? 'text-amber-600' : 'text-green-600'}
+                            />
+                            <span
+                              className={`text-xs font-medium ${xenditPendingVerification ? 'text-amber-700' : 'text-green-600'}`}
+                            >
+                              {connectedPaymentProvider === 'stripe'
+                                ? 'Connected (Stripe)'
+                                : xenditPendingVerification
+                                  ? 'Xendit: credentials saved — verify webhook'
+                                  : 'Connected (Xendit)'}
+                            </span>
                           </>
                         ) : (
                           <>
@@ -1956,13 +2578,15 @@ export default function CompanyPage() {
                   {connectedPaymentProvider ? (
                     <Button
                       size="sm"
-                      variant="outline"
-                      onClick={() => void disconnectPayment()}
+                      variant={xenditPendingVerification ? 'default' : 'outline'}
+                      className="shrink-0"
+                      style={xenditPendingVerification ? { background: 'var(--brand)' } : undefined}
+                      onClick={openPaymentGatewayManageDialog}
                     >
-                      Disconnect
+                      {xenditPendingVerification ? 'Continue setup' : 'Manage'}
                     </Button>
                   ) : (
-                    <Button size="sm" onClick={openPaymentConnectDialog}>
+                    <Button size="sm" style={{ background: 'var(--brand)' }} onClick={openPaymentConnectDialog}>
                       Connect
                     </Button>
                   )}
@@ -2012,15 +2636,17 @@ export default function CompanyPage() {
               ) : null}
 
               <div className="space-y-3">
-                <p className="text-sm font-medium">AI</p>
+                <p className="text-sm font-medium">{OPERATOR_SCHEDULE_AI_DISPLAY_NAME}</p>
                 <div className="p-4 border border-border rounded-xl flex items-start justify-between gap-3">
                   <div className="flex items-start gap-3 min-w-0">
                     <div className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0" style={{ background: "var(--brand-light)" }}>
                       <Bot size={18} style={{ color: "var(--brand)" }} />
                     </div>
                     <div className="min-w-0">
-                      <p className="font-semibold text-foreground text-sm">AI Agent</p>
-                      <p className="text-xs text-muted-foreground leading-relaxed">Connect AI provider and API key</p>
+                      <p className="font-semibold text-foreground text-sm">{OPERATOR_SCHEDULE_AI_DISPLAY_NAME}</p>
+                      <p className="text-xs text-muted-foreground leading-relaxed">
+                        Connect AI model provider and API key for schedule assistant &amp; automation
+                      </p>
                       <div className="flex items-center gap-1 mt-1.5">
                         {integrationState.ai ? (
                           <>
@@ -2624,34 +3250,204 @@ export default function CompanyPage() {
         </TabsContent>
       </Tabs>
 
-      <Dialog open={showPaymentDialog} onOpenChange={setShowPaymentDialog}>
-        <DialogContent>
+      <Dialog
+        open={showPaymentDialog}
+        onOpenChange={(open) => {
+          setShowPaymentDialog(open)
+          if (!open) {
+            setPaymentGatewayStep('choose')
+            setPaymentGatewayFromManage(false)
+            setXenditSecretInput('')
+            setXenditCallbackTokenInput('')
+          }
+        }}
+      >
+        <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>Select payment provider</DialogTitle>
-            <DialogDescription>Choose one provider to connect for payment gateway.</DialogDescription>
+            <DialogTitle>
+              {paymentGatewayStep === 'stripe-manage'
+                ? 'Stripe'
+                : paymentGatewayStep === 'xendit-form'
+                  ? 'Xendit'
+                  : 'Connect payment gateway'}
+            </DialogTitle>
+            {paymentGatewayStep === 'choose' ? (
+              <DialogDescription>
+                Stripe uses OAuth to your own Stripe account. Xendit uses your own secret key and callback token; paste
+                the webhook URL into Xendit (same pattern as Coliving operator company).
+              </DialogDescription>
+            ) : paymentGatewayStep === 'stripe-manage' ? (
+              <DialogDescription>Stripe Connect is active for this company. Disconnect here if you need to switch gateway.</DialogDescription>
+            ) : (
+              <DialogDescription>
+                The server never returns your full secret. When a value is already stored, the inputs are pre-filled with
+                dots + last characters — paste a full new key or token to replace; you can change one or both before Save.
+              </DialogDescription>
+            )}
           </DialogHeader>
-          <div className="grid grid-cols-1 gap-3">
-            <button
-              type="button"
-              className={`w-full border rounded-lg p-3 text-left ${selectedPaymentProvider === 'stripe' ? 'border-primary bg-primary/5' : 'border-border'}`}
-              onClick={() => setSelectedPaymentProvider('stripe')}
-            >
-              <p className="font-medium">Stripe</p>
-              <p className="text-xs text-muted-foreground">Card payment integration</p>
-            </button>
-            <button
-              type="button"
-              className={`w-full border rounded-lg p-3 text-left ${selectedPaymentProvider === 'xendit' ? 'border-primary bg-primary/5' : 'border-border'}`}
-              onClick={() => setSelectedPaymentProvider('xendit')}
-            >
-              <p className="font-medium">Xendit</p>
-              <p className="text-xs text-muted-foreground">MYR/SGD payment gateway</p>
-            </button>
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setShowPaymentDialog(false)}>Cancel</Button>
-            <Button onClick={() => void connectSelectedPaymentProvider()}>Connect</Button>
-          </DialogFooter>
+          {paymentGatewayStep === 'stripe-manage' ? (
+            <>
+              <div className="rounded-lg border p-4 space-y-3">
+                <p className="text-sm text-muted-foreground">Funds use your connected Stripe account for client invoice card payments.</p>
+              </div>
+              <Button
+                type="button"
+                variant="destructive"
+                className="w-full"
+                onClick={() =>
+                  void disconnectPayment().then(() => {
+                    setShowPaymentDialog(false)
+                  })
+                }
+              >
+                Disconnect Stripe
+              </Button>
+              <DialogFooter>
+                <Button type="button" variant="outline" onClick={() => setShowPaymentDialog(false)}>
+                  Close
+                </Button>
+              </DialogFooter>
+            </>
+          ) : paymentGatewayStep === 'choose' ? (
+            <>
+              <div className="grid grid-cols-1 gap-3">
+                <button
+                  type="button"
+                  className={`w-full border rounded-lg p-3 text-left ${selectedPaymentProvider === 'stripe' ? 'border-primary bg-primary/5' : 'border-border'}`}
+                  onClick={() => setSelectedPaymentProvider('stripe')}
+                >
+                  <p className="font-medium">Stripe</p>
+                  <p className="text-xs text-muted-foreground">Connect your own account (OAuth)</p>
+                </button>
+                <button
+                  type="button"
+                  className={`w-full border rounded-lg p-3 text-left ${selectedPaymentProvider === 'xendit' ? 'border-primary bg-primary/5' : 'border-border'}`}
+                  onClick={() => setSelectedPaymentProvider('xendit')}
+                >
+                  <p className="font-medium">Xendit</p>
+                  <p className="text-xs text-muted-foreground">Secret key + X-CALLBACK-TOKEN + webhook URL</p>
+                </button>
+              </div>
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setShowPaymentDialog(false)}>
+                  Cancel
+                </Button>
+                <Button
+                  onClick={() => {
+                    if (selectedPaymentProvider === 'stripe') void startStripeConnectOAuth()
+                    else {
+                      primeXenditCredentialInputs()
+                      setPaymentGatewayStep('xendit-form')
+                    }
+                  }}
+                >
+                  Continue
+                </Button>
+              </DialogFooter>
+            </>
+          ) : (
+            <>
+              <div className="space-y-3 rounded-lg border p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-sm font-medium">Status</p>
+                  <Badge variant={xenditGatewayState.connectionStatus === 'connected' ? 'default' : 'secondary'}>
+                    {xenditGatewayStatusLabel}
+                  </Badge>
+                </div>
+                <p className="text-sm text-muted-foreground">
+                  <strong>Pending verification</strong> is normal after save: keys are stored, but status becomes{' '}
+                  <strong>Connected</strong> only after Xendit sends a server-to-server callback to your webhook URL with
+                  the correct <strong>X-CALLBACK-TOKEN</strong>.
+                </p>
+              </div>
+              <div className="space-y-2">
+                <Label className="text-xs font-semibold">Webhook URL</Label>
+                <Input readOnly value={clnXenditWebhookUrl || '(set NEXT_PUBLIC_CLEANLEMON_API_URL in portal .env)'} className="mt-1 bg-muted text-xs" />
+                {(clnXenditWebhookUrl || '').startsWith('http://localhost') ? (
+                  <p className="text-xs text-amber-800">
+                    Xendit runs in the cloud: it cannot reach localhost. Use a public URL (e.g. ngrok to port 5000) in
+                    Xendit, or test on your deployed API, or status will stay Pending.
+                  </p>
+                ) : null}
+              </div>
+              <div>
+                <Label className="text-xs font-semibold">Xendit secret key</Label>
+                <Input
+                  type="password"
+                  placeholder="xnd_development_… or xnd_production_…"
+                  value={xenditSecretInput}
+                  onChange={(e) => setXenditSecretInput(e.target.value)}
+                  className="mt-1"
+                  autoComplete="off"
+                />
+              </div>
+              <div>
+                <Label className="text-xs font-semibold">X-CALLBACK-TOKEN</Label>
+                <Input
+                  type="password"
+                  placeholder="Paste your X-CALLBACK-TOKEN"
+                  value={xenditCallbackTokenInput}
+                  onChange={(e) => setXenditCallbackTokenInput(e.target.value)}
+                  className="mt-1"
+                  autoComplete="off"
+                />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Dots in the fields are a saved placeholder (not your full secret). Select all and paste to replace.
+              </p>
+              <div className="rounded-lg border p-3 text-sm text-muted-foreground">
+                In Xendit webhook / callback settings, enable invoice / payment result callbacks (and match this URL
+                exactly, including <code className="text-xs">operator_id</code>).
+              </div>
+              <Button
+                className="w-full"
+                style={{ background: 'var(--brand)' }}
+                disabled={xenditCredentialBusy || !xenditCredentialsSaveEnabled}
+                onClick={() => void saveClnXenditCredentialsFromDialog()}
+              >
+                {xenditCredentialBusy ? 'Saving…' : 'Save Xendit credentials'}
+              </Button>
+              <p className="text-xs text-muted-foreground">
+                After saving, trigger a test callback from Xendit. Status becomes Connected when our server verifies the
+                token.
+              </p>
+              {integrationState.xendit ? (
+                <Button
+                  type="button"
+                  variant="destructive"
+                  className="w-full"
+                  disabled={xenditCredentialBusy}
+                  onClick={() => void disconnectPayment().then(() => setShowPaymentDialog(false))}
+                >
+                  Disconnect Xendit
+                </Button>
+              ) : null}
+              <DialogFooter className="gap-2 sm:gap-0">
+                {!paymentGatewayFromManage ? (
+                  <>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => {
+                        setPaymentGatewayStep('choose')
+                        setXenditSecretInput('')
+                        setXenditCallbackTokenInput('')
+                      }}
+                    >
+                      Back
+                    </Button>
+                    <Button type="button" variant="outline" onClick={() => setShowPaymentDialog(false)}>
+                      Close
+                    </Button>
+                  </>
+                ) : (
+                  <Button type="button" variant="outline" onClick={() => setShowPaymentDialog(false)}>
+                    Close
+                  </Button>
+                )}
+              </DialogFooter>
+            </>
+          )}
         </DialogContent>
       </Dialog>
 
@@ -2730,8 +3526,8 @@ export default function CompanyPage() {
       <Dialog open={showAiProviderDialog} onOpenChange={setShowAiProviderDialog}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Select AI provider</DialogTitle>
-            <DialogDescription>Choose provider before entering API key.</DialogDescription>
+            <DialogTitle>Select model provider ({OPERATOR_SCHEDULE_AI_DISPLAY_NAME})</DialogTitle>
+            <DialogDescription>Choose vendor before entering the API key for {OPERATOR_SCHEDULE_AI_DISPLAY_NAME}.</DialogDescription>
           </DialogHeader>
           <div className="grid grid-cols-1 gap-3">
             <button

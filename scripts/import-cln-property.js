@@ -1,12 +1,12 @@
 /**
  * Import Wix CMS Propertydetail CSV → cln_property.
  * Wix ID → id. Owner → operator_id + client_id + owner_wix_id (cln_operatordetail / legacy FK).
- * CSV "reference" has no DB column — ignored.
- * If cc_json parses and contains wixClientReference (UUID) existing in cln_clientdetail, sets clientdetail_id
- * (same idea as migration 0210 backfill).
+ * clientdetail_id from (first match wins):
+ *   1) cc_json.wixClientReference if UUID exists in cln_clientdetail
+ *   2) CSV column "reference" if UUID exists in cln_clientdetail (Wix client ref on property)
  *
  * Usage: node scripts/import-cln-property.js [csv_path]
- * Default: cleanlemon/next-app/Propertydetail (6).csv
+ * Default: Import_csv/Propertydetail.csv (repo root)
  *
  * Address: Wix often stores one block with "Waze:" / "Google Map(s):" lines. If columns exist, the script
  * extracts URLs into `waze_url` / `google_maps_url` and trims the prose into `address` (same intent as
@@ -27,7 +27,7 @@ const { splitAddressWazeGoogleFromText } = require('../src/modules/cleanlemon/cl
 const root = path.join(__dirname, '..');
 const csvPath = process.argv[2]
   ? path.resolve(process.argv[2])
-  : path.join(root, 'cleanlemon/next-app/Propertydetail (6).csv');
+  : path.join(root, 'Import_csv', 'Propertydetail.csv');
 
 const loose = process.env.CLN_IMPORT_LOOSE === '1';
 const forcedOperatorId = String(process.env.CLN_IMPORT_OPERATOR_ID || '').trim();
@@ -68,7 +68,7 @@ const CSV_TO_DB = {
   generalcleaning: 'generalcleaning',
   renovationcleaning: 'renovationcleaning',
   Colivingsourceid: 'coliving_source_id',
-  reference: '_skip',
+  reference: '_reference_clientdetail_csv',
 };
 
 function tryParseCcForClientdetailId(ccVal, validClientdetailIds) {
@@ -208,9 +208,20 @@ async function run() {
         }
       }
 
+      const refCsv =
+        row._reference_clientdetail_csv != null &&
+        looksLikeUuid(String(row._reference_clientdetail_csv).trim())
+          ? String(row._reference_clientdetail_csv).trim()
+          : null;
+      delete row._reference_clientdetail_csv;
+
       if (tableColumns.has('clientdetail_id')) {
         const fromCc = tryParseCcForClientdetailId(row.cc_json, validClientdetailIds);
-        if (fromCc) row.clientdetail_id = fromCc;
+        if (fromCc) {
+          row.clientdetail_id = fromCc;
+        } else if (refCsv && validClientdetailIds.has(refCsv)) {
+          row.clientdetail_id = refCsv;
+        }
       }
 
       for (const k of ['score', 'min_value', 'bed_count', 'room_count', 'bathroom_count', 'kitchen', 'living_room', 'balcony', 'staircase', 'special_area_count']) {

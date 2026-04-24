@@ -6,6 +6,7 @@
  */
 
 const pool = require('../../config/db');
+const { buildBukkuSalesInvoicePublicUrl } = require('../bukku/lib/bukkuSalesInvoicePublicUrl');
 const { ACCOUNTING_PLAN_IDS } = require('../access/access.service');
 const {
   ensureContactInAccounting,
@@ -840,8 +841,7 @@ async function getInvoiceUrl(req, provider, invoiceId) {
       return buildXeroInvoiceOpenUrl(invoiceId);
     }
     if (provider === 'bukku' && req.client?.bukku_subdomain) {
-      const sub = String(req.client.bukku_subdomain).trim();
-      return `https://${sub}.bukku.my/invoices/${invoiceId}`;
+      return buildBukkuSalesInvoicePublicUrl(req.client.bukku_subdomain, invoiceId);
     }
     return null;
   } catch {
@@ -913,9 +913,8 @@ async function getBukkuSubdomainForClientInvoiceLink(clientId) {
 function buildRentalInvoiceDisplayUrl(invoiceurl, invoiceid, bukkuSub) {
   const u = invoiceurl != null ? String(invoiceurl).trim() : '';
   if (u && /^https?:\/\//i.test(u)) return u;
-  const id = invoiceid != null && String(invoiceid).trim() !== '' ? String(invoiceid).trim() : '';
-  const sub = bukkuSub != null && String(bukkuSub).trim() !== '' ? String(bukkuSub).trim() : '';
-  if (id && sub) return `https://${sub}.bukku.my/invoices/${id}`.replace(/\/+/g, '/');
+  const built = buildBukkuSalesInvoicePublicUrl(bukkuSub, invoiceid);
+  if (built) return built;
   return u || null;
 }
 

@@ -231,7 +231,18 @@ async function getTenantPublicProfileById(tenantId) {
     );
     owner = ownerRows[0] || null;
   }
-  const email = String(tenant?.email || owner?.email || '').trim().toLowerCase();
+  let portalAccountDirect = null;
+  if (!tenant && !owner) {
+    const [paRows] = await pool.query(
+      `SELECT id, email, fullname, first_name, last_name, profile, avatar_url
+       FROM portal_account WHERE id = ? LIMIT 1`,
+      [tenantId]
+    );
+    portalAccountDirect = paRows[0] || null;
+  }
+  const email = String(tenant?.email || owner?.email || portalAccountDirect?.email || '')
+    .trim()
+    .toLowerCase();
   if (!email) return { ok: false, reason: 'TENANT_NOT_FOUND' };
 
   let tenantReviewWhere = '';
@@ -248,6 +259,9 @@ async function getTenantPublicProfileById(tenantId) {
       tenantReviewWhere = 'par.subject_kind = ? AND par.portal_account_id = ?';
       tenantReviewParams = ['tenant', opid];
     }
+  } else if (portalAccountDirect?.id != null) {
+    tenantReviewWhere = 'par.subject_kind = ? AND par.portal_account_id = ?';
+    tenantReviewParams = ['tenant', String(portalAccountDirect.id)];
   } else {
     tenantReviewWhere = '1=0';
     tenantReviewParams = [];
@@ -306,7 +320,9 @@ async function getTenantPublicProfileById(tenantId) {
       ? await resolvePortalAccountIdForTenantdetail(String(tenant.id))
       : owner?.id != null
         ? await resolvePortalAccountIdForOwnerdetail(String(owner.id))
-        : null;
+        : portalAccountDirect?.id != null
+          ? String(portalAccountDirect.id)
+          : null;
 
   if (portalForMerge) {
     ownerReviewWhere = 'par.subject_kind = ? AND par.portal_account_id = ?';
@@ -380,13 +396,24 @@ async function getTenantPublicProfileById(tenantId) {
     ? Number((reviews.reduce((a, x) => a + Number(x.overallScore || 0), 0) / reviews.length).toFixed(2))
     : null;
 
+  const paFullName = portalAccountDirect
+    ? String(portalAccountDirect.fullname || '')
+        .trim() ||
+      [portalAccountDirect.first_name, portalAccountDirect.last_name].filter(Boolean).join(' ').trim()
+    : '';
+  const avatarFromPortalOnly =
+    parseProfileAvatar(portalAccountDirect?.profile) ||
+    (portalAccountDirect?.avatar_url && String(portalAccountDirect.avatar_url).trim()
+      ? String(portalAccountDirect.avatar_url).trim()
+      : null);
+
   return {
     ok: true,
     tenant: {
-      id: tenant?.id || owner?.id || tenantId,
-      fullname: tenant?.fullname || owner?.ownername || '',
+      id: tenant?.id || owner?.id || portalAccountDirect?.id || tenantId,
+      fullname: tenant?.fullname || owner?.ownername || paFullName,
       email,
-      avatarUrl: parseProfileAvatar(tenant?.profile || owner?.profile),
+      avatarUrl: parseProfileAvatar(tenant?.profile || owner?.profile) || avatarFromPortalOnly,
     },
     summary: {
       reviewCount: reviews.length,

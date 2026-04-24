@@ -48,7 +48,7 @@ interface Task {
   unitNumber: string
   property: string
   serviceProvider: string
-  status: 'pending-checkout' | 'ready-to-clean' | 'in-progress' | 'completed'
+  status: 'pending-checkout' | 'ready-to-clean' | 'in-progress' | 'completed' | 'cancelled'
   estimateKpi: number
   estimatedDuration: number
   completedPhotos: string[]
@@ -66,6 +66,8 @@ interface Task {
   smartdoorTokenEnabled?: boolean
   propertySmartdoorId?: string | null
   operatorDoorAccessMode?: string
+  /** Same-day checkout + check-in — priority flag */
+  btob?: boolean
 }
 
 type UploadPreview = {
@@ -74,13 +76,22 @@ type UploadPreview = {
   url: string
 }
 
-/** Mobile strip + pill: red not ready, yellow pending clean, green complete */
+/** Mobile strip + pill: match real job status (was wrongly lumping ready-to-clean into "Pending clean"). */
 function mobileSchedulePresentation(status: Task['status']) {
   if (status === 'completed') {
     return { label: 'Complete', bar: 'bg-emerald-500', pill: 'bg-emerald-600 text-white' }
   }
   if (status === 'pending-checkout') {
     return { label: 'Not ready', bar: 'bg-red-600', pill: 'bg-red-600 text-white' }
+  }
+  if (status === 'ready-to-clean') {
+    return { label: 'Ready to Clean', bar: 'bg-blue-600', pill: 'bg-blue-600 text-white' }
+  }
+  if (status === 'in-progress') {
+    return { label: 'In progress', bar: 'bg-amber-400', pill: 'bg-amber-400 text-gray-900' }
+  }
+  if (status === 'cancelled') {
+    return { label: 'Cancelled', bar: 'bg-gray-500', pill: 'bg-gray-200 text-gray-700' }
   }
   return { label: 'Pending clean', bar: 'bg-amber-400', pill: 'bg-amber-400 text-gray-900' }
 }
@@ -145,12 +156,16 @@ function jobMatchesEmployee(job: Task, keys: Set<string>): boolean {
 }
 
 function normalizeTaskStatus(status: string): Task['status'] {
-  const x = String(status || '').toLowerCase().replace(/_/g, '-').replace(/\s+/g, '-')
+  const raw = String(status ?? '').trim()
+  if (raw === '') return 'pending-checkout'
+  const x = raw.toLowerCase().replace(/_/g, '-').replace(/\s+/g, '-')
   if (x.includes('complete')) return 'completed'
   if (x.includes('progress')) return 'in-progress'
-  if (x.includes('checkout')) return 'pending-checkout'
-  if (x.includes('ready')) return 'ready-to-clean'
-  return 'ready-to-clean'
+  if (x.includes('cancel')) return 'cancelled'
+  if (x.includes('checkout') || x.includes('check-out')) return 'pending-checkout'
+  if (x.includes('customer') && x.includes('missing')) return 'pending-checkout'
+  if (x.includes('ready') && x.includes('clean')) return 'ready-to-clean'
+  return 'pending-checkout'
 }
 
 export function EmployeeDashboardSchedule() {
@@ -230,6 +245,7 @@ export function EmployeeDashboardSchedule() {
           x.propertySmartdoorId != null && String(x.propertySmartdoorId).trim()
             ? String(x.propertySmartdoorId).trim()
             : null,
+        btob: Boolean(x.btob),
       }))
       setTasks(mapped)
     } finally {
@@ -707,7 +723,13 @@ export function EmployeeDashboardSchedule() {
               filteredTasks.map((task) => {
                 const vis = mobileSchedulePresentation(task.status)
                 return (
-                  <div key={task.id} className="flex gap-3 rounded-xl border bg-card p-3 shadow-sm">
+                  <div
+                    key={task.id}
+                    className={cn(
+                      'flex gap-3 rounded-xl border bg-card p-3 shadow-sm',
+                      task.btob && 'border-2 border-red-600 bg-red-50/40',
+                    )}
+                  >
                     <div className={cn('w-2 shrink-0 self-stretch rounded-full', vis.bar)} aria-hidden />
                     <div className="min-w-0 flex-1 space-y-2">
                       <div className="flex items-start justify-between gap-2">
@@ -730,9 +752,22 @@ export function EmployeeDashboardSchedule() {
                         <span className="text-foreground">{task.serviceProvider}</span>
                       </p>
                       <div className="flex flex-wrap items-center gap-2">
-                        <span className={cn('rounded-full px-2.5 py-0.5 text-xs font-semibold', vis.pill)}>
-                          {vis.label}
-                        </span>
+                        {task.status === 'ready-to-clean' ? (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="default"
+                            className="h-8 gap-1 rounded-full px-3 text-xs font-semibold shadow-sm"
+                            onClick={() => openStartDialog(task)}
+                          >
+                            <Sparkles className="h-3.5 w-3.5 shrink-0" />
+                            {vis.label}
+                          </Button>
+                        ) : (
+                          <span className={cn('rounded-full px-2.5 py-0.5 text-xs font-semibold', vis.pill)}>
+                            {vis.label}
+                          </span>
+                        )}
                         <button
                           type="button"
                           className="text-xs text-primary underline-offset-2 hover:underline"
@@ -775,16 +810,29 @@ export function EmployeeDashboardSchedule() {
                   filteredTasks.map((task) => {
                     const vis = mobileSchedulePresentation(task.status)
                     return (
-                      <TableRow key={task.id}>
+                      <TableRow key={task.id} className={cn(task.btob && 'border-2 border-red-600 bg-red-50/30')}>
                         <TableCell>
                           <div className="font-medium">{task.unitNumber}</div>
                           <div className="text-xs text-muted-foreground">{task.property}</div>
                         </TableCell>
                         <TableCell className="max-w-[14rem] truncate">{task.serviceProvider}</TableCell>
                         <TableCell>
-                          <span className={cn('rounded-full px-2 py-0.5 text-xs font-semibold', vis.pill)}>
-                            {vis.label}
-                          </span>
+                          {task.status === 'ready-to-clean' ? (
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="default"
+                              className="h-8 gap-1 rounded-full px-3 text-xs font-semibold shadow-sm"
+                              onClick={() => openStartDialog(task)}
+                            >
+                              <Sparkles className="h-3.5 w-3.5 shrink-0" />
+                              {vis.label}
+                            </Button>
+                          ) : (
+                            <span className={cn('rounded-full px-2 py-0.5 text-xs font-semibold', vis.pill)}>
+                              {vis.label}
+                            </span>
+                          )}
                         </TableCell>
                         <TableCell className="text-right">
                           <div className="flex justify-end gap-1">
@@ -812,12 +860,6 @@ export function EmployeeDashboardSchedule() {
                                   <ShieldAlert className="mr-2 h-4 w-4" />
                                   Damage Report
                                 </DropdownMenuItem>
-                                {task.status === 'ready-to-clean' ? (
-                                  <DropdownMenuItem onClick={() => openStartDialog(task)}>
-                                    <Sparkles className="mr-2 h-4 w-4" />
-                                    Start Clean
-                                  </DropdownMenuItem>
-                                ) : null}
                                 {normalizeTaskStatus(task.status) === 'in-progress' ? (
                                   <DropdownMenuItem onClick={() => openEndDialog(task)}>
                                     <CheckCircle2 className="mr-2 h-4 w-4" />
@@ -859,6 +901,7 @@ export function EmployeeDashboardSchedule() {
                 ) : null}
                 {propertyHasSmartDoor(propertyAccessTask) ? (
                   <CleanlemonDoorOpenPanel
+                    smartdoorId={propertyAccessTask.propertySmartdoorId}
                     operatorDoorAccessMode={propertyAccessTask.operatorDoorAccessMode}
                     smartdoorGatewayReady={undefined}
                     hasBookingToday={propertyAccessTask.date === malaysiaDateString()}

@@ -20,11 +20,53 @@ function toYmdForBukkuApi(v) {
   return v;
 }
 
+function pickNonEmptyId(...candidates) {
+  for (const c of candidates) {
+    if (c == null || c === '') continue;
+    const s = String(c).trim();
+    if (s !== '') return c;
+  }
+  return null;
+}
+
 /**
- * POST /sales/invoices success body (varies by API version):
- * - `{ transaction: { id, number, short_link, ... } }`
- * - `{ data: { id, ... } }` or nested `data.transaction`
- * `bukkurequest` returns `{ ok: true, data: <API body> }`.
+ * Same priority idea as `resolveBukkuSalesTargetTransactionId` in rentalcollection-invoice.service.js:
+ * prefer numeric `bukku_invoice_id`, then numeric `invoiceid` (ignore IV-xxxx doc numbers for API id).
+ */
+function pickFirstNumericBukkuSalesTransactionId(body, tx) {
+  const b = body && typeof body === 'object' ? body : {};
+  const t = tx && typeof tx === 'object' ? tx : {};
+  const fields = [
+    b.bukku_invoice_id,
+    t.bukku_invoice_id,
+    b.bukkuInvoiceId,
+    t.bukkuInvoiceId,
+    b.invoiceid,
+    t.invoiceid,
+    b.invoiceId,
+    t.invoiceId
+  ];
+  for (const c of fields) {
+    const s = c == null ? '' : String(c).trim();
+    if (/^\d+$/.test(s)) return s;
+  }
+  return null;
+}
+
+/** Some Bukku responses use `transaction_id` or nest under `data` only. */
+function parseTransactionIdFromLocationHeader(headers) {
+  if (!headers || typeof headers !== 'object') return null;
+  const loc = headers.location || headers.Location;
+  if (!loc || typeof loc !== 'string') return null;
+  const m = loc.match(/\/sales\/invoices\/(\d+)/i) || loc.match(/\/invoices\/(\d+)/i);
+  return m ? m[1] : null;
+}
+
+/**
+ * POST /sales/invoices success body (varies by API version).
+ * Coliving UI link fallbacks: `coliving/next-app/app/operator/invoice/page.tsx` → `resolveBukkuInvoiceHref`
+ * (invoiceurl, then numeric id + subdomain). Create path uses this parser via rentalcollection-invoice + Cleanlemons operator accounting.
+ * `bukkurequest` returns `{ ok: true, data: <API body>, status?, headers? }`.
  */
 function parseBukkuSalesInvoiceCreateResponse(res) {
   const empty = { invoiceId: null, shortLink: null, documentNumber: null };
@@ -33,6 +75,10 @@ function parseBukkuSalesInvoiceCreateResponse(res) {
   }
   const root = res.data;
   if (!root || typeof root !== 'object') {
+    const fromLoc = parseTransactionIdFromLocationHeader(res.headers);
+    if (fromLoc != null && fromLoc !== '') {
+      return { invoiceId: String(fromLoc), shortLink: null, documentNumber: null };
+    }
     return empty;
   }
   /** Merge `data` wrapper so `id` at `body.data.id` is visible at top level. */
@@ -45,18 +91,52 @@ function parseBukkuSalesInvoiceCreateResponse(res) {
       ? body.transaction
       : body.invoice != null && typeof body.invoice === 'object'
         ? body.invoice
-        : body;
-  const id =
-    tx.id != null && tx.id !== ''
-      ? tx.id
-      : tx.invoice_id != null && tx.invoice_id !== ''
-        ? tx.invoice_id
-        : body.id != null && body.id !== ''
-          ? body.id
-          : null;
-  const shortLink = tx.short_link != null ? tx.short_link : body.short_link;
-  const documentNumber = tx.number != null ? tx.number : body.number;
+        : body.sale_invoice != null && typeof body.sale_invoice === 'object'
+          ? body.sale_invoice
+          : body.sales_invoice != null && typeof body.sales_invoice === 'object'
+            ? body.sales_invoice
+            : body.saleInvoice != null && typeof body.saleInvoice === 'object'
+              ? body.saleInvoice
+              : body;
+  let id = pickNonEmptyId(
+    tx.id,
+    tx.invoice_id,
+    tx.transaction_id,
+    body.transaction_id,
+    body.id,
+    body.invoice_id,
+    tx.transaction?.id,
+    tx.transaction?.invoice_id,
+    body.transaction?.id,
+    body.transaction?.invoice_id,
+    body.transaction?.transaction_id,
+    body.bukku_invoice_id,
+    tx.bukku_invoice_id,
+    body.bukkuInvoiceId,
+    tx.bukkuInvoiceId,
+    body.invoiceid,
+    tx.invoiceid,
+    body.invoiceId,
+    tx.invoiceId
+  );
+  const numericEcho = pickFirstNumericBukkuSalesTransactionId(body, tx);
+  if (!id || !/^\d+$/.test(String(id).trim())) {
+    if (numericEcho) id = numericEcho;
+  }
+  const shortLink =
+    pickNonEmptyId(tx.short_link, body.short_link, tx.shortLink, body.shortLink) || null;
+  const documentNumber =
+    pickNonEmptyId(tx.number, body.number, tx.document_number, body.document_number) || null;
   if (id == null || id === '') {
+    const fromLoc = parseTransactionIdFromLocationHeader(res.headers);
+    if (fromLoc != null && fromLoc !== '') {
+      const sl =
+        shortLink != null && String(shortLink).trim() !== ''
+          ? String(shortLink).trim()
+          : null;
+      const doc = documentNumber != null && String(documentNumber).trim() !== '' ? String(documentNumber).trim() : null;
+      return { invoiceId: String(fromLoc), shortLink: sl, documentNumber: doc };
+    }
     try {
       console.warn(
         '[bukku] parseBukkuSalesInvoiceCreateResponse: no id in response; keys:',
@@ -72,9 +152,14 @@ function parseBukkuSalesInvoiceCreateResponse(res) {
   return { invoiceId: String(id), shortLink: sl, documentNumber: doc };
 }
 
-function normalizeCreateInvoiceBodyForBukkuApi(body) {
+/**
+ * @param {object} body
+ * @param {{ omitFormItemProductIds?: boolean }} [options] — When true, strips `product_id` / `product_unit_id` from form_items before POST.
+ */
+function normalizeCreateInvoiceBodyForBukkuApi(body, options = {}) {
   if (!body || typeof body !== 'object') return body;
   const out = { ...body };
+  const omitPid = !!options.omitFormItemProductIds;
   if (out.date != null) out.date = toYmdForBukkuApi(out.date);
   if (Array.isArray(out.term_items)) {
     out.term_items = out.term_items.map((t) => {
@@ -88,6 +173,10 @@ function normalizeCreateInvoiceBodyForBukkuApi(body) {
     out.form_items = out.form_items.map((f) => {
       if (!f || typeof f !== 'object') return f;
       const row = { ...f };
+      if (omitPid) {
+        delete row.product_id;
+        delete row.product_unit_id;
+      }
       if (row.service_date != null) row.service_date = toYmdForBukkuApi(row.service_date);
       return row;
     });
@@ -99,7 +188,7 @@ function normalizeCreateInvoiceBodyForBukkuApi(body) {
  * POST /sales/invoices — same Joi as `bukku/routes/invoice.routes.js` so internal callers
  * (rentalcollection-invoice, einvoice) cannot send payloads that fail Bukku term_items rules.
  */
-async function createinvoice(req, payload) {
+async function createinvoice(req, payload, options = {}) {
   const { error, value } = create_invoice_schema.validate(payload, {
     abortEarly: false,
     stripUnknown: true
@@ -115,7 +204,7 @@ async function createinvoice(req, payload) {
       }
     };
   }
-  const data = normalizeCreateInvoiceBodyForBukkuApi(value);
+  const data = normalizeCreateInvoiceBodyForBukkuApi(value, options);
   const { token, subdomain } = getBukkuCreds(req);
   return bukkurequest({
     method: 'post',
