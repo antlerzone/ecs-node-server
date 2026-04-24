@@ -1,25 +1,21 @@
 "use client"
 
-import { useState, Suspense, useEffect } from "react"
-import { useSearchParams, useRouter } from "next/navigation"
-import { toast } from "sonner"
-import { formatGovIdErrorReason } from "@/lib/gov-id-callback-messages"
+import { useState, Suspense } from "react"
+import { useSearchParams } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import Link from "next/link"
 import { ArrowLeft, CheckCircle, Eye, EyeOff } from "lucide-react"
 import { Spinner } from "@/components/ui/spinner"
-import { isDemoSite, shouldUseDemoMock } from "@/lib/portal-api"
+import { isDemoSite } from "@/lib/portal-api"
 import { PortalSlidingAuthCard } from "@/components/portal-sliding-auth-card"
 import { SlidingSignInPanel } from "@/components/sliding-sign-in-panel"
-import { GovIdConnectButtons } from "@/components/gov-id-connect-buttons"
 
 function getEcsBase(): string {
   return (process.env.NEXT_PUBLIC_ECS_BASE_URL ?? "").replace(/\/$/, "")
 }
 
 function RegisterPageInner() {
-  const router = useRouter()
   const searchParams = useSearchParams()
   const nextAfterRegister = searchParams.get("next")
   const postRegisterHref =
@@ -28,28 +24,6 @@ function RegisterPageInner() {
       : "/login"
 
   const fromEnquiry = nextAfterRegister === "/enquiry"
-
-  const govIdReturnPath =
-    nextAfterRegister && nextAfterRegister.startsWith("/") && !nextAfterRegister.startsWith("//")
-      ? `/register?next=${encodeURIComponent(nextAfterRegister)}`
-      : "/register"
-
-  useEffect(() => {
-    const gov = searchParams.get("gov")
-    const reason = searchParams.get("reason")
-    const provider = searchParams.get("provider")
-    const cleanRegisterHref =
-      nextAfterRegister && nextAfterRegister.startsWith("/") && !nextAfterRegister.startsWith("//")
-        ? `/register?next=${encodeURIComponent(nextAfterRegister)}`
-        : "/register"
-    if (gov === "success") {
-      toast.success(`Connected${provider ? ` (${provider})` : ""}`)
-      router.replace(cleanRegisterHref, { scroll: false })
-    } else if (gov === "error" && reason) {
-      toast.error(formatGovIdErrorReason(reason))
-      router.replace(cleanRegisterHref, { scroll: false })
-    }
-  }, [searchParams, router, nextAfterRegister])
 
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
@@ -128,7 +102,7 @@ function RegisterPageInner() {
 
   if (submitted) {
     return (
-      <div className="min-h-screen bg-background flex items-center justify-center p-4">
+      <div className="min-h-screen min-h-[100dvh] bg-background flex items-center justify-center px-4 py-8 pt-[max(2rem,env(safe-area-inset-top,0px))] pb-[max(2rem,env(safe-area-inset-bottom,0px))]">
         <div className="max-w-md w-full text-center">
           <div className="w-16 h-16 rounded-full bg-green-100 flex items-center justify-center mx-auto mb-6">
             <CheckCircle size={32} className="text-green-600" />
@@ -153,7 +127,7 @@ function RegisterPageInner() {
   const backLabel = fromEnquiry ? "Back to enquiry" : "Back to Login"
 
   const signUpForm = (
-    <div className="w-full max-w-[300px] mx-auto space-y-5">
+    <div className="w-full max-w-sm mx-auto space-y-5">
       <h2 className="text-2xl sm:text-3xl font-bold text-foreground">Create Account</h2>
       <p className="text-xs text-muted-foreground">Register with your work email and a secure password.</p>
 
@@ -237,20 +211,13 @@ function RegisterPageInner() {
           )}
         </Button>
       </form>
-
-      <GovIdConnectButtons
-        returnPath={govIdReturnPath}
-        variant="stacked"
-        appearance="enquiry"
-        disabled={isLoading || shouldUseDemoMock()}
-      />
     </div>
   )
 
   return (
-    <div className="min-h-screen bg-background">
-      <div className="max-w-[920px] mx-auto px-4 sm:px-6 pt-8 pb-12">
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-8">
+    <div className="min-h-screen min-h-[100dvh] bg-background">
+      <div className="max-w-[920px] mx-auto px-4 sm:px-6 pt-[max(2rem,env(safe-area-inset-top,0px))] pb-[max(3rem,env(safe-area-inset-bottom,0px))]">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 sm:gap-4 mb-6 sm:mb-8">
           <div className="flex flex-col leading-tight">
             <span className="text-lg font-bold tracking-widest text-primary uppercase">Coliving</span>
             <span className="text-[10px] tracking-[0.3em] text-muted-foreground uppercase">Management</span>
@@ -266,11 +233,7 @@ function RegisterPageInner() {
         <PortalSlidingAuthCard
           defaultMode="signup"
           signIn={
-            <SlidingSignInPanel
-              afterLogin={postRegisterHref}
-              oauthEnquiry={fromEnquiry}
-              govIdReturnPath={govIdReturnPath}
-            />
+            <SlidingSignInPanel afterLogin={postRegisterHref} oauthEnquiry={fromEnquiry} />
           }
           signUp={signUpForm}
         />

@@ -35,7 +35,55 @@ export function PortalSlidingAuthCard({
         className
       )}
     >
-      <div className="flex flex-1 min-h-[min(520px,80vh)] relative w-full">
+      {/* Narrow screens: one full-width panel + text toggle (avoids ~50% column squeeze) */}
+      <div className="lg:hidden flex flex-col min-h-0">
+        <div
+          className="shrink-0 px-4 pt-5 pb-4 text-center text-white"
+          style={brandPanelStyle}
+        >
+          <h2 className="text-xl font-bold tracking-tight">
+            {signup ? "Create account" : "Welcome back"}
+          </h2>
+          <p className="text-xs sm:text-sm leading-snug opacity-95 mt-1.5 max-w-md mx-auto px-1">
+            {signup
+              ? "Register with your work email and a secure password."
+              : "Sign in with email, NRIC / ID, or Google / Facebook."}
+          </p>
+        </div>
+        <div className="flex-1 min-h-0 px-4 py-6 sm:px-6 bg-[var(--brand-muted)]/50">
+          {signup ? signUp : signIn}
+        </div>
+        <div className="shrink-0 px-4 py-3.5 sm:py-4 border-t border-border bg-background/80 text-center text-sm pb-[max(0.875rem,env(safe-area-inset-bottom,0px))]">
+          {signup ? (
+            <span className="text-muted-foreground">
+              Already have an account?{" "}
+              <button
+                type="button"
+                onClick={() => setMode("signin")}
+                className="font-semibold text-foreground underline-offset-2 hover:underline"
+                style={{ color: "var(--brand)" }}
+              >
+                Sign in
+              </button>
+            </span>
+          ) : (
+            <span className="text-muted-foreground">
+              New here?{" "}
+              <button
+                type="button"
+                onClick={() => setMode("signup")}
+                className="font-semibold underline-offset-2 hover:underline"
+                style={{ color: "var(--brand)" }}
+              >
+                Create account
+              </button>
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Large screens: sliding two-column card */}
+      <div className="hidden lg:flex flex-1 min-h-[min(520px,80vh)] relative w-full">
         {/* Left: Sign In */}
         <section className="flex-1 flex flex-col items-center justify-center text-center px-6 sm:px-10 py-10 sm:py-12 z-[1] min-w-0 bg-[var(--brand-muted)]/50">
           {signIn}

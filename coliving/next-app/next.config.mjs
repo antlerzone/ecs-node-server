@@ -38,10 +38,13 @@ const nextConfig = {
     const coopAllowPopups = [
       { key: "Cross-Origin-Opener-Policy", value: "same-origin-allow-popups" },
     ];
+    const noStore = [{ key: "Cache-Control", value: "no-store, no-cache, must-revalidate" }];
     return [
       { source: "/auth/callback", headers: coopAllowPopups },
-      { source: "/login", headers: coopAllowPopups },
-      { source: "/signup", headers: coopAllowPopups },
+      { source: "/login", headers: [...coopAllowPopups, ...noStore] },
+      { source: "/signup", headers: [...coopAllowPopups, ...noStore] },
+      /** Avoid stale HTML/JS after deploy (e.g. old register chunk still showing removed UI). */
+      { source: "/register", headers: [...coopAllowPopups, ...noStore] },
     ];
   },
 }

@@ -6,8 +6,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { CheckCircle, Eye, EyeOff } from "lucide-react"
 import { Spinner } from "@/components/ui/spinner"
-import { GovIdConnectButtons } from "@/components/gov-id-connect-buttons"
-import { isDemoSite, shouldUseDemoMock } from "@/lib/portal-api"
+import { isDemoSite } from "@/lib/portal-api"
 
 function getEcsBase(): string {
   return (process.env.NEXT_PUBLIC_ECS_BASE_URL ?? "").replace(/\/$/, "")
@@ -15,13 +14,10 @@ function getEcsBase(): string {
 
 export function SlidingRegisterPanel({
   nextPath = "/enquiry",
-  /** When set, show MyDigital / Singpass under the form (same as sign-in). */
-  govIdReturnPath,
   emailHint,
 }: {
   /** Post-success “Continue” target (must be same-origin path) */
   nextPath?: string
-  govIdReturnPath?: string
   emailHint?: string
 }) {
   const postRegisterHref =

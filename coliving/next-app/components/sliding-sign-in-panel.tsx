@@ -11,9 +11,8 @@ import {
   buildPortalOAuthStartUrl,
   loginWithPassword,
 } from "@/components/portal-auth-form"
-import { GovIdConnectButtons } from "@/components/gov-id-connect-buttons"
 import { PORTAL_KEYS, setMember, setCurrentRole } from "@/lib/portal-session"
-import { isDemoSite, shouldUseDemoMock } from "@/lib/portal-api"
+import { isDemoSite } from "@/lib/portal-api"
 
 function getEcsBase(): string {
   return (process.env.NEXT_PUBLIC_ECS_BASE_URL ?? "").replace(/\/$/, "")
@@ -22,14 +21,11 @@ function getEcsBase(): string {
 export function SlidingSignInPanel({
   afterLogin,
   oauthEnquiry = false,
-  /** When set (e.g. `/demologin`), show MyDigital ID & Singpass under Google/Facebook. */
-  govIdReturnPath,
   emailHint,
 }: {
   afterLogin: string
   /** Pass enquiry OAuth flag when onboarding from /enquiry */
   oauthEnquiry?: boolean
-  govIdReturnPath?: string
   emailHint?: string
 }) {
   const router = useRouter()
@@ -192,7 +188,7 @@ export function SlidingSignInPanel({
   }
 
   return (
-    <div className="w-full max-w-[300px] mx-auto space-y-5">
+    <div className="w-full max-w-sm mx-auto space-y-5">
       <h2 className="text-2xl sm:text-3xl font-bold text-foreground">Sign In</h2>
       <p className="text-xs text-muted-foreground">Use your email or NRIC / ID number and password, or Google / Facebook below.</p>
 
