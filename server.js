@@ -106,6 +106,8 @@ const cleanlemonRoutes = require('./src/modules/cleanlemon/cleanlemon.routes');
 const cleanlemonAntlerzoneSyncRoutes = require('./src/modules/cleanlemon/cleanlemon-antlerzone-sync.routes');
 const clnOperatorAiSvc = require('./src/modules/cleanlemon/cln-operator-ai.service');
 const { getOperatorMasterTableName } = require('./src/config/operatorMasterTable');
+const telegramOpsRoutes = require('./src/modules/telegram-ops/telegram-ops.routes');
+const telegramOpsSvc = require('./src/modules/telegram-ops/telegram-ops.service');
 
 // Google / Facebook OAuth for portal login (strategies register on require)
 require('./src/modules/portal-auth/passport-strategies');
@@ -297,6 +299,13 @@ app.post('/api/internal/cleanlemon-schedule-ai-midnight', async (req, res) => {
     return res.status(500).json({ ok: false, reason: e?.message || 'ERROR' });
   }
 });
+// Telegram ECS ops (git pull + confirm); set TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, TELEGRAM_ALLOWED_CHAT_IDS
+if (telegramOpsSvc.isTelegramOpsConfigured()) {
+  app.use('/api/telegram-ops', telegramOpsRoutes);
+  console.log('[server] telegram-ops: enabled POST /api/telegram-ops/webhook');
+} else {
+  console.log('[server] telegram-ops: disabled (missing TELEGRAM_* env)');
+}
 // Available Unit list – public (no login), for portal /available-unit page
 app.use('/api/availableunit', availableunitRoutes);
 app.use('/api/available-unit', availableunitRoutes);

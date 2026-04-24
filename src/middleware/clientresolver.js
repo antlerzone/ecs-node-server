@@ -15,7 +15,8 @@ module.exports = async function (req, res, next) {
       path.startsWith('/api/availableunit') ||
       path.startsWith('/api/available-unit') ||
       path.startsWith('/api/cleanlemon') ||
-      path.startsWith('/api/public')
+      path.startsWith('/api/public') ||
+      path.startsWith('/api/telegram-ops')
     ) {
       return next();
     }
